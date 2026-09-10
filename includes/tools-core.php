@@ -1163,6 +1163,9 @@ class REEVE_Tools_Core {
   * The value is the sentence shown in the tool description, so the schema and the
   * behaviour cannot drift.
   */
+  /** How many matches a preview shows in context. The rest are counted, not collected. */
+  const PREVIEW_MATCHES = 10;
+
   const PREVIEWABLE = [
     'wp_delete_post' => 'Set preview to true to be told what would be deleted, including anything attached to it, without deleting anything.',
     'wp_update_post' => 'Set preview to true to be shown which fields would change and how, without writing.',
@@ -1307,6 +1310,9 @@ class REEVE_Tools_Core {
     $replace = (string) ( $a['replace'] ?? '' );
 
     $matches = [];
+    $count = 0;
+    $pattern = null;
+
     if ( !empty( $a['regex'] ) ) {
       // The same compiler the real handler uses. A preview built on its own idea of
       // what the pattern means is worse than no preview: it would report matches that
@@ -1316,15 +1322,27 @@ class REEVE_Tools_Core {
         $r['error'] = [ 'code' => -32602, 'message' => $error ];
         return $r;
       }
-      // PREG_OFFSET_CAPTURE so the surrounding text can be shown: a match is only
-      // meaningful with what sits either side of it.
-      if ( @preg_match_all( $pattern, $subject, $found, PREG_OFFSET_CAPTURE ) === false ) {
+      // Count without materialising anything. Asking for every match with
+      // PREG_OFFSET_CAPTURE and slicing to ten afterwards means one array entry and one
+      // preg_replace call per match: a pattern matching every character of a 400 KB post
+      // exhausted 128 MB. The fatal net turned that into a tool error rather than a dead
+      // connection, but a preview is the cautious option and has no business being the
+      // expensive one.
+      $count = @preg_match_all( $pattern, $subject );
+      if ( $count === false ) {
         $msg = function_exists( 'preg_last_error_msg' ) ? preg_last_error_msg() : 'PCRE error code ' . preg_last_error();
         $r['error'] = [ 'code' => -32602, 'message' => 'That pattern failed against this content: ' . $msg ];
         return $r;
       }
-      foreach ( $found[0] as $hit ) {
-        $matches[] = [ 'text' => $hit[0], 'at' => $hit[1], 'becomes' => preg_replace( $pattern, $replace, $hit[0] ) ];
+      // Then walk out only the handful actually shown.
+      $offset = 0;
+      while ( count( $matches ) < self::PREVIEW_MATCHES
+        && @preg_match( $pattern, $subject, $found, PREG_OFFSET_CAPTURE, $offset ) === 1 ) {
+        $text = (string) $found[0][0];
+        $at = (int) $found[0][1];
+        $matches[] = [ 'text' => $text, 'at' => $at, 'becomes' => preg_replace( $pattern, $replace, $text ) ];
+        // A zero-width match would leave the offset where it was and spin forever.
+        $offset = $at + max( 1, strlen( $text ) );
       }
     }
     else {
@@ -1332,20 +1350,22 @@ class REEVE_Tools_Core {
         $r['error'] = [ 'code' => -32602, 'message' => 'search cannot be empty.' ];
         return $r;
       }
+      $count = substr_count( $subject, $search );
       $offset = 0;
-      while ( ( $at = strpos( $subject, $search, $offset ) ) !== false ) {
+      while ( count( $matches ) < self::PREVIEW_MATCHES
+        && ( $at = strpos( $subject, $search, $offset ) ) !== false ) {
         $matches[] = [ 'text' => $search, 'at' => $at, 'becomes' => $replace ];
         $offset = $at + strlen( $search );
       }
     }
 
-    if ( !$matches ) {
+    if ( !$count ) {
       return $this->preview_text( $r, 'No match in ' . $field . ' of post #' . $post->ID
         . '. Running this for real would report success and change nothing, which is the failure worth catching here.' );
     }
 
-    $lines = [ count( $matches ) . ' match(es) in ' . $field . ' of post #' . $post->ID . ':' ];
-    foreach ( array_slice( $matches, 0, 10 ) as $index => $match ) {
+    $lines = [ $count . ' match(es) in ' . $field . ' of post #' . $post->ID . ':' ];
+    foreach ( $matches as $index => $match ) {
       $before = substr( $subject, max( 0, $match['at'] - 40 ), min( 40, $match['at'] ) );
       $after = substr( $subject, $match['at'] + strlen( $match['text'] ), 40 );
       $lines[] = '';
@@ -1353,9 +1373,9 @@ class REEVE_Tools_Core {
       $lines[] = '   ...' . $this->flatten( $before ) . '[' . $this->flatten( $match['text'] ) . ']' . $this->flatten( $after ) . '...';
       $lines[] = '   becomes: ...' . $this->flatten( $before ) . '[' . $this->flatten( (string) $match['becomes'] ) . ']' . $this->flatten( $after ) . '...';
     }
-    if ( count( $matches ) > 10 ) {
+    if ( $count > count( $matches ) ) {
       $lines[] = '';
-      $lines[] = '(' . ( count( $matches ) - 10 ) . ' further match(es) not shown.)';
+      $lines[] = '(' . ( $count - count( $matches ) ) . ' further match(es) not shown.)';
     }
     return $this->preview_text( $r, implode( "\n", $lines ) );
   }

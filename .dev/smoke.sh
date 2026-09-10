@@ -24,6 +24,9 @@ check() { # check <label> <actual> <expected>
 }
 
 py() { python3 -c "$1" < "$OUT/$2"; }
+# "error" when the call was refused, "ok" when it went through. A refusal can arrive as a
+# JSON-RPC error or as an isError result, depending on where in the stack it was decided.
+verdict() { py 'import json,sys;d=json.load(sys.stdin);print("error" if ("error" in d or d.get("result",{}).get("isError")) else "ok")' "$1"; }
 
 call init '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
 check "initialize handshake" "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["protocolVersion"])' init)" "2025-06-18"
@@ -96,6 +99,31 @@ check "the post still exists" \
 check "every preview says nothing was changed" \
   "$(for f in pv_alter pv_none pv_re pv_upd pv_del; do py 'import json,sys;print("Nothing has been changed" in json.load(sys.stdin)["result"]["content"][0]["text"])' $f; done | sort -u | tr -d '\n')" "True"
 docker compose exec -T cli wp post delete "$P_ID" --force >/dev/null 2>&1
+
+# A preview is the cautious option and has no business being the expensive one. Asking
+# preg_match_all for every match with PREG_OFFSET_CAPTURE, then slicing to ten, means one
+# array entry and one preg_replace call per match: a pattern matching every character of
+# a 400 KB post exhausted 128 MB and the call died. Matches are counted without being
+# materialised, and only the shown handful are walked out.
+BIG_ID=$(docker compose exec -T cli wp eval '
+  $body = str_repeat( "<!-- wp:paragraph --><p>The quick brown fox jumps over the lazy dog. </p><!-- /wp:paragraph -->\n", 4000 );
+  echo wp_insert_post( [ "post_title" => "Big body", "post_content" => $body, "post_status" => "draft" ] );' 2>/dev/null | tr -d '\r\n')
+call pv_many "{\"jsonrpc\":\"2.0\",\"id\":55,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":{\"ID\":$BIG_ID,\"field\":\"post_content\",\"search\":\".\",\"replace\":\"x\",\"regex\":true,\"preview\":true}}}"
+check "a pattern matching every character survives" "$(verdict pv_many)" "ok"
+check "and reports the real total, not the shown ten" \
+  "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["content"][0]["text"].split()[0])' pv_many)" "380000"
+check "while showing only a handful in context" \
+  "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["content"][0]["text"].count("becomes:"))' pv_many)" "10"
+# A zero-width match leaves the offset where it was, so the walk has to advance anyway.
+call pv_zero "{\"jsonrpc\":\"2.0\",\"id\":56,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":{\"ID\":$BIG_ID,\"field\":\"post_content\",\"search\":\"x*\",\"replace\":\"y\",\"regex\":true,\"preview\":true}}}"
+check "a zero-width match does not spin" "$(verdict pv_zero)" "ok"
+# PCRE's backtrack limit turns this into "no match" rather than a hang, and the tool has
+# to report that honestly rather than as a successful zero-match preview of a good pattern.
+call pv_redos "{\"jsonrpc\":\"2.0\",\"id\":57,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":{\"ID\":$BIG_ID,\"field\":\"post_content\",\"search\":\"(a+)+$\",\"replace\":\"x\",\"regex\":true,\"preview\":true}}}"
+check "catastrophic backtracking returns rather than hangs" "$(verdict pv_redos)" "ok"
+check "the big-body preview left the post alone" \
+  "$(docker compose exec -T cli wp post get "$BIG_ID" --field=post_status 2>/dev/null | tr -d '\r\n')" "draft"
+docker compose exec -T cli wp post delete "$BIG_ID" --force >/dev/null 2>&1
 
 echo "-- prompts --"
 call plist '{"jsonrpc":"2.0","id":30,"method":"prompts/list"}'
