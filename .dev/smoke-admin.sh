@@ -723,7 +723,24 @@ docker compose exec -T cli wp eval '$p=get_page_by_title("Written over the URL t
 # wp_upload_request is write level and writes nothing: it mints a URL on a route whose
 # permission callback returns true unconditionally, so the caller walks away holding an
 # unauthenticated upload endpoint. A level rule cannot see that, hence the exception list.
-check "no upload URL was handed out" "$(grep -c upload_url "$OUT/ut_one" || true)" "0"
+#
+# Its own call and its own file. This read $OUT/ut_one, which the loop above overwrites on
+# every iteration, so it was asserting against whatever happened to run last and passed
+# for that reason rather than this one. Reordering the loop would have broken it silently.
+call_url_token ut_upload '{"jsonrpc":"2.0","id":196,"method":"tools/call","params":{"name":"wp_upload_request","arguments":{"filename":"x.png"}}}'
+check "no upload URL was handed out" "$(grep -c upload_url "$OUT/ut_upload" || true)" "0"
+# The settings tool returns the administration email, which is a person's address rather
+# than a fact about the site, and changing it already costs a confirmation token.
+call_url_token ut_settings '{"jsonrpc":"2.0","id":197,"method":"tools/call","params":{"name":"wp_get_settings","arguments":{}}}'
+check "the settings tool is refused there" "$(verdict ut_settings)" "error"
+check "and the administration email did not come out" \
+  "$(grep -c 'a@b.test' "$OUT/ut_settings" || true)" "0"
+# Deliberately still reachable: all of this is in wp_site_briefing, which is read level and
+# allowed there, so blocking them one at a time would be a line drawn where nothing changes.
+for readable in wp_list_menus wp_list_sidebars wp_list_themes wp_get_permalink_structure; do
+  call_url_token ut_read_one "{\"jsonrpc\":\"2.0\",\"id\":198,\"method\":\"tools/call\",\"params\":{\"name\":\"$readable\",\"arguments\":{}}}"
+  check "$readable still reads there, as documented" "$(verdict ut_read_one)" "ok"
+done
 
 echo "-- what two-step confirmation does and does not cover --"
 # The readmes led with "deleting takes two calls" for a long time. It is true of plugins,

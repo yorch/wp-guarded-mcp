@@ -95,7 +95,7 @@ Yes. Nothing in the plugin is specific to one vendor. Any client that speaks the
 
 = What is the URL-token endpoint, and why can't it do everything? =
 
-If your server strips the Authorization header before PHP sees it, Reeve also answers on a URL that contains the token. That puts the secret in the request path, where proxies, access logs and browser history all keep it, so that route is deliberately narrowed. It cannot install anything, change settings or users, touch menus or widgets, run the Site Health report, or hand out an upload link. It is not read-only: content tools still work there, so anyone holding that URL can write posts and comments. Prefer the header, and press "Run the setup checks" if it is not arriving.
+If your server strips the Authorization header before PHP sees it, Reeve also answers on a URL that contains the token. That puts the secret in the request path, where proxies, access logs and browser history all keep it, so that route is deliberately narrowed. It cannot install anything, change settings or users, touch menus or widgets, read your settings, run the Site Health report, or hand out an upload link. It is not otherwise restricted: anyone holding that URL can write posts and comments, and can list your menus, widget areas, themes and permalink structure. Prefer the header, and press "Run the setup checks" if it is not arriving.
 
 = Can I limit what an agent is allowed to do? =
 

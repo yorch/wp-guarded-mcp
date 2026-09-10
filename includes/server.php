@@ -391,6 +391,14 @@ class REEVE_Server {
   * neither the role filter nor a key's tool list can see. Single use and MIME-checked, but
   * a capability handed out over a logged secret is the shape this whole route is about.
   *
+  * wp_get_settings is read level and returns the administration email address, which is a
+  * real person's address rather than a fact about the site. Changing it already costs a
+  * confirmation token and a cooldown, so reading it out of an access log should not be
+  * free. The rest of the administration group stays reachable here on purpose: menus,
+  * widget areas, themes and the permalink structure are all in wp_site_briefing, which is
+  * read level and deliberately allowed, so blocking them one at a time would be a line
+  * drawn where nothing changes.
+  *
   * The filter adds to and removes from the exception list. It cannot unblock an
   * admin-level tool: that decision is the rule, and a site whose host strips the
   * Authorization header should fix the header rather than widen this. That is a
@@ -409,6 +417,7 @@ class REEVE_Server {
     $exceptions = apply_filters( 'reeve_header_auth_only_tools', [
       'wp_get_site_health',
       'wp_upload_request',
+      'wp_get_settings',
     ], $level );
 
     if ( in_array( $tool, (array) $exceptions, true ) ) {
