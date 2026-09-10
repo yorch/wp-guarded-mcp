@@ -110,6 +110,32 @@ check "prompt arguments cannot smuggle instructions" \
   "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["messages"][0]["content"]["text"];print("delete everything" not in t)' pinj)" "True"
 call pbad '{"jsonrpc":"2.0","id":33,"method":"prompts/get","params":{"name":"no_such_prompt"}}'
 check "unknown prompt is refused" "$(py 'import json,sys;print("error" in json.load(sys.stdin))' pbad)" "True"
+# Arguments are driven by each prompt's OWN declared list, with a per-argument default.
+# A hardcoded map of three names got this wrong in both directions: a third-party prompt's
+# argument was dropped and its placeholder delivered as a literal brace, while an unrelated
+# literal {days} in that same template was rewritten.
+call pdef '{"jsonrpc":"2.0","id":41,"method":"prompts/get","params":{"name":"content_audit"}}'
+check "a prompt renders the default it advertises" \
+  "$(py 'import json,sys,re;print(re.search(r"most recent (\d+)",json.load(sys.stdin)["result"]["messages"][0]["content"]["text"]).group(1))' pdef)" "30"
+# Repairing a value rather than validating it silently means a different number:
+# "1e3" became 13, 1.5 became 15, "-5" became 5.
+call pbad1 '{"jsonrpc":"2.0","id":42,"method":"prompts/get","params":{"name":"content_audit","arguments":{"limit":"1e3"}}}'
+check "a value that is not a plain integer falls back, not mangled" \
+  "$(py 'import json,sys,re;print(re.search(r"most recent (\d+)",json.load(sys.stdin)["result"]["messages"][0]["content"]["text"]).group(1))' pbad1)" "30"
+call pgood '{"jsonrpc":"2.0","id":43,"method":"prompts/get","params":{"name":"content_audit","arguments":{"limit":"25"}}}'
+check "a valid value still lands" \
+  "$(py 'import json,sys,re;print(re.search(r"most recent (\d+)",json.load(sys.stdin)["result"]["messages"][0]["content"]["text"]).group(1))' pgood)" "25"
+# An array reaching a string cast logs a warning, and with WP_DEBUG_DISPLAY that text
+# prepends the JSON-RPC body and the client gets a parse error instead of a result.
+call parr '{"jsonrpc":"2.0","id":44,"method":"prompts/get","params":{"name":"content_audit","arguments":{"limit":[1,2]}}}'
+check "a non-scalar argument is refused quietly" "$(py 'import json,sys;print("result" in json.load(sys.stdin))' parr)" "True"
+call pnamearr '{"jsonrpc":"2.0","id":45,"method":"prompts/get","params":{"name":["x"]}}'
+check "a non-scalar prompt name is refused quietly" "$(py 'import json,sys;print("error" in json.load(sys.stdin))' pnamearr)" "True"
+# MCP wants each argument to be an object with a name. One malformed third-party prompt
+# would otherwise make the whole listing invalid to a strict client.
+check "every listed argument is a well-formed object" \
+  "$(py 'import json,sys;p=json.load(sys.stdin)["result"]["prompts"];print(all(isinstance(a,dict) and "name" in a for x in p for a in x.get("arguments",[])))' plist)" "True"
+
 echo "-- resources --"
 # A resource is the one path where a person, not a model, chooses what enters the
 # conversation. It has to actually work, and it has to be no softer than the tools.
@@ -129,6 +155,20 @@ call rfile '{"jsonrpc":"2.0","id":39,"method":"resources/read","params":{"uri":"
 check "a foreign URI scheme resolves to nothing" "$(py 'import json,sys;print("error" in json.load(sys.stdin))' rfile)" "True"
 call rtrav '{"jsonrpc":"2.0","id":40,"method":"resources/read","params":{"uri":"reeve://post/1/../../etc/passwd"}}'
 check "a traversal-shaped URI resolves to nothing" "$(py 'import json,sys;print("error" in json.load(sys.stdin))' rtrav)" "True"
+# Being gated by a tool is not the same as returning what the tool returns. This resource
+# read the comments directly and came back with author email addresses and raw untrimmed
+# bodies, both of which wp_get_comments withholds on purpose, for up to fifty unmoderated
+# messages written by strangers.
+call rcmt '{"jsonrpc":"2.0","id":46,"method":"resources/read","params":{"uri":"reeve://comments/pending"}}'
+call tcmt '{"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"wp_get_comments","arguments":{"status":"hold","limit":50}}}'
+check "the comment resource is exactly what its tool returns" \
+  "$(python3 -c "
+import json
+a=json.load(open('$OUT/rcmt'))['result']['contents'][0]['text']
+b=json.load(open('$OUT/tcmt'))['result']['content'][0]['text']
+print(json.loads(a)==json.loads(b))")" "True"
+check "and carries no author email" "$(grep -c 'author_email' "$OUT/rcmt" || true)" "0"
+
 call init2 '{"jsonrpc":"2.0","id":35,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
 check "server reports its real version" \
   "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["serverInfo"]["version"])' init2)" "1.0.0"

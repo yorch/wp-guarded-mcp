@@ -510,6 +510,58 @@ check "nor is it offered the post template" \
   "$(py 'import json,sys;print(len(json.load(sys.stdin)["result"]["resourceTemplates"]))' r_tpl)" "0"
 docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
 
+echo "-- undo is not a way round the access levels --"
+# wp_undo_change sits at the write level; wp_update_option sits at admin. Undo replays the
+# same write backwards, so without a check of its own it is an unscoped write primitive:
+# a key refused wp_update_option outright reopened public registration by reverting the
+# change that closed it. Every admin-level tightening became a handle usable at write
+# level, and a tool scope list did not help, because "undo" is one name standing for
+# every write on the journal.
+docker compose exec -T cli wp option update users_can_register 1 >/dev/null 2>&1
+docker compose exec -T cli wp option delete reeve_journal >/dev/null 2>&1
+K_UNDO=$(docker compose exec -T cli wp eval '$a=REEVE_Tokens::create("Deploy","readwrite",0,["wp_get_posts","wp_list_changes","wp_undo_change"]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+call u_tighten '{"jsonrpc":"2.0","id":140,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"users_can_register","value":"0"}}}'
+check "an admin connection can tighten registration" \
+  "$(docker compose exec -T cli wp option get users_can_register 2>/dev/null | tr -d '\r\n')" "0"
+kcall u_direct "$K_UNDO" '{"jsonrpc":"2.0","id":141,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"users_can_register","value":"1"}}}'
+check "a write-level key cannot set that option directly" "$(verdict u_direct)" "error"
+kcall u_list "$K_UNDO" '{"jsonrpc":"2.0","id":142,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":1}}}'
+U_ID=$(py "import json,sys;d=json.load(sys.stdin);print(json.loads(d['result']['content'][0]['text'])[0]['id'])" u_list)
+kcall u_revert "$K_UNDO" "{\"jsonrpc\":\"2.0\",\"id\":143,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$U_ID\"}}}"
+check "nor reach it through undo" "$(verdict u_revert)" "error"
+# Assert the stored option, not the refusal text. The refusal is what the tool says; this
+# is what actually happened.
+check "registration really is still closed" \
+  "$(docker compose exec -T cli wp option get users_can_register 2>/dev/null | tr -d '\r\n')" "0"
+check "the refusal names the tool that made the change" "$(refusal u_revert | grep -c wp_update_option)" "1"
+# The gate must not break legitimate undo, which is the whole point of the feature.
+call u_admin "{\"jsonrpc\":\"2.0\",\"id\":144,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$U_ID\"}}}"
+check "an admin connection can still undo its own change" \
+  "$(docker compose exec -T cli wp option get users_can_register 2>/dev/null | tr -d '\r\n')" "1"
+docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
+
+echo "-- a credential in an innocuous option is not journalled --"
+# option_guard matches on the option NAME. Most secrets do not live in the name:
+# woocommerce_stripe_settings, wp_mail_smtp and jetpack_options are all innocuous names
+# holding an array with a secret_key inside. Rotating one through the agent left the old
+# live key sitting in a second row.
+docker compose exec -T cli wp option delete reeve_journal >/dev/null 2>&1
+call c_set1 '{"jsonrpc":"2.0","id":145,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"acme_gateway_settings","value":{"mode":"live","secret_key":"sk_live_SUPERSECRET123"}}}}'
+call c_set2 '{"jsonrpc":"2.0","id":146,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"acme_gateway_settings","value":{"mode":"test","secret_key":"sk_test_rotated"}}}}'
+check "the rotated-out credential is not in the journal" \
+  "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("reeve_journal",[])),"sk_live_SUPERSECRET123")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
+call c_list '{"jsonrpc":"2.0","id":147,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":1}}}'
+# Silently skipping it would leave someone believing the change is reversible.
+check "and the entry says why it cannot be reverted" \
+  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0].get("not_reversible_because",""))' c_list)" \
+  "The previous value looked like it held a credential, so it was never stored."
+# The journal row holds previous values of other options, so it must not be readable.
+call c_read '{"jsonrpc":"2.0","id":148,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"reeve_journal"}}}'
+check "the journal row cannot be read through the option tools" "$(verdict c_read)" "error"
+call c_keys '{"jsonrpc":"2.0","id":149,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"reeve_tokens"}}}'
+check "nor can the key table" "$(verdict c_keys)" "error"
+docker compose exec -T cli wp option delete acme_gateway_settings >/dev/null 2>&1
+
 echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
 # The hard flush is what writes .htaccess, and it only runs if save_mod_rewrite_rules()
 # exists. That lives in wp-admin/includes/misc.php and calls get_home_path() from

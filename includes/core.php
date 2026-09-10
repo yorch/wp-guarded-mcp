@@ -80,6 +80,11 @@ class REEVE_Core {
     $exact = [
       self::OPTION_NAME,
       'reeve_oauth_db_version',
+      // The journal holds previous values of other options. Readable through the option
+      // tools, it would be a second copy of whatever those options held.
+      'reeve_journal',
+      // Key hashes. Not replayable, but there is no reason to hand them out either.
+      'reeve_tokens',
     ];
     $patterns = [ 'password', 'secret', 'token', 'private_key', 'api_key', 'apikey', 'auth_key', 'salt', 'nonce_key' ];
 

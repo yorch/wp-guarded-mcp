@@ -22,9 +22,16 @@ if ( !defined( 'ABSPATH' ) ) {
 *
 * Two things it deliberately will not record:
 *
-* Anything REEVE_Core::option_guard() refuses. The journal writes previous values into
-* an option row, so recording the plugin's own settings would copy the bearer token into
-* a second place, reachable by anything that can read options.
+* Anything REEVE_Core::option_guard() refuses, by name or by the names inside its value.
+* The journal writes previous values into an option row, so recording the plugin's own
+* settings would copy the bearer token into a second place. The value check exists
+* because the name check is not enough: woocommerce_stripe_settings is an innocuous name
+* holding a live secret_key, and matching only on the name would journal it in full.
+*
+* This is a heuristic and it is not retroactive. A site that adds an option to
+* reeve_protected_options later gets a correct refusal at revert time, but the plaintext
+* already recorded stays in the row until the log rolls past it. Clear the journal after
+* protecting something that was previously being recorded.
 *
 * Anything large. Previous values above MAX_VALUE are described rather than copied, and
 * the log is trimmed by total size as well as by count, so it cannot grow without bound.
@@ -95,12 +102,46 @@ class REEVE_Journal {
     if ( $old === $new ) {
       return;
     }
-    $this->record( [
+    // The guard matches on the option's NAME, which is not where most secrets live.
+    // woocommerce_stripe_settings, wp_mail_smtp and jetpack_options are all innocuous
+    // names holding an array with a secret_key or an api_key inside it. Copying that
+    // array here would put a live credential in a second row, and rotating the
+    // credential through the agent would leave the old one on disk.
+    $entry = [
       'kind' => 'option',
       'key' => $key,
       'what' => "Option \"{$key}\" changed",
-      'previous' => $this->storable( $old ),
-    ] );
+    ];
+    if ( self::holds_credential( $old ) ) {
+      $entry['previous'] = null;
+      $entry['redacted'] = true;
+    }
+    else {
+      $entry['previous'] = $this->storable( $old );
+    }
+    $this->record( $entry );
+  }
+
+  /**
+  * Whether a value carries something credential-shaped, judged by the names inside it.
+  *
+  * Deliberately about structure rather than content: guessing whether a bare string is
+  * a secret means guessing, and guessing wrong in the permissive direction stores the
+  * secret. Settings arrays are how plugins actually hold these, and their keys say so.
+  */
+  private static function holds_credential( $value, int $depth = 0 ): bool {
+    if ( $depth > 6 || !is_array( $value ) ) {
+      return false;
+    }
+    foreach ( $value as $key => $inner ) {
+      if ( is_string( $key ) && REEVE_Core::option_guard( $key ) !== true ) {
+        return true;
+      }
+      if ( is_array( $inner ) && self::holds_credential( $inner, $depth + 1 ) ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public function option_added( $key, $value ): void {
@@ -223,6 +264,9 @@ class REEVE_Journal {
       return 'It has already been reverted.';
     }
     if ( ( $entry['kind'] ?? '' ) === 'option' ) {
+      if ( !empty( $entry['redacted'] ) ) {
+        return 'The previous value looked like it held a credential, so it was never stored.';
+      }
       if ( self::too_large( $entry['previous'] ?? null ) ) {
         return 'The previous value was too large to keep.';
       }
@@ -266,6 +310,28 @@ class REEVE_Journal {
       $why = self::reversible( $entry );
       if ( $why !== true ) {
         return [ 'ok' => false, 'message' => 'That change cannot be reverted. ' . $why ];
+      }
+
+      // Undo is a write, and it is the same write the original tool made, backwards.
+      // Without this it is an unscoped write primitive: wp_undo_change sits at the
+      // write level while wp_update_option sits at admin, so a key refused
+      // wp_update_option outright could still reopen public registration by reverting
+      // the change that closed it. Every admin-level tightening made through the agent
+      // would become a handle usable at write level, and a key scoped to a short list
+      // of tools would still reach every write on the journal, because "undo" is one
+      // name standing for all of them.
+      //
+      // So ask whether this caller could call the tool that made the change. Defaults
+      // to false: no server means no answer, and a security check with no answer must
+      // refuse.
+      $tool = (string) ( $entry['tool'] ?? '' );
+      if ( !apply_filters( 'reeve_can_call_tool', false, $tool ) ) {
+        return [
+          'ok' => false,
+          'message' => $tool !== ''
+            ? "That change was made by {$tool}, and reverting it is the same write in reverse. This connection cannot call {$tool}, so it cannot undo what {$tool} did."
+            : 'That change has no recorded tool, so there is no way to tell whether you are allowed to reverse it.',
+        ];
       }
 
       // A revert writes options and posts like anything else, and recording it would

@@ -17,9 +17,15 @@ if ( !defined( 'ABSPATH' ) ) {
 * forgot, or reading what actually changed last week is unambiguously useful and is work
 * nobody enjoys.
 *
-* A prompt is only text. It cannot do anything the tools do not already allow, and it
-* runs under whatever access level the caller has, so a read-only token given the comment
-* triage prompt will simply report and be unable to act.
+* A prompt is only text. It cannot do anything the tools do not already allow, and it runs
+* under whatever access level the caller has, so a read-only token given the comment triage
+* prompt can report and cannot act.
+*
+* That is a claim about the prompt, not a promise that every tool it names will answer. A
+* prompt whose tools are not registered is hidden from the listing rather than offered and
+* then refused, but a tool that exists at a level above the caller's still returns a
+* refusal mid-task, and the templates are written to carry on rather than stop when that
+* happens.
 */
 class REEVE_Prompts {
 
@@ -34,10 +40,11 @@ class REEVE_Prompts {
     $prompts = [
       [
         'name' => 'triage_comments',
+        'tools' => [ 'wp_get_comments' ],
         'title' => 'Triage the comment queue',
         'description' => 'Read the pending comments and recommend approve, spam or trash for each, with a reason.',
         'arguments' => [
-          [ 'name' => 'limit', 'description' => 'How many to look at. Default 20.', 'required' => false ],
+          [ 'name' => 'limit', 'description' => 'How many to look at. Default 20.', 'required' => false, 'default' => '20' ],
         ],
         'template' => 'Use wp_get_comments to fetch up to {limit} comments with status "hold" on this WordPress site.'
           . "\n\n" . 'For each one, judge whether it is genuine, spam, or abusive, and say which and why in one line. '
@@ -47,10 +54,11 @@ class REEVE_Prompts {
       ],
       [
         'name' => 'stale_drafts',
+        'tools' => [ 'wp_get_posts' ],
         'title' => 'Find forgotten drafts',
         'description' => 'List drafts that have not been touched in a while, with a short summary of each, so you can decide what to finish or bin.',
         'arguments' => [
-          [ 'name' => 'months', 'description' => 'How old, in months. Default 6.', 'required' => false ],
+          [ 'name' => 'months', 'description' => 'How old, in months. Default 6.', 'required' => false, 'default' => '6' ],
         ],
         'template' => 'Find every draft post on this WordPress site that has not been modified in the last {months} months. '
           . 'Use wp_get_posts with post_status "draft".'
@@ -61,20 +69,23 @@ class REEVE_Prompts {
       ],
       [
         'name' => 'whats_changed',
+        'tools' => [ 'wp_get_posts', 'wp_get_comments' ],
         'title' => 'What changed on the site recently',
         'description' => 'A plain summary of recent posts, edits, comments and new users, for catching up after time away.',
         'arguments' => [
-          [ 'name' => 'days', 'description' => 'How far back to look. Default 7.', 'required' => false ],
+          [ 'name' => 'days', 'description' => 'How far back to look. Default 7.', 'required' => false, 'default' => '7' ],
         ],
         'template' => 'Give me a summary of what has changed on this WordPress site in the last {days} days.'
-          . "\n\n" . 'Cover: posts and pages published or modified, comments received, and users registered. '
-          . 'Use wp_get_posts with a date filter, wp_get_comments, and wp_get_users.'
+          . "\n\n" . 'Cover posts and pages published or modified, and comments received, using wp_get_posts '
+          . 'with a date filter and wp_get_comments. If wp_get_users is available to you, include users '
+          . 'registered in the same period; if it is not, say so in one line and carry on rather than stopping.'
           . "\n\n" . 'Write it as a short briefing I can read in under a minute, not a list of raw records. '
           . 'Lead with anything that looks unusual: a spike in comments, a user registering with an odd address, '
           . 'a published post I might not have expected.',
       ],
       [
         'name' => 'update_review',
+        'tools' => [ 'wp_list_plugins', 'wp_list_themes' ],
         'title' => 'Review pending updates',
         'description' => 'List plugins and themes with updates available and advise on the order to apply them.',
         'arguments' => [],
@@ -88,10 +99,11 @@ class REEVE_Prompts {
       ],
       [
         'name' => 'content_audit',
+        'tools' => [ 'wp_get_posts' ],
         'title' => 'Audit published content',
         'description' => 'Look over published posts for missing excerpts, absent featured images, thin content and untagged items.',
         'arguments' => [
-          [ 'name' => 'limit', 'description' => 'How many posts to examine. Default 30.', 'required' => false ],
+          [ 'name' => 'limit', 'description' => 'How many posts to examine. Default 30.', 'required' => false, 'default' => '30' ],
         ],
         'template' => 'Examine the most recent {limit} published posts on this WordPress site.'
           . "\n\n" . 'For each, check whether it has an excerpt, a featured image, at least one category or tag, '
@@ -101,6 +113,7 @@ class REEVE_Prompts {
       ],
       [
         'name' => 'site_health_brief',
+        'tools' => [ 'wp_get_site_health' ],
         'title' => 'Explain this site\'s health',
         'description' => 'Run the Site Health checks and translate the results into plain language with a recommended order of work.',
         'arguments' => [],
@@ -121,19 +134,67 @@ class REEVE_Prompts {
     return is_array( $prompts ) ? $prompts : [];
   }
 
-  /** The catalogue as the protocol wants it: no templates, only the metadata. */
-  public static function listing(): array {
+  /**
+  * The catalogue as the protocol wants it: no templates, only the metadata.
+  *
+  * Prompts whose tools are not registered on this site are left out entirely. The
+  * administration tools are off by default, so a stock install was offering "Explain this
+  * site's health" and "Review pending updates" in the client's menu, and picking either
+  * sent the agent at a tool that does not exist. A menu entry that cannot work is worse
+  * than no entry: the person has already decided to do the thing before they find out.
+  *
+  * @param callable|null $permitted Given a tool name, whether this caller can reach it.
+  */
+  public static function listing( ?callable $permitted = null ): array {
     $out = [];
     foreach ( self::all() as $prompt ) {
       if ( empty( $prompt['name'] ) ) {
+        continue;
+      }
+      if ( $permitted !== null && !self::usable( $prompt, $permitted ) ) {
         continue;
       }
       $out[] = [
         'name' => $prompt['name'],
         'title' => $prompt['title'] ?? $prompt['name'],
         'description' => $prompt['description'] ?? '',
-        'arguments' => array_values( (array) ( $prompt['arguments'] ?? [] ) ),
+        'arguments' => self::arguments( $prompt ),
       ];
+    }
+    return $out;
+  }
+
+  /** Every tool a prompt drives has to be reachable, or the prompt is not offered. */
+  private static function usable( array $prompt, callable $permitted ): bool {
+    foreach ( (array) ( $prompt['tools'] ?? [] ) as $tool ) {
+      if ( !is_string( $tool ) || !$permitted( $tool ) ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+  * A prompt's declared arguments, in the shape the protocol requires.
+  *
+  * MCP wants a list of objects, each with a name. A prompt registered through the filter
+  * can declare anything, and `(array) 'age'` produces `["age"]`, a bare string where an
+  * object belongs. One malformed third-party prompt would make the whole listing invalid
+  * to a strict client, so entries that are not shaped like arguments are dropped rather
+  * than passed through.
+  */
+  private static function arguments( array $prompt ): array {
+    $out = [];
+    foreach ( (array) ( $prompt['arguments'] ?? [] ) as $argument ) {
+      if ( !is_array( $argument ) || empty( $argument['name'] ) || !is_string( $argument['name'] ) ) {
+        continue;
+      }
+      $row = [ 'name' => $argument['name'] ];
+      if ( isset( $argument['description'] ) && is_string( $argument['description'] ) ) {
+        $row['description'] = $argument['description'];
+      }
+      $row['required'] = !empty( $argument['required'] );
+      $out[] = $row;
     }
     return $out;
   }
@@ -141,9 +202,12 @@ class REEVE_Prompts {
   /**
   * Render one prompt into the message a client will send.
   *
-  * Arguments are substituted as {name} placeholders, and anything the caller did not
-  * supply falls back to the default named in the template's own description rather than
-  * being left as a literal brace, which would reach the model as noise.
+  * Substitution is driven by the prompt's OWN declared arguments. It used to be driven by
+  * a hardcoded map of three names, which was wrong in both directions: a third-party
+  * prompt declaring an "age" argument had the caller's value dropped and `{age}` delivered
+  * to the model as a literal brace, while an unrelated literal `{days}` in that same
+  * template was rewritten to 7. It also meant content_audit advertised a default of 30 and
+  * rendered 20.
   *
   * @return array|null The messages payload, or null when the name is unknown.
   */
@@ -154,13 +218,11 @@ class REEVE_Prompts {
       }
       $text = (string) ( $prompt['template'] ?? '' );
 
-      $defaults = [ 'limit' => '20', 'months' => '6', 'days' => '7' ];
-      foreach ( $defaults as $key => $fallback ) {
-        $value = isset( $args[ $key ] ) && $args[ $key ] !== '' ? (string) $args[ $key ] : $fallback;
-        // Numeric arguments only: these land in a prompt a model acts on, so a value
-        // carrying instructions of its own has no business being interpolated.
-        $value = preg_replace( '/[^0-9]/', '', $value );
-        $text = str_replace( '{' . $key . '}', $value !== '' ? $value : $fallback, $text );
+      foreach ( self::arguments( $prompt ) as $argument ) {
+        $key = $argument['name'];
+        $declared = self::declared( $prompt, $key );
+        $fallback = isset( $declared['default'] ) ? (string) $declared['default'] : '';
+        $text = str_replace( '{' . $key . '}', self::value( $args[ $key ] ?? null, $fallback ), $text );
       }
 
       return [
@@ -174,5 +236,36 @@ class REEVE_Prompts {
       ];
     }
     return null;
+  }
+
+  private static function declared( array $prompt, string $name ): array {
+    foreach ( (array) ( $prompt['arguments'] ?? [] ) as $argument ) {
+      if ( is_array( $argument ) && ( $argument['name'] ?? '' ) === $name ) {
+        return $argument;
+      }
+    }
+    return [];
+  }
+
+  /**
+  * Validate an argument, or fall back. Never repair one.
+  *
+  * These land in a prompt a model acts on, so a value carrying instructions of its own has
+  * no business being interpolated. The first version stripped non-digits, which is
+  * repairing rather than validating and quietly produced a different number than the
+  * caller asked for: "1e3" became 13, 1.5 became 15, "-5" became 5, and 2.0E+21 became
+  * 2021. Refusing the value and using the default is the only answer that cannot silently
+  * mean something else. The length cap is part of that: a four-hundred-digit limit was
+  * being interpolated whole.
+  */
+  private static function value( $given, string $fallback ): string {
+    if ( !is_scalar( $given ) ) {
+      // An array here used to reach a string cast and log "Array to string conversion",
+      // which on a site with WP_DEBUG_DISPLAY prepends warning text to the JSON-RPC body
+      // and hands the client a parse error instead of a result.
+      return $fallback;
+    }
+    $value = trim( (string) $given );
+    return preg_match( '/^[0-9]{1,4}$/', $value ) ? $value : $fallback;
   }
 }

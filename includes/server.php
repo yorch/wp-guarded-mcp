@@ -96,6 +96,11 @@ class REEVE_Server {
     }
     $this->mcp_role = $this->core->get_option( 'mcp_role', 'admin' );
 
+    // So the change journal can ask whether this caller could make the write it is
+    // about to replay. Registered here rather than in the constructor because it is
+    // only meaningful once auth has been resolved for a REST request.
+    add_filter( 'reeve_can_call_tool', [ $this, 'filter_can_call_tool' ], 10, 2 );
+
     // Auth filter runs for both bearer token and OAuth token paths; register
     // unconditionally so that OAuth-only deployments (no static bearer set) work.
     static $filter_added = false;
@@ -608,21 +613,25 @@ class REEVE_Server {
           $reply = [
             'jsonrpc' => '2.0',
             'id' => $id,
-            'result' => [ 'prompts' => REEVE_Prompts::listing() ],
+            'result' => [ 'prompts' => REEVE_Prompts::listing( [ $this, 'resource_permitted' ] ) ],
           ];
           break;
 
         case 'prompts/get':
-          $params = $data['params'] ?? [];
+          $params = is_array( $data['params'] ?? null ) ? $data['params'] : [];
+          // params.name is whatever the client sent. An array reaching a string cast logs
+          // "Array to string conversion", and with WP_DEBUG_DISPLAY that text lands in
+          // front of the JSON-RPC body and the client gets a parse error.
+          $prompt_name = isset( $params['name'] ) && is_scalar( $params['name'] ) ? (string) $params['name'] : '';
           $rendered = REEVE_Prompts::render(
-            (string) ( $params['name'] ?? '' ),
+            $prompt_name,
             is_array( $params['arguments'] ?? null ) ? $params['arguments'] : []
           );
           $reply = $rendered === null
             ? [
               'jsonrpc' => '2.0',
               'id' => $id,
-              'error' => [ 'code' => -32602, 'message' => 'Unknown prompt: ' . (string) ( $params['name'] ?? '' ) ],
+              'error' => [ 'code' => -32602, 'message' => 'Unknown prompt: ' . $prompt_name ],
             ]
             : [ 'jsonrpc' => '2.0', 'id' => $id, 'result' => $rendered ];
           break;
@@ -953,11 +962,15 @@ class REEVE_Server {
   * it exists to gate.
   */
   /**
-  * Whether this caller could have called the tool a resource is backed by.
+  * Could this caller, right now, call this tool?
   *
-  * Public because the resource layer is handed it as a callable. It answers the same
-  * question the tool gate answers, in the same order, so a resource can never be a
-  * softer route to data than the tool it mirrors.
+  * The single answer to that question, so nothing has to reimplement it and drift. The
+  * resource layer is handed it as a callable, and the change journal reaches it through
+  * the reeve_can_call_tool filter before replaying a write.
+  *
+  * It runs the same gates as execute_tool, in the same order, including the URL-token
+  * ceiling. Leaving that ceiling out would mean a caller barred from a tool because its
+  * secret is in the request path could still reach that tool's effect by another route.
   */
   public function resource_permitted( string $tool ): bool {
     if ( empty( $this->tool_access_levels ) ) {
@@ -971,10 +984,21 @@ class REEVE_Server {
     if ( !$this->token_allows_tool( $tool ) ) {
       return false;
     }
+    if ( $this->auth_method === 'bearer_url' && $this->tool_requires_header_auth( $tool ) ) {
+      return false;
+    }
     if ( $this->role_filter_applies() && !$this->role_has_access( $this->tool_access_levels[ $tool ] ) ) {
       return false;
     }
     return true;
+  }
+
+  /**
+  * Answer reeve_can_call_tool for anything that needs the decision but cannot see this
+  * object. Defaults to false at the call site, so a missing server fails closed.
+  */
+  public function filter_can_call_tool( $allowed, $tool ) {
+    return $this->resource_permitted( (string) $tool );
   }
 
   private function token_allows_tool( string $tool ): bool {
@@ -1263,11 +1287,6 @@ class REEVE_Server {
   private function arm_fatal_net( $tool, $id ) {
     self::$currentToolCall = [ 'tool' => $tool, 'id' => $id ];
 
-    // Paired with reeve_tool_called in the finally block below. The change journal
-    // uses the pair to tell an agent's writes from a person's: it listens to WordPress
-    // itself, so without a "a tool call is in flight" signal it would also record
-    // somebody saving a settings page by hand.
-    do_action( 'reeve_tool_start', $tool, $args );
     if ( self::$memoryReserve === null ) {
       self::$memoryReserve = str_repeat( 'x', 2 * 1024 * 1024 );
     }
@@ -1318,6 +1337,18 @@ class REEVE_Server {
     $status = 'error';
     $error_msg = null;
     $this->arm_fatal_net( $tool, $id );
+
+    // Paired with reeve_tool_called in the finally block below. The change journal uses
+    // the pair to tell an agent's writes from a person's: it listens to WordPress itself,
+    // so without a "a tool call is in flight" signal it would also record somebody saving
+    // a settings page by hand.
+    //
+    // It has to fire here and not inside arm_fatal_net(), where it first landed. There is
+    // no $args in that scope, so every single tool call logged an undefined-variable
+    // warning, and on a site with WP_DEBUG_DISPLAY the warning text prepends the JSON-RPC
+    // body and the client gets a parse error instead of a result.
+    do_action( 'reeve_tool_start', $tool, $args );
+
     try {
       // Ensure tool access levels are populated (each HTTP request starts fresh)
       if ( empty( $this->tool_access_levels ) ) {
