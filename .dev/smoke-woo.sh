@@ -177,6 +177,11 @@ kcall pii_prod "$K_RO" '{"jsonrpc":"2.0","id":36,"method":"tools/call","params":
 check "but can still read products" "$(verdict pii_prod)" "ok"
 kcall pii_sales "$K_RO" '{"jsonrpc":"2.0","id":37,"method":"tools/call","params":{"name":"wc_sales_summary","arguments":{}}}'
 check "and sales figures, which name nobody" "$(verdict pii_sales)" "ok"
+kcall pii_brief "$K_RO" '{"jsonrpc":"2.0","id":38,"method":"tools/call","params":{"name":"wc_store_briefing","arguments":{}}}'
+for f in pii_prod pii_sales pii_brief; do
+  check "nothing customer-shaped comes back from $f" \
+    "$(grep -cE '@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|billing|shipping|first_name|last_name' "$OUT/$f" || true)" "0"
+done
 docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
 
 echo "-- the switch really is a switch --"
