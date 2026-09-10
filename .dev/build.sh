@@ -56,6 +56,14 @@ for required in "$SLUG.php" readme.txt LICENSE CREDITS.md uninstall.php; do
 done
 grep -qi "jordy meow" "$STAGE/$SLUG/CREDITS.md" || { echo "CREDITS.md no longer names the upstream author" >&2; exit 1; }
 
+# GPLv2 2(a) asks the modified FILES to carry the notice, not a companion document, so
+# each file derived from upstream states what it came from and that it was changed. A
+# refactor that drops one of these is a licensing regression no test would otherwise see.
+for derived in includes/server.php includes/oauth.php includes/tools-core.php includes/tools-rest.php; do
+  grep -qi "Derived from AI Engine" "$STAGE/$SLUG/$derived" \
+    || { echo "$derived has lost its upstream notice" >&2; exit 1; }
+done
+
 # Parse every shipped file before anyone installs it. A package that does not compile is
 # a white screen on somebody's site.
 if command -v php >/dev/null 2>&1; then

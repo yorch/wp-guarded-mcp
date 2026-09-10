@@ -1,5 +1,12 @@
 <?php
 
+/*
+ * Derived from AI Engine 3.7.7 (labs/mcp.php), Copyright (C) Jordy Meow,
+ * GPLv2 or later. Modified 2026 by Jorge Barnaby: renamed throughout, prompts and resources added, named keys, an audit
+ * hook, per-tool access gating and the URL-token ceiling.
+ * See CREDITS.md for the full statement of changes.
+ */
+
 /**
 * Guarded MCP
 *

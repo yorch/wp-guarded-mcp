@@ -26,11 +26,14 @@ Plugin. Or copy the directory into `wp-content/plugins/guarded-mcp` and activate
 wp plugin install /path/to/guarded-mcp.zip --activate
 ```
 
-**The directory must be named `guarded-mcp`.** Not `guarded-mcp-main`, not `ai-engine`.
+**The directory must be named `guarded-mcp`.** Not `wp-guarded-mcp`, not
+`wp-guarded-mcp-main`, not `ai-engine`.
 The plugin derives its own identity from the folder through `plugin_basename()`, and the
 guard that stops an agent deactivating or deleting the plugin mid-call compares against
 that. Rename the folder and the self-protection silently stops matching. A GitHub
-"Download ZIP" gives you `guarded-mcp-main`, so rename it if you go that route.
+"Download ZIP" gives you `wp-guarded-mcp-main`, so rename it if you go that route. The
+repository is named `wp-guarded-mcp` and the plugin `guarded-mcp`; only the second name
+matters to WordPress.
 
 Then open **MCP Server** in the admin menu.
 

@@ -2,7 +2,7 @@
 
 /*
 Plugin Name: Guarded MCP
-Plugin URI: https://github.com/yorch/guarded-mcp
+Plugin URI: https://github.com/yorch/wp-guarded-mcp
 Description: Safe MCP server for Claude and any AI agent. Full site administration with guardrails: confirmed deletions, repository-only installs, no API keys.
 Version: 1.0.0
 Requires at least: 6.0

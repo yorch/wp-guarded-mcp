@@ -1,5 +1,12 @@
 <?php
 
+/*
+ * Derived from AI Engine 3.7.7 (labs/mcp-core.php), Copyright (C) Jordy Meow,
+ * GPLv2 or later. Modified 2026 by Jorge Barnaby: renamed throughout, block-aware HTML sanitising, protected options,
+ * preview mode, and the change-journal tools.
+ * See CREDITS.md for the full statement of changes.
+ */
+
 class GMCP_Tools_Core {
   private $core = null;
 

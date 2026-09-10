@@ -1,5 +1,11 @@
 <?php
 
+/*
+ * Derived from AI Engine 3.7.7 (labs/mcp-rest.php), Copyright (C) Jordy Meow,
+ * GPLv2 or later. Modified 2026 by Jorge Barnaby: renamed throughout.
+ * See CREDITS.md for the full statement of changes.
+ */
+
 class GMCP_Tools_Rest {
   // Bump the suffix when build_schema_from_args() changes so old cached schemas are ignored.
   private $cache_key = 'gmcp_tools_cache_v4';
