@@ -138,6 +138,11 @@ class REEVE_Settings {
   * query string would write the secret into the browser history, the server access log,
   * and any referrer header the next page sends.
   */
+  /** Where a newly minted key waits for the one page load that shows it. */
+  private static function new_key_transient(): string {
+    return 'reeve_new_key_' . get_current_user_id();
+  }
+
   private function create_key(): void {
     $label = isset( $_POST['key_label'] ) ? sanitize_text_field( wp_unslash( $_POST['key_label'] ) ) : '';
     $level = isset( $_POST['key_level'] ) ? sanitize_key( wp_unslash( $_POST['key_level'] ) ) : 'readonly';
@@ -153,7 +158,12 @@ class REEVE_Settings {
     }
 
     $key = REEVE_Tokens::create( $label, $level, $days, $tools );
-    set_transient( 'reeve_new_key', $key['secret'], MINUTE_IN_SECONDS );
+    // Named for the person who minted it, so it is not a fixed target that anything else
+    // can go and read. Belt to the option guard's braces: without a persistent object
+    // cache a transient is an ordinary wp_options row, so for its sixty seconds the
+    // plaintext really is in the database, which is the exact thing hashing the stored
+    // keys exists to avoid.
+    set_transient( self::new_key_transient(), $key['secret'], MINUTE_IN_SECONDS );
     $this->notice = __( 'Key created. Copy it now: it is stored hashed and cannot be shown again.', 'reeve' );
   }
 
@@ -395,9 +405,9 @@ class REEVE_Settings {
   }
 
   private function render_keys(): void {
-    $fresh = get_transient( 'reeve_new_key' );
+    $fresh = get_transient( self::new_key_transient() );
     if ( $fresh ) {
-      delete_transient( 'reeve_new_key' );
+      delete_transient( self::new_key_transient() );
       ?>
       <div class="notice notice-success inline" style="padding:12px">
         <p><strong><?php esc_html_e( 'Your new key. This is the only time it is shown.', 'reeve' ); ?></strong></p>

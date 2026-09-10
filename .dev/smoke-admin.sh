@@ -655,6 +655,28 @@ kcall pr_ok "$K_PR" '{"jsonrpc":"2.0","id":172,"method":"prompts/get","params":{
 check "an offered prompt still renders for it" "$(py 'import json,sys;print("result" in json.load(sys.stdin))' pr_ok)" "True"
 docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
 
+echo "-- this plugin's own rows are not readable through its own tools --"
+# The guard used to name rows one at a time and was wrong twice: the change journal was
+# readable until it was named, and the one-time plaintext of a newly minted key sits in
+# _transient_reeve_new_key, which no exact entry matched. Reading it needs an admin-level
+# caller, so it is not a level escalation, but an admin key deliberately narrowed to
+# wp_get_option, the shape of a reporting key someone would think safe, harvested any key
+# minted in the next sixty seconds. It also undercut the whole reason keys are hashed.
+docker compose exec -T cli wp eval 'set_transient("reeve_new_key_1","reeve_deadbeef_SECRETPLAINTEXTKEY",60);' >/dev/null 2>&1
+for row in _transient_reeve_new_key_1 reeve_journal reeve_tokens reeve_activity reeve_options; do
+  call g_row "{\"jsonrpc\":\"2.0\",\"id\":180,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_option\",\"arguments\":{\"key\":\"$row\"}}}"
+  check "$row is refused" "$(verdict g_row)" "error"
+done
+# raw:true reads straight from the database, bypassing the object cache and option_*
+# filters, so it has to be refused by the same gate rather than sneaking round it.
+call g_raw '{"jsonrpc":"2.0","id":181,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"_transient_reeve_new_key_1","raw":true}}}'
+check "and the raw read is refused too" "$(verdict g_raw)" "error"
+# The opposite failure: a prefix rule broad enough to refuse everything would pass all of
+# the above and make the option tools useless.
+call g_ok '{"jsonrpc":"2.0","id":182,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"blogname"}}}'
+check "an ordinary option still reads" "$(verdict g_ok)" "ok"
+docker compose exec -T cli wp eval 'delete_transient("reeve_new_key_1");' >/dev/null 2>&1
+
 echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
 # The hard flush is what writes .htaccess, and it only runs if save_mod_rewrite_rules()
 # exists. That lives in wp-admin/includes/misc.php and calls get_home_path() from

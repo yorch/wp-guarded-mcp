@@ -80,13 +80,17 @@ class REEVE_Core {
     $exact = [
       self::OPTION_NAME,
       'reeve_oauth_db_version',
-      // The journal holds previous values of other options. Readable through the option
-      // tools, it would be a second copy of whatever those options held.
-      'reeve_journal',
-      // Key hashes. Not replayable, but there is no reason to hand them out either.
-      'reeve_tokens',
     ];
-    $patterns = [ 'password', 'secret', 'token', 'private_key', 'api_key', 'apikey', 'auth_key', 'salt', 'nonce_key' ];
+    $patterns = [
+      // This plugin's own rows, whatever they are called and however they are wrapped.
+      // A prefix rather than a list of names, because the list was already wrong twice:
+      // the change journal was readable until it was named, and the one-time plaintext of
+      // a new key sits in _transient_reeve_new_key, which no exact entry matched. A rule
+      // that covers rows added later is the only kind that stays correct, and the cost is
+      // that an agent cannot read this plugin's own bookkeeping, which is not its business.
+      'reeve_',
+      'password', 'secret', 'token', 'private_key', 'api_key', 'apikey', 'auth_key', 'salt', 'nonce_key',
+    ];
 
     $exact = apply_filters( 'reeve_protected_options', $exact, $key );
     $patterns = apply_filters( 'reeve_protected_option_patterns', $patterns, $key );

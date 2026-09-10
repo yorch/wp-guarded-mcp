@@ -89,7 +89,7 @@ reading it back.
 - Settings are an allowlist, not a blocklist. `siteurl` and `home` are refused outright, since a wrong value makes the site and this endpoint unreachable with no way back. A default role that can edit content is refused, because open registration plus an editing default role is a way in.
 - None of them are reachable over the URL-token endpoint, since that endpoint puts the secret somewhere servers log it.
 
-The plugin's own options row is not readable or writable through the option tools, so the bearer token cannot be read back out or overwritten through the API.
+None of this plugin's own rows are readable or writable through the option tools, so the bearer token cannot be read back out or overwritten through the API. That is a prefix rule rather than a list of names, because a list was wrong twice: the change journal was readable until it was named, and the one-time plaintext of a newly minted key lives in a transient, which without a persistent object cache is an ordinary options row that no exact entry matched.
 
 **WooCommerce**, off by default, and the switch only appears when the shop is installed: products, stock levels, orders, order notes, customers, a sales summary and a store briefing. Separate from site administration because the risk is a different shape. The administration tools can break a site; these read customer names, email addresses and delivery addresses and hand them to a model, which is a decision a shop owner should make deliberately rather than inherit.
 
