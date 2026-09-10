@@ -5,17 +5,26 @@ if ( !defined( 'ABSPATH' ) ) {
 }
 
 /**
-* The whole admin surface: one page under Settings.
+* The whole admin surface: one page, four tabs.
 *
 * Plain PHP and core's own form styles on purpose. The upstream plugin shipped a 1.1 MB
 * minified React bundle with no source in the repository, which made the settings screen
 * the one part of the plugin nobody could edit. Everything here is readable and fits on
 * a screen.
+*
+* The tabs are query arguments rather than anything client side, so the screen works with
+* JavaScript off and every tab is a link somebody can bookmark or send to a colleague.
 */
 class GMCP_Settings {
 
   const PAGE_SLUG = 'guarded-mcp-settings';
   const NONCE_ACTION = 'gmcp_save_settings';
+
+  /**
+  * The tabs, in the order they appear, and the order somebody meets them: connect a
+  * client, decide who may connect, decide what they may touch, then read what they did.
+  */
+  const TABS = [ 'connect', 'access', 'tools', 'logs' ];
 
   private $core = null;
   private $notice = null;
@@ -39,16 +48,25 @@ class GMCP_Settings {
     return $links;
   }
 
-  /** Where the settings screen lives, in one place so a move does not strand links. */
-  public static function page_url(): string {
-    return admin_url( 'admin.php?page=' . self::PAGE_SLUG );
+  /**
+  * Where the settings screen lives, in one place so a move does not strand links.
+  *
+  * The tab is omitted when empty, which lands on the first one. Callers that do not
+  * care which tab they get should keep passing nothing.
+  */
+  public static function page_url( string $tab = '' ): string {
+    $args = [ 'page' => self::PAGE_SLUG ];
+    if ( $tab !== '' ) {
+      $args['tab'] = $tab;
+    }
+    return add_query_arg( $args, admin_url( 'admin.php' ) );
   }
 
   public function add_menu() {
     // Top level rather than buried under Settings. This is the only screen the plugin
     // has, it is the first thing anyone needs after activating, and "Settings, then
     // scroll" is a poor answer to "where do I connect my agent".
-    add_menu_page(
+    $hook = add_menu_page(
       __( 'MCP Server', 'guarded-mcp' ),
       __( 'MCP Server', 'guarded-mcp' ),
       'manage_options',
@@ -57,6 +75,10 @@ class GMCP_Settings {
       self::menu_icon(),
       80 // Just above Settings.
     );
+    // Hooked to this screen's own admin_head so the rules load on this page and nowhere
+    // else. There is no stylesheet to enqueue and no build step to produce one; what is
+    // here is the handful of things core has no class for.
+    add_action( 'admin_head-' . $hook, [ $this, 'print_styles' ] );
   }
 
   /**
@@ -76,7 +98,78 @@ class GMCP_Settings {
     return 'data:image/svg+xml;base64,' . base64_encode( $svg );
   }
 
+  /**
+  * The few rules core does not already provide.
+  *
+  * The colours are WordPress's own admin palette, the same values that were previously
+  * repeated as inline style attributes throughout this file. Status is never carried by
+  * colour alone: every coloured mark below is accompanied by a word, visible or for a
+  * screen reader.
+  */
+  public function print_styles(): void {
+    ?>
+    <style>
+      /*
+      Core sets `.form-table td fieldset label` to inline-block, which is three
+      selectors deep and beats a bare class. These choices have to stack, so the rule
+      that puts them back has to be at least as specific. The markup this replaced
+      carried display:block as an inline style on every label, which won for the same
+      reason without saying so.
+      */
+      .gmcp-choices label,
+      .form-table td fieldset.gmcp-choices label { display: block; margin-bottom: 6px; }
+      .gmcp-actions { margin: 12px 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      .gmcp-actions form { display: inline; }
+      .gmcp-recipe { max-width: 800px; margin: 0 0 24px; }
+      .gmcp-recipe h3 { margin: 0 0 4px; }
+      .gmcp-recipe p.description { margin: 0 0 8px; }
+      .gmcp-table { max-width: 900px; }
+      .gmcp-mark { width: 28px; font-weight: 700; vertical-align: top; }
+      .gmcp-ok { color: #00a32a; }
+      .gmcp-warn { color: #dba617; }
+      .gmcp-fail { color: #d63638; }
+      .gmcp-muted { color: #787c82; }
+      .gmcp-nowrap { white-space: nowrap; }
+      .gmcp-expired td { opacity: .55; }
+      .gmcp-detail { color: #787c82; font-size: 12px; }
+      /* Darker than .gmcp-detail on purpose: what a call changed outranks what it said. */
+      .gmcp-change { color: #1d2327; font-size: 12px; }
+      .gmcp-args { white-space: pre-wrap; font-size: 11px; margin: 4px 0 0; }
+      .gmcp-summary { cursor: pointer; color: #2271b1; font-size: 12px; }
+      .gmcp-limits { font-size: 11px; }
+      .gmcp-intro { max-width: 800px; }
+    </style>
+    <?php
+  }
+
   #region Save
+
+  /**
+  * Which option this screen writes, and how each is read out of the request.
+  *
+  * Split out because a form now covers one tab rather than the whole screen. An
+  * unchecked box and a box that was never rendered look identical in $_POST, so without
+  * a record of what a given form was responsible for, saving the bearer token would read
+  * every tool group as unticked and switch them all off.
+  *
+  * A form declares its keys in a hidden field. That field travels in the request like
+  * any other, so it is intersected with this list rather than trusted: a name that is
+  * not here writes nothing.
+  */
+  private static function field_kinds(): array {
+    return [
+      'mcp_bearer_token' => 'text',
+      'mcp_role' => 'role',
+      'mcp_tools_core' => 'bool',
+      'mcp_tools_admin' => 'bool',
+      'mcp_tools_rest' => 'bool',
+      'mcp_tools_woo' => 'bool',
+      'mcp_debug_mode' => 'bool',
+      'mcp_activity_log' => 'bool',
+      'mcp_audit_days' => 'days',
+      'mcp_change_journal' => 'bool',
+    ];
+  }
 
   public function maybe_handle_post() {
     if ( empty( $_POST['gmcp_action'] ) ) {
@@ -149,10 +242,13 @@ class GMCP_Settings {
     }
 
     // Redirect so a refresh does not repeat the action, and carry the notice across.
-    $url = add_query_arg( [
-      'page' => self::PAGE_SLUG,
-      'gmcp_notice' => $this->notice ? rawurlencode( $this->notice ) : null,
-    ], admin_url( 'admin.php' ) );
+    // The tab comes back with the form so the answer appears where the question was
+    // asked, rather than bouncing to the first tab on every save.
+    $tab = isset( $_POST['gmcp_tab'] ) ? sanitize_key( wp_unslash( $_POST['gmcp_tab'] ) ) : '';
+    $url = add_query_arg(
+      [ 'gmcp_notice' => $this->notice ? rawurlencode( $this->notice ) : null ],
+      self::page_url( in_array( $tab, self::TABS, true ) ? $tab : '' )
+    );
     wp_safe_redirect( $url );
     exit;
   }
@@ -194,25 +290,32 @@ class GMCP_Settings {
   }
 
   private function save_settings() {
-    $roles = [ 'admin', 'readwrite', 'readonly' ];
-    $role = isset( $_POST['mcp_role'] ) ? sanitize_key( wp_unslash( $_POST['mcp_role'] ) ) : 'admin';
+    $kinds = self::field_kinds();
+    $declared = isset( $_POST['gmcp_fields'] )
+      ? preg_split( '/\s+/', (string) wp_unslash( $_POST['gmcp_fields'] ), -1, PREG_SPLIT_NO_EMPTY )
+      : [];
 
     $options = $this->core->get_all_options( true );
-    $options['mcp_role'] = in_array( $role, $roles, true ) ? $role : 'admin';
-    $options['mcp_tools_core'] = !empty( $_POST['mcp_tools_core'] );
-    $options['mcp_tools_admin'] = !empty( $_POST['mcp_tools_admin'] );
-    $options['mcp_tools_rest'] = !empty( $_POST['mcp_tools_rest'] );
-    $options['mcp_tools_woo'] = !empty( $_POST['mcp_tools_woo'] );
-    $options['mcp_debug_mode'] = !empty( $_POST['mcp_debug_mode'] );
-    $options['mcp_activity_log'] = !empty( $_POST['mcp_activity_log'] );
-    $options['mcp_audit_days'] = isset( $_POST['mcp_audit_days'] ) ? max( 1, min( 3650, (int) $_POST['mcp_audit_days'] ) ) : 90;
-    $options['mcp_change_journal'] = !empty( $_POST['mcp_change_journal'] );
-
-    // The token is only rewritten when the field was actually submitted, so saving the
-    // rest of the form never silently drops it.
-    if ( isset( $_POST['mcp_bearer_token'] ) ) {
-      $token = trim( sanitize_text_field( wp_unslash( $_POST['mcp_bearer_token'] ) ) );
-      $options['mcp_bearer_token'] = $token;
+    foreach ( $declared as $key ) {
+      $key = sanitize_key( $key );
+      if ( !isset( $kinds[ $key ] ) ) {
+        continue;
+      }
+      if ( $kinds[ $key ] === 'bool' ) {
+        $options[ $key ] = !empty( $_POST[ $key ] );
+      }
+      elseif ( $kinds[ $key ] === 'text' ) {
+        $options[ $key ] = isset( $_POST[ $key ] )
+          ? trim( sanitize_text_field( wp_unslash( $_POST[ $key ] ) ) )
+          : '';
+      }
+      elseif ( $kinds[ $key ] === 'role' ) {
+        $role = isset( $_POST[ $key ] ) ? sanitize_key( wp_unslash( $_POST[ $key ] ) ) : '';
+        $options[ $key ] = in_array( $role, [ 'admin', 'readwrite', 'readonly' ], true ) ? $role : 'admin';
+      }
+      elseif ( $kinds[ $key ] === 'days' ) {
+        $options[ $key ] = isset( $_POST[ $key ] ) ? max( 1, min( 3650, (int) $_POST[ $key ] ) ) : 90;
+      }
     }
 
     $this->core->update_options( $options );
@@ -251,14 +354,44 @@ class GMCP_Settings {
     return get_rest_url( null, 'mcp/v1/http' );
   }
 
+  private function current_tab(): string {
+    $tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : '';
+    return in_array( $tab, self::TABS, true ) ? $tab : 'connect';
+  }
+
+  /**
+  * The hidden pair every POST form on this screen carries: the action, and the tab to
+  * come back to. The nonce is printed alongside so no form can forget one of the three.
+  */
+  private function form_head( string $action, string $tab ): void {
+    wp_nonce_field( self::NONCE_ACTION );
+    printf(
+      '<input type="hidden" name="gmcp_action" value="%s"><input type="hidden" name="gmcp_tab" value="%s">',
+      esc_attr( $action ),
+      esc_attr( $tab )
+    );
+  }
+
+  /** Tells the save which options this particular form is answerable for. */
+  private function form_fields( array $keys ): void {
+    printf( '<input type="hidden" name="gmcp_fields" value="%s">', esc_attr( implode( ' ', $keys ) ) );
+  }
+
   public function render() {
     if ( !current_user_can( 'manage_options' ) ) {
       wp_die( esc_html__( 'You do not have permission to view this page.', 'guarded-mcp' ) );
     }
 
     $options = $this->core->get_all_options( true );
-    $token = (string) $options['mcp_bearer_token'];
+    $tab = $this->current_tab();
     $notice = isset( $_GET['gmcp_notice'] ) ? sanitize_text_field( wp_unslash( $_GET['gmcp_notice'] ) ) : '';
+
+    $labels = [
+      'connect' => __( 'Connect', 'guarded-mcp' ),
+      'access' => __( 'Access', 'guarded-mcp' ),
+      'tools' => __( 'Tools', 'guarded-mcp' ),
+      'logs' => __( 'Logs', 'guarded-mcp' ),
+    ];
     ?>
     <div class="wrap">
       <h1><?php esc_html_e( 'MCP Server', 'guarded-mcp' ); ?></h1>
@@ -267,178 +400,262 @@ class GMCP_Settings {
         <div class="notice notice-success is-dismissible"><p><?php echo esc_html( $notice ); ?></p></div>
       <?php endif; ?>
 
-      <p><?php esc_html_e( 'Connect an AI agent to this site. Point the client at the endpoint below.', 'guarded-mcp' ); ?></p>
+      <nav class="nav-tab-wrapper wp-clearfix" aria-label="<?php esc_attr_e( 'MCP Server sections', 'guarded-mcp' ); ?>">
+        <?php foreach ( self::TABS as $slug ) : $active = $slug === $tab; ?>
+          <a href="<?php echo esc_url( self::page_url( $slug ) ); ?>"
+             class="nav-tab<?php echo $active ? ' nav-tab-active' : ''; ?>"
+             <?php echo $active ? 'aria-current="page"' : ''; ?>>
+            <?php echo esc_html( $labels[ $slug ] ); ?>
+          </a>
+        <?php endforeach; ?>
+      </nav>
 
+      <?php
+      if ( $tab === 'access' ) {
+        $this->render_access( $options );
+      }
+      elseif ( $tab === 'tools' ) {
+        $this->render_tools( $options );
+      }
+      elseif ( $tab === 'logs' ) {
+        $this->render_logs( $options );
+      }
+      else {
+        $this->render_connect();
+      }
+      ?>
+    </div>
+    <?php
+  }
+
+  #endregion
+
+  #region Connect
+
+  /**
+  * The endpoint, how to give it to each kind of client, and a readiness report.
+  *
+  * All three exist because of the same failure. A client that cannot configure itself
+  * reports "couldn't determine the server settings" and names none of the half dozen
+  * causes, so the site owner is left guessing. The report walks the same steps a client
+  * does and shows which one breaks; the snippets remove the other half of the guessing,
+  * which is what exactly to paste where.
+  */
+  private function render_connect(): void {
+    $endpoint = $this->endpoint_url();
+    $fallback = home_url( '/index.php?rest_route=/mcp/v1/http' );
+    $token = (string) $this->core->get_option( 'mcp_bearer_token' );
+    $token_display = $token !== '' ? $token : 'YOUR_TOKEN';
+    ?>
+    <p class="gmcp-intro"><?php esc_html_e( 'Connect an AI agent to this site. Point the client at the endpoint below.', 'guarded-mcp' ); ?></p>
+
+    <h2 class="title"><?php esc_html_e( 'Endpoint', 'guarded-mcp' ); ?></h2>
+    <table class="form-table" role="presentation">
+      <tr>
+        <th scope="row"><label for="gmcp_endpoint"><?php esc_html_e( 'Address', 'guarded-mcp' ); ?></label></th>
+        <td>
+          <input type="text" id="gmcp_endpoint" class="large-text code" readonly
+            value="<?php echo esc_attr( $endpoint ); ?>"
+            onfocus="this.select()">
+          <p class="description">
+            <?php esc_html_e( 'Clients that support OAuth need nothing else: they will send you to a WordPress login and a consent screen. Clients that cannot do OAuth use the bearer token from the Access tab.', 'guarded-mcp' ); ?>
+          </p>
+          <p class="description">
+            <?php
+            printf(
+              /* translators: %s: the alternative endpoint URL. */
+              esc_html__( 'If pretty permalinks are off or broken on this site, clients can use %s instead. It works regardless of rewrite rules.', 'guarded-mcp' ),
+              '<code>' . esc_html( $fallback ) . '</code>'
+            );
+            ?>
+          </p>
+        </td>
+      </tr>
+    </table>
+
+    <h2 class="title"><?php esc_html_e( 'Connect a client', 'guarded-mcp' ); ?></h2>
+
+    <div class="gmcp-recipe">
+      <h3><?php esc_html_e( 'Claude Desktop, or any client that supports OAuth', 'guarded-mcp' ); ?></h3>
+      <?php // No second copy of the address here on purpose: it is the field above, and
+            // two copy targets holding the same string is how somebody ends up pasting
+            // the stale one after a site move. ?>
+      <p class="description">
+        <?php esc_html_e( 'Add a connector and give it the address above. It will send you to a WordPress login and then a consent screen. There is no token to copy and nothing else to configure.', 'guarded-mcp' ); ?>
+      </p>
+    </div>
+
+    <div class="gmcp-recipe">
+      <h3><?php esc_html_e( 'Claude Code', 'guarded-mcp' ); ?></h3>
+      <p class="description">
+        <?php esc_html_e( 'Run this in your project. It stores the token in Claude Code\'s own configuration.', 'guarded-mcp' ); ?>
+      </p>
+      <label class="screen-reader-text" for="gmcp_recipe_cli"><?php esc_html_e( 'Command for Claude Code', 'guarded-mcp' ); ?></label>
+      <textarea id="gmcp_recipe_cli" class="large-text code" rows="2" readonly onfocus="this.select()"><?php
+        echo esc_textarea( sprintf(
+          "claude mcp add --transport http wordpress %s \\\n  --header \"Authorization: Bearer %s\"",
+          $endpoint,
+          $token_display
+        ) );
+      ?></textarea>
+    </div>
+
+    <div class="gmcp-recipe">
+      <h3><?php esc_html_e( 'Anything else that reads a JSON config', 'guarded-mcp' ); ?></h3>
+      <label class="screen-reader-text" for="gmcp_recipe_json"><?php esc_html_e( 'JSON configuration block', 'guarded-mcp' ); ?></label>
+      <textarea id="gmcp_recipe_json" class="large-text code" rows="10" readonly onfocus="this.select()"><?php
+        echo esc_textarea( wp_json_encode( [
+          'mcpServers' => [
+            'wordpress' => [
+              'type' => 'http',
+              'url' => $endpoint,
+              'headers' => [ 'Authorization' => 'Bearer ' . $token_display ],
+            ],
+          ],
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) );
+      ?></textarea>
+      <?php if ( $token === '' ) : ?>
+        <p class="description">
+          <strong><?php esc_html_e( 'No bearer token is set yet.', 'guarded-mcp' ); ?></strong>
+          <?php
+          printf(
+            /* translators: %s: link to the Access tab. */
+            esc_html__( 'Generate one on the %s tab and this snippet will fill itself in. OAuth clients do not need one.', 'guarded-mcp' ),
+            '<a href="' . esc_url( self::page_url( 'access' ) ) . '">' . esc_html__( 'Access', 'guarded-mcp' ) . '</a>'
+          );
+          ?>
+        </p>
+      <?php endif; ?>
+    </div>
+
+    <h2 class="title"><?php esc_html_e( 'Is this site ready', 'guarded-mcp' ); ?></h2>
+    <form method="post">
+      <?php $this->form_head( 'self_test', 'connect' ); ?>
+      <button type="submit" class="button button-secondary"><?php esc_html_e( 'Run the setup checks', 'guarded-mcp' ); ?></button>
+    </form>
+    <?php $this->render_report(); ?>
+    <?php
+  }
+
+  /**
+  * The result of the last readiness run. Read once and cleared, so a stale result never
+  * sits on the page looking like live status.
+  */
+  private function render_report(): void {
+    $checks = get_transient( 'gmcp_setup_report' );
+    if ( !is_array( $checks ) ) {
+      echo '<p class="description">' . esc_html__( 'Walks the same steps a client does when it configures itself, and shows which one fails. Safe to run at any time: it sends no credentials anywhere except to this site.', 'guarded-mcp' ) . '</p>';
+      return;
+    }
+    delete_transient( 'gmcp_setup_report' );
+
+    // The word beside each mark is not decoration. A tick and a cross differ only by
+    // colour to a screen reader otherwise, and colour is the one channel some readers
+    // of this table do not have.
+    $style = [
+      'ok' => [ 'gmcp-ok', "\u{2713}", __( 'Passed', 'guarded-mcp' ) ],
+      'warn' => [ 'gmcp-warn', '!', __( 'Warning', 'guarded-mcp' ) ],
+      'fail' => [ 'gmcp-fail', "\u{2715}", __( 'Failed', 'guarded-mcp' ) ],
+      'skip' => [ 'gmcp-muted', "\u{2013}", __( 'Not checked', 'guarded-mcp' ) ],
+    ];
+    ?>
+    <table class="widefat striped gmcp-table" style="margin-top:12px">
+      <caption class="screen-reader-text"><?php esc_html_e( 'Setup check results', 'guarded-mcp' ); ?></caption>
+      <tbody>
+        <?php foreach ( $checks as $check ) :
+          list( $class, $mark, $word ) = $style[ $check['status'] ] ?? $style['skip']; ?>
+          <tr>
+            <td class="gmcp-mark <?php echo esc_attr( $class ); ?>">
+              <span aria-hidden="true"><?php echo esc_html( $mark ); ?></span>
+              <span class="screen-reader-text"><?php echo esc_html( $word ); ?></span>
+            </td>
+            <td>
+              <strong><?php echo esc_html( $check['label'] ); ?></strong>
+              <?php if ( !empty( $check['detail'] ) ) : ?>
+                <p class="gmcp-detail" style="margin:4px 0 0"><?php echo esc_html( $check['detail'] ); ?></p>
+              <?php endif; ?>
+            </td>
+          </tr>
+        <?php endforeach; ?>
+      </tbody>
+    </table>
+    <?php
+  }
+
+  #endregion
+
+  #region Access
+
+  /** Who may connect, and how far each of them reaches. */
+  private function render_access( array $options ): void {
+    $token = (string) $options['mcp_bearer_token'];
+    ?>
+    <p class="gmcp-intro"><?php esc_html_e( 'Three ways in, in increasing order of how much you can tell apart afterwards: one shared token, named keys, and OAuth.', 'guarded-mcp' ); ?></p>
+
+    <h2 class="title"><?php esc_html_e( 'Bearer token', 'guarded-mcp' ); ?></h2>
+    <form method="post">
+      <?php
+      $this->form_head( 'save', 'access' );
+      $this->form_fields( [ 'mcp_bearer_token', 'mcp_role' ] );
+      ?>
       <table class="form-table" role="presentation">
         <tr>
-          <th scope="row"><?php esc_html_e( 'Endpoint', 'guarded-mcp' ); ?></th>
+          <th scope="row"><label for="mcp_bearer_token"><?php esc_html_e( 'Token', 'guarded-mcp' ); ?></label></th>
           <td>
-            <input type="text" class="large-text code" readonly
-              value="<?php echo esc_attr( $this->endpoint_url() ); ?>"
-              onfocus="this.select()">
+            <input type="text" id="mcp_bearer_token" name="mcp_bearer_token" class="large-text code"
+              value="<?php echo esc_attr( $token ); ?>" autocomplete="off" spellcheck="false">
             <p class="description">
-              <?php esc_html_e( 'Clients that support OAuth need nothing else: they will send you to a WordPress login and a consent screen. Clients that cannot do OAuth use the bearer token below.', 'guarded-mcp' ); ?>
+              <?php esc_html_e( 'Optional. A static token for clients that cannot do OAuth, such as a local CLI agent. Leave empty to require OAuth. Treat it like a password: it grants the access level selected below.', 'guarded-mcp' ); ?>
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row"><?php esc_html_e( 'Access level', 'guarded-mcp' ); ?></th>
+          <td>
+            <fieldset class="gmcp-choices">
+              <legend class="screen-reader-text"><?php esc_html_e( 'What the bearer token may do', 'guarded-mcp' ); ?></legend>
+              <?php
+              $levels = [
+                'admin' => __( 'Admin. Every tool, including deleting content and changing users and options.', 'guarded-mcp' ),
+                'readwrite' => __( 'Read and write. Create and update, but no destructive tools.', 'guarded-mcp' ),
+                'readonly' => __( 'Read only. Nothing on the site can be changed.', 'guarded-mcp' ),
+              ];
+              foreach ( $levels as $value => $label ) : ?>
+                <label>
+                  <input type="radio" name="mcp_role" value="<?php echo esc_attr( $value ); ?>"
+                    <?php checked( $options['mcp_role'], $value ); ?>>
+                  <?php echo esc_html( $label ); ?>
+                </label>
+              <?php endforeach; ?>
+            </fieldset>
+            <p class="description">
+              <?php esc_html_e( 'Applies to the bearer token only. OAuth connections always act as the administrator who approved them.', 'guarded-mcp' ); ?>
             </p>
           </td>
         </tr>
       </table>
+      <?php submit_button(); ?>
+    </form>
 
-      <?php $this->render_setup(); ?>
-
+    <div class="gmcp-actions">
       <form method="post">
-        <?php wp_nonce_field( self::NONCE_ACTION ); ?>
-        <input type="hidden" name="gmcp_action" value="save">
-
-        <h2 class="title"><?php esc_html_e( 'Access', 'guarded-mcp' ); ?></h2>
-        <table class="form-table" role="presentation">
-          <tr>
-            <th scope="row"><label for="mcp_bearer_token"><?php esc_html_e( 'Bearer token', 'guarded-mcp' ); ?></label></th>
-            <td>
-              <input type="text" id="mcp_bearer_token" name="mcp_bearer_token" class="large-text code"
-                value="<?php echo esc_attr( $token ); ?>" autocomplete="off" spellcheck="false">
-              <p class="description">
-                <?php esc_html_e( 'Optional. A static token for clients that cannot do OAuth, such as a local CLI agent. Leave empty to require OAuth. Treat it like a password: it grants the access level selected below.', 'guarded-mcp' ); ?>
-              </p>
-            </td>
-          </tr>
-          <tr>
-            <th scope="row"><?php esc_html_e( 'Token access level', 'guarded-mcp' ); ?></th>
-            <td>
-              <fieldset>
-                <?php
-                $levels = [
-                  'admin' => __( 'Admin. Every tool, including deleting content and changing users and options.', 'guarded-mcp' ),
-                  'readwrite' => __( 'Read and write. Create and update, but no destructive tools.', 'guarded-mcp' ),
-                  'readonly' => __( 'Read only. Nothing on the site can be changed.', 'guarded-mcp' ),
-                ];
-                foreach ( $levels as $value => $label ) : ?>
-                  <label style="display:block;margin-bottom:6px">
-                    <input type="radio" name="mcp_role" value="<?php echo esc_attr( $value ); ?>"
-                      <?php checked( $options['mcp_role'], $value ); ?>>
-                    <?php echo esc_html( $label ); ?>
-                  </label>
-                <?php endforeach; ?>
-              </fieldset>
-              <p class="description">
-                <?php esc_html_e( 'Applies to the bearer token only. OAuth connections always act as the administrator who approved them.', 'guarded-mcp' ); ?>
-              </p>
-            </td>
-          </tr>
-        </table>
-
-        <h2 class="title"><?php esc_html_e( 'Tools', 'guarded-mcp' ); ?></h2>
-        <table class="form-table" role="presentation">
-          <tr>
-            <th scope="row"><?php esc_html_e( 'Available tools', 'guarded-mcp' ); ?></th>
-            <td>
-              <label style="display:block;margin-bottom:6px">
-                <input type="checkbox" name="mcp_tools_core" value="1" <?php checked( !empty( $options['mcp_tools_core'] ) ); ?>>
-                <?php esc_html_e( 'WordPress tools (posts, media, users, terms, comments, options, blocks)', 'guarded-mcp' ); ?>
-              </label>
-              <label style="display:block;margin-bottom:6px">
-                <input type="checkbox" name="mcp_tools_admin" value="1" <?php checked( !empty( $options['mcp_tools_admin'] ) ); ?>>
-                <?php esc_html_e( 'Site administration (plugins, themes, menus, widgets, settings, permalinks, site health)', 'guarded-mcp' ); ?>
-              </label>
-              <?php if ( class_exists( 'WooCommerce' ) ) : ?>
-                <label style="display:block;margin-bottom:6px">
-                  <input type="checkbox" name="mcp_tools_woo" value="1" <?php checked( !empty( $options['mcp_tools_woo'] ) ); ?>>
-                  <?php esc_html_e( 'WooCommerce (products, stock, orders, customers, sales figures)', 'guarded-mcp' ); ?>
-                </label>
-              <?php endif; ?>
-              <label style="display:block">
-                <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>
-                <?php esc_html_e( 'Generate tools from this site\'s REST API routes', 'guarded-mcp' ); ?>
-              </label>
-              <p class="description">
-                <?php esc_html_e( 'Administration tools install code on this site, so they are off by default. Installs are restricted to the wordpress.org repository, deletions take two steps, and they are refused entirely over the URL-token endpoint.', 'guarded-mcp' ); ?>
-              </p>
-              <?php if ( class_exists( 'WooCommerce' ) ) : ?>
-                <p class="description">
-                  <?php esc_html_e( 'The WooCommerce tools are separate because the risk is a different shape: they read customer names, email addresses and delivery addresses and hand them to a model. Refunds are deliberately not included, and any action that emails a customer says so in its own description.', 'guarded-mcp' ); ?>
-                </p>
-              <?php endif; ?>
-              <p class="description">
-                <?php esc_html_e( 'The REST option exposes a large, generic surface. The curated WordPress tools are usually the better choice.', 'guarded-mcp' ); ?>
-              </p>
-            </td>
-          </tr>
-          <tr>
-            <th scope="row"><?php esc_html_e( 'Debug logging', 'guarded-mcp' ); ?></th>
-            <td>
-              <label>
-                <input type="checkbox" name="mcp_debug_mode" value="1" <?php checked( !empty( $options['mcp_debug_mode'] ) ); ?>>
-                <?php esc_html_e( 'Write protocol traffic to the PHP error log', 'guarded-mcp' ); ?>
-              </label>
-              <p class="description">
-                <?php esc_html_e( 'Verbose. It also shortens the idle stream timeout from 180 to 30 seconds, so leave it off in normal use.', 'guarded-mcp' ); ?>
-              </p>
-            </td>
-          </tr>
-          <tr>
-            <th scope="row"><?php esc_html_e( 'Audit log', 'guarded-mcp' ); ?></th>
-            <td>
-              <label>
-                <input type="checkbox" name="mcp_activity_log" value="1" <?php checked( !empty( $options['mcp_activity_log'] ) ); ?>>
-                <?php esc_html_e( 'Record every tool call, including refused ones, with its arguments', 'guarded-mcp' ); ?>
-              </label>
-              <p class="description">
-                <?php esc_html_e( 'Without this an agent works with no visible record: you can see that something changed, but not what did it or when. Refusals are recorded too, since those are the interesting ones.', 'guarded-mcp' ); ?>
-              </p>
-              <p>
-                <label>
-                  <?php esc_html_e( 'Keep entries for', 'guarded-mcp' ); ?>
-                  <input type="number" name="mcp_audit_days" min="1" max="3650" class="small-text"
-                         value="<?php echo esc_attr( (int) ( $options['mcp_audit_days'] ?? 90 ) ); ?>">
-                  <?php esc_html_e( 'days', 'guarded-mcp' ); ?>
-                </label>
-              </p>
-              <p class="description">
-                <?php esc_html_e( 'Pruned once a day. Two further limits apply whatever this says, because age alone does not bound a busy site: at most 50,000 entries and 50 MB of recorded arguments, oldest removed first.', 'guarded-mcp' ); ?>
-              </p>
-            </td>
-          </tr>
-          <tr>
-            <th scope="row"><?php esc_html_e( 'Change journal', 'guarded-mcp' ); ?></th>
-            <td>
-              <label>
-                <input type="checkbox" name="mcp_change_journal" value="1" <?php checked( !empty( $options['mcp_change_journal'] ) ); ?>>
-                <?php esc_html_e( 'Remember previous values so changes can be reverted', 'guarded-mcp' ); ?>
-              </label>
-              <p class="description">
-                <?php esc_html_e( 'Records what a setting or post said before an agent changed it, and lets the change be put back with the wp_undo_change tool. Only writes made through this API are recorded, never your own. Values that look like credentials are never stored.', 'guarded-mcp' ); ?>
-              </p>
-            </td>
-          </tr>
-        </table>
-
-        <?php submit_button(); ?>
+        <?php $this->form_head( 'generate_token', 'access' ); ?>
+        <button type="submit" class="button"><?php esc_html_e( 'Generate a new token', 'guarded-mcp' ); ?></button>
       </form>
-
-      <h2 class="title"><?php esc_html_e( 'Token actions', 'guarded-mcp' ); ?></h2>
-      <p>
-        <form method="post" style="display:inline">
-          <?php wp_nonce_field( self::NONCE_ACTION ); ?>
-          <input type="hidden" name="gmcp_action" value="generate_token">
-          <button type="submit" class="button"><?php esc_html_e( 'Generate a new token', 'guarded-mcp' ); ?></button>
+      <?php if ( $token !== '' ) : ?>
+        <form method="post">
+          <?php $this->form_head( 'clear_token', 'access' ); ?>
+          <button type="submit" class="button"><?php esc_html_e( 'Clear the token', 'guarded-mcp' ); ?></button>
         </form>
-        <?php if ( $token !== '' ) : ?>
-          <form method="post" style="display:inline">
-            <?php wp_nonce_field( self::NONCE_ACTION ); ?>
-            <input type="hidden" name="gmcp_action" value="clear_token">
-            <button type="submit" class="button"><?php esc_html_e( 'Clear the token', 'guarded-mcp' ); ?></button>
-          </form>
-        <?php endif; ?>
-      </p>
-
-      <h2 class="title"><?php esc_html_e( 'Keys', 'guarded-mcp' ); ?></h2>
-      <?php $this->render_keys(); ?>
-
-      <h2 class="title"><?php esc_html_e( 'Connected apps', 'guarded-mcp' ); ?></h2>
-      <?php $this->render_apps(); ?>
-
-      <h2 class="title"><?php esc_html_e( 'Recent activity', 'guarded-mcp' ); ?></h2>
-      <?php $this->render_activity(); ?>
+      <?php endif; ?>
     </div>
+    <p class="description"><?php esc_html_e( 'These two act immediately and do not wait for Save changes.', 'guarded-mcp' ); ?></p>
+
+    <h2 class="title"><?php esc_html_e( 'Named keys', 'guarded-mcp' ); ?></h2>
+    <?php $this->render_keys(); ?>
+
+    <h2 class="title"><?php esc_html_e( 'Connected apps', 'guarded-mcp' ); ?></h2>
+    <?php $this->render_apps(); ?>
     <?php
   }
 
@@ -449,14 +666,17 @@ class GMCP_Settings {
       ?>
       <div class="notice notice-success inline" style="padding:12px">
         <p><strong><?php esc_html_e( 'Your new key. This is the only time it is shown.', 'guarded-mcp' ); ?></strong></p>
-        <p><input type="text" class="large-text code" readonly onclick="this.select()" value="<?php echo esc_attr( $fresh ); ?>"></p>
+        <p>
+          <label class="screen-reader-text" for="gmcp_new_key"><?php esc_html_e( 'The new key', 'guarded-mcp' ); ?></label>
+          <input type="text" id="gmcp_new_key" class="large-text code" readonly onclick="this.select()" value="<?php echo esc_attr( $fresh ); ?>">
+        </p>
       </div>
       <?php
     }
 
     $keys = GMCP_Tokens::all();
     ?>
-    <p class="description">
+    <p class="description gmcp-intro">
       <?php esc_html_e( 'The bearer token above is one secret with one access level, shared by every client. A key is narrower: it carries a label so you can tell clients apart in the activity list, it can expire on its own, and it can be limited to a named list of tools. Keys are stored hashed, so a key is shown once and never again.', 'guarded-mcp' ); ?>
     </p>
 
@@ -464,24 +684,24 @@ class GMCP_Settings {
       <table class="widefat striped" style="margin-bottom:16px">
         <thead>
           <tr>
-            <th><?php esc_html_e( 'Label', 'guarded-mcp' ); ?></th>
-            <th><?php esc_html_e( 'Access', 'guarded-mcp' ); ?></th>
-            <th><?php esc_html_e( 'Limited to', 'guarded-mcp' ); ?></th>
-            <th><?php esc_html_e( 'Expires', 'guarded-mcp' ); ?></th>
-            <th><?php esc_html_e( 'Last used', 'guarded-mcp' ); ?></th>
-            <th></th>
+            <th scope="col"><?php esc_html_e( 'Label', 'guarded-mcp' ); ?></th>
+            <th scope="col"><?php esc_html_e( 'Access', 'guarded-mcp' ); ?></th>
+            <th scope="col"><?php esc_html_e( 'Limited to', 'guarded-mcp' ); ?></th>
+            <th scope="col"><?php esc_html_e( 'Expires', 'guarded-mcp' ); ?></th>
+            <th scope="col"><?php esc_html_e( 'Last used', 'guarded-mcp' ); ?></th>
+            <th scope="col"><span class="screen-reader-text"><?php esc_html_e( 'Actions', 'guarded-mcp' ); ?></span></th>
           </tr>
         </thead>
         <tbody>
         <?php foreach ( $keys as $key ) : $expired = GMCP_Tokens::is_expired( $key ); ?>
-          <tr<?php echo $expired ? ' style="opacity:.55"' : ''; ?>>
+          <tr<?php echo $expired ? ' class="gmcp-expired"' : ''; ?>>
             <td><strong><?php echo esc_html( $key['label'] ); ?></strong></td>
             <td><?php echo esc_html( $key['level'] ); ?></td>
             <td>
               <?php if ( empty( $key['tools'] ) ) : ?>
-                <span style="color:#646970"><?php esc_html_e( 'everything its access level allows', 'guarded-mcp' ); ?></span>
+                <span class="gmcp-muted"><?php esc_html_e( 'everything its access level allows', 'guarded-mcp' ); ?></span>
               <?php else : ?>
-                <code style="font-size:11px"><?php echo esc_html( implode( ', ', $key['tools'] ) ); ?></code>
+                <code class="gmcp-limits"><?php echo esc_html( implode( ', ', $key['tools'] ) ); ?></code>
               <?php endif; ?>
             </td>
             <td>
@@ -500,10 +720,12 @@ class GMCP_Settings {
             </td>
             <td>
               <form method="post">
-                <?php wp_nonce_field( self::NONCE_ACTION ); ?>
-                <input type="hidden" name="gmcp_action" value="revoke_key">
+                <?php $this->form_head( 'revoke_key', 'access' ); ?>
                 <input type="hidden" name="key_id" value="<?php echo esc_attr( $key['id'] ); ?>">
-                <button type="submit" class="button button-small"><?php esc_html_e( 'Revoke', 'guarded-mcp' ); ?></button>
+                <button type="submit" class="button button-small">
+                  <?php esc_html_e( 'Revoke', 'guarded-mcp' ); ?>
+                  <span class="screen-reader-text"><?php echo esc_html( $key['label'] ); ?></span>
+                </button>
               </form>
             </td>
           </tr>
@@ -512,9 +734,9 @@ class GMCP_Settings {
       </table>
     <?php endif; ?>
 
+    <h3><?php esc_html_e( 'Create a key', 'guarded-mcp' ); ?></h3>
     <form method="post">
-      <?php wp_nonce_field( self::NONCE_ACTION ); ?>
-      <input type="hidden" name="gmcp_action" value="create_key">
+      <?php $this->form_head( 'create_key', 'access' ); ?>
       <table class="form-table" role="presentation">
         <tr>
           <th scope="row"><label for="key_label"><?php esc_html_e( 'Label', 'guarded-mcp' ); ?></label></th>
@@ -575,11 +797,11 @@ class GMCP_Settings {
     <table class="widefat striped">
       <thead>
         <tr>
-          <th><?php esc_html_e( 'App', 'guarded-mcp' ); ?></th>
-          <th><?php esc_html_e( 'Account', 'guarded-mcp' ); ?></th>
-          <th><?php esc_html_e( 'Connected', 'guarded-mcp' ); ?></th>
-          <th><?php esc_html_e( 'Last used', 'guarded-mcp' ); ?></th>
-          <th></th>
+          <th scope="col"><?php esc_html_e( 'App', 'guarded-mcp' ); ?></th>
+          <th scope="col"><?php esc_html_e( 'Account', 'guarded-mcp' ); ?></th>
+          <th scope="col"><?php esc_html_e( 'Connected', 'guarded-mcp' ); ?></th>
+          <th scope="col"><?php esc_html_e( 'Last used', 'guarded-mcp' ); ?></th>
+          <th scope="col"><span class="screen-reader-text"><?php esc_html_e( 'Actions', 'guarded-mcp' ); ?></span></th>
         </tr>
       </thead>
       <tbody>
@@ -591,10 +813,12 @@ class GMCP_Settings {
             <td><?php echo esc_html( $app['last_used'] ? $this->format_date( $app['last_used'] ) : __( 'Never', 'guarded-mcp' ) ); ?></td>
             <td>
               <form method="post">
-                <?php wp_nonce_field( self::NONCE_ACTION ); ?>
-                <input type="hidden" name="gmcp_action" value="revoke_app">
+                <?php $this->form_head( 'revoke_app', 'access' ); ?>
                 <input type="hidden" name="app_id" value="<?php echo esc_attr( $app['id'] ); ?>">
-                <button type="submit" class="button button-small"><?php esc_html_e( 'Revoke', 'guarded-mcp' ); ?></button>
+                <button type="submit" class="button button-small">
+                  <?php esc_html_e( 'Revoke', 'guarded-mcp' ); ?>
+                  <span class="screen-reader-text"><?php echo esc_html( $app['client_name'] ); ?></span>
+                </button>
               </form>
             </td>
           </tr>
@@ -604,118 +828,147 @@ class GMCP_Settings {
     <?php
   }
 
-  /**
-  * Setup: how to connect each kind of client, and a readiness report.
-  *
-  * Both halves exist because of the same failure. A client that cannot configure itself
-  * reports "couldn't determine the server settings" and names none of the half dozen
-  * causes, so the site owner is left guessing. The report walks the same steps a client
-  * does and shows which one breaks; the snippets remove the other half of the guessing,
-  * which is what exactly to paste where.
-  */
-  private function render_setup(): void {
-    $endpoint = rest_url( 'mcp/v1/http' );
-    $fallback = home_url( '/index.php?rest_route=/mcp/v1/http' );
-    $token = (string) $this->core->get_option( 'mcp_bearer_token' );
-    $token_display = $token !== '' ? $token : 'YOUR_TOKEN';
+  #endregion
+
+  #region Tools
+
+  /** What a connected agent is offered. Nothing on this tab is about who may connect. */
+  private function render_tools( array $options ): void {
+    $woo = class_exists( 'WooCommerce' );
+
+    // Only the groups actually rendered are declared to the save. A checkbox that was
+    // never on screen must keep its stored value rather than read as unticked, which is
+    // what happens to the WooCommerce group on a site where Woo is switched off.
+    $keys = [ 'mcp_tools_core', 'mcp_tools_admin', 'mcp_tools_rest' ];
+    if ( $woo ) {
+      $keys[] = 'mcp_tools_woo';
+    }
     ?>
-    <h2 class="title"><?php esc_html_e( 'Connect a client', 'guarded-mcp' ); ?></h2>
+    <p class="gmcp-intro"><?php esc_html_e( 'Which groups of tools an agent is offered. A group that is off is not merely hidden: its tools are refused if asked for by name.', 'guarded-mcp' ); ?></p>
 
-    <h3 style="margin-bottom:4px"><?php esc_html_e( 'Claude Desktop, or any client that supports OAuth', 'guarded-mcp' ); ?></h3>
-    <p class="description" style="margin-top:0">
-      <?php esc_html_e( 'Add a connector and give it this address. It will send you to a WordPress login and then a consent screen. There is no token to copy and nothing to configure.', 'guarded-mcp' ); ?>
-    </p>
-    <input type="text" class="large-text code" readonly onfocus="this.select()"
-      value="<?php echo esc_attr( $endpoint ); ?>">
-
-    <h3 style="margin-bottom:4px"><?php esc_html_e( 'Claude Code', 'guarded-mcp' ); ?></h3>
-    <p class="description" style="margin-top:0">
-      <?php esc_html_e( 'Run this in your project. It stores the token in Claude Code\'s own configuration.', 'guarded-mcp' ); ?>
-    </p>
-    <textarea class="large-text code" rows="2" readonly onfocus="this.select()"><?php
-      echo esc_textarea( sprintf(
-        "claude mcp add --transport http wordpress %s \\\n  --header \"Authorization: Bearer %s\"",
-        $endpoint,
-        $token_display
-      ) );
-    ?></textarea>
-
-    <h3 style="margin-bottom:4px"><?php esc_html_e( 'Anything else that reads a JSON config', 'guarded-mcp' ); ?></h3>
-    <textarea class="large-text code" rows="10" readonly onfocus="this.select()"><?php
-      echo esc_textarea( wp_json_encode( [
-        'mcpServers' => [
-          'wordpress' => [
-            'type' => 'http',
-            'url' => $endpoint,
-            'headers' => [ 'Authorization' => 'Bearer ' . $token_display ],
-          ],
-        ],
-      ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) );
-    ?></textarea>
-    <?php if ( $token === '' ) : ?>
-      <p class="description">
-        <strong><?php esc_html_e( 'No bearer token is set yet.', 'guarded-mcp' ); ?></strong>
-        <?php esc_html_e( 'Generate one below and this snippet will fill itself in. OAuth clients do not need one.', 'guarded-mcp' ); ?>
-      </p>
-    <?php endif; ?>
-
-    <p class="description">
-      <?php
-      printf(
-        /* translators: %s: the alternative endpoint URL. */
-        esc_html__( 'If pretty permalinks are off or broken on this site, clients can use %s instead. It works regardless of rewrite rules.', 'guarded-mcp' ),
-        '<code>' . esc_html( $fallback ) . '</code>'
-      );
-      ?>
-    </p>
-
-    <h2 class="title"><?php esc_html_e( 'Is this site ready', 'guarded-mcp' ); ?></h2>
+    <h2 class="title"><?php esc_html_e( 'Tool groups', 'guarded-mcp' ); ?></h2>
     <form method="post">
-      <?php wp_nonce_field( self::NONCE_ACTION ); ?>
-      <input type="hidden" name="gmcp_action" value="self_test">
-      <button type="submit" class="button button-secondary"><?php esc_html_e( 'Run the setup checks', 'guarded-mcp' ); ?></button>
+      <?php
+      $this->form_head( 'save', 'tools' );
+      $this->form_fields( $keys );
+      ?>
+      <table class="form-table" role="presentation">
+        <tr>
+          <th scope="row"><?php esc_html_e( 'Available tools', 'guarded-mcp' ); ?></th>
+          <td>
+            <fieldset class="gmcp-choices">
+              <legend class="screen-reader-text"><?php esc_html_e( 'Groups of tools to offer', 'guarded-mcp' ); ?></legend>
+              <label>
+                <input type="checkbox" name="mcp_tools_core" value="1" <?php checked( !empty( $options['mcp_tools_core'] ) ); ?>>
+                <?php esc_html_e( 'WordPress tools (posts, media, users, terms, comments, options, blocks)', 'guarded-mcp' ); ?>
+              </label>
+              <label>
+                <input type="checkbox" name="mcp_tools_admin" value="1" <?php checked( !empty( $options['mcp_tools_admin'] ) ); ?>>
+                <?php esc_html_e( 'Site administration (plugins, themes, menus, widgets, settings, permalinks, site health)', 'guarded-mcp' ); ?>
+              </label>
+              <?php if ( $woo ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_woo" value="1" <?php checked( !empty( $options['mcp_tools_woo'] ) ); ?>>
+                  <?php esc_html_e( 'WooCommerce (products, stock, orders, customers, sales figures)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
+              <label>
+                <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>
+                <?php esc_html_e( 'Generate tools from this site\'s REST API routes', 'guarded-mcp' ); ?>
+              </label>
+            </fieldset>
+            <p class="description">
+              <?php esc_html_e( 'Administration tools install code on this site, so they are off by default. Installs are restricted to the wordpress.org repository, deletions take two steps, and they are refused entirely over the URL-token endpoint.', 'guarded-mcp' ); ?>
+            </p>
+            <?php if ( $woo ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The WooCommerce tools are separate because the risk is a different shape: they read customer names, email addresses and delivery addresses and hand them to a model. Refunds are deliberately not included, and any action that emails a customer says so in its own description.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <p class="description">
+              <?php esc_html_e( 'The REST option exposes a large, generic surface. The curated WordPress tools are usually the better choice.', 'guarded-mcp' ); ?>
+            </p>
+          </td>
+        </tr>
+      </table>
+      <?php submit_button(); ?>
     </form>
-    <?php $this->render_report(); ?>
     <?php
   }
 
-  /**
-  * The result of the last readiness run. Read once and cleared, so a stale result never
-  * sits on the page looking like live status.
-  */
-  private function render_report(): void {
-    $checks = get_transient( 'gmcp_setup_report' );
-    if ( !is_array( $checks ) ) {
-      echo '<p class="description">' . esc_html__( 'Walks the same steps a client does when it configures itself, and shows which one fails. Safe to run at any time: it sends no credentials anywhere except to this site.', 'guarded-mcp' ) . '</p>';
-      return;
-    }
-    delete_transient( 'gmcp_setup_report' );
+  #endregion
 
-    $style = [
-      'ok' => [ '#00a32a', "\u{2713}" ],
-      'warn' => [ '#dba617', '!' ],
-      'fail' => [ '#d63638', "\u{2715}" ],
-      'skip' => [ '#787c82', "\u{2013}" ],
-    ];
+  #region Logs
+
+  /**
+  * What the plugin records, and the record itself.
+  *
+  * The switches used to sit four hundred lines away from the log they fill, under a
+  * heading about tools. Reading the log and deciding whether to keep one are the same
+  * job, so they are the same tab.
+  */
+  private function render_logs( array $options ): void {
     ?>
-    <table class="widefat striped" style="margin-top:12px;max-width:900px">
-      <tbody>
-        <?php foreach ( $checks as $check ) :
-          list( $colour, $mark ) = $style[ $check['status'] ] ?? $style['skip']; ?>
-          <tr>
-            <td style="width:28px;color:<?php echo esc_attr( $colour ); ?>;font-weight:700;vertical-align:top">
-              <?php echo esc_html( $mark ); ?>
-            </td>
-            <td>
-              <strong><?php echo esc_html( $check['label'] ); ?></strong>
-              <?php if ( !empty( $check['detail'] ) ) : ?>
-                <p style="margin:4px 0 0;color:#50575e"><?php echo esc_html( $check['detail'] ); ?></p>
-              <?php endif; ?>
-            </td>
-          </tr>
-        <?php endforeach; ?>
-      </tbody>
-    </table>
+    <p class="gmcp-intro"><?php esc_html_e( 'An agent that leaves no record is an agent you cannot review. These are the three things the plugin can remember, and below them, what it has remembered so far.', 'guarded-mcp' ); ?></p>
+
+    <h2 class="title"><?php esc_html_e( 'What gets recorded', 'guarded-mcp' ); ?></h2>
+    <form method="post">
+      <?php
+      $this->form_head( 'save', 'logs' );
+      $this->form_fields( [ 'mcp_activity_log', 'mcp_audit_days', 'mcp_change_journal', 'mcp_debug_mode' ] );
+      ?>
+      <table class="form-table" role="presentation">
+        <tr>
+          <th scope="row"><?php esc_html_e( 'Audit log', 'guarded-mcp' ); ?></th>
+          <td>
+            <label>
+              <input type="checkbox" name="mcp_activity_log" value="1" <?php checked( !empty( $options['mcp_activity_log'] ) ); ?>>
+              <?php esc_html_e( 'Record every tool call, including refused ones, with its arguments', 'guarded-mcp' ); ?>
+            </label>
+            <p class="description">
+              <?php esc_html_e( 'Without this an agent works with no visible record: you can see that something changed, but not what did it or when. Refusals are recorded too, since those are the interesting ones.', 'guarded-mcp' ); ?>
+            </p>
+            <p>
+              <label for="mcp_audit_days"><?php esc_html_e( 'Keep entries for', 'guarded-mcp' ); ?></label>
+              <input type="number" id="mcp_audit_days" name="mcp_audit_days" min="1" max="3650" class="small-text"
+                     value="<?php echo esc_attr( (int) ( $options['mcp_audit_days'] ?? 90 ) ); ?>">
+              <?php esc_html_e( 'days', 'guarded-mcp' ); ?>
+            </p>
+            <p class="description">
+              <?php esc_html_e( 'Pruned once a day. Two further limits apply whatever this says, because age alone does not bound a busy site: at most 50,000 entries and 50 MB of recorded arguments, oldest removed first.', 'guarded-mcp' ); ?>
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row"><?php esc_html_e( 'Change journal', 'guarded-mcp' ); ?></th>
+          <td>
+            <label>
+              <input type="checkbox" name="mcp_change_journal" value="1" <?php checked( !empty( $options['mcp_change_journal'] ) ); ?>>
+              <?php esc_html_e( 'Remember previous values so changes can be reverted', 'guarded-mcp' ); ?>
+            </label>
+            <p class="description">
+              <?php esc_html_e( 'Records what a setting or post said before an agent changed it, and lets the change be put back with the wp_undo_change tool. Only writes made through this API are recorded, never your own. Values that look like credentials are never stored.', 'guarded-mcp' ); ?>
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row"><?php esc_html_e( 'Debug logging', 'guarded-mcp' ); ?></th>
+          <td>
+            <label>
+              <input type="checkbox" name="mcp_debug_mode" value="1" <?php checked( !empty( $options['mcp_debug_mode'] ) ); ?>>
+              <?php esc_html_e( 'Write protocol traffic to the PHP error log', 'guarded-mcp' ); ?>
+            </label>
+            <p class="description">
+              <?php esc_html_e( 'Verbose. It also shortens the idle stream timeout from 180 to 30 seconds, so leave it off in normal use.', 'guarded-mcp' ); ?>
+            </p>
+          </td>
+        </tr>
+      </table>
+      <?php submit_button(); ?>
+    </form>
+
+    <h2 class="title"><?php esc_html_e( 'The audit log', 'guarded-mcp' ); ?></h2>
+    <?php $this->render_activity(); ?>
     <?php
   }
 
@@ -783,7 +1036,7 @@ class GMCP_Settings {
 
   private function render_activity(): void {
     if ( empty( $this->core->get_option( 'mcp_activity_log' ) ) ) {
-      echo '<p>' . esc_html__( 'The audit log is switched off, so nothing is being recorded.', 'guarded-mcp' ) . '</p>';
+      echo '<p>' . esc_html__( 'The audit log is switched off, so nothing is being recorded. Switch it on above and calls from then on will appear here.', 'guarded-mcp' ) . '</p>';
       return;
     }
 
@@ -798,10 +1051,14 @@ class GMCP_Settings {
     ?>
     <form method="get" style="margin-bottom:10px">
       <input type="hidden" name="page" value="<?php echo esc_attr( self::PAGE_SLUG ); ?>">
-      <input type="search" name="gmcp_q" value="<?php echo esc_attr( $search ); ?>"
+      <?php // Without this the filter form throws you back to the first tab on submit. ?>
+      <input type="hidden" name="tab" value="logs">
+      <label class="screen-reader-text" for="gmcp_q"><?php esc_html_e( 'Search the audit log', 'guarded-mcp' ); ?></label>
+      <input type="search" id="gmcp_q" name="gmcp_q" value="<?php echo esc_attr( $search ); ?>"
              placeholder="<?php esc_attr_e( 'Search targets, arguments and refusal messages', 'guarded-mcp' ); ?>"
              class="regular-text">
-      <select name="gmcp_outcome">
+      <label class="screen-reader-text" for="gmcp_outcome"><?php esc_html_e( 'Filter by outcome', 'guarded-mcp' ); ?></label>
+      <select id="gmcp_outcome" name="gmcp_outcome">
         <option value=""><?php esc_html_e( 'Everything', 'guarded-mcp' ); ?></option>
         <option value="refused" <?php selected( $only, 'refused' ); ?>><?php esc_html_e( 'Refusals only', 'guarded-mcp' ); ?></option>
         <option value="ok" <?php selected( $only, 'ok' ); ?>><?php esc_html_e( 'Successes only', 'guarded-mcp' ); ?></option>
@@ -817,46 +1074,46 @@ class GMCP_Settings {
       <table class="widefat striped">
         <thead>
           <tr>
-            <th><?php esc_html_e( 'When', 'guarded-mcp' ); ?></th>
-            <th><?php esc_html_e( 'Tool', 'guarded-mcp' ); ?></th>
-            <th><?php esc_html_e( 'Target', 'guarded-mcp' ); ?></th>
+            <th scope="col"><?php esc_html_e( 'When', 'guarded-mcp' ); ?></th>
+            <th scope="col"><?php esc_html_e( 'Tool', 'guarded-mcp' ); ?></th>
+            <th scope="col"><?php esc_html_e( 'Target', 'guarded-mcp' ); ?></th>
             <?php // Not "Who". A shared token borrows one administrator account, so the
             // account below is the same whoever sent the request, and a column headed
             // "Who" invites a reader to believe something this site cannot know. ?>
-            <th><?php esc_html_e( 'Called by', 'guarded-mcp' ); ?></th>
-            <th><?php esc_html_e( 'Result', 'guarded-mcp' ); ?></th>
+            <th scope="col"><?php esc_html_e( 'Called by', 'guarded-mcp' ); ?></th>
+            <th scope="col"><?php esc_html_e( 'Result', 'guarded-mcp' ); ?></th>
           </tr>
         </thead>
         <tbody>
           <?php foreach ( $entries as $e ) : ?>
             <tr>
-              <td style="white-space:nowrap"><?php echo esc_html( $this->ago( strtotime( $e['ts'] . ' UTC' ) ) ); ?></td>
+              <td class="gmcp-nowrap"><?php echo esc_html( $this->ago( strtotime( $e['ts'] . ' UTC' ) ) ); ?></td>
               <td><code><?php echo esc_html( $e['tool'] ); ?></code></td>
               <td><?php echo $e['target'] !== '' ? '<code>' . esc_html( $e['target'] ) . '</code>' : '&mdash;'; ?></td>
               <td>
                 <?php echo esc_html( $e['client'] ?: $e['auth_method'] ); ?>
                 <?php if ( $e['actor_name'] !== '' ) : ?>
-                  <span style="color:#787c82" title="<?php esc_attr_e( 'The WordPress account the call ran as. A shared bearer token borrows one administrator, so this does not identify a person.', 'guarded-mcp' ); ?>">
+                  <span class="gmcp-muted" title="<?php esc_attr_e( 'The WordPress account the call ran as. A shared bearer token borrows one administrator, so this does not identify a person.', 'guarded-mcp' ); ?>">
                     <?php echo esc_html( sprintf( __( 'ran as %s', 'guarded-mcp' ), $e['actor_name'] ) ); ?></span>
                 <?php endif; ?>
               </td>
               <td>
                 <?php if ( $e['outcome'] === 'ok' ) : ?>
-                  <span style="color:#00a32a"><?php esc_html_e( 'Done', 'guarded-mcp' ); ?></span>
-                  <span style="color:#787c82"><?php echo esc_html( sprintf( '(%dms)', (int) $e['ms'] ) ); ?></span>
+                  <span class="gmcp-ok"><?php esc_html_e( 'Done', 'guarded-mcp' ); ?></span>
+                  <span class="gmcp-muted"><?php echo esc_html( sprintf( '(%dms)', (int) $e['ms'] ) ); ?></span>
                 <?php else : ?>
-                  <span style="color:#d63638"><?php esc_html_e( 'Refused', 'guarded-mcp' ); ?></span>
+                  <span class="gmcp-fail"><?php esc_html_e( 'Refused', 'guarded-mcp' ); ?></span>
                 <?php endif; ?>
                 <?php if ( $e['detail'] !== '' && $e['detail'] !== null ) : ?>
-                  <div style="color:#787c82;font-size:12px"><?php echo esc_html( mb_substr( $e['detail'], 0, 160 ) ); ?></div>
+                  <div class="gmcp-detail"><?php echo esc_html( mb_substr( $e['detail'], 0, 160 ) ); ?></div>
                 <?php endif; ?>
                 <?php foreach ( $this->changed_lines( $e['changes'] ?? null ) as $line ) : ?>
-                  <div style="color:#1d2327;font-size:12px"><?php echo esc_html( $line ); ?></div>
+                  <div class="gmcp-change"><?php echo esc_html( $line ); ?></div>
                 <?php endforeach; ?>
                 <?php if ( !empty( $e['args'] ) && $e['args'] !== '[]' && $e['args'] !== '{}' ) : ?>
                   <details style="margin-top:4px">
-                    <summary style="cursor:pointer;color:#2271b1;font-size:12px"><?php esc_html_e( 'arguments', 'guarded-mcp' ); ?></summary>
-                    <pre style="white-space:pre-wrap;font-size:11px;margin:4px 0 0"><?php
+                    <summary class="gmcp-summary"><?php esc_html_e( 'arguments', 'guarded-mcp' ); ?></summary>
+                    <pre class="gmcp-args"><?php
                       echo esc_html( wp_json_encode( json_decode( $e['args'], true ), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) ); ?></pre>
                   </details>
                 <?php endif; ?>
@@ -876,7 +1133,7 @@ class GMCP_Settings {
         (int) GMCP_Audit::retention_days()
       ); ?>
       <?php if ( $chain['ok'] ) : ?>
-        <span style="color:#00a32a"><?php echo esc_html( $chain['complete']
+        <span class="gmcp-ok"><?php echo esc_html( $chain['complete']
           ? sprintf(
               /* translators: %d: number of entries verified. */
               __( 'The chain is intact across all %d entries.', 'guarded-mcp' ), (int) $chain['checked'] )
@@ -888,38 +1145,38 @@ class GMCP_Settings {
               (int) $chain['checked'], (int) $chain['total'] )
         ); ?></span>
         <?php if ( !empty( $chain['imported'] ) ) : ?>
-          <span style="color:#787c82"><?php printf(
+          <span class="gmcp-muted"><?php printf(
             esc_html__( '%d older entries were carried over from before this log was chained and are not covered.', 'guarded-mcp' ),
             (int) $chain['imported'] ); ?></span>
         <?php endif; ?>
         <?php if ( !$chain['complete'] ) : ?>
+          <?php // Through form_head, not by hand: the POST redirects, and a form that
+          // forgets gmcp_tab sends the reader to the first tab to read a verdict about
+          // the log they were just looking at. ?>
           <form method="post" style="display:inline">
-            <?php wp_nonce_field( self::NONCE_ACTION ); ?>
-            <input type="hidden" name="gmcp_action" value="verify_audit">
+            <?php $this->form_head( 'verify_audit', 'logs' ); ?>
             <button type="submit" class="button button-small"><?php esc_html_e( 'Check the whole chain', 'guarded-mcp' ); ?></button>
           </form>
         <?php endif; ?>
       <?php else : ?>
-        <strong style="color:#d63638"><?php printf(
+        <strong class="gmcp-fail"><?php printf(
           esc_html__( 'The chain breaks at entry %1$d: %2$s', 'guarded-mcp' ),
           (int) $chain['broken_at'], esc_html( $chain['reason'] )
         ); ?></strong>
       <?php endif; ?>
     </p>
 
-    <p>
-      <form method="post" style="display:inline">
-        <?php wp_nonce_field( self::NONCE_ACTION ); ?>
-        <input type="hidden" name="gmcp_action" value="prune_audit">
+    <div class="gmcp-actions">
+      <form method="post">
+        <?php $this->form_head( 'prune_audit', 'logs' ); ?>
         <button type="submit" class="button"><?php esc_html_e( 'Prune now', 'guarded-mcp' ); ?></button>
       </form>
-      <form method="post" style="display:inline">
-        <?php wp_nonce_field( self::NONCE_ACTION ); ?>
-        <input type="hidden" name="gmcp_action" value="clear_activity">
+      <form method="post">
+        <?php $this->form_head( 'clear_activity', 'logs' ); ?>
         <button type="submit" class="button"><?php esc_html_e( 'Clear everything', 'guarded-mcp' ); ?></button>
       </form>
-    </p>
-    <p class="description">
+    </div>
+    <p class="description gmcp-intro">
       <?php esc_html_e( 'Every call, including the refused ones, with the arguments it was given. Anything that looks like a password or a key is replaced before the entry is written, so what you see here is what was recorded, not a redacted view of something fuller. Each entry hashes the one before it, so a row that is edited or removed later shows up as a break in the chain rather than disappearing quietly.', 'guarded-mcp' ); ?>
     </p>
     <?php
