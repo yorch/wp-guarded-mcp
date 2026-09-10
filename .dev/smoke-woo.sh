@@ -87,8 +87,9 @@ call o_done "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":
 check "a status starting with c really is applied" \
   "$(docker compose exec -T cli wp eval "echo wc_get_order($O_ID)->get_status();" 2>/dev/null | tr -d '\r\n')" "completed"
 check "the reply names the status it actually set" "$(body o_done | grep -c 'to completed')" "1"
-# Silence here would be worse than the wrong answer: somebody has been emailed.
-check "and warns that the customer was emailed" "$(body o_done | grep -c 'email')" "1"
+# Silence here would be worse than the wrong answer: somebody has been written to. Assert
+# the address rather than the word "email", which the old wording carried either way.
+check "and names the customer it wrote to" "$(body o_done | grep -c 'ada@example.com')" "1"
 call o_same "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_order_status\",\"arguments\":{\"id\":$O_ID,\"status\":\"completed\"}}}"
 check "setting the status it already has sends nothing" "$(body o_same | grep -c 'no email was sent')" "1"
 call o_bad "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_order_status\",\"arguments\":{\"id\":$O_ID,\"status\":\"teleported\"}}}"
@@ -133,13 +134,24 @@ call e_hold "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\"
 # The status the old hardcoded list left out entirely, and the one a shop uses for bank
 # transfers, so it is not an exotic path.
 check "moving to on-hold reports the customer was emailed" \
-  "$(body e_hold | grep -c 'emailed the customer at customer@example.test')" "1"
+  "$(body e_hold | grep -c 'notification for this change to customer@example.test')" "1"
 call e_cancel "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_order_status\",\"arguments\":{\"id\":$M_ORD,\"status\":\"cancelled\"}}}"
 # The old list claimed this one mailed the customer. It mails the shop.
 check "cancelling reports that the customer was not emailed" \
   "$(body e_cancel | grep -c 'none of them to the customer')" "1"
 check "and does not claim the customer was reached" \
-  "$(body e_cancel | grep -c 'emailed the customer')" "0"
+  "$(body e_cancel | grep -c 'customer@example.test')" "0"
+
+# The wp_mail filter fires before pre_wp_mail, so an SMTP or mail-disabling plugin
+# intercepting delivery does not hide the fact that WooCommerce decided to write.
+docker compose exec -T wp sh -c 'cat > /var/www/html/wp-content/mu-plugins/mailkill.php <<"PHPEOF"
+<?php
+add_filter( "pre_wp_mail", function () { return true; }, 1 );
+PHPEOF' >/dev/null 2>&1
+call e_killed "{\"jsonrpc\":\"2.0\",\"id\":38,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_order_status\",\"arguments\":{\"id\":$M_ORD,\"status\":\"failed\"}}}"
+check "a mail-intercepting plugin does not hide the notification" \
+  "$(body e_killed | grep -c 'customer@example.test')" "1"
+docker compose exec -T wp sh -c 'rm -f /var/www/html/wp-content/mu-plugins/mailkill.php' >/dev/null 2>&1
 
 # The flag was documented as emailing the note and was never read: set_status records
 # whatever it is given privately, so a note meant for the customer stayed internal.

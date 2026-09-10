@@ -680,10 +680,15 @@ class REEVE_Tools_Woo {
   /**
   * Who was actually written to during the change.
   *
-  * "Asked to send" rather than "sent": this sees the call into wp_mail, not the delivery.
-  * That is still the fact worth reporting, because the thing you cannot take back is the
-  * message leaving, and a silent success here would let an agent tell someone nobody was
-  * contacted when a stranger has a message in their inbox.
+  * The wp_mail filter is the right hook and not by luck: in current WordPress it fires
+  * before pre_wp_mail, so this still sees a message that an SMTP or mail-disabling plugin
+  * later intercepts. Verified against a pre_wp_mail short-circuit. That ordering is the
+  * useful way round, because the question is whether WooCommerce decided to write to the
+  * customer, not whether the host's mail server was working.
+  *
+  * It follows that this reports an intention rather than a delivery, so the wording says
+  * so. Over-reporting is the safe direction: an agent telling someone nobody was
+  * contacted, when a stranger has a message in their inbox, is the failure that matters.
   */
   private function describe_mail( array $sent, $order ): string {
     if ( !$sent ) {
@@ -692,7 +697,8 @@ class REEVE_Tools_Woo {
     $sent = array_values( array_unique( $sent ) );
     $customer = strtolower( trim( (string) $order->get_billing_email() ) );
     if ( $customer !== '' && in_array( $customer, $sent, true ) ) {
-      return 'WooCommerce emailed the customer at ' . $customer . ', so this has reached a real person and cannot be taken back.';
+      return 'WooCommerce sent the customer notification for this change to ' . $customer
+        . '. Treat that as having reached a real person: it cannot be taken back.';
     }
     return count( $sent ) . ' notification(s) went out, none of them to the customer.';
   }
