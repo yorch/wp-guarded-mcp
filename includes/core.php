@@ -42,6 +42,7 @@ class GMCP_Core {
     // Keep a short history of tool calls, including refused ones, for the settings
     // screen. An agent otherwise operates with no visible record at all.
     'mcp_activity_log' => true,
+    'mcp_audit_days' => 90,
     'mcp_change_journal' => true,
   ];
 
@@ -113,6 +114,70 @@ class GMCP_Core {
     return true;
   }
 
+  /**
+  * Field names that mark a value as credential-shaped.
+  *
+  * Lives here rather than in one subsystem because two of them need to agree: the change
+  * journal decides whether a previous value is safe to keep, and the audit log decides
+  * whether an argument is safe to write down. Two lists would drift, and the direction
+  * they drift in is a secret being recorded by whichever one was not updated.
+  *
+  * Separate from option_guard()'s list, which matches whole OPTION names and gates reads
+  * and writes. These match FIELD names inside a value, where conventions are shorter and
+  * the cost of a false positive is only that one value is not recorded.
+  */
+  public static function credential_field_patterns(): array {
+    return apply_filters( 'gmcp_credential_field_patterns', [
+      'pass', 'pwd', 'secret', 'token', 'key', 'auth', 'salt', 'nonce',
+      'credential', 'bearer', 'signature', 'licence', 'license', 'private',
+    ] );
+  }
+
+  public static function field_looks_secret( string $field ): bool {
+    $needle = strtolower( $field );
+    foreach ( (array) self::credential_field_patterns() as $pattern ) {
+      if ( $pattern !== '' && strpos( $needle, strtolower( (string) $pattern ) ) !== false ) {
+        return true;
+      }
+    }
+    // Honour the option-name guard too, so a site that protects a name through
+    // gmcp_protected_options also has that name redacted when it appears as a field.
+    return self::option_guard( $field ) !== true;
+  }
+
+  /**
+  * A copy of a value with anything credential-shaped replaced.
+  *
+  * Unlike the journal's holds_credential(), which refuses the whole value if any part of
+  * it looks secret, this keeps the shape and blanks the leaves. An audit entry is worth
+  * far more with the harmless arguments intact, and the redaction marker is itself
+  * information: it records that a secret was passed without recording the secret.
+  *
+  * Walks arrays and objects. Does not try to parse strings: a JSON blob under an
+  * innocuous field name is left whole, and callers that care should test it with
+  * field_looks_secret() on the field it arrived under.
+  */
+  public static function redact( $value, int $depth = 0 ) {
+    if ( $depth > 8 ) {
+      return '[too deeply nested to record]';
+    }
+    if ( is_object( $value ) ) {
+      $value = get_object_vars( $value );
+    }
+    if ( !is_array( $value ) ) {
+      return $value;
+    }
+    $out = [];
+    foreach ( $value as $key => $inner ) {
+      if ( is_string( $key ) && self::field_looks_secret( $key ) ) {
+        $out[ $key ] = '[redacted]';
+        continue;
+      }
+      $out[ $key ] = self::redact( $inner, $depth + 1 );
+    }
+    return $out;
+  }
+
   public function init() {
     load_plugin_textdomain( GMCP_DOMAIN, false, basename( GMCP_PATH ) . '/languages' );
 
@@ -122,7 +187,10 @@ class GMCP_Core {
     $this->server = new GMCP_Server( $this );
 
     if ( $this->get_option( 'mcp_activity_log' ) ) {
-      new GMCP_Activity();
+      // Constructed on every request a tool call might arrive on, and it registers the
+      // prune cron handler as well as the recorder, so a scheduled prune fires even on a
+      // request that never touches the API.
+      new GMCP_Audit();
     }
 
     // What changed and how to put it back. Listens to WordPress rather than to the

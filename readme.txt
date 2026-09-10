@@ -31,7 +31,7 @@ The other difference is the guardrails, which exist because of a specific risk. 
 * **The riskiest tools can say what they would do first.** A search and replace, a delete or a rewrite can be run with `preview`, which describes every match and everything attached, and changes nothing.
 * **Changes can be put back.** It remembers what a setting or a post said before an agent changed it, and one call reverts it. Only writes made through this API are recorded, never your own. Reverting needs the same access the original change needed, so undo is not a way around the access levels. Settings that look like they hold a credential are recorded as changed but their previous value is not kept, so those cannot be reverted.
 
-You can also see what actually happened. The settings screen keeps the last hundred tool calls, including the refused ones, with what each was aimed at and why it was turned down, alongside the list of changes that can still be reverted.
+You can also see what actually happened. The settings screen keeps a full audit log: every tool call, including the refused ones, with the arguments it was given, what it was aimed at and why it was turned down. Anything that looks like a password or a key is replaced before the entry is written. Each entry hashes the one before it, so a row edited or deleted later shows up as a break rather than vanishing quietly. Entries are kept for 90 days by default and pruned automatically, and you can prune or clear them yourself at any time.
 
 = What an agent can do =
 
@@ -127,7 +127,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * Content tools: posts, block content, taxonomies, comments, media, users, post meta, options, post types and block patterns.
 * Site administration tools, off by default: plugins, themes, menus, widgets, settings, permalinks and Site Health.
 * Two-step confirmation on destructive operations, wordpress.org-only installs, filtered post and widget markup, and refusal of any operation that would make the site or the endpoint unreachable.
-* Activity history of the last hundred tool calls, refusals included.
+* Audit log of every tool call, refusals included, with redacted arguments, a tamper-evident hash chain, and automatic pruning.
 * Connection test on the settings screen and in Site Health, which distinguishes an unreachable endpoint from credentials that never arrived.
 * WooCommerce tools on their own switch: products, stock, orders, order notes, customers and sales figures. No refunds.
 * Named keys with their own access level, expiry date and tool list, stored hashed.

@@ -17,6 +17,7 @@ delete_option( 'gmcp_oauth_db_version' );
 // leaving it behind for a plugin that is gone means nobody will ever look at it again or
 // know to remove it. The key table holds credential hashes, which have the same problem.
 delete_option( 'gmcp_activity' );
+delete_option( 'gmcp_audit_db_version' );
 delete_option( 'gmcp_journal' );
 delete_option( 'gmcp_tokens' );
 
@@ -35,7 +36,15 @@ $clients = $wpdb->prefix . 'gmcp_oauth_clients';
 $tokens = $wpdb->prefix . 'gmcp_oauth_tokens';
 $old_clients = $wpdb->prefix . 'reeve_oauth_clients';
 $old_tokens = $wpdb->prefix . 'reeve_oauth_tokens';
-$wpdb->query( "DROP TABLE IF EXISTS {$tokens}, {$clients}, {$old_tokens}, {$old_clients}" );
+$audit = $wpdb->prefix . 'gmcp_audit';
+$wpdb->query( "DROP TABLE IF EXISTS {$tokens}, {$clients}, {$old_tokens}, {$old_clients}, {$audit}" );
+
+// The prune schedule outlives the plugin files otherwise, and WordPress will keep firing
+// an action nothing listens to until somebody notices.
+$next = wp_next_scheduled( 'gmcp_audit_prune' );
+if ( $next ) {
+  wp_unschedule_event( $next, 'gmcp_audit_prune' );
+}
 
 // Transients: pending authorization codes, consent state, message queue and one-time
 // upload tokens. They are short-lived, but an uninstall should not leave them to age out.

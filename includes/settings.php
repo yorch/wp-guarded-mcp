@@ -109,8 +109,19 @@ class GMCP_Settings {
       set_transient( 'gmcp_setup_report', GMCP_SelfTest::report(), 5 * MINUTE_IN_SECONDS );
     }
     elseif ( $action === 'clear_activity' ) {
-      GMCP_Activity::clear();
-      $this->notice = __( 'Activity history cleared.', 'guarded-mcp' );
+      GMCP_Audit::clear();
+      $this->notice = __( 'Audit log cleared.', 'guarded-mcp' );
+    }
+    elseif ( $action === 'prune_audit' ) {
+      $gone = GMCP_Audit::prune();
+      $total = array_sum( $gone );
+      $this->notice = $total
+        ? sprintf(
+            /* translators: 1: number removed for age, 2: for the row cap, 3: for the size cap. */
+            __( 'Pruned %1$d entries past the retention window, %2$d over the entry limit and %3$d over the size limit.', 'guarded-mcp' ),
+            $gone['age'], $gone['rows'], $gone['bytes']
+          )
+        : __( 'Nothing needed pruning.', 'guarded-mcp' );
     }
     elseif ( $action === 'create_key' ) {
       $this->create_key();
@@ -179,6 +190,7 @@ class GMCP_Settings {
     $options['mcp_tools_woo'] = !empty( $_POST['mcp_tools_woo'] );
     $options['mcp_debug_mode'] = !empty( $_POST['mcp_debug_mode'] );
     $options['mcp_activity_log'] = !empty( $_POST['mcp_activity_log'] );
+    $options['mcp_audit_days'] = isset( $_POST['mcp_audit_days'] ) ? max( 1, min( 3650, (int) $_POST['mcp_audit_days'] ) ) : 90;
     $options['mcp_change_journal'] = !empty( $_POST['mcp_change_journal'] );
 
     // The token is only rewritten when the field was actually submitted, so saving the
@@ -348,14 +360,25 @@ class GMCP_Settings {
             </td>
           </tr>
           <tr>
-            <th scope="row"><?php esc_html_e( 'Activity history', 'guarded-mcp' ); ?></th>
+            <th scope="row"><?php esc_html_e( 'Audit log', 'guarded-mcp' ); ?></th>
             <td>
               <label>
                 <input type="checkbox" name="mcp_activity_log" value="1" <?php checked( !empty( $options['mcp_activity_log'] ) ); ?>>
-                <?php esc_html_e( 'Record the last 100 tool calls, including refused ones', 'guarded-mcp' ); ?>
+                <?php esc_html_e( 'Record every tool call, including refused ones, with its arguments', 'guarded-mcp' ); ?>
               </label>
               <p class="description">
                 <?php esc_html_e( 'Without this an agent works with no visible record: you can see that something changed, but not what did it or when. Refusals are recorded too, since those are the interesting ones.', 'guarded-mcp' ); ?>
+              </p>
+              <p>
+                <label>
+                  <?php esc_html_e( 'Keep entries for', 'guarded-mcp' ); ?>
+                  <input type="number" name="mcp_audit_days" min="1" max="3650" class="small-text"
+                         value="<?php echo esc_attr( (int) ( $options['mcp_audit_days'] ?? 90 ) ); ?>">
+                  <?php esc_html_e( 'days', 'guarded-mcp' ); ?>
+                </label>
+              </p>
+              <p class="description">
+                <?php esc_html_e( 'Pruned once a day. Two further limits apply whatever this says, because age alone does not bound a busy site: at most 50,000 entries and 50 MB of recorded arguments, oldest removed first.', 'guarded-mcp' ); ?>
               </p>
             </td>
           </tr>
@@ -700,57 +723,121 @@ class GMCP_Settings {
 
   private function render_activity(): void {
     if ( empty( $this->core->get_option( 'mcp_activity_log' ) ) ) {
-      echo '<p>' . esc_html__( 'Activity history is switched off, so nothing is being recorded.', 'guarded-mcp' ) . '</p>';
+      echo '<p>' . esc_html__( 'The audit log is switched off, so nothing is being recorded.', 'guarded-mcp' ) . '</p>';
       return;
     }
 
-    $entries = GMCP_Activity::recent( 25 );
-    if ( empty( $entries ) ) {
-      echo '<p>' . esc_html__( 'No tool calls recorded yet. Anything an agent does will appear here.', 'guarded-mcp' ) . '</p>';
-      return;
-    }
+    $search = isset( $_GET['gmcp_q'] ) ? sanitize_text_field( wp_unslash( $_GET['gmcp_q'] ) ) : '';
+    $only = isset( $_GET['gmcp_outcome'] ) ? sanitize_key( wp_unslash( $_GET['gmcp_outcome'] ) ) : '';
+    $entries = GMCP_Audit::query( [
+      'limit' => 50,
+      'search' => $search,
+      'outcome' => in_array( $only, [ 'ok', 'refused' ], true ) ? $only : '',
+    ] );
+    $total = GMCP_Audit::count();
     ?>
-    <table class="widefat striped">
-      <thead>
-        <tr>
-          <th><?php esc_html_e( 'When', 'guarded-mcp' ); ?></th>
-          <th><?php esc_html_e( 'Tool', 'guarded-mcp' ); ?></th>
-          <th><?php esc_html_e( 'Target', 'guarded-mcp' ); ?></th>
-          <th><?php esc_html_e( 'Client', 'guarded-mcp' ); ?></th>
-          <th><?php esc_html_e( 'Result', 'guarded-mcp' ); ?></th>
-        </tr>
-      </thead>
-      <tbody>
-        <?php foreach ( $entries as $e ) : ?>
+    <form method="get" style="margin-bottom:10px">
+      <input type="hidden" name="page" value="<?php echo esc_attr( self::PAGE_SLUG ); ?>">
+      <input type="search" name="gmcp_q" value="<?php echo esc_attr( $search ); ?>"
+             placeholder="<?php esc_attr_e( 'Search targets, arguments and refusal messages', 'guarded-mcp' ); ?>"
+             class="regular-text">
+      <select name="gmcp_outcome">
+        <option value=""><?php esc_html_e( 'Everything', 'guarded-mcp' ); ?></option>
+        <option value="refused" <?php selected( $only, 'refused' ); ?>><?php esc_html_e( 'Refusals only', 'guarded-mcp' ); ?></option>
+        <option value="ok" <?php selected( $only, 'ok' ); ?>><?php esc_html_e( 'Successes only', 'guarded-mcp' ); ?></option>
+      </select>
+      <button type="submit" class="button"><?php esc_html_e( 'Filter', 'guarded-mcp' ); ?></button>
+    </form>
+
+    <?php if ( empty( $entries ) ) : ?>
+      <p><?php echo $search || $only
+        ? esc_html__( 'Nothing matches that.', 'guarded-mcp' )
+        : esc_html__( 'No tool calls recorded yet. Anything an agent does will appear here.', 'guarded-mcp' ); ?></p>
+    <?php else : ?>
+      <table class="widefat striped">
+        <thead>
           <tr>
-            <td style="white-space:nowrap"><?php echo esc_html( $this->ago( (int) $e['t'] ) ); ?></td>
-            <td><code><?php echo esc_html( $e['tool'] ); ?></code></td>
-            <td><?php echo $e['target'] !== '' ? '<code>' . esc_html( $e['target'] ) . '</code>' : '&mdash;'; ?></td>
-            <td><?php echo esc_html( $e['who'] ); ?></td>
-            <td>
-              <?php if ( !empty( $e['ok'] ) ) : ?>
-                <span style="color:#00a32a"><?php esc_html_e( 'Done', 'guarded-mcp' ); ?></span>
-                <span style="color:#787c82"><?php echo esc_html( sprintf( '(%dms)', (int) $e['ms'] ) ); ?></span>
-              <?php else : ?>
-                <span style="color:#d63638"><?php esc_html_e( 'Refused', 'guarded-mcp' ); ?></span>
-                <?php if ( $e['err'] !== '' ) : ?>
-                  <span style="color:#787c82"><?php echo esc_html( $e['err'] ); ?></span>
-                <?php endif; ?>
-              <?php endif; ?>
-            </td>
+            <th><?php esc_html_e( 'When', 'guarded-mcp' ); ?></th>
+            <th><?php esc_html_e( 'Tool', 'guarded-mcp' ); ?></th>
+            <th><?php esc_html_e( 'Target', 'guarded-mcp' ); ?></th>
+            <th><?php esc_html_e( 'Who', 'guarded-mcp' ); ?></th>
+            <th><?php esc_html_e( 'Result', 'guarded-mcp' ); ?></th>
           </tr>
-        <?php endforeach; ?>
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          <?php foreach ( $entries as $e ) : ?>
+            <tr>
+              <td style="white-space:nowrap"><?php echo esc_html( $this->ago( strtotime( $e['ts'] . ' UTC' ) ) ); ?></td>
+              <td><code><?php echo esc_html( $e['tool'] ); ?></code></td>
+              <td><?php echo $e['target'] !== '' ? '<code>' . esc_html( $e['target'] ) . '</code>' : '&mdash;'; ?></td>
+              <td>
+                <?php echo esc_html( $e['client'] ?: $e['auth_method'] ); ?>
+                <?php if ( $e['actor_name'] !== '' ) : ?>
+                  <span style="color:#787c82"><?php echo esc_html( 'as ' . $e['actor_name'] ); ?></span>
+                <?php endif; ?>
+              </td>
+              <td>
+                <?php if ( $e['outcome'] === 'ok' ) : ?>
+                  <span style="color:#00a32a"><?php esc_html_e( 'Done', 'guarded-mcp' ); ?></span>
+                  <span style="color:#787c82"><?php echo esc_html( sprintf( '(%dms)', (int) $e['ms'] ) ); ?></span>
+                <?php else : ?>
+                  <span style="color:#d63638"><?php esc_html_e( 'Refused', 'guarded-mcp' ); ?></span>
+                <?php endif; ?>
+                <?php if ( $e['detail'] !== '' && $e['detail'] !== null ) : ?>
+                  <div style="color:#787c82;font-size:12px"><?php echo esc_html( mb_substr( $e['detail'], 0, 160 ) ); ?></div>
+                <?php endif; ?>
+                <?php if ( !empty( $e['args'] ) && $e['args'] !== '[]' && $e['args'] !== '{}' ) : ?>
+                  <details style="margin-top:4px">
+                    <summary style="cursor:pointer;color:#2271b1;font-size:12px"><?php esc_html_e( 'arguments', 'guarded-mcp' ); ?></summary>
+                    <pre style="white-space:pre-wrap;font-size:11px;margin:4px 0 0"><?php
+                      echo esc_html( wp_json_encode( json_decode( $e['args'], true ), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) ); ?></pre>
+                  </details>
+                <?php endif; ?>
+              </td>
+            </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+    <?php endif; ?>
+
+    <?php $chain = GMCP_Audit::verify(); ?>
+    <p style="margin-top:12px">
+      <?php printf(
+        esc_html__( '%1$s entries, %2$s of recorded arguments. Kept for %3$d days, then pruned automatically.', 'guarded-mcp' ),
+        esc_html( number_format_i18n( $total ) ),
+        esc_html( size_format( GMCP_Audit::bytes() ) ),
+        (int) GMCP_Audit::retention_days()
+      ); ?>
+      <?php if ( $chain['ok'] ) : ?>
+        <span style="color:#00a32a"><?php printf(
+          esc_html__( 'The chain is intact across %d entries.', 'guarded-mcp' ), (int) $chain['checked'] ); ?></span>
+        <?php if ( !empty( $chain['imported'] ) ) : ?>
+          <span style="color:#787c82"><?php printf(
+            esc_html__( '%d older entries were carried over from before this log was chained and are not covered.', 'guarded-mcp' ),
+            (int) $chain['imported'] ); ?></span>
+        <?php endif; ?>
+      <?php else : ?>
+        <strong style="color:#d63638"><?php printf(
+          esc_html__( 'The chain breaks at entry %1$d: %2$s', 'guarded-mcp' ),
+          (int) $chain['broken_at'], esc_html( $chain['reason'] )
+        ); ?></strong>
+      <?php endif; ?>
+    </p>
+
     <p>
       <form method="post" style="display:inline">
         <?php wp_nonce_field( self::NONCE_ACTION ); ?>
+        <input type="hidden" name="gmcp_action" value="prune_audit">
+        <button type="submit" class="button"><?php esc_html_e( 'Prune now', 'guarded-mcp' ); ?></button>
+      </form>
+      <form method="post" style="display:inline">
+        <?php wp_nonce_field( self::NONCE_ACTION ); ?>
         <input type="hidden" name="gmcp_action" value="clear_activity">
-        <button type="submit" class="button"><?php esc_html_e( 'Clear the history', 'guarded-mcp' ); ?></button>
+        <button type="submit" class="button"><?php esc_html_e( 'Clear everything', 'guarded-mcp' ); ?></button>
       </form>
     </p>
     <p class="description">
-      <?php esc_html_e( 'The last 100 calls, newest first. This is a record for you to read, not a security log: it lives in an option, so it is not tamper-proof and a burst of simultaneous calls can lose an entry. Hook gmcp_tool_called if you need a real audit trail.', 'guarded-mcp' ); ?>
+      <?php esc_html_e( 'Every call, including the refused ones, with the arguments it was given. Anything that looks like a password or a key is replaced before the entry is written, so what you see here is what was recorded, not a redacted view of something fuller. Each entry hashes the one before it, so a row that is edited or removed later shows up as a break in the chain rather than disappearing quietly.', 'guarded-mcp' ); ?>
     </p>
     <?php
   }

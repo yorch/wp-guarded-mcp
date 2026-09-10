@@ -477,6 +477,23 @@ class GMCP_Tools_Admin {
         'accessLevel' => 'read',
       ],
 
+      'wp_get_audit_log' => [
+        'name' => 'wp_get_audit_log',
+        'description' => 'Read this API\'s own audit log: every tool call made through it, including the refused ones, with the arguments each was given and why it was turned down. Useful for answering "what did I change last week" or "what has been refused and why". Read only; nothing here can prune or clear the log.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'limit' => [ 'type' => 'integer', 'description' => 'Default 50, maximum 500.' ],
+            'offset' => [ 'type' => 'integer' ],
+            'tool' => [ 'type' => 'string', 'description' => 'Only calls to this tool.' ],
+            'outcome' => [ 'type' => 'string', 'description' => 'ok or refused.' ],
+            'since' => [ 'type' => 'string', 'description' => 'GMT datetime, e.g. 2026-09-01 00:00:00.' ],
+            'until' => [ 'type' => 'string' ],
+            'search' => [ 'type' => 'string', 'description' => 'Matches the target, the arguments and the refusal message.' ],
+          ],
+        ],
+        'accessLevel' => 'admin',
+      ],
       /* -------- Site health -------- */
       'wp_get_site_health' => [
         'name' => 'wp_get_site_health',
@@ -700,6 +717,9 @@ class GMCP_Tools_Admin {
       case 'wp_get_site_health':
         return $this->site_health( $r );
 
+      case 'wp_get_audit_log':
+        return $this->audit_log( $a, $r );
+
       case 'wp_site_briefing':
         return $this->site_briefing( $r );
 
@@ -748,6 +768,7 @@ class GMCP_Tools_Admin {
   private const READ_ONLY_TOOLS = [
     'wp_list_themes', 'wp_get_settings', 'wp_get_permalink_structure', 'wp_get_site_health',
     'wp_list_menus', 'wp_get_menu_items', 'wp_list_sidebars', 'wp_site_briefing',
+    'wp_get_audit_log',
   ];
 
   private function is_mutating_tool( string $tool ): bool {
@@ -1842,31 +1863,85 @@ class GMCP_Tools_Admin {
     return $out;
   }
 
-  /** A one-line pulse from the activity log, so the agent knows whether it is the first here. */
+  /** A one-line pulse from the audit log, so an agent knows whether it is the first here. */
   private function recent_activity_summary(): array {
-    if ( !class_exists( 'GMCP_Activity' ) ) {
+    if ( !class_exists( 'GMCP_Audit' ) || empty( $this->core->get_option( 'mcp_activity_log' ) ) ) {
       return [ 'available' => false ];
     }
-    $recent = GMCP_Activity::recent( 25 );
+    $recent = GMCP_Audit::query( [ 'limit' => 25 ] );
     if ( !$recent ) {
       return [ 'available' => true, 'calls' => 0 ];
     }
     $failed = 0;
     foreach ( $recent as $entry ) {
-      if ( empty( $entry['ok'] ) ) {
+      if ( ( $entry['outcome'] ?? '' ) !== 'ok' ) {
         $failed++;
       }
     }
     return [
       'available' => true,
-      'calls' => count( $recent ),
-      'refused_or_failed' => $failed,
-      'most_recent' => gmdate( 'Y-m-d H:i', (int) $recent[0]['t'] ) . ' GMT',
+      'calls_recorded' => GMCP_Audit::count(),
+      'refused_in_last_25' => $failed,
+      'most_recent' => $recent[0]['ts'] . ' GMT',
       'most_recent_tool' => (string) $recent[0]['tool'],
     ];
   }
 
   #endregion
+
+  /**
+  * The audit log, as an agent is allowed to see it.
+  *
+  * Read only, deliberately. An agent that can prune its own audit trail is not being
+  * audited, so nothing here deletes, and the settings screen is the only place the log
+  * can be cleared.
+  *
+  * The chain verdict rides along with the rows, because a caller asking what happened
+  * should be told immediately if the record it is reading has been altered, rather than
+  * having to know to ask.
+  */
+  private function audit_log( array $a, array $r ): array {
+    if ( !class_exists( 'GMCP_Audit' ) || empty( $this->core->get_option( 'mcp_activity_log' ) ) ) {
+      return $this->error( $r, 'The audit log is switched off for this site, so there is nothing recorded to read. Turn it on under the MCP Server screen in the admin menu.' );
+    }
+
+    $filters = [];
+    foreach ( [ 'tool', 'outcome', 'since', 'until', 'search' ] as $key ) {
+      if ( isset( $a[ $key ] ) && is_scalar( $a[ $key ] ) && (string) $a[ $key ] !== '' ) {
+        $filters[ $key ] = (string) $a[ $key ];
+      }
+    }
+    $filters['limit'] = isset( $a['limit'] ) ? (int) $a['limit'] : 50;
+    $filters['offset'] = isset( $a['offset'] ) ? (int) $a['offset'] : 0;
+
+    $rows = [];
+    foreach ( GMCP_Audit::query( $filters ) as $row ) {
+      $rows[] = [
+        'id' => (int) $row['id'],
+        'when' => $row['ts'] . ' GMT',
+        'tool' => $row['tool'],
+        'target' => $row['target'],
+        'outcome' => $row['outcome'],
+        'ms' => (int) $row['ms'],
+        'client' => $row['client'] ?: $row['auth_method'],
+        'actor' => $row['actor_name'],
+        'arguments' => $row['args'] ? json_decode( $row['args'], true ) : null,
+        'detail' => $row['detail'],
+      ];
+    }
+
+    $chain = GMCP_Audit::verify();
+    return $this->json( $r, [
+      'entries' => $rows,
+      'total_recorded' => GMCP_Audit::count(),
+      'retention_days' => GMCP_Audit::retention_days(),
+      'tamper_check' => $chain['ok']
+        ? 'The hash chain is intact across ' . $chain['checked'] . ' entries.'
+        : 'The hash chain breaks at entry ' . $chain['broken_at'] . ': ' . $chain['reason']
+          . ' Treat everything from that point on as unverified.',
+      'note' => 'Arguments are recorded with credential-shaped fields replaced, so a value reading "[redacted]" means a secret was passed rather than that the field was empty.',
+    ] );
+  }
 
   #region Site health
 

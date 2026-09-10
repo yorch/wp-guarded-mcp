@@ -20,7 +20,7 @@ spl_autoload_register( function ( $class ) {
     'GMCP_Tools_Rest' => '/includes/tools-rest.php',
     'GMCP_Tools_Woo' => '/includes/tools-woo.php',
     'GMCP_Tools_Admin' => '/includes/tools-admin.php',
-    'GMCP_Activity' => '/includes/activity.php',
+    'GMCP_Audit' => '/includes/audit.php',
     'GMCP_Journal' => '/includes/journal.php',
     'GMCP_Tokens' => '/includes/tokens.php',
     'GMCP_SelfTest' => '/includes/selftest.php',
@@ -42,8 +42,19 @@ $gmcp_core = new GMCP_Core();
 // being active, so an activation has to invalidate them.
 register_activation_hook( GMCP_ENTRY, function () {
   require_once( GMCP_PATH . '/includes/oauth.php' );
+  require_once( GMCP_PATH . '/includes/audit.php' );
   gmcp_adopt_previous_data();
+  GMCP_Audit::install();
+  GMCP_Audit::adopt_activity_option();
+  GMCP_Audit::schedule();
   GMCP_OAuth::purge_discovery_cache();
+} );
+
+// A deactivated plugin should leave nothing running. The table and its rows stay, so
+// reactivating picks up where it left off; only the schedule goes.
+register_deactivation_hook( GMCP_ENTRY, function () {
+  require_once( GMCP_PATH . '/includes/audit.php' );
+  GMCP_Audit::unschedule();
 } );
 
 /**

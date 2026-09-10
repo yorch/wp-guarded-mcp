@@ -139,16 +139,44 @@ common and is not a fault.
 limited to, when it expires and when it was last used, with a control to revoke it. A new
 key's secret appears once, on creation, and is not recoverable afterwards.
 
-**Recent activity** records the last hundred tool calls, refusals included. Without it an
-agent works with no visible record at all: you can see that a plugin is gone, but not
-that your agent removed it, when, or that it tried three times first. Refusals are the
-interesting entries, which is why they are kept rather than discarded.
+**Recent activity** is the audit log. Every tool call, refusals included, with the
+arguments it was given, who made it, what it was aimed at, how long it took and why it
+was turned down. Without it an agent works with no visible record at all: you can see
+that a plugin is gone, but not that your agent removed it, when, or that it tried three
+times first. Refusals are the interesting entries, which is why they are kept.
 
-It stores the tool, a short target such as the plugin file or post title, the outcome and
-how long it took. It deliberately does not store the full arguments, which can carry a
-whole post body. It is a record for a person to read, not a security log: it lives in an
-option, so a burst of simultaneous calls can lose an entry and anyone who can write
-options can rewrite it. Hook `gmcp_tool_called` if you need a real audit trail.
+It lives in its own table, `{prefix}gmcp_audit`, indexed by time, tool and actor. That
+replaced an option row, which was a read-modify-write: two calls landing together could
+lose an entry, and it held a hundred rows at most.
+
+Three things about it are decisions rather than defaults.
+
+*Arguments are recorded, redacted.* An entry that does not say what was asked for is half
+an entry, but `wp_create_user` takes a password and `wp_update_option` takes whatever a
+settings array holds. Everything goes through `GMCP_Core::redact()`, which keeps the
+shape and blanks the leaves, and `user_pass` is dropped whatever the detector thinks. A
+field reading `[redacted]` is itself information: it says a secret was passed. The option
+name in `wp_update_option` is deliberately kept, because the credential patterns are
+written for field names inside a value, where `key` signals a secret, and at the top level
+of a call it is the name of the thing being changed.
+
+*Each row hashes the one before it.* Nothing here stops somebody with database access
+editing a row, and pretending otherwise would be worse than not trying. What the chain
+does is make it visible: the screen recomputes it and names the first row that no longer
+matches, and says whether the row was edited or one before it removed. That is the
+difference between a history and an audit. Rows carried over from the option-based
+version have no hash and are reported as uncovered rather than as tampering.
+
+*Pruning is bounded three ways.* Age alone lets a runaway agent fill a disk in a day; a
+row cap alone lets one enormous entry do it; a byte cap alone throws away last week
+because of last year. So retention in days (90 by default, configurable), a hard cap of
+50,000 entries and one of 50 MB of recorded arguments, whichever is hit first, pruned by
+a daily WP-Cron event. There are Prune now and Clear everything buttons on the screen.
+
+An agent can read the log through `wp_get_audit_log` at `admin` level, filtered by tool,
+outcome, date or free text, and the reply carries the tamper verdict so a caller is told
+immediately if what it is reading has been altered. Nothing exposed through MCP can prune
+or clear it: an agent that can edit its own audit trail is not being audited.
 
 ## Extending
 
@@ -190,7 +218,8 @@ Other hooks:
 | `gmcp_prompts` | Add or replace the ready-made prompts |
 | `gmcp_protected_options` | Option keys that must never be read, written or journalled |
 | `gmcp_protected_option_patterns` | Substrings that mark an option as credential-shaped |
-| `gmcp_credential_field_patterns` | Field names inside a value that stop it being recorded in the change journal |
+| `gmcp_credential_field_patterns` | Field names inside a value that mark it as a credential, used by both the change journal and the audit log |
+| `gmcp_audit_prune` | The daily cron event. Hook it to forward or archive entries before they are pruned |
 | `gmcp_can_call_tool` | Answers whether the caller could call a given tool. The change journal asks it before replaying a write, so this is the gate on undo |
 | `gmcp_header_auth_only_tools` | Tools the URL-token endpoint may not reach, on top of every `admin`-level tool. Adds to and removes from the exception list; it cannot unblock an admin-level tool |
 | `gmcp_allow_remote_install` | Permit installs from a URL rather than the wordpress.org repository |

@@ -80,6 +80,7 @@ reset_state() {
   docker compose exec -T cli wp transient delete gmcp_admin_email_cooldown >/dev/null 2>&1
   docker compose exec -T cli wp option delete adminhash >/dev/null 2>&1
   docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+  docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
   docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
   # A role that is dangerous WITHOUT holding edit_posts: the case the first guard missed.
   docker compose exec -T cli wp eval 'remove_role("api_admin"); add_role("api_admin","API Admin",["read"=>true,"manage_options"=>true]);' >/dev/null 2>&1
@@ -346,22 +347,28 @@ check "block attributes survive sanitising" \
   "$(docker compose exec -T cli wp eval '$p=get_page_by_path("probe-d",OBJECT,"post"); $b=parse_blocks($p->post_content)[0]; echo ($b["blockName"]==="core/faq" && ($b["attrs"]["q"]??"")==="&lt;p&gt;hi&lt;/p&gt;") ? "ok" : "lost";' 2>/dev/null | tr -d '\r\n')" "ok"
 docker compose exec -T cli wp eval 'foreach(["probe-a","probe-b","probe-c","probe-d"] as $s){ $p=get_page_by_path($s,OBJECT,"post"); if($p) wp_delete_post($p->ID,true); }' >/dev/null 2>&1
 
-echo "-- activity history --"
-docker compose exec -T cli wp option delete gmcp_activity >/dev/null 2>&1
+echo "-- what gets recorded, and against what --"
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
 call act1 '{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Activity Probe","post_status":"draft"}}}'
 # A refusal must be recorded too: those are the entries worth having.
 call act2 '{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"wp_deactivate_plugin","arguments":{"plugin":"guarded-mcp"}}}'
+audit_q() { docker compose exec -T cli wp eval "global \$wpdb; echo (string) \$wpdb->get_var(\"$1\");" 2>/dev/null | tr -d '\r\n'; }
 check "successful call recorded" \
-  "$(docker compose exec -T cli wp eval '$l=get_option("gmcp_activity",[]); echo (int) (bool) array_filter($l, fn($e)=>$e["tool"]==="wp_create_post" && $e["ok"]);' 2>/dev/null | tr -d '\r\n')" "1"
+  "$(audit_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_create_post\" AND outcome=\"ok\"')" "1"
 check "refused call recorded as refused" \
-  "$(docker compose exec -T cli wp eval '$l=get_option("gmcp_activity",[]); echo (int) (bool) array_filter($l, fn($e)=>$e["tool"]==="wp_deactivate_plugin" && !$e["ok"]);' 2>/dev/null | tr -d '\r\n')" "1"
+  "$(audit_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_deactivate_plugin\" AND outcome=\"refused\"')" "1"
 check "the target is captured, not just the tool" \
-  "$(docker compose exec -T cli wp eval '$l=get_option("gmcp_activity",[]); $m=array_values(array_filter($l, fn($e)=>$e["tool"]==="wp_deactivate_plugin")); echo $m ? $m[0]["target"] : "";' 2>/dev/null | tr -d '\r\n')" "guarded-mcp"
-# Full arguments must not be stored: they can carry a whole post body.
-check "arguments are not stored wholesale" \
-  "$(docker compose exec -T cli wp eval '$l=get_option("gmcp_activity",[]); echo (int) (bool) array_filter($l, fn($e)=>isset($e["args"]));' 2>/dev/null | tr -d '\r\n')" "0"
-check "the log option is not autoloaded" \
-  "$(docker compose exec -T cli wp eval 'global $wpdb; echo $wpdb->get_var("SELECT autoload FROM {$wpdb->options} WHERE option_name=\"gmcp_activity\"");' 2>/dev/null | tr -d '\r\n' | grep -qE '^(no|off)$' && echo no || echo yes)" "no"
+  "$(audit_q 'SELECT target FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_deactivate_plugin\" LIMIT 1')" "guarded-mcp"
+# Arguments ARE stored now, which is the point of the change, so assert it rather than
+# leaving the old check to pass because the option it queried no longer exists.
+check "arguments are stored, redacted" \
+  "$(audit_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_create_post\" AND args LIKE \"%Activity Probe%\"')" "1"
+# A table, so a burst of calls cannot lose an entry to a read-modify-write, which the
+# option row it replaced could.
+check "the record is a table, not an option row" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$t=$wpdb->prefix."gmcp_audit";echo $wpdb->get_var("SHOW TABLES LIKE \"$t\"")===$t?"table":"NO";' 2>/dev/null | tr -d '\r\n')" "table"
+check "and the old option is gone" \
+  "$(docker compose exec -T cli wp eval 'echo get_option("gmcp_activity",null)===null?"gone":"STILL THERE";' 2>/dev/null | tr -d '\r\n')" "gone"
 
 echo "-- site briefing --"
 # One call has to answer "what am I looking at", or an agent spends five round trips
@@ -755,6 +762,73 @@ call cf_post "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/call\",\"params
 check "deleting a post permanently takes one call, as documented" "$(verdict cf_post)" "ok"
 check "and the post really is gone" \
   "$(docker compose exec -T cli wp post list --post__in="$CF_POST" --format=count 2>/dev/null | tr -d '\r\n')" "0"
+
+echo "-- the audit log --"
+# The old version lived in an option: a read-modify-write that could lose a concurrent
+# entry, capped at a hundred rows. This is a table, so an INSERT cannot lose anything and
+# the record survives long enough to answer a question about last month.
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+call au_refuse '{"jsonrpc":"2.0","id":210,"method":"tools/call","params":{"name":"wp_delete_theme","arguments":{"stylesheet":"twentytwentyfive"}}}'
+call au_ok '{"jsonrpc":"2.0","id":211,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Audited","post_status":"draft"}}}'
+check "a refusal is recorded, not just successes" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE outcome=\"refused\"");' 2>/dev/null | tr -d '\r\n')" "1"
+# The refusal message is the interesting content in the whole table: it is the sentence
+# that says a guard fired.
+check "and the refusal text is kept" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)(bool)$wpdb->get_var("SELECT detail FROM {$wpdb->prefix}gmcp_audit WHERE outcome=\"refused\" LIMIT 1");' 2>/dev/null | tr -d '\r\n')" "1"
+
+# The decision the whole design turns on. wp_create_user takes a password and
+# wp_update_option takes whatever a settings array holds, so recording arguments verbatim
+# would put plaintext credentials in a table meant to be kept for months.
+call au_pw '{"jsonrpc":"2.0","id":212,"method":"tools/call","params":{"name":"wp_create_user","arguments":{"user_login":"audituser","user_email":"au@example.test","user_pass":"PLAINTEXTMUSTNOTAPPEAR","role":"subscriber"}}}'
+call au_secret '{"jsonrpc":"2.0","id":213,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"acme_gw","value":{"mode":"live","secret_key":"sk_live_MUSTNOTAPPEAR"}}}}'
+leaked_audit() { docker compose exec -T cli wp eval 'global $wpdb;$a=implode("",$wpdb->get_col("SELECT CONCAT(COALESCE(args,\"\"),COALESCE(detail,\"\")) FROM {$wpdb->prefix}gmcp_audit"));echo strpos($a,"'"$1"'")===false?0:1;' 2>/dev/null | tr -d '\r\n'; }
+check "a password argument is never written down" "$(leaked_audit PLAINTEXTMUSTNOTAPPEAR)" "0"
+check "nor a key nested in a settings array" "$(leaked_audit sk_live_MUSTNOTAPPEAR)" "0"
+# The control. Without it, a scan that silently returns nothing passes both checks above
+# for the wrong reason, which happened while writing them.
+check "but harmless arguments are, so the scan works" "$(leaked_audit au@example.test)" "1"
+# The credential patterns suit field names inside a value, where "key" is a good signal.
+# At the top level it is the option's NAME, and redacting it leaves an entry saying an
+# option changed without saying which.
+check "the option name stays readable" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)(bool)$wpdb->get_var("SELECT id FROM {$wpdb->prefix}gmcp_audit WHERE args LIKE \"%acme_gw%\"");' 2>/dev/null | tr -d '\r\n')" "1"
+
+# An edited row and a deleted row have to look different from a real one, or this is a
+# history rather than an audit.
+check "the chain is intact before tampering" \
+  "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify();echo $v["ok"]?"ok":"broken";' 2>/dev/null | tr -d '\r\n')" "ok"
+check "editing a row is detected" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$t=$wpdb->prefix."gmcp_audit";$id=(int)$wpdb->get_var("SELECT id FROM $t ORDER BY id ASC LIMIT 1 OFFSET 1");$wpdb->query($wpdb->prepare("UPDATE $t SET target=%s WHERE id=%d","tampered",$id));$v=GMCP_Audit::verify();echo $v["ok"]?"missed":"detected";' 2>/dev/null | tr -d '\r\n')" "detected"
+check "deleting a row is detected too" \
+  "$(docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1; for i in 1 2 3 4; do curl -sS -o /dev/null -X POST "$URL" -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":$i,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_posts\",\"arguments\":{\"limit\":1}}}"; done; docker compose exec -T cli wp eval 'global $wpdb;$t=$wpdb->prefix."gmcp_audit";$id=(int)$wpdb->get_var("SELECT id FROM $t ORDER BY id ASC LIMIT 1 OFFSET 1");$wpdb->query("DELETE FROM $t WHERE id=$id");$v=GMCP_Audit::verify();echo $v["ok"]?"missed":"detected";' 2>/dev/null | tr -d '\r\n')" "detected"
+# Rows carried over from the option-based version were never in a chain. Reporting them
+# as a break would tell every upgraded site on day one that its log had been tampered with.
+check "imported rows are reported, not called tampering" \
+  "$(docker compose exec -T cli wp eval 'GMCP_Audit::clear();global $wpdb;$wpdb->insert($wpdb->prefix."gmcp_audit",["ts"=>gmdate("Y-m-d H:i:s"),"tool"=>"old","outcome"=>"ok","hash"=>"","prev_hash"=>""]);$v=GMCP_Audit::verify();echo $v["ok"]&&$v["imported"]===1?"handled":"WRONG";' 2>/dev/null | tr -d '\r\n')" "handled"
+
+# Age, row count and byte count, because any one alone fails: age lets a runaway agent
+# fill a disk in a day, a row cap lets one enormous entry do it, a byte cap throws away
+# last week because of last year.
+check "pruning drops everything past the retention window" \
+  "$(docker compose exec -T cli wp eval 'GMCP_Audit::clear();global $wpdb;$t=$wpdb->prefix."gmcp_audit";for($i=0;$i<40;$i++){$wpdb->insert($t,["ts"=>gmdate("Y-m-d H:i:s",time()-($i*5*DAY_IN_SECONDS)),"tool"=>"wp_get_posts","outcome"=>"ok","args"=>"{}","detail"=>"","hash"=>"","prev_hash"=>""]);}GMCP_Audit::prune();$cut=gmdate("Y-m-d H:i:s",time()-(GMCP_Audit::retention_days()*DAY_IN_SECONDS));echo (int)$wpdb->get_var("SELECT COUNT(*) FROM $t WHERE ts < \"$cut\"");' 2>/dev/null | tr -d '\r\n')" "0"
+check "and keeps everything inside it" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::count() > 0 ? "kept" : "OVERPRUNED";' 2>/dev/null | tr -d '\r\n')" "kept"
+check "a prune is scheduled" \
+  "$(docker compose exec -T cli wp eval 'echo wp_next_scheduled("gmcp_audit_prune") ? "yes" : "no";' 2>/dev/null | tr -d '\r\n')" "yes"
+
+# An agent that can prune its own audit trail is not being audited.
+call au_tools '{"jsonrpc":"2.0","id":214,"method":"tools/list"}'
+check "the only audit tool is the read one" \
+  "$(py "import json,sys;t=[x['name'] for x in json.load(sys.stdin)['result']['tools']];print(','.join(sorted(n for n in t if 'audit' in n)))" au_tools)" \
+  "wp_get_audit_log"
+call au_read '{"jsonrpc":"2.0","id":215,"method":"tools/call","params":{"name":"wp_get_audit_log","arguments":{"limit":5}}}'
+check "and it reads" "$(verdict au_read)" "ok"
+# A caller reading the record should be told straight away if the record was altered.
+check "the reply carries the tamper verdict" \
+  "$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print('yes' if d.get('tamper_check') else 'no')" au_read)" "yes"
+docker compose exec -T cli wp user delete audituser --yes >/dev/null 2>&1
+docker compose exec -T cli wp option delete acme_gw >/dev/null 2>&1
 
 echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
 # The hard flush is what writes .htaccess, and it only runs if save_mod_rewrite_rules()

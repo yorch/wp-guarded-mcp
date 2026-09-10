@@ -40,7 +40,8 @@ without it.
 **Added.** Work that is not derived from upstream at all: MCP prompts and resources, a
 one-call site briefing, a change journal with a gated undo, named keys with their own
 access level, expiry and tool list, preview mode on the tools whose effect is not visible
-from the call, and a WooCommerce group on its own switch. The catalog is 43 content tools,
+from the call, a WooCommerce group on its own switch, and a tamper-evident audit log in
+its own table with redacted arguments and bounded retention. The catalog is 43 content tools,
 26 more with site administration switched on, and 12 more again with WooCommerce.
 
 **Renamed.** All classes, hooks, options, transients, database tables and CSS classes now

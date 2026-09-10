@@ -129,27 +129,6 @@ class GMCP_Journal {
   }
 
   /**
-  * Field names that mark a value as credential-shaped.
-  *
-  * Separate from GMCP_Core::option_guard()'s list, which matches whole OPTION names and
-  * is applied to reads and writes. These match FIELD names inside a value, where the
-  * conventions are shorter and the cost of a false positive is only that one change
-  * cannot be undone. That asymmetry is why "key" and "pass" belong here and would be far
-  * too broad on the option-name list, where they would make ordinary options unreadable.
-  *
-  * The short forms are the ones that matter. The guard matches by substring, so the
-  * pattern "password" does not match a field called "pass", and wp_mail_smtp stores its
-  * password under exactly that. The motivating example was slipping past the check
-  * written to catch it.
-  */
-  private static function field_patterns(): array {
-    return apply_filters( 'gmcp_credential_field_patterns', [
-      'pass', 'pwd', 'secret', 'token', 'key', 'auth', 'salt', 'nonce',
-      'credential', 'bearer', 'signature', 'licence', 'license', 'private',
-    ] );
-  }
-
-  /**
   * Whether a value carries something credential-shaped, judged by the names inside it.
   *
   * Deliberately about structure rather than content: guessing whether a bare string is a
@@ -203,15 +182,9 @@ class GMCP_Journal {
   }
 
   private static function field_looks_secret( string $field ): bool {
-    $needle = strtolower( $field );
-    foreach ( (array) self::field_patterns() as $pattern ) {
-      if ( $pattern !== '' && strpos( $needle, strtolower( (string) $pattern ) ) !== false ) {
-        return true;
-      }
-    }
-    // Still honour the option-name guard, so a site that protects a name through
-    // gmcp_protected_options also has that name redacted when it turns up as a field.
-    return GMCP_Core::option_guard( $field ) !== true;
+    // @see GMCP_Core::field_looks_secret(). Shared because the audit log has to make the
+    // same judgement, and two lists would drift in the direction of recording a secret.
+    return GMCP_Core::field_looks_secret( $field );
   }
 
   public function option_added( $key, $value ): void {
