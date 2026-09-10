@@ -56,6 +56,22 @@ discovery failed and the client will not say which step. `./diagnose-connector.s
 https://example.com` walks the same steps in order and stops at the first break. It is
 read-only and sends no credentials.
 
+## Building an installable zip
+
+```
+./build.sh
+```
+
+Writes `tmp/guarded-mcp-<version>.zip`, built from the current commit rather than from
+the directory, so an untracked scratch file cannot end up inside a plugin somebody
+installs. It refuses to run with uncommitted changes; `./build.sh --dirty` overrides that
+and marks the filename. Every PHP file in the package is parsed before the zip is
+written, and the build fails if `CREDITS.md` is missing or no longer names the upstream
+author, because that file carries the attribution GPLv2 requires.
+
+Never install the result over the bind-mounted plugin directory of this stack. See the
+warning above.
+
 Tear down. `down` on its own keeps the site; add `-v` to destroy the database and start
 from nothing:
 

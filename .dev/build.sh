@@ -1,0 +1,90 @@
+#!/bin/bash
+# Build an installable plugin zip.
+#
+#   ./build.sh              build from the current commit
+#   ./build.sh --dirty      build from the working tree, uncommitted changes included
+#
+# Writes tmp/guarded-mcp-<version>.zip, which is gitignored.
+#
+# The package is built from `git archive`, not from the directory, so an untracked
+# scratch file, an editor backup or a stray .DS_Store cannot end up inside a plugin
+# somebody installs. --dirty falls back to copying the tree and says so.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+SLUG=guarded-mcp
+DIRTY=0
+[ "${1:-}" = "--dirty" ] && DIRTY=1
+
+# The folder name inside the zip is load-bearing. WordPress derives the plugin's identity
+# from it through plugin_basename(), and the guard that stops an agent deactivating or
+# deleting the plugin mid-call compares against that, so under any other name the
+# self-protection silently stops matching.
+VERSION=$(sed -n 's/^Version: *//p' "$SLUG.php" | head -1)
+[ -n "$VERSION" ] || { echo "could not read Version from $SLUG.php" >&2; exit 1; }
+
+if [ "$DIRTY" = "0" ] && ! git diff-index --quiet HEAD --; then
+  echo "The working tree has uncommitted changes." >&2
+  echo "A zip built from an unrecorded state cannot be rebuilt later. Commit first," >&2
+  echo "or run ./build.sh --dirty if you know that is what you want." >&2
+  exit 1
+fi
+
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+mkdir -p "$STAGE/$SLUG"
+
+if [ "$DIRTY" = "1" ]; then
+  echo "Building from the WORKING TREE, uncommitted changes included."
+  git ls-files -z | tar --null -T - -cf - | ( cd "$STAGE/$SLUG" && tar -xf - )
+else
+  echo "Building from $(git rev-parse --short HEAD)."
+  git archive HEAD | ( cd "$STAGE/$SLUG" && tar -xf - )
+fi
+
+# Build-time only. .wordpress-org holds the directory listing assets, which belong in the
+# SVN assets/ folder rather than in the plugin. README.md documents the repository and
+# the dev stack; readme.txt is the one a user reads.
+( cd "$STAGE/$SLUG" && rm -rf .dev .wordpress-org .gitignore README.md )
+
+# CREDITS.md ships. It is the only file carrying the upstream copyright notice and the
+# statement of changes that GPLv2 sections 1 and 2(a) require, and every zip built before
+# this script existed left it out, which meant distributing a derivative work with the
+# attribution stripped.
+for required in "$SLUG.php" readme.txt LICENSE CREDITS.md uninstall.php; do
+  [ -f "$STAGE/$SLUG/$required" ] || { echo "missing from the package: $required" >&2; exit 1; }
+done
+grep -qi "jordy meow" "$STAGE/$SLUG/CREDITS.md" || { echo "CREDITS.md no longer names the upstream author" >&2; exit 1; }
+
+# Parse every shipped file before anyone installs it. A package that does not compile is
+# a white screen on somebody's site.
+if command -v php >/dev/null 2>&1; then
+  LINT="php -l"
+elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^wptest-wp-1$'; then
+  LINT="docker exec -i wptest-wp-1 php -l /dev/stdin <"
+else
+  LINT=""
+  echo "No PHP available, skipping the syntax check." >&2
+fi
+if [ -n "$LINT" ]; then
+  fails=0
+  while IFS= read -r f; do
+    if command -v php >/dev/null 2>&1; then
+      php -l "$f" >/dev/null || fails=1
+    else
+      docker exec -i wptest-wp-1 php -l /dev/stdin < "$f" >/dev/null || { echo "  syntax error: $f" >&2; fails=1; }
+    fi
+  done < <(find "$STAGE/$SLUG" -name '*.php')
+  [ "$fails" -eq 0 ] || { echo "package does not compile" >&2; exit 1; }
+fi
+
+mkdir -p tmp
+OUT="tmp/$SLUG-$VERSION.zip"
+[ "$DIRTY" = "1" ] && OUT="tmp/$SLUG-$VERSION-dirty.zip"
+rm -f "$OUT"
+( cd "$STAGE" && zip -qr "$OLDPWD/$OUT" "$SLUG" -x '*.DS_Store' )
+
+echo
+echo "  $OUT"
+echo "  $(unzip -l "$OUT" | tail -1 | awk '{print $2}') files, $(du -h "$OUT" | cut -f1)"
+echo "  top-level folder: $(unzip -l "$OUT" | awk 'NR==4{print $4}')"

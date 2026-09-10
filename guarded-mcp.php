@@ -13,6 +13,16 @@ License URI: https://www.gnu.org/licenses/gpl-2.0.html
 Text Domain: guarded-mcp
 */
 
+/*
+Portions of this plugin are derived from AI Engine 3.7.7, Copyright (C) Jordy Meow,
+distributed under GPLv2 or later via https://wordpress.org/plugins/ai-engine/. The MCP
+transport, the OAuth module and the WordPress tool catalog originate there.
+
+CREDITS.md, distributed alongside this file, carries the full attribution and the
+statement of changes that GPLv2 sections 1 and 2(a) require. This notice is repeated
+here so it travels with the code rather than only with the repository.
+*/
+
 if ( !defined( 'ABSPATH' ) ) {
   exit;
 }

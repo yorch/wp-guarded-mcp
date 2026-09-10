@@ -19,8 +19,8 @@ It also speaks the parts of MCP most servers skip: prompts, so your client offer
 
 ## Install
 
-Upload the zip through Plugins, Add New, Upload Plugin, or copy the directory into
-`wp-content/plugins/guarded-mcp` and activate it.
+Build the zip with `.dev/build.sh`, then upload it through Plugins, Add New, Upload
+Plugin. Or copy the directory into `wp-content/plugins/guarded-mcp` and activate it.
 
 ```
 wp plugin install /path/to/guarded-mcp.zip --activate
