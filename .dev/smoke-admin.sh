@@ -677,6 +677,35 @@ call g_ok '{"jsonrpc":"2.0","id":182,"method":"tools/call","params":{"name":"wp_
 check "an ordinary option still reads" "$(verdict g_ok)" "ok"
 docker compose exec -T cli wp eval 'delete_transient("reeve_new_key_1");' >/dev/null 2>&1
 
+echo "-- the URL-token route cannot change anything an admin cares about --"
+# That endpoint puts the secret in the request path, where every proxy log, access log and
+# browser history keeps it. The blocklist used to name eleven tools covering plugins,
+# themes, settings and permalinks, and had never included menus or widgets. Both are admin
+# level, and a widget is arbitrary markup on every page, which is a wider blast radius
+# than most of what the list did cover. It is a rule now: every admin-level tool.
+docker compose exec -T cli wp eval 'foreach(wp_get_nav_menus() as $m){wp_delete_nav_menu($m->term_id);}' >/dev/null 2>&1
+for tool_call in \
+  'wp_create_menu:{"name":"URL token menu"}' \
+  'wp_add_widget:{"sidebar":"sidebar-1","id_base":"text","settings":{"title":"x","text":"y"}}' \
+  'wp_delete_plugin:{"plugin":"akismet/akismet.php"}' \
+  'wp_update_option:{"key":"blogname","value":"pwned"}' \
+  'wp_get_users:{}' ; do
+  tool="${tool_call%%:*}"; args="${tool_call#*:}"
+  call_url_token ut_one "{\"jsonrpc\":\"2.0\",\"id\":190,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}"
+  check "$tool is refused over the URL-token route" "$(verdict ut_one)" "error"
+done
+# Assert the effect, not the refusal text: a refusal that still wrote would look identical.
+check "and no menu was created" \
+  "$(docker compose exec -T cli wp menu list --format=count 2>/dev/null | tr -d '\r\n')" "0"
+check "and the site name is untouched" \
+  "$(docker compose exec -T cli wp option get blogname 2>/dev/null | tr -d '\r\n')" "MCP Test"
+# The route exists for hosts that strip the Authorization header, so reads must still work
+# or it is not a fallback at all.
+call_url_token ut_read '{"jsonrpc":"2.0","id":191,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"limit":1}}}'
+check "read-level tools still work there" "$(verdict ut_read)" "ok"
+call_url_token ut_ping '{"jsonrpc":"2.0","id":192,"method":"tools/call","params":{"name":"mcp_ping","arguments":{}}}'
+check "and so does the health check" "$(verdict ut_ping)" "ok"
+
 echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
 # The hard flush is what writes .htaccess, and it only runs if save_mod_rewrite_rules()
 # exists. That lives in wp-admin/includes/misc.php and calls get_home_path() from

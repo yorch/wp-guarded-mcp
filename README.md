@@ -63,8 +63,8 @@ The token access level applies to bearer-token callers only. OAuth callers alway
 | Level | Content only | + administration | + WooCommerce | What it can do |
 |---|---|---|---|---|
 | `admin` | 43 | 69 | 81 | Everything, including deletes, users and options |
-| `readwrite` | 33 | 41 | 53 | Create and update, no destructive tools |
-| `readonly` | 17 | 25 | 32 | Reads only |
+| `readwrite` | 33 | 41 | 50 | Create and update, no destructive tools |
+| `readonly` | 17 | 25 | 29 | Reads only |
 
 A **named key** narrows this further. It carries its own level, an optional expiry date,
 and an optional list of the only tools it may call, so a key handed to a deploy script
@@ -87,7 +87,7 @@ reading it back.
 - Changing the administration email takes a confirmation step and is rate limited, because it mails an arbitrary address from your domain with body text drawn from the site title.
 - Menu items refuse draft, private and password-protected targets, since a menu item stores its own copy of the title and WordPress renders it regardless of the target's status.
 - Settings are an allowlist, not a blocklist. `siteurl` and `home` are refused outright, since a wrong value makes the site and this endpoint unreachable with no way back. A default role that can edit content is refused, because open registration plus an editing default role is a way in.
-- None of them are reachable over the URL-token endpoint, since that endpoint puts the secret somewhere servers log it.
+- None of them can change anything over the URL-token endpoint, since that endpoint puts the secret somewhere servers log it. Every `admin`-level tool is refused there, which is a rule rather than a list: the list this replaced named plugins, themes, settings and permalinks, and had never included menus or widgets, so a widget, which is arbitrary markup on every page, could be planted with a token out of an access log. Read-level tools still work, so the route remains useful on a host that strips the `Authorization` header.
 
 None of this plugin's own rows are readable or writable through the option tools, so the bearer token cannot be read back out or overwritten through the API. That is a prefix rule rather than a list of names, because a list was wrong twice: the change journal was readable until it was named, and the one-time plaintext of a newly minted key lives in a transient, which without a persistent object cache is an ordinary options row that no exact entry matched.
 
@@ -107,7 +107,11 @@ Two things make that preview trustworthy rather than decorative. It compiles the
 
 It also counts matches without collecting them. A pattern of `.` against a 400 KB post is 380,000 matches, and building an entry for each in order to display ten exhausted the memory limit, which made the cautious call more dangerous than the write it was protecting.
 
-**Undo.** `wp_list_changes` and `wp_undo_change` put back a setting or post an agent changed. The journal listens to WordPress rather than to the tools, so it also covers widgets, which live in options, and menu items, which are posts. Only writes made during a tool call are recorded, never a person's own edits, and anything `REEVE_Core::option_guard()` refuses is never stored, so the journal cannot become a second copy of a secret.
+**Undo.** `wp_list_changes` and `wp_undo_change` put back a setting or post an agent changed. The journal listens to WordPress rather than to the tools, so it also covers widgets, which live in options, and menu items, which are posts. Only writes made during a tool call are recorded, never a person's own edits.
+
+Reverting is gated twice: on the tool that made the change, and on the operation the revert will perform, derived from the entry's own kind. Both are needed, because the recorded tool is whatever was in flight rather than what wrote the row. A plugin hooked on `save_post` that writes an option produces an option entry attributed to `wp_update_post`, and gating on that name alone let a write-level caller replay an admin-level option write.
+
+Two limits worth knowing. Values that look credential-shaped are not stored, judged by the field names inside them through `reeve_credential_field_patterns` as well as by the option's own name, so those changes are recorded but cannot be reverted. That check is structural, so a secret held as a bare string under an innocuous option name is still stored. And it is not retroactive: adding an option to `reeve_protected_options` refuses future reverts but does not scrub what is already recorded, so clear the journal after protecting something that was previously being written.
 
 **Prompts and resources.** The server offers six ready-made upkeep jobs through MCP prompts, and publishes recent posts, the comment queue and the site briefing as MCP resources a client can attach to a conversation. Every resource is backed by a tool and gated by it, so a resource is never a softer route to data than the tool it mirrors.
 
@@ -195,7 +199,7 @@ Other hooks:
 
 - Only administrators can authorize an OAuth client, checked both at authorize time and again on every request.
 - The shared bearer token is compared with `hash_equals` and stored in the options table in the clear, because the settings screen shows it back to you. Anyone who can read the database can read it, so rotate it if that changes. Named keys are different: they are stored as a SHA-256 hash and shown once, so the database holds nothing that can be replayed.
-- The plugin's own options row, and any option whose name looks like a credential, cannot be read or written through the option tools, and are never recorded in the change journal.
+- No row belonging to this plugin, and no option whose name looks like a credential, can be read or written through the option tools. The change journal additionally inspects the value it is about to record, so a settings array holding a `secret_key` or a `pass` field is not stored. That check reads field names, not content, so it will not catch a secret held as a bare string under an innocuous option name.
 - Tools do not execute arbitrary PHP or SQL. Every tool is a fixed WordPress operation with a schema.
 - An open stream holds one PHP worker for up to 180 seconds. Size your pool accordingly if several agents connect at once.
 

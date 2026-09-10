@@ -366,15 +366,37 @@ class REEVE_Server {
   * can take the site over. Callers that need them should send the Authorization header
   * or use OAuth.
   */
+  /**
+  * Tools that may not be reached with a secret sitting in the request path.
+  *
+  * A rule first, then a list. Every admin-level tool is blocked, because admin level is
+  * already this plugin's own answer to "what would you not want done on a misread
+  * instruction", and a token in the URL is a token in every proxy log, access log and
+  * browser history in front of the site.
+  *
+  * It used to be a list of eleven names covering plugins, themes, settings and
+  * permalinks, and the list was wrong: menus and widgets were never on it. Both are
+  * admin level, and a widget is arbitrary markup on every page of the site, which is a
+  * larger blast radius than most of what the list did cover. The documentation had
+  * claimed for some time that none of the administration tools were reachable this way.
+  *
+  * Read-level tools stay reachable, so the route remains useful on a host that strips
+  * the Authorization header. It cannot change anything an administrator would care about.
+  */
   private function tool_requires_header_auth( string $tool ): bool {
-    $blocked = [
-      'wp_install_plugin', 'wp_update_plugin', 'wp_delete_plugin',
-      'wp_activate_plugin', 'wp_deactivate_plugin',
-      'wp_install_theme', 'wp_update_theme', 'wp_delete_theme', 'wp_activate_theme',
-      'wp_update_settings', 'wp_set_permalink_structure',
-    ];
-    $blocked = apply_filters( 'reeve_header_auth_only_tools', $blocked );
-    return in_array( $tool, (array) $blocked, true );
+    if ( empty( $this->tool_access_levels ) ) {
+      $this->get_tools_list();
+    }
+    // An unregistered tool has no level. Refusing it here costs nothing, because it is
+    // about to be refused anyway, and it means a new tool is covered before anyone
+    // remembers to think about this.
+    $level = $this->tool_access_levels[ $tool ] ?? 'admin';
+
+    $blocked = apply_filters( 'reeve_header_auth_only_tools', [], $level );
+    if ( in_array( $tool, (array) $blocked, true ) ) {
+      return true;
+    }
+    return $level === 'admin';
   }
 
   #endregion

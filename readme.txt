@@ -29,7 +29,7 @@ The other difference is the guardrails, which exist because of a specific risk. 
 * **It refuses to break itself**: no deactivating or deleting the plugin mid-call, no deleting the active theme, no activating a theme this server cannot run.
 * **The plugin's own credentials are not readable through its own tools.**
 * **The riskiest tools can say what they would do first.** A search and replace, a delete or a rewrite can be run with `preview`, which describes every match and everything attached, and changes nothing.
-* **Changes can be put back.** Reeve remembers what a setting or a post said before an agent changed it, and one call reverts it. Only writes made through this API are recorded, never your own, and nothing credential-shaped is ever stored.
+* **Changes can be put back.** Reeve remembers what a setting or a post said before an agent changed it, and one call reverts it. Only writes made through this API are recorded, never your own. Reverting needs the same access the original change needed, so undo is not a way around the access levels. Settings that look like they hold a credential are recorded as changed but their previous value is not kept, so those cannot be reverted.
 
 You can also see what actually happened. The settings screen keeps the last hundred tool calls, including the refused ones, with what each was aimed at and why it was turned down, alongside the list of changes that can still be reverted.
 
