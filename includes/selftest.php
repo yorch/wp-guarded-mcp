@@ -18,7 +18,7 @@ if ( !defined( 'ABSPATH' ) ) {
 * and reports which of the three possible stories is true: the endpoint is unreachable,
 * the credentials never arrived, or everything works.
 */
-class REEVE_SelfTest {
+class GMCP_SelfTest {
 
   /**
   * A full readiness report: every step a client walks during setup, checked in order.
@@ -32,7 +32,7 @@ class REEVE_SelfTest {
   *   status is one of ok, warn, fail, skip.
   */
   public static function report(): array {
-    $core = $GLOBALS['reeve_core'] ?? null;
+    $core = $GLOBALS['gmcp_core'] ?? null;
     $endpoint = rest_url( 'mcp/v1/http' );
     $origin = untrailingslashit( home_url() );
     $checks = [];
@@ -117,7 +117,7 @@ class REEVE_SelfTest {
       'timeout' => 15,
       'headers' => [ 'Content-Type' => 'application/json' ],
       'body' => wp_json_encode( [
-        'client_name' => 'Reeve setup check',
+        'client_name' => 'Guarded MCP setup check',
         'redirect_uris' => [ 'https://claude.ai/api/mcp/auth_callback' ],
       ] ),
     ] );
@@ -197,7 +197,7 @@ class REEVE_SelfTest {
   *   status is one of ok, warning, error, unknown.
   */
   public static function run(): array {
-    $core = $GLOBALS['reeve_core'] ?? null;
+    $core = $GLOBALS['gmcp_core'] ?? null;
     $token = $core ? (string) $core->get_option( 'mcp_bearer_token' ) : '';
     $url = rest_url( 'mcp/v1/http' );
 
@@ -312,8 +312,8 @@ class REEVE_SelfTest {
   */
   public static function register_site_health(): void {
     add_filter( 'site_status_tests', function ( $tests ) {
-      $tests['direct']['reeve_endpoint'] = [
-        'label' => __( 'MCP endpoint', 'reeve' ),
+      $tests['direct']['gmcp_endpoint'] = [
+        'label' => __( 'MCP endpoint', 'guarded-mcp' ),
         'test' => [ __CLASS__, 'site_health_test' ],
       ];
       return $tests;
@@ -334,14 +334,14 @@ class REEVE_SelfTest {
     return [
       'label' => $result['summary'],
       'status' => $status,
-      'badge' => [ 'label' => __( 'MCP', 'reeve' ), 'color' => $colour ],
+      'badge' => [ 'label' => __( 'MCP', 'guarded-mcp' ), 'color' => $colour ],
       'description' => '<p>' . esc_html( $result['detail'] ) . '</p>',
       'actions' => sprintf(
         '<p><a href="%s">%s</a></p>',
-        esc_url( REEVE_Settings::page_url() ),
-        esc_html__( 'Open MCP Server settings', 'reeve' )
+        esc_url( GMCP_Settings::page_url() ),
+        esc_html__( 'Open MCP Server settings', 'guarded-mcp' )
       ),
-      'test' => 'reeve_endpoint',
+      'test' => 'gmcp_endpoint',
     ];
   }
 }

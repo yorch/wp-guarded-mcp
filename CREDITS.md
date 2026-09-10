@@ -44,8 +44,14 @@ from the call, and a WooCommerce group on its own switch. The catalog is 43 cont
 26 more with site administration switched on, and 12 more again with WooCommerce.
 
 **Renamed.** All classes, hooks, options, transients, database tables and CSS classes now
-use the `REEVE_` / `reeve_` prefix. Options live in a `reeve_options` row; the OAuth
-tables are `{prefix}reeve_oauth_clients` and `{prefix}reeve_oauth_tokens`.
+use the `GMCP_` / `gmcp_` prefix. Options live in a `gmcp_options` row; the OAuth tables
+are `{prefix}gmcp_oauth_clients` and `{prefix}gmcp_oauth_tokens`. MCP resource URIs use
+the `gmcp://` scheme.
+
+The plugin was briefly named Reeve during development. An install of that name is carried
+across on activation: settings, activity, journal, keys and the OAuth tables all move to
+the new prefix, so a connected app stays connected. That migration is in `includes/init.php`
+and can be deleted once no install of the old name plausibly remains.
 
 The REST namespace is deliberately unchanged at `mcp/v1`, so a client already pointed at
 `/wp-json/mcp/v1/http` keeps working. OAuth grants do not carry over, because the tables

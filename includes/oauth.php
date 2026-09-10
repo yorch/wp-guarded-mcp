@@ -5,7 +5,7 @@ if ( !defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Reeve OAuth 2.1 module.
+ * Guarded MCP OAuth 2.1 module.
  *
  * Implements OAuth 2.1 with Dynamic Client Registration (RFC 7591),
  * PKCE (RFC 7636, S256 only), Authorization Server Metadata (RFC 8414),
@@ -16,7 +16,7 @@ if ( !defined( 'ABSPATH' ) ) {
  * for developer tooling. OAuth is the consumer-facing path used by clients
  * like Claude Desktop that drive the user through a browser authorize flow.
  */
-class REEVE_OAuth {
+class GMCP_OAuth {
   public const DB_VERSION = '1.0.0';
   /**
   * States of the `revoked` column on a token row.
@@ -38,7 +38,7 @@ class REEVE_OAuth {
   public const ACCESS_TOKEN_TTL = 3600;       // 1 hour
   public const REFRESH_TOKEN_TTL = 2592000;   // 30 days
   public const AUTH_CODE_TTL = 60;            // seconds
-  public const NONCE_ACTION = 'reeve_oauth_consent';
+  public const NONCE_ACTION = 'gmcp_oauth_consent';
 
   private $core;
   private $mcp;
@@ -52,8 +52,8 @@ class REEVE_OAuth {
     $this->core = $core;
     $this->mcp = $mcp;
     $this->logging = method_exists( $mcp, 'is_logging_enabled' ) ? $mcp->is_logging_enabled() : false;
-    $this->table_clients = $wpdb->prefix . 'reeve_oauth_clients';
-    $this->table_tokens = $wpdb->prefix . 'reeve_oauth_tokens';
+    $this->table_clients = $wpdb->prefix . 'gmcp_oauth_clients';
+    $this->table_tokens = $wpdb->prefix . 'gmcp_oauth_tokens';
 
     $this->maybe_upgrade_db();
 
@@ -85,13 +85,13 @@ class REEVE_OAuth {
     }
     if ( strpos( $path, '/.well-known/oauth-protected-resource' ) === 0 ) {
       if ( $this->logging ) {
-        error_log( '[Reeve OAuth] Host-root PRM hit: ' . $path );
+        error_log( '[Guarded MCP OAuth] Host-root PRM hit: ' . $path );
       }
       $this->emit_json( $this->protected_resource_metadata() );
     }
     if ( strpos( $path, '/.well-known/oauth-authorization-server' ) === 0 ) {
       if ( $this->logging ) {
-        error_log( '[Reeve OAuth] Host-root ASM hit: ' . $path );
+        error_log( '[Guarded MCP OAuth] Host-root ASM hit: ' . $path );
       }
       $this->emit_json( $this->authorization_server_metadata() );
     }
@@ -112,7 +112,7 @@ class REEVE_OAuth {
   * usual module instances exist yet.
   *
   * LiteSpeed is handled directly, since that is where this was diagnosed. Any other
-  * cache can listen to reeve_purge_discovery_urls, which carries the same list.
+  * cache can listen to gmcp_purge_discovery_urls, which carries the same list.
   */
   public static function purge_discovery_cache() {
     $urls = [
@@ -122,7 +122,7 @@ class REEVE_OAuth {
     foreach ( $urls as $url ) {
       do_action( 'litespeed_purge_url', $url );
     }
-    do_action( 'reeve_purge_discovery_urls', $urls );
+    do_action( 'gmcp_purge_discovery_urls', $urls );
   }
 
   private function emit_json( $payload ) {
@@ -190,7 +190,7 @@ class REEVE_OAuth {
 
   #region DB schema
   private function maybe_upgrade_db() {
-    if ( get_option( 'reeve_oauth_db_version' ) === self::DB_VERSION ) {
+    if ( get_option( 'gmcp_oauth_db_version' ) === self::DB_VERSION ) {
       return;
     }
 
@@ -234,7 +234,7 @@ class REEVE_OAuth {
     dbDelta( $sql_clients );
     dbDelta( $sql_tokens );
 
-    update_option( 'reeve_oauth_db_version', self::DB_VERSION );
+    update_option( 'gmcp_oauth_db_version', self::DB_VERSION );
   }
   #endregion
 
@@ -374,7 +374,7 @@ class REEVE_OAuth {
     }
 
     if ( $this->logging ) {
-      error_log( '[Reeve OAuth] Registered client: ' . $client_name . ' (' . $client_id . ')' );
+      error_log( '[Guarded MCP OAuth] Registered client: ' . $client_name . ' (' . $client_id . ')' );
     }
 
     $this->prune_orphan_clients();
@@ -426,7 +426,7 @@ class REEVE_OAuth {
     // because every branch below only renders a page in the user's browser. That
     // ambiguity has cost several support rounds.
     if ( $this->logging ) {
-      error_log( '[Reeve OAuth] → GET /oauth/authorize client_id='
+      error_log( '[Guarded MCP OAuth] → GET /oauth/authorize client_id='
         . ( $params['client_id'] ?: '(none)' ) . ' redirect_uri=' . ( $params['redirect_uri'] ?: '(none)' )
         . ' scope=' . $params['scope'] );
     }
@@ -476,7 +476,7 @@ class REEVE_OAuth {
     // privileges they do not hold in WordPress itself.
     if ( !$this->user_can_authorize( $user->ID ) ) {
       if ( $this->logging ) {
-        error_log( '[Reeve OAuth] ❌ Non-admin user ' . $user->ID . ' tried to authorize client ' . $params['client_id'] );
+        error_log( '[Guarded MCP OAuth] ❌ Non-admin user ' . $user->ID . ' tried to authorize client ' . $params['client_id'] );
       }
       $this->render_error_page( 'Only administrators can authorize MCP applications on this site.' );
       exit;
@@ -488,7 +488,7 @@ class REEVE_OAuth {
 
   private function log_authorize_refusal( $reason ) {
     if ( $this->logging ) {
-      error_log( '[Reeve OAuth] ❌ Authorize refused: ' . $reason );
+      error_log( '[Guarded MCP OAuth] ❌ Authorize refused: ' . $reason );
     }
   }
 
@@ -501,13 +501,13 @@ class REEVE_OAuth {
 
     if ( !$this->user_can_authorize( get_current_user_id() ) ) {
       if ( $this->logging ) {
-        error_log( '[Reeve OAuth] ❌ Non-admin user ' . get_current_user_id() . ' attempted authorize submit' );
+        error_log( '[Guarded MCP OAuth] ❌ Non-admin user ' . get_current_user_id() . ' attempted authorize submit' );
       }
       $this->render_error_page( 'Only administrators can authorize MCP applications on this site.' );
       exit;
     }
 
-    $nonce = (string) $request->get_param( '_reeve_nonce' );
+    $nonce = (string) $request->get_param( '_gmcp_nonce' );
     if ( !wp_verify_nonce( $nonce, self::NONCE_ACTION ) ) {
       $this->render_error_page( 'Security check failed. Please try again from your application.' );
       exit;
@@ -549,7 +549,7 @@ class REEVE_OAuth {
     ];
     if ( $this->logging && $code_data['resource'] !== ''
       && $code_data['resource'] !== rest_url( $this->namespace . '/http' ) ) {
-      error_log( '[Reeve OAuth] Client asked for resource ' . $code_data['resource']
+      error_log( '[Guarded MCP OAuth] Client asked for resource ' . $code_data['resource']
         . ', we serve ' . rest_url( $this->namespace . '/http' ) . '. Accepted anyway.' );
     }
     set_transient( $this->auth_code_key( $code ), $code_data, self::AUTH_CODE_TTL );
@@ -560,7 +560,7 @@ class REEVE_OAuth {
     }
 
     if ( $this->logging ) {
-      error_log( '[Reeve OAuth] Authorized user ' . get_current_user_id() . ' for client ' . $client_id );
+      error_log( '[Guarded MCP OAuth] Authorized user ' . get_current_user_id() . ' for client ' . $client_id );
     }
 
     wp_redirect( $this->append_params( $redirect_uri, $params ) );
@@ -568,7 +568,7 @@ class REEVE_OAuth {
   }
 
   private function auth_code_key( $code ) {
-    return 'reeve_oauth_code_' . hash( 'sha256', $code );
+    return 'gmcp_oauth_code_' . hash( 'sha256', $code );
   }
   #endregion
 
@@ -582,7 +582,7 @@ class REEVE_OAuth {
     // permission problem. Tokens are never logged, only a short hash prefix so two lines
     // can be tied to the same grant.
     if ( $this->logging ) {
-      error_log( '[Reeve OAuth] → /oauth/token grant_type=' . ( $grant_type ?: '(none)' ) );
+      error_log( '[Guarded MCP OAuth] → /oauth/token grant_type=' . ( $grant_type ?: '(none)' ) );
     }
 
     if ( $grant_type === 'authorization_code' ) {
@@ -592,7 +592,7 @@ class REEVE_OAuth {
       return $this->handle_token_refresh( $request );
     }
     if ( $this->logging ) {
-      error_log( '[Reeve OAuth] ❌ Unsupported grant_type: ' . ( $grant_type ?: '(none)' ) );
+      error_log( '[Guarded MCP OAuth] ❌ Unsupported grant_type: ' . ( $grant_type ?: '(none)' ) );
     }
     return $this->oauth_error( 'unsupported_grant_type', 'Supported: authorization_code, refresh_token.', 400 );
   }
@@ -652,7 +652,7 @@ class REEVE_OAuth {
     $client_id = (string) ( $request->get_param( 'client_id' ) ?? '' );
     if ( $refresh_token === '' ) {
       if ( $this->logging ) {
-        error_log( '[Reeve OAuth] ❌ Refresh rejected: no refresh_token in the request.' );
+        error_log( '[Guarded MCP OAuth] ❌ Refresh rejected: no refresh_token in the request.' );
       }
       return $this->oauth_error( 'invalid_request', 'Missing refresh_token.', 400 );
     }
@@ -674,7 +674,7 @@ class REEVE_OAuth {
           "SELECT id FROM {$this->table_tokens} WHERE refresh_token_hash = %s LIMIT 1",
           $hash
         ) );
-        error_log( '[Reeve OAuth] ❌ Refresh rejected for token ' . $marker . ': ' . ( $revoked
+        error_log( '[Guarded MCP OAuth] ❌ Refresh rejected for token ' . $marker . ': ' . ( $revoked
           ? 'the grant exists but is revoked (already rotated, or revoked in Connected Apps).'
           : 'no grant matches this refresh token.' ) );
       }
@@ -682,7 +682,7 @@ class REEVE_OAuth {
     }
     if ( $row->refresh_expires && strtotime( $row->refresh_expires . ' UTC' ) < time() ) {
       if ( $this->logging ) {
-        error_log( '[Reeve OAuth] ❌ Refresh rejected for token ' . $marker
+        error_log( '[Guarded MCP OAuth] ❌ Refresh rejected for token ' . $marker
           . ': refresh token expired on ' . $row->refresh_expires . ' UTC.' );
       }
       return $this->oauth_error( 'invalid_grant', 'Refresh token expired.', 400 );
@@ -691,21 +691,21 @@ class REEVE_OAuth {
     $client = $this->get_client( $row->client_id );
     if ( !$client ) {
       if ( $this->logging ) {
-        error_log( '[Reeve OAuth] ❌ Refresh rejected for token ' . $marker
+        error_log( '[Guarded MCP OAuth] ❌ Refresh rejected for token ' . $marker
           . ': client ' . $row->client_id . ' no longer exists.' );
       }
       return $this->oauth_error( 'invalid_client', 'Client not found.', 401 );
     }
     if ( $client_id !== '' && $client_id !== $client->client_id ) {
       if ( $this->logging ) {
-        error_log( '[Reeve OAuth] ❌ Refresh rejected for token ' . $marker
+        error_log( '[Guarded MCP OAuth] ❌ Refresh rejected for token ' . $marker
           . ': client_id in the request does not match the one on the grant.' );
       }
       return $this->oauth_error( 'invalid_client', 'client_id mismatch.', 401 );
     }
     if ( !$this->authenticate_client_if_required( $client, $request ) ) {
       if ( $this->logging ) {
-        error_log( '[Reeve OAuth] ❌ Refresh rejected for token ' . $marker
+        error_log( '[Guarded MCP OAuth] ❌ Refresh rejected for token ' . $marker
           . ': client authentication failed (method ' . $client->token_endpoint_auth_method
           . '). If this client authenticates with client_secret_basic, check that the host'
           . ' forwards the Authorization header on POST requests.' );
@@ -718,7 +718,7 @@ class REEVE_OAuth {
     $wpdb->update( $this->table_tokens, [ 'revoked' => self::TOKEN_ROTATED ], [ 'id' => $row->id ] );
 
     if ( $this->logging ) {
-      error_log( '[Reeve OAuth] ✅ Refresh accepted for token ' . $marker
+      error_log( '[Guarded MCP OAuth] ✅ Refresh accepted for token ' . $marker
         . ', user ' . (int) $row->user_id . ', client ' . $client->client_id
         . '. New pair issued; the previous access token stays valid until '
         . $row->access_expires . ' UTC.' );
@@ -830,7 +830,7 @@ class REEVE_OAuth {
   public function user_can_authorize( $user_id ) {
     $user_id = (int) $user_id;
     $allowed = $user_id > 0 && user_can( $user_id, 'manage_options' );
-    return (bool) apply_filters( 'reeve_oauth_user_can_authorize', $allowed, $user_id );
+    return (bool) apply_filters( 'gmcp_oauth_user_can_authorize', $allowed, $user_id );
   }
   #endregion
 
@@ -868,7 +868,7 @@ class REEVE_OAuth {
           "SELECT id FROM {$this->table_tokens} WHERE access_token_hash = %s LIMIT 1",
           $hash
         ) );
-        error_log( '[Reeve OAuth] ❌ Access token ' . $marker . ' rejected: ' . ( $revoked
+        error_log( '[Guarded MCP OAuth] ❌ Access token ' . $marker . ' rejected: ' . ( $revoked
           ? 'this grant was revoked (from Connected Apps, or by the client signing out).'
           : 'no grant matches this token. The client is using a credential this site never issued, or one whose grant has been deleted.' ) );
       }
@@ -876,7 +876,7 @@ class REEVE_OAuth {
     }
     if ( strtotime( $row->access_expires . ' UTC' ) < time() ) {
       if ( $this->logging ) {
-        error_log( '[Reeve OAuth] ❌ Access token ' . $this->token_marker( $token )
+        error_log( '[Guarded MCP OAuth] ❌ Access token ' . $this->token_marker( $token )
           . ' rejected: it expired on ' . $row->access_expires . ' UTC. The client should refresh it.' );
       }
       return null;
@@ -1053,32 +1053,32 @@ class REEVE_OAuth {
       'code_challenge' => $params['code_challenge'],
       'code_challenge_method' => $params['code_challenge_method'],
       'resource' => $params['resource'],
-      '_reeve_nonce' => $nonce,
+      '_gmcp_nonce' => $nonce,
     ];
 
     echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">';
     echo '<meta name="viewport" content="width=device-width, initial-scale=1">';
     echo '<title>' . esc_html( sprintf( 'Authorize %s', $client_name ) ) . '</title>';
     echo $this->consent_styles();
-    echo '</head><body><main class="reeve-oauth-card">';
+    echo '</head><body><main class="gmcp-oauth-card">';
 
     echo '<h1>Authorize this app</h1>';
-    echo '<p class="reeve-oauth-app"><strong>' . esc_html( $client_name ) . '</strong> wants to connect to <strong>' . esc_html( $site_name ) . '</strong>.</p>';
+    echo '<p class="gmcp-oauth-app"><strong>' . esc_html( $client_name ) . '</strong> wants to connect to <strong>' . esc_html( $site_name ) . '</strong>.</p>';
 
-    echo '<div class="reeve-oauth-meta">';
-    echo '<div><span class="reeve-oauth-label">Signed in as</span><span class="reeve-oauth-value">' . esc_html( $user->display_name ) . ' (' . esc_html( $user->user_login ) . ')</span></div>';
-    echo '<div><span class="reeve-oauth-label">Permissions</span><span class="reeve-oauth-value">' . esc_html( $role_label ) . '</span></div>';
+    echo '<div class="gmcp-oauth-meta">';
+    echo '<div><span class="gmcp-oauth-label">Signed in as</span><span class="gmcp-oauth-value">' . esc_html( $user->display_name ) . ' (' . esc_html( $user->user_login ) . ')</span></div>';
+    echo '<div><span class="gmcp-oauth-label">Permissions</span><span class="gmcp-oauth-value">' . esc_html( $role_label ) . '</span></div>';
     echo '</div>';
 
-    echo '<p class="reeve-oauth-note">The app will be able to call MCP tools using your account. You can revoke access at any time from the MCP Server screen in your site&rsquo;s admin menu.</p>';
+    echo '<p class="gmcp-oauth-note">The app will be able to call MCP tools using your account. You can revoke access at any time from the MCP Server screen in your site&rsquo;s admin menu.</p>';
 
     echo '<form method="POST" action="' . esc_url( $action_url ) . '">';
     foreach ( $hidden_fields as $name => $value ) {
       echo '<input type="hidden" name="' . esc_attr( $name ) . '" value="' . esc_attr( $value ) . '">';
     }
-    echo '<div class="reeve-oauth-buttons">';
-    echo '<button type="submit" name="action" value="approve" class="reeve-oauth-approve">Approve</button>';
-    echo '<button type="submit" name="action" value="deny" class="reeve-oauth-deny">Deny</button>';
+    echo '<div class="gmcp-oauth-buttons">';
+    echo '<button type="submit" name="action" value="approve" class="gmcp-oauth-approve">Approve</button>';
+    echo '<button type="submit" name="action" value="deny" class="gmcp-oauth-deny">Deny</button>';
     echo '</div>';
     echo '</form>';
 
@@ -1092,9 +1092,9 @@ class REEVE_OAuth {
     echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">';
     echo '<title>Authorization error</title>';
     echo $this->consent_styles();
-    echo '</head><body><main class="reeve-oauth-card">';
+    echo '</head><body><main class="gmcp-oauth-card">';
     echo '<h1>Authorization error</h1>';
-    echo '<p class="reeve-oauth-note">' . esc_html( $message ) . '</p>';
+    echo '<p class="gmcp-oauth-note">' . esc_html( $message ) . '</p>';
     echo '</main></body></html>';
   }
 
@@ -1116,20 +1116,20 @@ class REEVE_OAuth {
   private function consent_styles() {
     return '<style>
       body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f1f2f5; color: #1d2330; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
-      .reeve-oauth-card { background: #fff; border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,0.08); padding: 36px 36px 28px; max-width: 440px; width: 100%; }
-      .reeve-oauth-card h1 { font-size: 22px; margin: 0 0 16px; font-weight: 600; }
-      .reeve-oauth-app { font-size: 15px; line-height: 1.5; margin: 0 0 24px; }
-      .reeve-oauth-meta { background: #f7f8fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px; }
-      .reeve-oauth-meta > div { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 0; font-size: 14px; }
-      .reeve-oauth-label { color: #6b7280; }
-      .reeve-oauth-value { color: #1d2330; font-weight: 500; text-align: right; }
-      .reeve-oauth-note { font-size: 13px; color: #6b7280; line-height: 1.5; margin: 0 0 24px; }
-      .reeve-oauth-buttons { display: flex; gap: 10px; }
-      .reeve-oauth-buttons button { flex: 1; padding: 11px 14px; border-radius: 8px; border: 1px solid transparent; font-size: 14px; font-weight: 600; cursor: pointer; transition: background .15s; }
-      .reeve-oauth-approve { background: #2271b1; color: #fff; }
-      .reeve-oauth-approve:hover { background: #135e96; }
-      .reeve-oauth-deny { background: #fff; color: #1d2330; border-color: #d0d4da; }
-      .reeve-oauth-deny:hover { background: #f1f2f5; }
+      .gmcp-oauth-card { background: #fff; border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,0.08); padding: 36px 36px 28px; max-width: 440px; width: 100%; }
+      .gmcp-oauth-card h1 { font-size: 22px; margin: 0 0 16px; font-weight: 600; }
+      .gmcp-oauth-app { font-size: 15px; line-height: 1.5; margin: 0 0 24px; }
+      .gmcp-oauth-meta { background: #f7f8fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px; }
+      .gmcp-oauth-meta > div { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 0; font-size: 14px; }
+      .gmcp-oauth-label { color: #6b7280; }
+      .gmcp-oauth-value { color: #1d2330; font-weight: 500; text-align: right; }
+      .gmcp-oauth-note { font-size: 13px; color: #6b7280; line-height: 1.5; margin: 0 0 24px; }
+      .gmcp-oauth-buttons { display: flex; gap: 10px; }
+      .gmcp-oauth-buttons button { flex: 1; padding: 11px 14px; border-radius: 8px; border: 1px solid transparent; font-size: 14px; font-weight: 600; cursor: pointer; transition: background .15s; }
+      .gmcp-oauth-approve { background: #2271b1; color: #fff; }
+      .gmcp-oauth-approve:hover { background: #135e96; }
+      .gmcp-oauth-deny { background: #fff; color: #1d2330; border-color: #d0d4da; }
+      .gmcp-oauth-deny:hover { background: #f1f2f5; }
     </style>';
   }
   #endregion

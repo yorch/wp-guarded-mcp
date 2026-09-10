@@ -7,8 +7,8 @@ if ( !defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 global $wpdb;
 
 // Settings.
-delete_option( 'reeve_options' );
-delete_option( 'reeve_oauth_db_version' );
+delete_option( 'gmcp_options' );
+delete_option( 'gmcp_oauth_db_version' );
 
 // Everything else this plugin writes to the options table.
 //
@@ -16,6 +16,14 @@ delete_option( 'reeve_oauth_db_version' );
 // agent changed it, which is site content sitting in a row nothing else knows about, and
 // leaving it behind for a plugin that is gone means nobody will ever look at it again or
 // know to remove it. The key table holds credential hashes, which have the same problem.
+delete_option( 'gmcp_activity' );
+delete_option( 'gmcp_journal' );
+delete_option( 'gmcp_tokens' );
+
+// And anything left under the name this plugin shipped as before. The activation
+// migration copies rather than moves, so an uninstall has to clear both.
+delete_option( 'reeve_options' );
+delete_option( 'reeve_oauth_db_version' );
 delete_option( 'reeve_activity' );
 delete_option( 'reeve_journal' );
 delete_option( 'reeve_tokens' );
@@ -23,14 +31,18 @@ delete_option( 'reeve_tokens' );
 // OAuth clients and grants. Dropping these revokes every connected app, which is the
 // point: leaving live tokens behind for a plugin that no longer exists would mean
 // credentials nobody can see or revoke.
-$clients = $wpdb->prefix . 'reeve_oauth_clients';
-$tokens = $wpdb->prefix . 'reeve_oauth_tokens';
-$wpdb->query( "DROP TABLE IF EXISTS {$tokens}, {$clients}" );
+$clients = $wpdb->prefix . 'gmcp_oauth_clients';
+$tokens = $wpdb->prefix . 'gmcp_oauth_tokens';
+$old_clients = $wpdb->prefix . 'reeve_oauth_clients';
+$old_tokens = $wpdb->prefix . 'reeve_oauth_tokens';
+$wpdb->query( "DROP TABLE IF EXISTS {$tokens}, {$clients}, {$old_tokens}, {$old_clients}" );
 
 // Transients: pending authorization codes, consent state, message queue and one-time
 // upload tokens. They are short-lived, but an uninstall should not leave them to age out.
 $wpdb->query(
   "DELETE FROM {$wpdb->options}
-   WHERE option_name LIKE '_transient_reeve_%'
+   WHERE option_name LIKE '_transient_gmcp_%'
+      OR option_name LIKE '_transient_timeout_gmcp_%'
+      OR option_name LIKE '_transient_reeve_%'
       OR option_name LIKE '_transient_timeout_reeve_%'"
 );

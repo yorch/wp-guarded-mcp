@@ -77,21 +77,21 @@ reset_state() {
   docker compose exec -T cli wp option update blogdescription "reset" >/dev/null 2>&1
   docker compose exec -T cli wp option update default_role subscriber >/dev/null 2>&1
   docker compose exec -T cli wp option update users_can_register 0 >/dev/null 2>&1
-  docker compose exec -T cli wp transient delete reeve_admin_email_cooldown >/dev/null 2>&1
+  docker compose exec -T cli wp transient delete gmcp_admin_email_cooldown >/dev/null 2>&1
   docker compose exec -T cli wp option delete adminhash >/dev/null 2>&1
-  docker compose exec -T cli wp option delete reeve_journal >/dev/null 2>&1
-  docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
+  docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+  docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
   # A role that is dangerous WITHOUT holding edit_posts: the case the first guard missed.
   docker compose exec -T cli wp eval 'remove_role("api_admin"); add_role("api_admin","API Admin",["read"=>true,"manage_options"=>true]);' >/dev/null 2>&1
 }
 reset_state
 
 echo "-- credential protection (privilege escalation) --"
-call opt_read '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"reeve_options"}}}'
+call opt_read '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"gmcp_options"}}}'
 check "own options are unreadable" "$(verdict opt_read)" "error"
-call opt_raw '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"reeve_options","raw":true}}}'
+call opt_raw '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"gmcp_options","raw":true}}}'
 check "raw read cannot bypass it" "$(verdict opt_raw)" "error"
-call opt_write '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"reeve_options","value":{"mcp_bearer_token":"pwned","mcp_role":"admin"}}}}'
+call opt_write '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"gmcp_options","value":{"mcp_bearer_token":"pwned","mcp_role":"admin"}}}}'
 check "own options are unwritable" "$(verdict opt_write)" "error"
 call opt_cred '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"some_plugin_api_key"}}}'
 check "credential-shaped keys refused" "$(verdict opt_cred)" "error"
@@ -118,9 +118,9 @@ call t_active '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"w
 check "deleting the active theme refused" "$(verdict t_active)" "error"
 
 echo "-- self-protection --"
-call self_off '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"wp_deactivate_plugin","arguments":{"plugin":"reeve"}}}'
+call self_off '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"wp_deactivate_plugin","arguments":{"plugin":"guarded-mcp"}}}'
 check "cannot deactivate itself" "$(verdict self_off)" "error"
-call self_del '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"reeve"}}}'
+call self_del '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"guarded-mcp"}}}'
 check "cannot delete itself" "$(verdict self_del)" "error"
 
 echo "-- install source restriction --"
@@ -347,21 +347,21 @@ check "block attributes survive sanitising" \
 docker compose exec -T cli wp eval 'foreach(["probe-a","probe-b","probe-c","probe-d"] as $s){ $p=get_page_by_path($s,OBJECT,"post"); if($p) wp_delete_post($p->ID,true); }' >/dev/null 2>&1
 
 echo "-- activity history --"
-docker compose exec -T cli wp option delete reeve_activity >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_activity >/dev/null 2>&1
 call act1 '{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Activity Probe","post_status":"draft"}}}'
 # A refusal must be recorded too: those are the entries worth having.
-call act2 '{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"wp_deactivate_plugin","arguments":{"plugin":"reeve"}}}'
+call act2 '{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"wp_deactivate_plugin","arguments":{"plugin":"guarded-mcp"}}}'
 check "successful call recorded" \
-  "$(docker compose exec -T cli wp eval '$l=get_option("reeve_activity",[]); echo (int) (bool) array_filter($l, fn($e)=>$e["tool"]==="wp_create_post" && $e["ok"]);' 2>/dev/null | tr -d '\r\n')" "1"
+  "$(docker compose exec -T cli wp eval '$l=get_option("gmcp_activity",[]); echo (int) (bool) array_filter($l, fn($e)=>$e["tool"]==="wp_create_post" && $e["ok"]);' 2>/dev/null | tr -d '\r\n')" "1"
 check "refused call recorded as refused" \
-  "$(docker compose exec -T cli wp eval '$l=get_option("reeve_activity",[]); echo (int) (bool) array_filter($l, fn($e)=>$e["tool"]==="wp_deactivate_plugin" && !$e["ok"]);' 2>/dev/null | tr -d '\r\n')" "1"
+  "$(docker compose exec -T cli wp eval '$l=get_option("gmcp_activity",[]); echo (int) (bool) array_filter($l, fn($e)=>$e["tool"]==="wp_deactivate_plugin" && !$e["ok"]);' 2>/dev/null | tr -d '\r\n')" "1"
 check "the target is captured, not just the tool" \
-  "$(docker compose exec -T cli wp eval '$l=get_option("reeve_activity",[]); $m=array_values(array_filter($l, fn($e)=>$e["tool"]==="wp_deactivate_plugin")); echo $m ? $m[0]["target"] : "";' 2>/dev/null | tr -d '\r\n')" "reeve"
+  "$(docker compose exec -T cli wp eval '$l=get_option("gmcp_activity",[]); $m=array_values(array_filter($l, fn($e)=>$e["tool"]==="wp_deactivate_plugin")); echo $m ? $m[0]["target"] : "";' 2>/dev/null | tr -d '\r\n')" "guarded-mcp"
 # Full arguments must not be stored: they can carry a whole post body.
 check "arguments are not stored wholesale" \
-  "$(docker compose exec -T cli wp eval '$l=get_option("reeve_activity",[]); echo (int) (bool) array_filter($l, fn($e)=>isset($e["args"]));' 2>/dev/null | tr -d '\r\n')" "0"
+  "$(docker compose exec -T cli wp eval '$l=get_option("gmcp_activity",[]); echo (int) (bool) array_filter($l, fn($e)=>isset($e["args"]));' 2>/dev/null | tr -d '\r\n')" "0"
 check "the log option is not autoloaded" \
-  "$(docker compose exec -T cli wp eval 'global $wpdb; echo $wpdb->get_var("SELECT autoload FROM {$wpdb->options} WHERE option_name=\"reeve_activity\"");' 2>/dev/null | tr -d '\r\n' | grep -qE '^(no|off)$' && echo no || echo yes)" "no"
+  "$(docker compose exec -T cli wp eval 'global $wpdb; echo $wpdb->get_var("SELECT autoload FROM {$wpdb->options} WHERE option_name=\"gmcp_activity\"");' 2>/dev/null | tr -d '\r\n' | grep -qE '^(no|off)$' && echo no || echo yes)" "no"
 
 echo "-- site briefing --"
 # One call has to answer "what am I looking at", or an agent spends five round trips
@@ -373,7 +373,7 @@ check "it reports the real WordPress version" \
   "$(brief "b['versions']['wordpress']")" \
   "$(docker compose exec -T cli wp core version 2>/dev/null | tr -d '\r\n')"
 check "it names the active theme" "$(brief "b['theme']['stylesheet']")" "twentytwentyfive"
-check "it lists this plugin as active" "$(brief "'yes' if any(p.startswith('Reeve') for p in b['plugins']['active']) else 'no'")" "yes"
+check "it lists this plugin as active" "$(brief "'yes' if any(p.startswith('Guarded MCP') for p in b['plugins']['active']) else 'no'")" "yes"
 check "it counts published posts" \
   "$(brief "b['content']['post_types'][0]['published']")" \
   "$(docker compose exec -T cli wp post list --post_type=post --post_status=publish --format=count 2>/dev/null | tr -d '\r\n')"
@@ -440,18 +440,18 @@ docker compose exec -T cli wp option update blogname "MCP Test" >/dev/null 2>&1
 # The journal writes previous values into an option row. Anything credential-shaped that
 # reaches it is a second copy of a secret, sitting somewhere nothing expects one.
 check "credential-shaped keys are never journalled" \
-  "$(docker compose exec -T cli wp eval '$r=new ReflectionClass("REEVE_Journal");$m=$r->getMethod("skip_option");$m->setAccessible(true);$j=$r->newInstanceWithoutConstructor();$bad=0;foreach(["my_api_key","some_secret","reeve_options","_transient_x","rewrite_rules","active_plugins"] as $k){if(!$m->invoke($j,$k))$bad++;}echo $bad;' 2>/dev/null | tr -d '\r\n')" "0"
+  "$(docker compose exec -T cli wp eval '$r=new ReflectionClass("GMCP_Journal");$m=$r->getMethod("skip_option");$m->setAccessible(true);$j=$r->newInstanceWithoutConstructor();$bad=0;foreach(["my_api_key","some_secret","gmcp_options","_transient_x","rewrite_rules","active_plugins"] as $k){if(!$m->invoke($j,$k))$bad++;}echo $bad;' 2>/dev/null | tr -d '\r\n')" "0"
 check "the journal row does not contain the token" \
-  "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("reeve_journal",[])),"'"$TOK"'")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
+  "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("gmcp_journal",[])),"'"$TOK"'")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
 
 echo "-- named keys: reach and lifetime --"
 # One shared secret with one access level is fine until there are two of anything.
 # These check that a key's stated limits are real, not decoration.
 KEYS=$(docker compose exec -T cli wp eval '
-  $a = REEVE_Tokens::create("Scoped reader","readonly",0,["wp_get_posts"]);
-  $b = REEVE_Tokens::create("Already expired","admin",0,[]);
-  $rows = REEVE_Tokens::all(); $rows[$b["id"]]["expires"] = time() - 60; update_option("reeve_tokens",$rows,false);
-  $c = REEVE_Tokens::create("Admin but scoped","admin",0,["wp_get_posts"]);
+  $a = GMCP_Tokens::create("Scoped reader","readonly",0,["wp_get_posts"]);
+  $b = GMCP_Tokens::create("Already expired","admin",0,[]);
+  $rows = GMCP_Tokens::all(); $rows[$b["id"]]["expires"] = time() - 60; update_option("gmcp_tokens",$rows,false);
+  $c = GMCP_Tokens::create("Admin but scoped","admin",0,["wp_get_posts"]);
   echo $a["secret"], " ", $b["secret"], " ", $c["secret"];
 ' 2>/dev/null | tr -d '\r\n')
 K_SCOPED=$(echo "$KEYS" | cut -d' ' -f1)
@@ -484,31 +484,31 @@ check "ping works whatever the key is scoped to" "$(verdict k_ping)" "ok"
 check "an expired key is refused at the door" \
   "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H "Authorization: Bearer $K_EXPIRED" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" "401"
 check "a made-up key is refused" \
-  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'Authorization: Bearer reeve_00000000_deadbeef' -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" "401"
+  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'Authorization: Bearer gmcp_00000000_deadbeef' -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" "401"
 # A key readable back out of the database is a key that leaks with the database.
 check "keys are stored hashed, never in the clear" \
-  "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("reeve_tokens",[])),"'"$K_SCOPED"'")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
+  "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("gmcp_tokens",[])),"'"$K_SCOPED"'")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
 check "revoking a key locks it out immediately" \
-  "$(docker compose exec -T cli wp eval '$r=REEVE_Tokens::all();foreach($r as $k=>$v){REEVE_Tokens::revoke($k);}echo count(REEVE_Tokens::all());' 2>/dev/null | tr -d '\r\n')" "0"
+  "$(docker compose exec -T cli wp eval '$r=GMCP_Tokens::all();foreach($r as $k=>$v){GMCP_Tokens::revoke($k);}echo count(GMCP_Tokens::all());' 2>/dev/null | tr -d '\r\n')" "0"
 check "the revoked key no longer authenticates" \
   "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H "Authorization: Bearer $K_SCOPED" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" "401"
 
 echo "-- resources are no softer than the tools --"
 # A resource is a second way to reach the same data. If it does not go through the same
 # gate it is a second door into the same room with a different lock on it.
-K_RES=$(docker compose exec -T cli wp eval '$a=REEVE_Tokens::create("Comments only","readonly",0,["wp_get_comments"]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+K_RES=$(docker compose exec -T cli wp eval '$a=GMCP_Tokens::create("Comments only","readonly",0,["wp_get_comments"]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
 kcall r_list "$K_RES" '{"jsonrpc":"2.0","id":130,"method":"resources/list"}'
 check "a scoped key is offered only the resources it could already read" \
   "$(py "import json,sys;d=json.load(sys.stdin);print(','.join(r['uri'] for r in d['result']['resources']))" r_list)" \
-  "reeve://comments/pending"
-kcall r_post "$K_RES" '{"jsonrpc":"2.0","id":131,"method":"resources/read","params":{"uri":"reeve://post/1"}}'
+  "gmcp://comments/pending"
+kcall r_post "$K_RES" '{"jsonrpc":"2.0","id":131,"method":"resources/read","params":{"uri":"gmcp://post/1"}}'
 check "and cannot read a post through one" "$(py 'import json,sys;print("error" in json.load(sys.stdin))' r_post)" "True"
-kcall r_brief "$K_RES" '{"jsonrpc":"2.0","id":132,"method":"resources/read","params":{"uri":"reeve://site/briefing"}}'
+kcall r_brief "$K_RES" '{"jsonrpc":"2.0","id":132,"method":"resources/read","params":{"uri":"gmcp://site/briefing"}}'
 check "nor the site briefing" "$(py 'import json,sys;print("error" in json.load(sys.stdin))' r_brief)" "True"
 kcall r_tpl "$K_RES" '{"jsonrpc":"2.0","id":133,"method":"resources/templates/list"}'
 check "nor is it offered the post template" \
   "$(py 'import json,sys;print(len(json.load(sys.stdin)["result"]["resourceTemplates"]))' r_tpl)" "0"
-docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
 
 echo "-- undo is not a way round the access levels --"
 # wp_undo_change sits at the write level; wp_update_option sits at admin. Undo replays the
@@ -518,8 +518,8 @@ echo "-- undo is not a way round the access levels --"
 # level, and a tool scope list did not help, because "undo" is one name standing for
 # every write on the journal.
 docker compose exec -T cli wp option update users_can_register 1 >/dev/null 2>&1
-docker compose exec -T cli wp option delete reeve_journal >/dev/null 2>&1
-K_UNDO=$(docker compose exec -T cli wp eval '$a=REEVE_Tokens::create("Deploy","readwrite",0,["wp_get_posts","wp_list_changes","wp_undo_change"]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+K_UNDO=$(docker compose exec -T cli wp eval '$a=GMCP_Tokens::create("Deploy","readwrite",0,["wp_get_posts","wp_list_changes","wp_undo_change"]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
 call u_tighten '{"jsonrpc":"2.0","id":140,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"users_can_register","value":"0"}}}'
 check "an admin connection can tighten registration" \
   "$(docker compose exec -T cli wp option get users_can_register 2>/dev/null | tr -d '\r\n')" "0"
@@ -538,27 +538,27 @@ check "the refusal names the tool that made the change" "$(refusal u_revert | gr
 call u_admin "{\"jsonrpc\":\"2.0\",\"id\":144,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$U_ID\"}}}"
 check "an admin connection can still undo its own change" \
   "$(docker compose exec -T cli wp option get users_can_register 2>/dev/null | tr -d '\r\n')" "1"
-docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
 
 echo "-- a credential in an innocuous option is not journalled --"
 # option_guard matches on the option NAME. Most secrets do not live in the name:
 # woocommerce_stripe_settings, wp_mail_smtp and jetpack_options are all innocuous names
 # holding an array with a secret_key inside. Rotating one through the agent left the old
 # live key sitting in a second row.
-docker compose exec -T cli wp option delete reeve_journal >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
 call c_set1 '{"jsonrpc":"2.0","id":145,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"acme_gateway_settings","value":{"mode":"live","secret_key":"sk_live_SUPERSECRET123"}}}}'
 call c_set2 '{"jsonrpc":"2.0","id":146,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"acme_gateway_settings","value":{"mode":"test","secret_key":"sk_test_rotated"}}}}'
 check "the rotated-out credential is not in the journal" \
-  "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("reeve_journal",[])),"sk_live_SUPERSECRET123")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
+  "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("gmcp_journal",[])),"sk_live_SUPERSECRET123")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
 call c_list '{"jsonrpc":"2.0","id":147,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":1}}}'
 # Silently skipping it would leave someone believing the change is reversible.
 check "and the entry says why it cannot be reverted" \
   "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0].get("not_reversible_because",""))' c_list)" \
   "The previous value looked like it held a credential, so it was never stored."
 # The journal row holds previous values of other options, so it must not be readable.
-call c_read '{"jsonrpc":"2.0","id":148,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"reeve_journal"}}}'
+call c_read '{"jsonrpc":"2.0","id":148,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"gmcp_journal"}}}'
 check "the journal row cannot be read through the option tools" "$(verdict c_read)" "error"
-call c_keys '{"jsonrpc":"2.0","id":149,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"reeve_tokens"}}}'
+call c_keys '{"jsonrpc":"2.0","id":149,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"gmcp_tokens"}}}'
 check "nor can the key table" "$(verdict c_keys)" "error"
 docker compose exec -T cli wp option delete acme_gateway_settings >/dev/null 2>&1
 
@@ -582,13 +582,13 @@ M_POST=$(docker compose exec -T cli wp post create --post_title='Attribution pro
 # matched, the tool call below would change nothing and the journal would record nothing.
 # editor is what the revert would restore, so a successful revert is the escalation.
 docker compose exec -T cli wp option update default_role editor >/dev/null 2>&1
-docker compose exec -T cli wp option delete reeve_journal >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
 call m_touch "{\"jsonrpc\":\"2.0\",\"id\":150,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$M_POST,\"post_title\":\"Touched\"}}}"
 call m_all '{"jsonrpc":"2.0","id":151,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
 check "an option written during a post call is attributed to the post tool" \
   "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(any(x['tool']=='wp_update_post' and 'default_role' in x['what'] for x in e))" m_all)" "True"
 M_OPT=$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next(x['id'] for x in e if 'default_role' in x['what']))" m_all)
-K_MIX=$(docker compose exec -T cli wp eval '$a=REEVE_Tokens::create("Writer","readwrite",0,[]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+K_MIX=$(docker compose exec -T cli wp eval '$a=GMCP_Tokens::create("Writer","readwrite",0,[]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
 kcall m_direct "$K_MIX" '{"jsonrpc":"2.0","id":152,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"default_role","value":"editor"}}}'
 check "a write-level key cannot set default_role directly" "$(verdict m_direct)" "error"
 kcall m_undo "$K_MIX" "{\"jsonrpc\":\"2.0\",\"id\":153,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$M_OPT\"}}}"
@@ -604,28 +604,28 @@ kcall m_post "$K_MIX" "{\"jsonrpc\":\"2.0\",\"id\":155,\"method\":\"tools/call\"
 check "a write-level key can still revert a post change" "$(verdict m_post)" "ok"
 docker compose exec -T wp sh -c 'rm -f /var/www/html/wp-content/mu-plugins/hookprobe.php' >/dev/null 2>&1
 docker compose exec -T cli wp post delete "$M_POST" --force >/dev/null 2>&1
-docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
 docker compose exec -T cli wp option update default_role subscriber >/dev/null 2>&1
 
 # touch() is a read-modify-write of the row holding every key. Writing back a copy
 # fetched before the throttle check resurrected a key revoked in between.
 check "a revoked key is not resurrected by a later touch" \
-  "$(docker compose exec -T cli wp eval '$a=REEVE_Tokens::create("Doomed","readonly",0,[]);$r=REEVE_Tokens::all();$r[$a["id"]]["last_used"]=0;update_option("reeve_tokens",$r,false);$stale=REEVE_Tokens::all();REEVE_Tokens::revoke($a["id"]);REEVE_Tokens::touch($a["id"]);echo isset(REEVE_Tokens::all()[$a["id"]])?1:0;' 2>/dev/null | tr -d '\r\n')" "0"
-docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
+  "$(docker compose exec -T cli wp eval '$a=GMCP_Tokens::create("Doomed","readonly",0,[]);$r=GMCP_Tokens::all();$r[$a["id"]]["last_used"]=0;update_option("gmcp_tokens",$r,false);$stale=GMCP_Tokens::all();GMCP_Tokens::revoke($a["id"]);GMCP_Tokens::touch($a["id"]);echo isset(GMCP_Tokens::all()[$a["id"]])?1:0;' 2>/dev/null | tr -d '\r\n')" "0"
+docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
 
 # The guard matches field names inside a value. Options hold settings as arrays, as
 # stdClass and as JSON strings, and checking only arrays left two of those three
 # unguarded. The short forms matter most: the guard matches by substring, so "password"
 # does not match a field called "pass", and wp_mail_smtp stores its password under
 # exactly that. The example named in the comment was the one slipping past the check.
-docker compose exec -T cli wp option delete reeve_journal >/dev/null 2>&1
-docker compose exec -T cli wp eval-file /var/www/html/wp-content/plugins/reeve/.dev/credential-shapes.php >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+docker compose exec -T cli wp eval-file /var/www/html/wp-content/plugins/guarded-mcp/.dev/credential-shapes.php >/dev/null 2>&1
 call s_obj '{"jsonrpc":"2.0","id":160,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"probe_obj","value":{"secret_key":"rotated"}}}}'
 call s_json '{"jsonrpc":"2.0","id":161,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"probe_json","value":"{}"}}}'
 call s_smtp '{"jsonrpc":"2.0","id":162,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"probe_smtp","value":{"smtp":{"pass":"rotated"}}}}}'
 call s_deep '{"jsonrpc":"2.0","id":163,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"probe_deep","value":{"x":1}}}}'
 call s_plain '{"jsonrpc":"2.0","id":164,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"probe_plain","value":{"mode":"test"}}}}'
-leaked() { docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("reeve_journal",[])),"'"$1"'")===false?0:1;' 2>/dev/null | tr -d '\r\n'; }
+leaked() { docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("gmcp_journal",[])),"'"$1"'")===false?0:1;' 2>/dev/null | tr -d '\r\n'; }
 check "a credential in a stdClass is not journalled" "$(leaked OBJ_LEAK_1)" "0"
 check "a credential in a JSON string is not journalled" "$(leaked JSON_LEAK_2)" "0"
 check "a password under the short field name pass is not journalled" "$(leaked SMTP_LEAK_3)" "0"
@@ -640,7 +640,7 @@ check "an ordinary settings array is still journalled and revertible" \
 docker compose exec -T cli wp option delete probe_obj probe_json probe_smtp probe_deep probe_plain >/dev/null 2>&1
 
 echo "-- a hidden prompt cannot be fetched by name --"
-K_PR=$(docker compose exec -T cli wp eval '$a=REEVE_Tokens::create("Posts only","readonly",0,["wp_get_posts"]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+K_PR=$(docker compose exec -T cli wp eval '$a=GMCP_Tokens::create("Posts only","readonly",0,["wp_get_posts"]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
 kcall pr_list "$K_PR" '{"jsonrpc":"2.0","id":170,"method":"prompts/list"}'
 check "the scoped key is offered only prompts it can drive" \
   "$(py "import json,sys;print(','.join(sorted(x['name'] for x in json.load(sys.stdin)['result']['prompts'])))" pr_list)" \
@@ -653,34 +653,34 @@ check "the refusal names the tool it cannot reach" \
   "$(py 'import json,sys;print("wp_get_site_health" in json.load(sys.stdin)["error"]["message"])' pr_hidden)" "True"
 kcall pr_ok "$K_PR" '{"jsonrpc":"2.0","id":172,"method":"prompts/get","params":{"name":"stale_drafts"}}'
 check "an offered prompt still renders for it" "$(py 'import json,sys;print("result" in json.load(sys.stdin))' pr_ok)" "True"
-docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
 
 echo "-- this plugin's own rows are not readable through its own tools --"
 # The guard used to name rows one at a time and was wrong twice: the change journal was
 # readable until it was named, and the one-time plaintext of a newly minted key sits in
-# _transient_reeve_new_key, which no exact entry matched. Reading it needs an admin-level
+# _transient_gmcp_new_key, which no exact entry matched. Reading it needs an admin-level
 # caller, so it is not a level escalation, but an admin key deliberately narrowed to
 # wp_get_option, the shape of a reporting key someone would think safe, harvested any key
 # minted in the next sixty seconds. It also undercut the whole reason keys are hashed.
-docker compose exec -T cli wp eval 'set_transient("reeve_new_key_1","reeve_deadbeef_SECRETPLAINTEXTKEY",60);' >/dev/null 2>&1
-for row in _transient_reeve_new_key_1 reeve_journal reeve_tokens reeve_activity reeve_options; do
+docker compose exec -T cli wp eval 'set_transient("gmcp_new_key_1","gmcp_deadbeef_SECRETPLAINTEXTKEY",60);' >/dev/null 2>&1
+for row in _transient_gmcp_new_key_1 gmcp_journal gmcp_tokens gmcp_activity gmcp_options; do
   call g_row "{\"jsonrpc\":\"2.0\",\"id\":180,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_option\",\"arguments\":{\"key\":\"$row\"}}}"
   check "$row is refused" "$(verdict g_row)" "error"
 done
 # raw:true reads straight from the database, bypassing the object cache and option_*
 # filters, so it has to be refused by the same gate rather than sneaking round it.
-call g_raw '{"jsonrpc":"2.0","id":181,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"_transient_reeve_new_key_1","raw":true}}}'
+call g_raw '{"jsonrpc":"2.0","id":181,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"_transient_gmcp_new_key_1","raw":true}}}'
 check "and the raw read is refused too" "$(verdict g_raw)" "error"
 # Substring, not prefix, and that is load-bearing rather than incidental: the row this
-# finding was about is named _transient_reeve_new_key_<user>, so a rule anchored to the
+# finding was about is named _transient_gmcp_new_key_<user>, so a rule anchored to the
 # start of the option name would miss the one it most needs to catch.
 check "the match is not anchored to the start of the name" \
-  "$(docker compose exec -T cli wp eval 'echo REEVE_Core::option_guard("_transient_reeve_new_key_1")===true?"allowed":"refused";' 2>/dev/null | tr -d '\r\n')" "refused"
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Core::option_guard("_transient_gmcp_new_key_1")===true?"allowed":"refused";' 2>/dev/null | tr -d '\r\n')" "refused"
 # The opposite failure: a prefix rule broad enough to refuse everything would pass all of
 # the above and make the option tools useless.
 call g_ok '{"jsonrpc":"2.0","id":182,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"blogname"}}}'
 check "an ordinary option still reads" "$(verdict g_ok)" "ok"
-docker compose exec -T cli wp eval 'delete_transient("reeve_new_key_1");' >/dev/null 2>&1
+docker compose exec -T cli wp eval 'delete_transient("gmcp_new_key_1");' >/dev/null 2>&1
 
 echo "-- the URL-token route cannot change anything an admin cares about --"
 # That endpoint puts the secret in the request path, where every proxy log, access log and

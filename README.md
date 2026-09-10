@@ -1,8 +1,8 @@
-# Reeve
+# Guarded MCP
 
-A safe [Model Context Protocol](https://modelcontextprotocol.io) server for WordPress, so a local AI agent such as Claude Code or Claude Desktop can administer your site through conversation.
+A [Model Context Protocol](https://modelcontextprotocol.io) server for WordPress, so an AI agent such as Claude Code or Claude Desktop can administer your site through conversation.
 
-A reeve was the officer who administered an estate on the owner's behalf: full authority over the day-to-day, exercised for someone else, within bounds. That is the shape of this plugin. It hands an agent everything an administrator can do, and puts a guard on each of the operations you would not want done on a misread instruction.
+It is built on one assumption: the agent will occasionally get it wrong. An agent administering your site also reads your comments, your post bodies and your plugin descriptions, all written by anonymous people, and it has no reliable way to tell an instruction from content. So this hands an agent everything an administrator can do, and puts a guard on each of the operations you would not want done on a misread instruction.
 
 This is a fork of the MCP layer of [AI Engine](https://wordpress.org/plugins/ai-engine/) 3.7.7 by Jordy Meow, stripped of everything that is not the MCP server. GPLv2 or later, same as the original. See `CREDITS.md` for what was kept and what changed.
 
@@ -20,17 +20,17 @@ It also speaks the parts of MCP most servers skip: prompts, so your client offer
 ## Install
 
 Upload the zip through Plugins, Add New, Upload Plugin, or copy the directory into
-`wp-content/plugins/reeve` and activate it.
+`wp-content/plugins/guarded-mcp` and activate it.
 
 ```
-wp plugin install /path/to/reeve.zip --activate
+wp plugin install /path/to/guarded-mcp.zip --activate
 ```
 
-**The directory must be named `reeve`.** Not `reeve-main`, not `ai-engine`. The plugin
-derives its own identity from the folder through `plugin_basename()`, and the guard that
-stops an agent deactivating or deleting the plugin mid-call compares against that. Rename
-the folder and the self-protection silently stops matching. A GitHub "Download ZIP" gives
-you `reeve-main`, so rename it if you go that route.
+**The directory must be named `guarded-mcp`.** Not `guarded-mcp-main`, not `ai-engine`.
+The plugin derives its own identity from the folder through `plugin_basename()`, and the
+guard that stops an agent deactivating or deleting the plugin mid-call compares against
+that. Rename the folder and the self-protection silently stops matching. A GitHub
+"Download ZIP" gives you `guarded-mcp-main`, so rename it if you go that route.
 
 Then open **MCP Server** in the admin menu.
 
@@ -78,10 +78,10 @@ reading it back.
 
 **Site administration**, off by default: installing, activating, updating and deleting plugins and themes; navigation menus and their items; widgets and widget areas; the General, Reading and Discussion settings; the permalink structure; and a Site Health report. These install code and change how the site renders, so they are opt-in and carry their own guards:
 
-- Installs come from the wordpress.org repository by slug. An arbitrary ZIP URL is refused unless the site opts in through the `reeve_allow_remote_install` filter, and the download host is checked so a plugin cannot rewrite the repository's answer. If you do open that filter, note that the URL you approve is the one before redirects: `download_url()` follows up to five, and WordPress only blocks non-HTTP schemes, odd ports and IPv4 private ranges along the way. Allowlist hosts you control, and be aware an open redirect on one of them defeats the check.
+- Installs come from the wordpress.org repository by slug. An arbitrary ZIP URL is refused unless the site opts in through the `gmcp_allow_remote_install` filter, and the download host is checked so a plugin cannot rewrite the repository's answer. If you do open that filter, note that the URL you approve is the one before redirects: `download_url()` follows up to five, and WordPress only blocks non-HTTP schemes, odd ports and IPv4 private ranges along the way. Allowlist hosts you control, and be aware an open redirect on one of them defeats the check.
 - Deleting a plugin, a theme or a menu takes two calls, as does changing the administration email. The first changes nothing and returns a token bound to that exact target; only the second proceeds, so a single instruction cannot complete one, which matters because this agent reads comments and post content that other people wrote. Content deletions are not on that list: they go to the trash and can be restored, and the irreversible form, `force: true`, is one call. Use `preview` on it to see what would go, including the comments and attachments that go with it.
 - The plugin refuses to deactivate or delete itself, to delete the active theme or its parent, and to activate a theme this server cannot run.
-- Post and widget content is always filtered, regardless of the caller's capabilities. WordPress normally lets an administrator store raw HTML, but the caller being an administrator says nothing about who wrote the markup, and these tools sit at the `write` access level, so a deliberately limited token could otherwise plant a script on a public page. Blocks, shortcodes, inline styles and `data-` attributes all survive; `<iframe>`, inline `<svg>`, `<style>` blocks and Outlook conditional comments do not, unless you open `reeve_allow_unfiltered_post_html`.
+- Post and widget content is always filtered, regardless of the caller's capabilities. WordPress normally lets an administrator store raw HTML, but the caller being an administrator says nothing about who wrote the markup, and these tools sit at the `write` access level, so a deliberately limited token could otherwise plant a script on a public page. Blocks, shortcodes, inline styles and `data-` attributes all survive; `<iframe>`, inline `<svg>`, `<style>` blocks and Outlook conditional comments do not, unless you open `gmcp_allow_unfiltered_post_html`.
 - Block markup is filtered structurally rather than with `wp_kses_post` alone. Gutenberg escapes quotes and angle brackets inside block attributes as HTML entities, and kses does not recognise such a delimiter comment: it escapes the opener and destroys the block. Only the rendered HTML inside each block is filtered, and the attributes round-trip as JSON.
 - The default role for public registration is checked by construction: a role granting anything beyond a subscriber is refused, rather than checking a list of capabilities that would never stay complete.
 - Changing the administration email takes a confirmation step and is rate limited, because it mails an arbitrary address from your domain with body text drawn from the site title.
@@ -89,7 +89,7 @@ reading it back.
 - Settings are an allowlist, not a blocklist. `siteurl` and `home` are refused outright, since a wrong value makes the site and this endpoint unreachable with no way back. A default role that can edit content is refused, because open registration plus an editing default role is a way in.
 - None of them are reachable over the URL-token endpoint, since that endpoint puts the secret somewhere servers log it. Every `admin`-level tool is refused there, plus two whose declared level understates their reach: `wp_get_site_health`, which makes a loopback request and a wordpress.org call and returns a full account of your configuration, and `wp_upload_request`, which writes nothing itself but hands out an upload URL on a route that authenticates nobody. It cannot *change* anything on the list above, and it cannot read your settings or obtain an upload URL. It is not otherwise restricted, and that is worth stating rather than implying: a token recovered from an access log can create and edit posts, run a search and replace, post comments, and list your menus, widget areas, themes and permalink structure. Those last four are already in `wp_site_briefing`, which is read level and deliberately reachable there, so blocking them one at a time would draw a line where nothing changes. The settings tool is the exception because it returns the administration email, which is a person's address rather than a fact about the site.
 
-None of this plugin's own rows are readable or writable through the option tools, so the bearer token cannot be read back out or overwritten through the API. Any option name containing `reeve_` is refused, anywhere in the name rather than only at the start, which is deliberate: the one-time plaintext of a newly minted key lives at `_transient_reeve_new_key_<user>`, and a rule anchored to the start of the name would miss the row it most needs to catch. It replaced a list of exact names, which had been wrong twice: the change journal was readable until somebody named it, and that transient was never on it.
+None of this plugin's own rows are readable or writable through the option tools, so the bearer token cannot be read back out or overwritten through the API. Any option name containing `gmcp_` is refused, anywhere in the name rather than only at the start, which is deliberate: the one-time plaintext of a newly minted key lives at `_transient_gmcp_new_key_<user>`, and a rule anchored to the start of the name would miss the row it most needs to catch. It replaced a list of exact names, which had been wrong twice: the change journal was readable until somebody named it, and that transient was never on it.
 
 **WooCommerce**, off by default, and the switch only appears when the shop is installed: products, stock levels, orders, order notes, customers, a sales summary and a store briefing. Separate from site administration because the risk is a different shape. The administration tools can break a site; these read customer names, email addresses and delivery addresses and hand them to a model, which is a decision a shop owner should make deliberately rather than inherit.
 
@@ -111,7 +111,7 @@ It also counts matches without collecting them. A pattern of `.` against a 400 K
 
 Reverting is gated twice: on the tool that made the change, and on the operation the revert will perform, derived from the entry's own kind. Both are needed, because the recorded tool is whatever was in flight rather than what wrote the row. A plugin hooked on `save_post` that writes an option produces an option entry attributed to `wp_update_post`, and gating on that name alone let a write-level caller replay an admin-level option write.
 
-Two limits worth knowing. Values that look credential-shaped are not stored, judged by the field names inside them through `reeve_credential_field_patterns` as well as by the option's own name, so those changes are recorded but cannot be reverted. That check is structural, so a secret held as a bare string under an innocuous option name is still stored. And it is not retroactive: adding an option to `reeve_protected_options` refuses future reverts but does not scrub what is already recorded, so clear the journal after protecting something that was previously being written.
+Two limits worth knowing. Values that look credential-shaped are not stored, judged by the field names inside them through `gmcp_credential_field_patterns` as well as by the option's own name, so those changes are recorded but cannot be reverted. That check is structural, so a secret held as a bare string under an innocuous option name is still stored. And it is not retroactive: adding an option to `gmcp_protected_options` refuses future reverts but does not scrub what is already recorded, so clear the journal after protecting something that was previously being written.
 
 **Prompts and resources.** The server offers six ready-made upkeep jobs through MCP prompts, and publishes recent posts, the comment queue and the site briefing as MCP resources a client can attach to a conversation. Every resource is backed by a tool and gated by it, so a resource is never a softer route to data than the tool it mirrors.
 
@@ -148,14 +148,14 @@ It stores the tool, a short target such as the plugin file or post title, the ou
 how long it took. It deliberately does not store the full arguments, which can carry a
 whole post body. It is a record for a person to read, not a security log: it lives in an
 option, so a burst of simultaneous calls can lose an entry and anyone who can write
-options can rewrite it. Hook `reeve_tool_called` if you need a real audit trail.
+options can rewrite it. Hook `gmcp_tool_called` if you need a real audit trail.
 
 ## Extending
 
 Add your own tools with two filters:
 
 ```php
-add_filter( 'reeve_tools', function ( $tools ) {
+add_filter( 'gmcp_tools', function ( $tools ) {
   $tools[] = [
     'name' => 'my_tool',
     'description' => 'What it does.',
@@ -165,7 +165,7 @@ add_filter( 'reeve_tools', function ( $tools ) {
   return $tools;
 } );
 
-add_filter( 'reeve_callback', function ( $result, $tool, $args, $id ) {
+add_filter( 'gmcp_callback', function ( $result, $tool, $args, $id ) {
   if ( $tool !== 'my_tool' ) {
     return $result;
   }
@@ -181,21 +181,21 @@ Other hooks:
 
 | Hook | Purpose |
 |---|---|
-| `reeve_allow` | Override the auth decision |
-| `reeve_mutate` | Fires after any tool that changed content. Use it to purge a full-page cache |
-| `reeve_tool_called` | Every call, for auditing |
-| `reeve_stream_max_time` | Idle timeout for an open stream, default 180 seconds |
-| `reeve_oauth_user_can_authorize` | Who may approve an OAuth connection |
-| `reeve_tool_start` | Fires before a tool runs. Paired with `reeve_tool_called`, it marks when a call is in flight |
-| `reeve_prompts` | Add or replace the ready-made prompts |
-| `reeve_protected_options` | Option keys that must never be read, written or journalled |
-| `reeve_protected_option_patterns` | Substrings that mark an option as credential-shaped |
-| `reeve_credential_field_patterns` | Field names inside a value that stop it being recorded in the change journal |
-| `reeve_can_call_tool` | Answers whether the caller could call a given tool. The change journal asks it before replaying a write, so this is the gate on undo |
-| `reeve_header_auth_only_tools` | Tools the URL-token endpoint may not reach, on top of every `admin`-level tool. Adds to and removes from the exception list; it cannot unblock an admin-level tool |
-| `reeve_allow_remote_install` | Permit installs from a URL rather than the wordpress.org repository |
-| `reeve_allow_unfiltered_post_html` | Store post HTML unfiltered |
-| `reeve_allow_unfiltered_widget_html` | Store widget HTML unfiltered |
+| `gmcp_allow` | Override the auth decision |
+| `gmcp_mutate` | Fires after any tool that changed content. Use it to purge a full-page cache |
+| `gmcp_tool_called` | Every call, for auditing |
+| `gmcp_stream_max_time` | Idle timeout for an open stream, default 180 seconds |
+| `gmcp_oauth_user_can_authorize` | Who may approve an OAuth connection |
+| `gmcp_tool_start` | Fires before a tool runs. Paired with `gmcp_tool_called`, it marks when a call is in flight |
+| `gmcp_prompts` | Add or replace the ready-made prompts |
+| `gmcp_protected_options` | Option keys that must never be read, written or journalled |
+| `gmcp_protected_option_patterns` | Substrings that mark an option as credential-shaped |
+| `gmcp_credential_field_patterns` | Field names inside a value that stop it being recorded in the change journal |
+| `gmcp_can_call_tool` | Answers whether the caller could call a given tool. The change journal asks it before replaying a write, so this is the gate on undo |
+| `gmcp_header_auth_only_tools` | Tools the URL-token endpoint may not reach, on top of every `admin`-level tool. Adds to and removes from the exception list; it cannot unblock an admin-level tool |
+| `gmcp_allow_remote_install` | Permit installs from a URL rather than the wordpress.org repository |
+| `gmcp_allow_unfiltered_post_html` | Store post HTML unfiltered |
+| `gmcp_allow_unfiltered_widget_html` | Store widget HTML unfiltered |
 
 ## Security notes
 
@@ -204,7 +204,7 @@ Other hooks:
 - No row belonging to this plugin, and no option whose name looks like a credential, can be read or written through the option tools. The change journal additionally inspects the value it is about to record, so a settings array holding a `secret_key` or a `pass` field is not stored. That check reads field names, not content, so it will not catch a secret held as a bare string under an innocuous option name.
 - Tools do not execute arbitrary PHP or SQL. Every tool is a fixed WordPress operation with a schema.
 - An open stream holds one PHP worker for up to 180 seconds. Size your pool accordingly if several agents connect at once.
-- The URL-token endpoint can no longer perform any administrative *write*, and can no longer read your settings. If your host strips the `Authorization` header and you were relying on that route for installs, settings or user changes, those now fail. The fix is the header, not the route: re-saving your permalink structure regenerates the `.htaccess` rule that forwards it, and the connection check on the settings screen tells you whether it worked. Earlier versions let `reeve_header_auth_only_tools` empty the blocked set entirely; it can no longer do that.
+- The URL-token endpoint can no longer perform any administrative *write*, and can no longer read your settings. If your host strips the `Authorization` header and you were relying on that route for installs, settings or user changes, those now fail. The fix is the header, not the route: re-saving your permalink structure regenerates the `.htaccess` rule that forwards it, and the connection check on the settings screen tells you whether it worked. Earlier versions let `gmcp_header_auth_only_tools` empty the blocked set entirely; it can no longer do that.
 
 ## Development
 

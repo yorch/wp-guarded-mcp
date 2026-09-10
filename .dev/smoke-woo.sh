@@ -33,7 +33,7 @@ if [ "$(wpc plugin is-active woocommerce >/dev/null 2>&1 && echo yes || echo no)
   echo "  docker compose exec -T cli wp plugin install woocommerce --activate"
   exit 2
 fi
-docker compose exec -T cli wp eval '$o=get_option("reeve_options",[]);$o["mcp_tools_woo"]=true;update_option("reeve_options",$o);' >/dev/null 2>&1
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_woo"]=true;update_option("gmcp_options",$o);' >/dev/null 2>&1
 
 # Leave nothing behind from a previous run.
 docker compose exec -T cli wp eval '
@@ -167,7 +167,7 @@ echo "-- personal data is not cheaper than a username --"
 # wp_get_users is admin and returns no email at all. Orders and customers carry names,
 # email addresses and home addresses, so leaving them at read meant the lowest-privilege
 # key on the system read customers' addresses while being refused a list of usernames.
-K_RO=$(docker compose exec -T cli wp eval '$a=REEVE_Tokens::create("Read only","readonly",0,[]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+K_RO=$(docker compose exec -T cli wp eval '$a=GMCP_Tokens::create("Read only","readonly",0,[]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
 kcall pii_list "$K_RO" '{"jsonrpc":"2.0","id":34,"method":"tools/call","params":{"name":"wc_list_orders","arguments":{}}}'
 check "a readonly key cannot list orders" "$(verdict pii_list)" "error"
 kcall pii_cust "$K_RO" '{"jsonrpc":"2.0","id":35,"method":"tools/call","params":{"name":"wc_list_customers","arguments":{}}}'
@@ -182,16 +182,16 @@ for f in pii_prod pii_sales pii_brief; do
   check "nothing customer-shaped comes back from $f" \
     "$(grep -cE '@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|billing|shipping|first_name|last_name' "$OUT/$f" || true)" "0"
 done
-docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
 
 echo "-- the switch really is a switch --"
-docker compose exec -T cli wp eval '$o=get_option("reeve_options",[]);$o["mcp_tools_woo"]=false;update_option("reeve_options",$o);' >/dev/null 2>&1
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_woo"]=false;update_option("gmcp_options",$o);' >/dev/null 2>&1
 call w_off '{"jsonrpc":"2.0","id":16,"method":"tools/list"}'
 check "switching the group off removes every woo tool" \
   "$(py 'import json,sys;print(len([t for t in json.load(sys.stdin)["result"]["tools"] if t["name"].startswith("wc_")]))' w_off)" "0"
 call w_call '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"wc_list_orders","arguments":{}}}'
 check "and calling one anyway is refused" "$(verdict w_call)" "error"
-docker compose exec -T cli wp eval '$o=get_option("reeve_options",[]);$o["mcp_tools_woo"]=true;update_option("reeve_options",$o);' >/dev/null 2>&1
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_woo"]=true;update_option("gmcp_options",$o);' >/dev/null 2>&1
 
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -27,10 +27,10 @@ if ( !defined( 'ABSPATH' ) ) {
 * refusal mid-task, and the templates are written to carry on rather than stop when that
 * happens.
 */
-class REEVE_Prompts {
+class GMCP_Prompts {
 
   public function __construct() {
-    add_filter( 'reeve_prompts', [ $this, 'register' ] );
+    add_filter( 'gmcp_prompts', [ $this, 'register' ] );
   }
 
   /**
@@ -130,7 +130,7 @@ class REEVE_Prompts {
 
   /** All registered prompts, including any a site has added through the filter. */
   public static function all(): array {
-    $prompts = apply_filters( 'reeve_prompts', [] );
+    $prompts = apply_filters( 'gmcp_prompts', [] );
     return is_array( $prompts ) ? $prompts : [];
   }
 
@@ -226,7 +226,7 @@ class REEVE_Prompts {
             $missing[] = is_string( $tool ) ? $tool : '(unnamed)';
           }
         }
-        return [ '__reeve_unavailable' => $missing ];
+        return [ '__gmcp_unavailable' => $missing ];
       }
       $text = (string) ( $prompt['template'] ?? '' );
 

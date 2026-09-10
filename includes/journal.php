@@ -22,14 +22,14 @@ if ( !defined( 'ABSPATH' ) ) {
 *
 * Two things it deliberately will not record:
 *
-* Anything REEVE_Core::option_guard() refuses, by name or by the names inside its value.
+* Anything GMCP_Core::option_guard() refuses, by name or by the names inside its value.
 * The journal writes previous values into an option row, so recording the plugin's own
 * settings would copy the bearer token into a second place. The value check exists
 * because the name check is not enough: woocommerce_stripe_settings is an innocuous name
 * holding a live secret_key, and matching only on the name would journal it in full.
 *
 * This is a heuristic and it is not retroactive. A site that adds an option to
-* reeve_protected_options later gets a correct refusal at revert time, but the plaintext
+* gmcp_protected_options later gets a correct refusal at revert time, but the plaintext
 * already recorded stays in the row until the log rolls past it. Clear the journal after
 * protecting something that was previously being recorded.
 *
@@ -42,9 +42,9 @@ if ( !defined( 'ABSPATH' ) ) {
 * only exists if that post had been saved before. Restoring "the latest revision" after an
 * edit therefore restores the edit. The previous body is kept here instead.
 */
-class REEVE_Journal {
+class GMCP_Journal {
 
-  const OPTION = 'reeve_journal';
+  const OPTION = 'gmcp_journal';
   const LIMIT = 40;
   /** Serialized previous values above this are pointed at, not copied. */
   const MAX_VALUE = 64000;
@@ -58,8 +58,8 @@ class REEVE_Journal {
   private static $tool = '';
 
   public function __construct() {
-    add_action( 'reeve_tool_start', [ $this, 'start' ], 10, 1 );
-    add_action( 'reeve_tool_called', [ $this, 'stop' ], 99 );
+    add_action( 'gmcp_tool_start', [ $this, 'start' ], 10, 1 );
+    add_action( 'gmcp_tool_called', [ $this, 'stop' ], 99 );
     // Belt and braces for worker SAPIs. Under mod_php or PHP-FPM a static dies with the
     // request, so a fatal between start and stop costs nothing. Under FrankenPHP or
     // RoadRunner the worker survives, and a fatal mid-tool would leave the flag set for
@@ -90,7 +90,7 @@ class REEVE_Journal {
     if ( strpos( $key, '_transient' ) === 0 || strpos( $key, '_site_transient' ) === 0 ) {
       return true;
     }
-    if ( strpos( $key, 'reeve_' ) === 0 || strpos( $key, '_wp_' ) === 0 ) {
+    if ( strpos( $key, 'gmcp_' ) === 0 || strpos( $key, '_wp_' ) === 0 ) {
       return true;
     }
     $never = [ 'cron', 'rewrite_rules', 'active_plugins', 'recently_activated', 'auto_updater.lock',
@@ -98,7 +98,7 @@ class REEVE_Journal {
     if ( in_array( $key, $never, true ) ) {
       return true;
     }
-    return REEVE_Core::option_guard( $key ) !== true;
+    return GMCP_Core::option_guard( $key ) !== true;
   }
 
   public function option_changed( $key, $old, $new ): void {
@@ -131,7 +131,7 @@ class REEVE_Journal {
   /**
   * Field names that mark a value as credential-shaped.
   *
-  * Separate from REEVE_Core::option_guard()'s list, which matches whole OPTION names and
+  * Separate from GMCP_Core::option_guard()'s list, which matches whole OPTION names and
   * is applied to reads and writes. These match FIELD names inside a value, where the
   * conventions are shorter and the cost of a false positive is only that one change
   * cannot be undone. That asymmetry is why "key" and "pass" belong here and would be far
@@ -143,7 +143,7 @@ class REEVE_Journal {
   * written to catch it.
   */
   private static function field_patterns(): array {
-    return apply_filters( 'reeve_credential_field_patterns', [
+    return apply_filters( 'gmcp_credential_field_patterns', [
       'pass', 'pwd', 'secret', 'token', 'key', 'auth', 'salt', 'nonce',
       'credential', 'bearer', 'signature', 'licence', 'license', 'private',
     ] );
@@ -210,8 +210,8 @@ class REEVE_Journal {
       }
     }
     // Still honour the option-name guard, so a site that protects a name through
-    // reeve_protected_options also has that name redacted when it turns up as a field.
-    return REEVE_Core::option_guard( $field ) !== true;
+    // gmcp_protected_options also has that name redacted when it turns up as a field.
+    return GMCP_Core::option_guard( $field ) !== true;
   }
 
   public function option_added( $key, $value ): void {
@@ -268,14 +268,14 @@ class REEVE_Journal {
   private function storable( $value ) {
     $size = strlen( maybe_serialize( $value ) );
     if ( $size > self::MAX_VALUE ) {
-      return [ '__reeve_too_large' => $size ];
+      return [ '__gmcp_too_large' => $size ];
     }
     return $value;
   }
 
   /** True when storable() replaced the value with a description of its size. */
   private static function too_large( $value ): bool {
-    return is_array( $value ) && isset( $value['__reeve_too_large'] );
+    return is_array( $value ) && isset( $value['__gmcp_too_large'] );
   }
 
   private function oversized( array $values ): bool {
@@ -340,7 +340,7 @@ class REEVE_Journal {
       return 'It has already been reverted.';
     }
     foreach ( self::gates( $entry ) as $tool ) {
-      if ( !apply_filters( 'reeve_can_call_tool', false, $tool ) ) {
+      if ( !apply_filters( 'gmcp_can_call_tool', false, $tool ) ) {
         return "It needs {$tool}, which this connection cannot call.";
       }
     }
@@ -353,7 +353,7 @@ class REEVE_Journal {
       }
       // Re-checked at revert time as well: the guard list is filterable and a site may
       // have protected the key since.
-      return REEVE_Core::option_guard( (string) $entry['key'] ) === true
+      return GMCP_Core::option_guard( (string) $entry['key'] ) === true
         ? true
         : 'That option is protected.';
     }
@@ -398,7 +398,7 @@ class REEVE_Journal {
     $kind = (string) ( $entry['kind'] ?? '' );
     // An unknown kind yields a tool name nothing registers, so the check refuses. A new
     // kind added without a gate must fail closed rather than sail past an empty list.
-    $tools[] = $byKind[ $kind ] ?? 'reeve_unknown_change_kind';
+    $tools[] = $byKind[ $kind ] ?? 'gmcp_unknown_change_kind';
     $recorded = (string) ( $entry['tool'] ?? '' );
     if ( $recorded !== '' && $recorded !== $tools[0] ) {
       $tools[] = $recorded;
@@ -441,7 +441,7 @@ class REEVE_Journal {
       // to false: no server means no answer, and a security check with no answer must
       // refuse.
       foreach ( self::gates( $entry ) as $tool ) {
-        if ( !apply_filters( 'reeve_can_call_tool', false, $tool ) ) {
+        if ( !apply_filters( 'gmcp_can_call_tool', false, $tool ) ) {
           return [
             'ok' => false,
             'message' => "Reverting this is the same write in reverse, and it needs {$tool}, which this connection cannot call.",

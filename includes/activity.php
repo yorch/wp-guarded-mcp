@@ -20,16 +20,16 @@ if ( !defined( 'ABSPATH' ) ) {
 * What it is not: a security log. It lives in an option, a concurrent pair of calls can
 * lose an entry to a read-modify-write race, and anyone who can write options can rewrite
 * it. It is there so a person can see what happened, not so it can be relied on in an
-* argument. A site that needs a real audit trail should hook reeve_tool_called and write
+* argument. A site that needs a real audit trail should hook gmcp_tool_called and write
 * somewhere append-only.
 */
-class REEVE_Activity {
+class GMCP_Activity {
 
-  const OPTION = 'reeve_activity';
+  const OPTION = 'gmcp_activity';
   const LIMIT = 100;
 
   public function __construct() {
-    add_action( 'reeve_tool_called', [ $this, 'record' ] );
+    add_action( 'gmcp_tool_called', [ $this, 'record' ] );
   }
 
   /**

@@ -1,6 +1,6 @@
 <?php
 
-class REEVE_Tools_Core {
+class GMCP_Tools_Core {
   private $core = null;
 
   #region Initialize
@@ -9,8 +9,8 @@ class REEVE_Tools_Core {
     add_action( 'rest_api_init', [ $this, 'rest_api_init' ] );
   }
   public function rest_api_init() {
-    add_filter( 'reeve_tools', [ $this, 'register_rest_tools' ] );
-    add_filter( 'reeve_callback', [ $this, 'handle_call' ], 10, 4 );
+    add_filter( 'gmcp_tools', [ $this, 'register_rest_tools' ] );
+    add_filter( 'gmcp_callback', [ $this, 'handle_call' ], 10, 4 );
   }
   #endregion
 
@@ -30,10 +30,10 @@ class REEVE_Tools_Core {
   *
   * Off by default. A site that genuinely needs an iframe, inline SVG, a <style> block
   * or Outlook conditional comments written by an agent can turn it on, the same way
-  * reeve_allow_remote_install and reeve_allow_unfiltered_widget_html work.
+  * gmcp_allow_remote_install and gmcp_allow_unfiltered_widget_html work.
   */
   private function raw_post_html_allowed(): bool {
-    return (bool) apply_filters( 'reeve_allow_unfiltered_post_html', false );
+    return (bool) apply_filters( 'gmcp_allow_unfiltered_post_html', false );
   }
 
   /**
@@ -361,13 +361,13 @@ class REEVE_Tools_Core {
    * returns fresh data on sites with persistent object caches (Redis, Memcached) or
    * page caches (LiteSpeed, WP Rocket, Cloudflare, etc.). wp_insert_post / wp_update_post
    * call clean_post_cache themselves; this is idempotent and also fans out third-party
-   * purge hooks plus a generic reeve_post_changed action so sites can wire their own.
+   * purge hooks plus a generic gmcp_post_changed action so sites can wire their own.
    *
    * Per-request dedupe: agentic clients often hit the same post several times in quick
    * succession (e.g. wp_alter_post twice on the same page within the same JSON-RPC call),
    * which would multiply expensive third-party purges (Cloudflare global, Algolia reindex).
    * We keep a static set of post IDs already busted in this PHP request and short-circuit
-   * repeats. The $context array is forwarded to reeve_post_changed so handlers can
+   * repeats. The $context array is forwarded to gmcp_post_changed so handlers can
    * coalesce or defer purges across requests on their own (e.g. flush at end of batch).
    */
   /**
@@ -381,11 +381,11 @@ class REEVE_Tools_Core {
   }
 
   /**
-  * @see REEVE_Core::option_guard() for the rule and why it lives there.
+  * @see GMCP_Core::option_guard() for the rule and why it lives there.
   * @return true|string True if the key is allowed, otherwise the refusal message.
   */
   private function option_allowed( string $key ) {
-    return REEVE_Core::option_guard( $key );
+    return GMCP_Core::option_guard( $key );
   }
 
   private function bust_post_cache( int $post_id, array $context = [] ): void {
@@ -404,7 +404,7 @@ class REEVE_Tools_Core {
       'tool' => null,
       'batch' => false,
     ] );
-    do_action( 'reeve_post_changed', $post_id, $context );
+    do_action( 'gmcp_post_changed', $post_id, $context );
     do_action( 'litespeed_purge_post', $post_id );
     if ( function_exists( 'rocket_clean_post' ) ) {
       rocket_clean_post( $post_id );
@@ -593,7 +593,7 @@ class REEVE_Tools_Core {
       ],
       'wp_update_option' => [
         'name' => 'wp_update_option',
-        'description' => 'Create or update a WordPress option. Arrays/objects are stored natively (a JSON string is decoded back to an array first). WordPress refreshes the option cache automatically, but full-page caches (Varnish, WP Rocket, Cloudflare) are not purged, so a front-end may lag until its cache expires; integrations can hook the reeve_mutate action to purge on writes.',
+        'description' => 'Create or update a WordPress option. Arrays/objects are stored natively (a JSON string is decoded back to an array first). WordPress refreshes the option cache automatically, but full-page caches (Varnish, WP Rocket, Cloudflare) are not purged, so a front-end may lag until its cache expires; integrations can hook the gmcp_mutate action to purge on writes.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1773,20 +1773,20 @@ class REEVE_Tools_Core {
 
         /* ===== Change journal ===== */
       case 'wp_list_changes':
-        if ( !class_exists( 'REEVE_Journal' ) || !$this->core->get_option( 'mcp_change_journal' ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'The change journal is switched off for this site, so nothing is being recorded and nothing can be reverted. Turn it on under Reeve > Settings.' ];
+        if ( !class_exists( 'GMCP_Journal' ) || !$this->core->get_option( 'mcp_change_journal' ) ) {
+          $r['error'] = [ 'code' => -32603, 'message' => 'The change journal is switched off for this site, so nothing is being recorded and nothing can be reverted. Turn it on under the MCP Server screen in the admin menu.' ];
           break;
         }
         $limit = isset( $a['limit'] ) ? max( 1, min( 40, (int) $a['limit'] ) ) : 20;
-        $this->add_result_text( $r, wp_json_encode( REEVE_Journal::recent( $limit ), JSON_PRETTY_PRINT ) );
+        $this->add_result_text( $r, wp_json_encode( GMCP_Journal::recent( $limit ), JSON_PRETTY_PRINT ) );
         break;
 
       case 'wp_undo_change':
-        if ( !class_exists( 'REEVE_Journal' ) || !$this->core->get_option( 'mcp_change_journal' ) ) {
+        if ( !class_exists( 'GMCP_Journal' ) || !$this->core->get_option( 'mcp_change_journal' ) ) {
           $r['error'] = [ 'code' => -32603, 'message' => 'The change journal is switched off for this site, so there is nothing on record to revert.' ];
           break;
         }
-        $undo = REEVE_Journal::revert( (string) ( $a['id'] ?? '' ) );
+        $undo = GMCP_Journal::revert( (string) ( $a['id'] ?? '' ) );
         if ( !$undo['ok'] ) {
           $r['error'] = [ 'code' => -32602, 'message' => $undo['message'] ];
           break;
@@ -2829,7 +2829,7 @@ class REEVE_Tools_Core {
         }
         try {
           $token = wp_generate_password( 32, false );
-          $transient_key = 'reeve_upload_' . $token;
+          $transient_key = 'gmcp_upload_' . $token;
           $data = [
             'filename' => sanitize_file_name( $a['filename'] ),
             'title' => $a['title'] ?? '',
@@ -2903,7 +2903,7 @@ class REEVE_Tools_Core {
     // by WordPress, but full-page caches (Varnish, WP Rocket, Cloudflare) are not,
     // so a cache layer should listen here. Reads never trigger it.
     if ( empty( $r['error'] ) && $this->is_mutating_tool( $tool ) ) {
-      do_action( 'reeve_mutate', $tool, $a, $r );
+      do_action( 'gmcp_mutate', $tool, $a, $r );
     }
     return $r;
   }
@@ -2914,7 +2914,7 @@ class REEVE_Tools_Core {
   *
   * This is a list of exceptions rather than a list of mutating tools, and that is
   * deliberate. It used to name the mutating ones, which meant every delete tool was
-  * missing and reeve_mutate never fired on a deletion: anyone using the hook to
+  * missing and gmcp_mutate never fired on a deletion: anyone using the hook to
   * purge a full-page cache kept serving deleted posts. Listing the reads instead
   * makes the failure mode a needless cache purge rather than a silently stale page,
   * and a new admin tool is covered the day it is added instead of the day someone
@@ -2922,7 +2922,7 @@ class REEVE_Tools_Core {
   */
   private const NON_MUTATING_ADMIN_TOOLS = [ 'wp_get_users', 'wp_get_option' ];
 
-  // Whether a tool changes site state (so the reeve_mutate hook should fire).
+  // Whether a tool changes site state (so the gmcp_mutate hook should fire).
   private function is_mutating_tool( string $tool ): bool {
     $defs = $this->tools();
     $level = $defs[ $tool ]['accessLevel'] ?? '';

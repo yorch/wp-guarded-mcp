@@ -13,7 +13,7 @@ docker compose exec -T cli wp core install \
   --admin_email=a@b.test --skip-email
 
 docker compose exec -T cli wp rewrite structure '/%postname%/' --hard
-docker compose exec -T cli wp plugin activate reeve
+docker compose exec -T cli wp plugin activate guarded-mcp
 ```
 
 The repository is bind-mounted as the plugin directory, so edits apply immediately.
@@ -22,9 +22,9 @@ Set a token and call the server:
 
 ```
 docker compose exec -T cli wp eval '
-  $o = get_option("reeve_options", []);
+  $o = get_option("gmcp_options", []);
   $o["mcp_bearer_token"] = "testtoken1234567890";
-  update_option("reeve_options", $o, false);
+  update_option("gmcp_options", $o, false);
 '
 
 curl -sS -X POST 'http://localhost:8080/wp-json/mcp/v1/http' \
@@ -56,8 +56,10 @@ discovery failed and the client will not say which step. `./diagnose-connector.s
 https://example.com` walks the same steps in order and stops at the first break. It is
 read-only and sends no credentials.
 
-Tear down, including the database:
+Tear down. `down` on its own keeps the site; add `-v` to destroy the database and start
+from nothing:
 
 ```
-docker compose down -v
+docker compose down       # stop, keep the site
+docker compose down -v    # stop and wipe
 ```

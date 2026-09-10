@@ -1,7 +1,7 @@
 <?php
 
 /**
-* Reeve
+* Guarded MCP
 *
 * This class implements a Model Context Protocol (MCP) server for WordPress.
 *
@@ -23,19 +23,19 @@
 *   180 seconds normally, and 30 seconds when MCP debug logging is on. Size PHP
 *   workers off 180s, not 30s: an agent that opens streams and never sends DELETE
 *   holds one worker per stream for the full three minutes. Override with the
-*   reeve_stream_max_time filter (see below) if that is too long for the host.
+*   gmcp_stream_max_time filter (see below) if that is too long for the host.
 * - Heartbeat comments (every 10s) help proxies and connection_aborted() detect dead sockets
 */
 
-class REEVE_Server {
+class GMCP_Server {
   private $core = null;
   private $namespace = 'mcp/v1';
   // Reported to clients in serverInfo. Tracks the plugin so a bug report names a
   // version that exists; it used to be a hardcoded 0.0.1 for every release.
-  private $server_version = REEVE_VERSION;
+  private $server_version = GMCP_VERSION;
   private $protocol_version = '2025-06-18';
   private $supported_protocol_versions = [ '2024-11-05', '2025-06-18' ];
-  private $queue_key = 'reeve_msg';
+  private $queue_key = 'gmcp_msg';
   private $session_id = null;
   private $logging = false;
   private $last_action_time = 0;
@@ -72,7 +72,7 @@ class REEVE_Server {
     // token: bearer is for dev tools (Claude Code, scripts), OAuth is for
     // browser-driven clients like Claude Desktop. The new module enforces
     // strict redirect_uri matching, PKCE S256, and refresh-token rotation.
-    $this->oauth = new REEVE_OAuth( $core, $this );
+    $this->oauth = new GMCP_OAuth( $core, $this );
 
     add_action( 'rest_api_init', [ $this, 'rest_api_init' ] );
   }
@@ -99,13 +99,13 @@ class REEVE_Server {
     // So the change journal can ask whether this caller could make the write it is
     // about to replay. Registered here rather than in the constructor because it is
     // only meaningful once auth has been resolved for a REST request.
-    add_filter( 'reeve_can_call_tool', [ $this, 'filter_can_call_tool' ], 10, 2 );
+    add_filter( 'gmcp_can_call_tool', [ $this, 'filter_can_call_tool' ], 10, 2 );
 
     // Auth filter runs for both bearer token and OAuth token paths; register
     // unconditionally so that OAuth-only deployments (no static bearer set) work.
     static $filter_added = false;
     if ( !$filter_added ) {
-      add_filter( 'reeve_allow', [ $this, 'auth_via_bearer_token' ], 10, 2 );
+      add_filter( 'gmcp_allow', [ $this, 'auth_via_bearer_token' ], 10, 2 );
       $filter_added = true;
     }
 
@@ -187,7 +187,7 @@ class REEVE_Server {
     // admin-equivalent accounts (custom roles, individually granted caps) are
     // not locked out. Same reasoning as user_can_authorize() in oauth.php.
     $is_admin = current_user_can( 'manage_options' );
-    return apply_filters( 'reeve_allow', $is_admin, $request );
+    return apply_filters( 'gmcp_allow', $is_admin, $request );
   }
 
   /**
@@ -234,7 +234,7 @@ class REEVE_Server {
     // If no authorization header but bearer token is configured, deny access
     if ( !$hdr && !empty( $this->bearer_token ) ) {
       if ( $this->logging ) {
-        error_log( '[Reeve] ❌ No authorization header provided. Server may be stripping headers.' );
+        error_log( '[Guarded MCP] ❌ No authorization header provided. Server may be stripping headers.' );
       }
       return false;
     }
@@ -254,7 +254,7 @@ class REEVE_Server {
           // OAuth token would inherit the global mcp_role and reach admin tools.
           if ( !$this->oauth->user_can_authorize( $token_data['user_id'] ) ) {
             if ( $this->logging ) {
-              error_log( '[Reeve] ❌ OAuth token rejected: user ' . $token_data['user_id'] . ' is not an administrator.' );
+              error_log( '[Guarded MCP] ❌ OAuth token rejected: user ' . $token_data['user_id'] . ' is not an administrator.' );
             }
             return false;
           }
@@ -278,14 +278,14 @@ class REEVE_Server {
         $this->auth_client_id = 'bearer';
         $this->auth_client_name = null;
         if ( $this->logging ) {
-          error_log( '[Reeve] 🔐 Bearer token auth OK' );
+          error_log( '[Guarded MCP] 🔐 Bearer token auth OK' );
         }
         return true;
       }
 
       // Named keys, each with its own access level, expiry and tool list. Checked
       // after the shared token so an existing setup keeps behaving exactly as it did.
-      $key = class_exists( 'REEVE_Tokens' ) ? REEVE_Tokens::match( $token ) : null;
+      $key = class_exists( 'GMCP_Tokens' ) ? GMCP_Tokens::match( $token ) : null;
       if ( $key ) {
         if ( $admin = $this->core->get_admin_user() ) {
           wp_set_current_user( $admin->ID, $admin->user_login );
@@ -296,15 +296,15 @@ class REEVE_Server {
         $this->auth_method = 'bearer';
         $this->auth_client_id = 'key:' . $key['id'];
         $this->auth_client_name = $key['label'];
-        REEVE_Tokens::touch( $key['id'] );
+        GMCP_Tokens::touch( $key['id'] );
         if ( $this->logging ) {
-          error_log( '[Reeve] 🔐 Key auth OK: ' . $key['label'] );
+          error_log( '[Guarded MCP] 🔐 Key auth OK: ' . $key['label'] );
         }
         return true;
       }
 
       if ( $this->logging && $auth_result === 'none' ) {
-        error_log( '[Reeve] ❌ Bearer token invalid.' );
+        error_log( '[Guarded MCP] ❌ Bearer token invalid.' );
       }
       // Explicitly deny access for invalid tokens
       return false;
@@ -339,7 +339,7 @@ class REEVE_Server {
     $expected = '/' . $this->namespace . '/' . $this->bearer_token;
     if ( $route !== $expected ) {
       if ( $this->logging ) {
-        error_log( '[Reeve] ❌ Invalid Streamable HTTP no-auth URL access attempt.' );
+        error_log( '[Guarded MCP] ❌ Invalid Streamable HTTP no-auth URL access attempt.' );
       }
       return false;
     }
@@ -414,7 +414,7 @@ class REEVE_Server {
     // remembers to think about this.
     $level = $this->tool_access_levels[ $tool ] ?? 'admin';
 
-    $exceptions = apply_filters( 'reeve_header_auth_only_tools', [
+    $exceptions = apply_filters( 'gmcp_header_auth_only_tools', [
       'wp_get_site_health',
       'wp_upload_request',
       'wp_get_settings',
@@ -448,7 +448,7 @@ class REEVE_Server {
     if ( $this->logging ) {
       // Only log important messages to UI
       if ( strpos( $msg, 'queued' ) === false && strpos( $msg, 'flush' ) === false ) {
-        REEVE_Logging::log( "[Reeve] {$msg}" );
+        GMCP_Logging::log( "[Guarded MCP] {$msg}" );
       }
     }
   }
@@ -554,7 +554,7 @@ class REEVE_Server {
     if ( $method === 'initialize' || empty( $session_id ) ) {
       $session_id = wp_generate_uuid4();
       if ( $this->logging ) {
-        error_log( '[Reeve] 🆔 Direct session initialized: ' . $session_id );
+        error_log( '[Guarded MCP] 🆔 Direct session initialized: ' . $session_id );
       }
     }
 
@@ -571,7 +571,7 @@ class REEVE_Server {
           if ( $this->logging && $client_info ) {
             $client_name = $client_info['name'] ?? 'unknown';
             $client_version = $client_info['version'] ?? 'unknown';
-            error_log( "[Reeve] Client: {$client_name} v{$client_version}" );
+            error_log( "[Guarded MCP] Client: {$client_name} v{$client_version}" );
           }
 
           // Negotiate protocol version: use client's version if supported
@@ -581,7 +581,7 @@ class REEVE_Server {
           }
           else if ( $requested_version && $requested_version !== $this->protocol_version ) {
             if ( $this->logging ) {
-              REEVE_Logging::warn( "[Reeve] Client requested unsupported protocol version {$requested_version}" );
+              GMCP_Logging::warn( "[Guarded MCP] Client requested unsupported protocol version {$requested_version}" );
             }
           }
 
@@ -609,14 +609,14 @@ class REEVE_Server {
           // Debug logging for tools/list
           if ( $this->logging ) {
             $user_agent = isset( $_SERVER['HTTP_USER_AGENT'] ) ? $_SERVER['HTTP_USER_AGENT'] : 'unknown';
-            error_log( '[Reeve Direct] 📋 tools/list requested by: ' . $user_agent );
-            error_log( '[Reeve Direct] 📊 Returning ' . count( $tools ) . ' tools' );
+            error_log( '[Guarded MCP Direct] 📋 tools/list requested by: ' . $user_agent );
+            error_log( '[Guarded MCP Direct] 📊 Returning ' . count( $tools ) . ' tools' );
             if ( count( $tools ) > 0 ) {
               $tool_names = array_column( $tools, 'name' );
-              error_log( '[Reeve Direct] 🛠️ Tool names: ' . implode( ', ', $tool_names ) );
+              error_log( '[Guarded MCP Direct] 🛠️ Tool names: ' . implode( ', ', $tool_names ) );
             }
             else {
-              error_log( '[Reeve Direct] ⚠️ WARNING: No tools returned!' );
+              error_log( '[Guarded MCP Direct] ⚠️ WARNING: No tools returned!' );
             }
           }
 
@@ -633,19 +633,19 @@ class REEVE_Server {
           $arguments = $params['arguments'] ?? [];
 
           if ( $this->logging ) {
-            error_log( '[Reeve Direct] 🔧 tools/call - Tool: ' . $tool );
-            error_log( '[Reeve Direct] 🔧 tools/call - Arguments: ' . wp_json_encode( $arguments ) );
+            error_log( '[Guarded MCP Direct] 🔧 tools/call - Tool: ' . $tool );
+            error_log( '[Guarded MCP Direct] 🔧 tools/call - Arguments: ' . wp_json_encode( $arguments ) );
           }
 
           try {
             $reply = $this->execute_tool( $tool, $arguments, $id );
             if ( $this->logging ) {
-              error_log( '[Reeve Direct] ✅ tools/call - Success for tool: ' . $tool );
+              error_log( '[Guarded MCP Direct] ✅ tools/call - Success for tool: ' . $tool );
             }
           }
           catch ( Exception $e ) {
             if ( $this->logging ) {
-              error_log( '[Reeve Direct] ❌ tools/call - Error: ' . $e->getMessage() );
+              error_log( '[Guarded MCP Direct] ❌ tools/call - Error: ' . $e->getMessage() );
             }
             throw $e;
           }
@@ -662,7 +662,7 @@ class REEVE_Server {
           $reply = [
             'jsonrpc' => '2.0',
             'id' => $id,
-            'result' => [ 'prompts' => REEVE_Prompts::listing( [ $this, 'resource_permitted' ] ) ],
+            'result' => [ 'prompts' => GMCP_Prompts::listing( [ $this, 'resource_permitted' ] ) ],
           ];
           break;
 
@@ -672,7 +672,7 @@ class REEVE_Server {
           // "Array to string conversion", and with WP_DEBUG_DISPLAY that text lands in
           // front of the JSON-RPC body and the client gets a parse error.
           $prompt_name = isset( $params['name'] ) && is_scalar( $params['name'] ) ? (string) $params['name'] : '';
-          $rendered = REEVE_Prompts::render(
+          $rendered = GMCP_Prompts::render(
             $prompt_name,
             is_array( $params['arguments'] ?? null ) ? $params['arguments'] : [],
             [ $this, 'resource_permitted' ]
@@ -684,7 +684,7 @@ class REEVE_Server {
               'error' => [ 'code' => -32602, 'message' => 'Unknown prompt: ' . $prompt_name ],
             ];
           }
-          elseif ( isset( $rendered['__reeve_unavailable'] ) ) {
+          elseif ( isset( $rendered['__gmcp_unavailable'] ) ) {
             // Deliberately distinct from "unknown", so a client holding a listing from
             // when those tools were switched on can tell a withdrawn prompt from one
             // that never existed, and can say which tools it needs.
@@ -694,7 +694,7 @@ class REEVE_Server {
               'error' => [
                 'code' => -32602,
                 'message' => 'The prompt "' . $prompt_name . '" drives tools this connection cannot reach: '
-                  . implode( ', ', (array) $rendered['__reeve_unavailable'] )
+                  . implode( ', ', (array) $rendered['__gmcp_unavailable'] )
                   . '. It is not offered in prompts/list for the same reason.',
               ],
             ];
@@ -711,7 +711,7 @@ class REEVE_Server {
           $reply = [
             'jsonrpc' => '2.0',
             'id' => $id,
-            'result' => [ 'resources' => REEVE_Resources::listing( [ $this, 'resource_permitted' ] ) ],
+            'result' => [ 'resources' => GMCP_Resources::listing( [ $this, 'resource_permitted' ] ) ],
           ];
           break;
 
@@ -719,13 +719,13 @@ class REEVE_Server {
           $reply = [
             'jsonrpc' => '2.0',
             'id' => $id,
-            'result' => [ 'resourceTemplates' => REEVE_Resources::templates( [ $this, 'resource_permitted' ] ) ],
+            'result' => [ 'resourceTemplates' => GMCP_Resources::templates( [ $this, 'resource_permitted' ] ) ],
           ];
           break;
 
         case 'resources/read':
           $uri = (string) ( $data['params']['uri'] ?? '' );
-          $contents = REEVE_Resources::read( $uri, [ $this, 'resource_permitted' ] );
+          $contents = GMCP_Resources::read( $uri, [ $this, 'resource_permitted' ] );
           // One code for "no such thing" and for "not yours to read". Telling the two
           // apart would turn resources/read into a way to ask which post IDs exist.
           $reply = $contents === null
@@ -741,7 +741,7 @@ class REEVE_Server {
           // Check if it's a notification (no id)
           if ( $id === null && strpos( $method, 'notifications/' ) === 0 ) {
             if ( $this->logging ) {
-              error_log( '[Reeve] 📨 Notification received: ' . $method );
+              error_log( '[Guarded MCP] 📨 Notification received: ' . $method );
             }
             return $this->attach_session_header( new WP_REST_Response( null, 204 ), $session_id );
           }
@@ -761,7 +761,7 @@ class REEVE_Server {
     }
     catch ( Throwable $e ) {
       if ( $this->logging ) {
-        error_log( '[Reeve] ❌ Exception in handle_direct_jsonrpc: ' . $e->getMessage() );
+        error_log( '[Guarded MCP] ❌ Exception in handle_direct_jsonrpc: ' . $e->getMessage() );
       }
 
       $error_response = new WP_REST_Response( [
@@ -784,7 +784,7 @@ class REEVE_Server {
     $response->header( 'Mcp-Session-Id', $session_id );
 
     if ( $this->logging ) {
-      error_log( '[Reeve] 🪪 Response session header: ' . $session_id );
+      error_log( '[Guarded MCP] 🪪 Response session header: ' . $session_id );
     }
 
     return $response;
@@ -850,7 +850,7 @@ class REEVE_Server {
 
     // Log the request if debugging is enabled
     if ( $this->logging && isset( $data['method'] ) ) {
-      error_log( '[Reeve HTTP] ↓ ' . $data['method'] );
+      error_log( '[Guarded MCP HTTP] ↓ ' . $data['method'] );
     }
 
     // Reuse the existing direct JSON-RPC handler
@@ -876,7 +876,7 @@ class REEVE_Server {
     $session_id = !empty( $session_header ) ? sanitize_text_field( $session_header ) : wp_generate_uuid4();
 
     if ( $this->logging ) {
-      error_log( '[Reeve HTTP] 📡 SSE stream opened for session: ' . substr( $session_id, 0, 8 ) . '...' );
+      error_log( '[Guarded MCP HTTP] 📡 SSE stream opened for session: ' . substr( $session_id, 0, 8 ) . '...' );
     }
 
     // Set up SSE output
@@ -918,7 +918,7 @@ class REEVE_Server {
     * @param int $max_time Seconds. 180 normally, 30 when MCP logging is enabled.
     * @param string $session_id The session this stream belongs to.
     */
-    $max_time = (int) apply_filters( 'reeve_stream_max_time', $max_time, $session_id );
+    $max_time = (int) apply_filters( 'gmcp_stream_max_time', $max_time, $session_id );
     if ( $max_time < 5 ) {
       $max_time = 5;
     }
@@ -929,14 +929,14 @@ class REEVE_Server {
 
       if ( connection_aborted() || $idle ) {
         if ( $this->logging ) {
-          error_log( '[Reeve HTTP] 🔚 SSE closed (' . ( $idle ? 'idle' : 'abort' ) . ')' );
+          error_log( '[Guarded MCP HTTP] 🔚 SSE closed (' . ( $idle ? 'idle' : 'abort' ) . ')' );
         }
         break;
       }
 
       // Check for queued messages
       foreach ( $this->fetch_messages( $session_id ) as $msg ) {
-        if ( isset( $msg['method'] ) && $msg['method'] === 'reeve/kill' ) {
+        if ( isset( $msg['method'] ) && $msg['method'] === 'gmcp/kill' ) {
           echo "event: close\ndata: {}\n\n";
           flush();
           exit;
@@ -977,13 +977,13 @@ class REEVE_Server {
     $session_id = sanitize_text_field( $session_header );
 
     if ( $this->logging ) {
-      error_log( '[Reeve HTTP] 🗑️ Session terminated: ' . substr( $session_id, 0, 8 ) . '...' );
+      error_log( '[Guarded MCP HTTP] 🗑️ Session terminated: ' . substr( $session_id, 0, 8 ) . '...' );
     }
 
     // Queue kill signal for any active SSE streams
     $this->store_message( $session_id, [
       'jsonrpc' => '2.0',
-      'method' => 'reeve/kill'
+      'method' => 'gmcp/kill'
     ] );
 
     // Clean up any remaining transients for this session
@@ -1034,7 +1034,7 @@ class REEVE_Server {
   *
   * The single answer to that question, so nothing has to reimplement it and drift. The
   * resource layer is handed it as a callable, and the change journal reaches it through
-  * the reeve_can_call_tool filter before replaying a write.
+  * the gmcp_can_call_tool filter before replaying a write.
   *
   * It runs the same gates as execute_tool, in the same order, including the URL-token
   * ceiling. Leaving that ceiling out would mean a caller barred from a tool because its
@@ -1062,7 +1062,7 @@ class REEVE_Server {
   }
 
   /**
-  * Answer reeve_can_call_tool for anything that needs the decision but cannot see this
+  * Answer gmcp_can_call_tool for anything that needs the decision but cannot see this
   * object. Defaults to false at the call site, so a missing server fails closed.
   */
   public function filter_can_call_tool( $allowed, $tool ) {
@@ -1117,13 +1117,13 @@ class REEVE_Server {
     ];
 
     if ( $this->logging ) {
-      error_log( '[Reeve] 🔧 get_tools_list() - Starting with ' . count( $base_tools ) . ' base tools' );
+      error_log( '[Guarded MCP] 🔧 get_tools_list() - Starting with ' . count( $base_tools ) . ' base tools' );
     }
 
-    $filtered_tools = apply_filters( 'reeve_tools', $base_tools );
+    $filtered_tools = apply_filters( 'gmcp_tools', $base_tools );
 
     if ( $this->logging ) {
-      error_log( '[Reeve] 🔧 get_tools_list() - After filters: ' . count( $filtered_tools ) . ' tools' );
+      error_log( '[Guarded MCP] 🔧 get_tools_list() - After filters: ' . count( $filtered_tools ) . ' tools' );
     }
 
     // Build access level map for defense-in-depth checks in execute_tool()
@@ -1170,7 +1170,7 @@ class REEVE_Server {
     }
 
     if ( $this->logging ) {
-      error_log( '[Reeve] 🔧 get_tools_list() - Normalized tools: ' . count( $normalized_tools ) );
+      error_log( '[Guarded MCP] 🔧 get_tools_list() - Normalized tools: ' . count( $normalized_tools ) );
     }
 
     return $normalized_tools;
@@ -1196,19 +1196,19 @@ class REEVE_Server {
     // registration — exactly the case where the author needs to know. They're rare
     // in normal operation and the only reliable diagnostic when something is off.
     if ( !is_array( $tool ) ) {
-      error_log( '[Reeve] ⚠️ Tool definition at index ' . $index . ' skipped (expected array).' );
+      error_log( '[Guarded MCP] ⚠️ Tool definition at index ' . $index . ' skipped (expected array).' );
       return null;
     }
 
     $name = isset( $tool['name'] ) ? trim( (string) $tool['name'] ) : '';
     if ( $name === '' ) {
-      error_log( '[Reeve] ⚠️ Tool skipped due to missing name at index ' . $index );
+      error_log( '[Guarded MCP] ⚠️ Tool skipped due to missing name at index ' . $index );
       return null;
     }
 
     $normalized_schema = $this->normalize_input_schema( $tool['inputSchema'] ?? null, $name );
     if ( !$normalized_schema ) {
-      error_log( '[Reeve] ⚠️ Tool "' . $name . '" skipped due to invalid input schema.' );
+      error_log( '[Guarded MCP] ⚠️ Tool "' . $name . '" skipped due to invalid input schema.' );
       return null;
     }
 
@@ -1238,7 +1238,7 @@ class REEVE_Server {
 
     $type = isset( $schema['type'] ) ? (string) $schema['type'] : 'object';
     if ( $type !== 'object' ) {
-      error_log( '[Reeve] ⚠️ Tool "' . $tool_name . '" has unsupported schema type: ' . $type );
+      error_log( '[Guarded MCP] ⚠️ Tool "' . $tool_name . '" has unsupported schema type: ' . $type );
       return null;
     }
 
@@ -1259,7 +1259,7 @@ class REEVE_Server {
             $complex_types = array_intersect( $type_array, [ 'object', 'array' ] );
             if ( !empty( $complex_types ) ) {
               error_log(
-                '[Reeve] ⚠️ Tool "' . $tool_name . '" property "' . $prop_name .
+                '[Guarded MCP] ⚠️ Tool "' . $tool_name . '" property "' . $prop_name .
                 '" has problematic union type with complex types: [' . implode( ', ', $type_array ) .
                 ']. This breaks ChatGPT. Auto-fixing by removing type constraint.'
               );
@@ -1328,7 +1328,7 @@ class REEVE_Server {
     }
 
     if ( empty( $normalized ) && $this->logging && !empty( $annotations ) ) {
-      error_log( '[Reeve] 🔎 Tool "' . $tool_name . '" included unsupported annotation keys.' );
+      error_log( '[Guarded MCP] 🔎 Tool "' . $tool_name . '" included unsupported annotation keys.' );
     }
 
     return $normalized;
@@ -1406,7 +1406,7 @@ class REEVE_Server {
     $error_msg = null;
     $this->arm_fatal_net( $tool, $id );
 
-    // Paired with reeve_tool_called in the finally block below. The change journal uses
+    // Paired with gmcp_tool_called in the finally block below. The change journal uses
     // the pair to tell an agent's writes from a person's: it listens to WordPress itself,
     // so without a "a tool call is in flight" signal it would also record somebody saving
     // a settings page by hand.
@@ -1415,7 +1415,7 @@ class REEVE_Server {
     // no $args in that scope, so every single tool call logged an undefined-variable
     // warning, and on a site with WP_DEBUG_DISPLAY the warning text prepends the JSON-RPC
     // body and the client gets a parse error instead of a result.
-    do_action( 'reeve_tool_start', $tool, $args );
+    do_action( 'gmcp_tool_start', $tool, $args );
 
     try {
       // Ensure tool access levels are populated (each HTTP request starts fresh)
@@ -1513,10 +1513,10 @@ class REEVE_Server {
           }
         }
         // Log to both error log and UI
-        error_log( '[Reeve] 🛠️ ' . $tool . $args_preview );
+        error_log( '[Guarded MCP] 🛠️ ' . $tool . $args_preview );
         $this->log( '🛠️ Tool: ' . $tool . $args_preview );
       }
-      $filtered = apply_filters( 'reeve_callback', null, $tool, $args, $id, $this );
+      $filtered = apply_filters( 'gmcp_callback', null, $tool, $args, $id, $this );
 
       if ( $filtered !== null ) {
         // Check if it's already a full JSON-RPC response (backward compatibility)
@@ -1573,7 +1573,7 @@ class REEVE_Server {
       $duration_ms = (int) round( ( microtime( true ) - $start ) * 1000 );
       // Fire the action even on access denials and errors so admins can see
       // attempted-but-blocked tool calls in MCP Logs.
-      do_action( 'reeve_tool_called', [
+      do_action( 'gmcp_tool_called', [
         'tool' => $tool,
         'args' => $args,
         'result' => $response,
@@ -1597,7 +1597,7 @@ class REEVE_Server {
       return new WP_REST_Response( [ 'success' => false, 'message' => 'Missing token.' ], 400 );
     }
 
-    $transient_key = 'reeve_upload_' . $token;
+    $transient_key = 'gmcp_upload_' . $token;
     $data = get_transient( $transient_key );
     if ( empty( $data ) ) {
       return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired upload token.' ], 403 );

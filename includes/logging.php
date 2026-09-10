@@ -13,14 +13,14 @@ if ( !defined( 'ABSPATH' ) ) {
 * does not block it. error_log() is where a server operator already looks, needs no
 * filesystem handle, and costs nothing when the calls are gated.
 */
-class REEVE_Logging {
+class GMCP_Logging {
 
   private static $enabled = null;
 
   private static function enabled() {
     if ( self::$enabled === null ) {
-      global $reeve_core;
-      self::$enabled = $reeve_core ? (bool) $reeve_core->get_option( 'mcp_debug_mode' ) : false;
+      global $gmcp_core;
+      self::$enabled = $gmcp_core ? (bool) $gmcp_core->get_option( 'mcp_debug_mode' ) : false;
     }
     return self::$enabled;
   }
@@ -30,7 +30,7 @@ class REEVE_Logging {
   */
   public static function log( $message ) {
     if ( self::enabled() ) {
-      error_log( '[Reeve] ' . $message );
+      error_log( '[Guarded MCP] ' . $message );
     }
   }
 
@@ -39,10 +39,10 @@ class REEVE_Logging {
   * with debug mode on is a warning nobody sees when it matters.
   */
   public static function warn( $message ) {
-    error_log( '[Reeve] WARNING: ' . $message );
+    error_log( '[Guarded MCP] WARNING: ' . $message );
   }
 
   public static function error( $message ) {
-    error_log( '[Reeve] ERROR: ' . $message );
+    error_log( '[Guarded MCP] ERROR: ' . $message );
   }
 }

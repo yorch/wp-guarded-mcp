@@ -1,8 +1,8 @@
 <?php
 
-class REEVE_Tools_Rest {
+class GMCP_Tools_Rest {
   // Bump the suffix when build_schema_from_args() changes so old cached schemas are ignored.
-  private $cache_key = 'reeve_tools_cache_v4';
+  private $cache_key = 'gmcp_tools_cache_v4';
   private $allowed = [ 'posts', 'pages', 'media' ];
 
   public function __construct() {
@@ -10,8 +10,8 @@ class REEVE_Tools_Rest {
   }
 
   public function rest_api_init() {
-    add_filter( 'reeve_tools', [ $this, 'register_rest_tools' ] );
-    add_filter( 'reeve_callback', [ $this, 'handle_call' ], 10, 4 );
+    add_filter( 'gmcp_tools', [ $this, 'register_rest_tools' ] );
+    add_filter( 'gmcp_callback', [ $this, 'handle_call' ], 10, 4 );
   }
 
   public function register_rest_tools( $prevTools ) {

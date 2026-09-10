@@ -24,9 +24,9 @@ if ( !defined( 'ABSPATH' ) ) {
 *
 * Not a rate limiter and not an audit trail. Reach and lifetime, nothing else.
 */
-class REEVE_Tokens {
+class GMCP_Tokens {
 
-  const OPTION = 'reeve_tokens';
+  const OPTION = 'gmcp_tokens';
   const LEVELS = [ 'readonly', 'readwrite', 'admin' ];
   /** Writing last_used on every call would mean an option write per request. */
   const TOUCH_INTERVAL = 300;
@@ -49,7 +49,7 @@ class REEVE_Tokens {
     // Long enough that guessing is not a strategy, and hex so it survives being pasted
     // into a shell, a YAML file, or a JSON config without quoting surprises.
     $secret = bin2hex( random_bytes( 24 ) );
-    $token = 'reeve_' . $id . '_' . $secret;
+    $token = 'gmcp_' . $id . '_' . $secret;
 
     $rows[ $id ] = [
       'id' => $id,
@@ -87,7 +87,7 @@ class REEVE_Tokens {
   * @return array|null The key row, or null if unknown, malformed or expired.
   */
   public static function match( string $token ): ?array {
-    if ( strpos( $token, 'reeve_' ) !== 0 ) {
+    if ( strpos( $token, 'gmcp_' ) !== 0 ) {
       return null;
     }
     $parts = explode( '_', $token );

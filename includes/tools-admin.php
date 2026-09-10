@@ -13,7 +13,7 @@ if ( !defined( 'ABSPATH' ) ) {
 * different risk class: installing a plugin is remote code execution by design, so the
 * guards live together where they can be reviewed as a set.
 */
-class REEVE_Tools_Admin {
+class GMCP_Tools_Admin {
 
   private $core = null;
 
@@ -23,8 +23,8 @@ class REEVE_Tools_Admin {
   }
 
   public function rest_api_init() {
-    add_filter( 'reeve_tools', [ $this, 'register_tools' ] );
-    add_filter( 'reeve_callback', [ $this, 'handle_call' ], 10, 4 );
+    add_filter( 'gmcp_tools', [ $this, 'register_tools' ] );
+    add_filter( 'gmcp_callback', [ $this, 'handle_call' ], 10, 4 );
   }
 
   #region Guards
@@ -95,7 +95,7 @@ class REEVE_Tools_Admin {
     // plugin as "akismet" or "akismet/akismet.php"; both resolve to the same file, so
     // both must share one token, and the token has to be bound to what will actually
     // be deleted rather than to how it happened to be spelled.
-    $key = 'reeve_confirm_' . hash( 'sha256', $tool . '|' . (string) $target );
+    $key = 'gmcp_confirm_' . hash( 'sha256', $tool . '|' . (string) $target );
 
     $given = isset( $a['confirm'] ) ? (string) $a['confirm'] : '';
     $expected = get_transient( $key );
@@ -111,21 +111,21 @@ class REEVE_Tools_Admin {
   }
 
   /**
-  * The plugin file of this plugin, e.g. "reeve/reeve.php".
+  * The plugin file of this plugin, e.g. "guarded-mcp/guarded-mcp.php".
   *
   * Deactivating or deleting ourselves would tear down the endpoint handling the very
   * call that asked for it: the agent gets a dropped connection rather than a result,
   * and then has no way back in to undo it. Refuse instead.
   */
   private function self_plugin_file(): string {
-    return plugin_basename( REEVE_ENTRY );
+    return plugin_basename( GMCP_ENTRY );
   }
 
   /**
   * Capability check.
   *
   * Worth doing even though a bearer-token request already runs as an administrator.
-  * The OAuth path binds to a real user, the reeve_allow filter lets a site widen who
+  * The OAuth path binds to a real user, the gmcp_allow filter lets a site widen who
   * gets in, and WordPress itself revokes some of these capabilities on multisite and
   * under DISALLOW_FILE_MODS. Asking WordPress the question is cheap and keeps the
   * answer correct in all of those cases instead of only the common one.
@@ -212,7 +212,7 @@ class REEVE_Tools_Admin {
   * Only wordpress.org slugs are accepted by default. An arbitrary ZIP URL is a direct
   * path from "the model was talked into a URL" to code running on the site, and unlike
   * the .org repository nothing has reviewed what is inside it. Sites that genuinely
-  * need it can open the door with the reeve_allow_remote_install filter, which also
+  * need it can open the door with the gmcp_allow_remote_install filter, which also
   * gives them somewhere to allowlist their own hosts.
   *
   * @return string|WP_Error The download URL, or an error explaining the refusal.
@@ -222,21 +222,21 @@ class REEVE_Tools_Admin {
     $url = isset( $a['url'] ) ? trim( (string) $a['url'] ) : '';
 
     if ( $url !== '' ) {
-      $allowed = apply_filters( 'reeve_allow_remote_install', false, $url, $type );
+      $allowed = apply_filters( 'gmcp_allow_remote_install', false, $url, $type );
       if ( !$allowed ) {
         return new WP_Error(
-          'reeve_remote_install_blocked',
-          'Installing from an arbitrary URL is disabled, because it runs unreviewed code on this site. Use the wordpress.org "slug" argument instead. A site that needs URL installs can enable them with the reeve_allow_remote_install filter.'
+          'gmcp_remote_install_blocked',
+          'Installing from an arbitrary URL is disabled, because it runs unreviewed code on this site. Use the wordpress.org "slug" argument instead. A site that needs URL installs can enable them with the gmcp_allow_remote_install filter.'
         );
       }
       if ( !wp_http_validate_url( $url ) ) {
-        return new WP_Error( 'reeve_bad_url', 'That URL is not a valid, externally reachable HTTP(S) URL.' );
+        return new WP_Error( 'gmcp_bad_url', 'That URL is not a valid, externally reachable HTTP(S) URL.' );
       }
       return $url;
     }
 
     if ( $slug === '' ) {
-      return new WP_Error( 'reeve_no_package', 'Provide a wordpress.org "slug" (for example "classic-editor").' );
+      return new WP_Error( 'gmcp_no_package', 'Provide a wordpress.org "slug" (for example "classic-editor").' );
     }
 
     $this->load_upgrader();
@@ -252,13 +252,13 @@ class REEVE_Tools_Admin {
 
     if ( is_wp_error( $info ) ) {
       return new WP_Error(
-        'reeve_not_found',
+        'gmcp_not_found',
         "No {$type} with the slug \"{$slug}\" was found on wordpress.org (" . $info->get_error_message() . ')'
       );
     }
     $link = is_object( $info ) ? ( $info->download_link ?? '' ) : ( $info['download_link'] ?? '' );
     if ( empty( $link ) ) {
-      return new WP_Error( 'reeve_no_package', "wordpress.org returned no download for \"{$slug}\"." );
+      return new WP_Error( 'gmcp_no_package', "wordpress.org returned no download for \"{$slug}\"." );
     }
     // Asking wordpress.org is not the same as being answered by wordpress.org. Both
     // plugins_api() and themes_api() run filters (plugins_api, plugins_api_result and
@@ -270,7 +270,7 @@ class REEVE_Tools_Admin {
     $host = strtolower( (string) wp_parse_url( $link, PHP_URL_HOST ) );
     if ( $host !== 'wordpress.org' && substr( $host, -14 ) !== '.wordpress.org' ) {
       return new WP_Error(
-        'reeve_not_dot_org',
+        'gmcp_not_dot_org',
         "The download for \"{$slug}\" resolved to \"{$host}\", which is not a wordpress.org host. Something on this site is rewriting the repository response, so the package was not installed."
       );
     }
@@ -645,7 +645,7 @@ class REEVE_Tools_Admin {
     $result = $this->run( $tool, $a, $id );
     $failed = !empty( $result['error'] ) || !empty( $result['result']['isError'] );
     if ( !$failed && $this->is_mutating_tool( $tool ) ) {
-      do_action( 'reeve_mutate', $tool, $a, $result );
+      do_action( 'gmcp_mutate', $tool, $a, $result );
     }
     return $result;
   }
@@ -738,7 +738,7 @@ class REEVE_Tools_Admin {
   }
 
   /**
-  * Tools here that change site state. reeve_mutate is fired for these so cache
+  * Tools here that change site state. gmcp_mutate is fired for these so cache
   * integrations hear about them, exactly as they do for content changes.
   *
   * Listed as the read-only exceptions rather than the mutating ones, matching
@@ -1012,7 +1012,7 @@ class REEVE_Tools_Admin {
       // certificate on a staging install would otherwise answer it with a WP_Error,
       // which this treats as "cannot tell" and so stops rolling back a plugin that
       // genuinely did break things. Nothing is disclosed by not verifying, and the
-      // function that does send a secret verifies properly. See REEVE_SelfTest.
+      // function that does send a secret verifies properly. See GMCP_SelfTest.
       'sslverify' => false,
       'headers' => [ 'Cache-Control' => 'no-cache' ],
     ] );
@@ -1514,7 +1514,7 @@ class REEVE_Tools_Admin {
     if ( $ok !== true ) {
       return $ok;
     }
-    if ( get_transient( 'reeve_admin_email_cooldown' ) ) {
+    if ( get_transient( 'gmcp_admin_email_cooldown' ) ) {
       return 'An administration email change was already requested from here in the last 15 minutes. Wait before requesting another.';
     }
 
@@ -1523,7 +1523,7 @@ class REEVE_Tools_Admin {
       return 'This WordPress version does not expose the confirmation flow, so the address was not changed.';
     }
 
-    set_transient( 'reeve_admin_email_cooldown', 1, 15 * MINUTE_IN_SECONDS );
+    set_transient( 'gmcp_admin_email_cooldown', 1, 15 * MINUTE_IN_SECONDS );
 
     // update_option_new_admin_email() returns nothing and swallows a wp_mail failure,
     // so without this the tool cheerfully reports "a confirmation link was emailed" on
@@ -1552,24 +1552,24 @@ class REEVE_Tools_Admin {
         return ( $value === true || $value === 1 || $value === '1' || $value === 'true' || $value === 'yes' ) ? 1 : 0;
       case 'int':
         if ( !is_numeric( $value ) ) {
-          return new WP_Error( 'reeve_bad_value', 'Expected a number.' );
+          return new WP_Error( 'gmcp_bad_value', 'Expected a number.' );
         }
         return (int) $value;
       case 'float':
         if ( !is_numeric( $value ) ) {
-          return new WP_Error( 'reeve_bad_value', 'Expected a number.' );
+          return new WP_Error( 'gmcp_bad_value', 'Expected a number.' );
         }
         return (float) $value;
       case 'timezone':
         $tz = trim( (string) $value );
         if ( $tz !== '' && !in_array( $tz, timezone_identifiers_list(), true ) ) {
-          return new WP_Error( 'reeve_bad_value', "\"{$tz}\" is not a recognised timezone identifier, e.g. Europe/Madrid." );
+          return new WP_Error( 'gmcp_bad_value', "\"{$tz}\" is not a recognised timezone identifier, e.g. Europe/Madrid." );
         }
         return $tz;
       case 'role':
         $role = sanitize_key( (string) $value );
         if ( !get_role( $role ) ) {
-          return new WP_Error( 'reeve_bad_value', "\"{$role}\" is not a role on this site." );
+          return new WP_Error( 'gmcp_bad_value', "\"{$role}\" is not a role on this site." );
         }
         return $role;
       case 'textarea':
@@ -1761,7 +1761,7 @@ class REEVE_Tools_Admin {
       'versions' => [
         'wordpress' => get_bloginfo( 'version' ),
         'php' => PHP_VERSION,
-        'reeve' => REEVE_VERSION,
+        'guarded-mcp' => GMCP_VERSION,
       ],
       'theme' => [
         'name' => $theme->get( 'Name' ),
@@ -1844,10 +1844,10 @@ class REEVE_Tools_Admin {
 
   /** A one-line pulse from the activity log, so the agent knows whether it is the first here. */
   private function recent_activity_summary(): array {
-    if ( !class_exists( 'REEVE_Activity' ) ) {
+    if ( !class_exists( 'GMCP_Activity' ) ) {
       return [ 'available' => false ];
     }
-    $recent = REEVE_Activity::recent( 25 );
+    $recent = GMCP_Activity::recent( 25 );
     if ( !$recent ) {
       return [ 'available' => true, 'calls' => 0 ];
     }
@@ -2318,10 +2318,10 @@ class REEVE_Tools_Admin {
   * Whether this site has opted into storing raw HTML in widgets.
   *
   * Off by default. A site that genuinely needs a tracking snippet in a sidebar can
-  * turn it on, the same way reeve_allow_remote_install works.
+  * turn it on, the same way gmcp_allow_remote_install works.
   */
   private function raw_widget_html_allowed( string $sidebar ): bool {
-    return (bool) apply_filters( 'reeve_allow_unfiltered_widget_html', false, $sidebar );
+    return (bool) apply_filters( 'gmcp_allow_unfiltered_widget_html', false, $sidebar );
   }
 
   /**

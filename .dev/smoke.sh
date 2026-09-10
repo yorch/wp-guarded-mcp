@@ -1,5 +1,5 @@
 #!/bin/bash
-# Smoke test for Reeve. Responses go to files, never through shell
+# Smoke test for Guarded MCP. Responses go to files, never through shell
 # variables: a JSON body full of \/ and \n escapes does not survive echo.
 set -u
 URL='http://localhost:8080/wp-json/mcp/v1/http'
@@ -211,22 +211,22 @@ check "resources are listed" \
   "$(py 'import json,sys;r=json.load(sys.stdin)["result"]["resources"];print(len(r)>0 and all("uri" in x and "name" in x for x in r))' rlist)" "True"
 call rtpl '{"jsonrpc":"2.0","id":36,"method":"resources/templates/list"}'
 check "a post template is offered" \
-  "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["resourceTemplates"];print(any(x["uriTemplate"]=="reeve://post/{id}" for x in t))' rtpl)" "True"
-call rread '{"jsonrpc":"2.0","id":37,"method":"resources/read","params":{"uri":"reeve://post/1"}}'
+  "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["resourceTemplates"];print(any(x["uriTemplate"]=="gmcp://post/{id}" for x in t))' rtpl)" "True"
+call rread '{"jsonrpc":"2.0","id":37,"method":"resources/read","params":{"uri":"gmcp://post/1"}}'
 check "a post reads back with its body" \
   "$(py 'import json,sys;c=json.load(sys.stdin)["result"]["contents"][0];print("title: Hello world!" in c["text"] and "Welcome to WordPress" in c["text"])' rread)" "True"
-call rmiss '{"jsonrpc":"2.0","id":38,"method":"resources/read","params":{"uri":"reeve://post/999999"}}'
+call rmiss '{"jsonrpc":"2.0","id":38,"method":"resources/read","params":{"uri":"gmcp://post/999999"}}'
 check "a missing resource is refused" "$(py 'import json,sys;print("error" in json.load(sys.stdin))' rmiss)" "True"
 # The URI is attacker-influenceable text. Only the shapes this server defines resolve.
 call rfile '{"jsonrpc":"2.0","id":39,"method":"resources/read","params":{"uri":"file:///etc/passwd"}}'
 check "a foreign URI scheme resolves to nothing" "$(py 'import json,sys;print("error" in json.load(sys.stdin))' rfile)" "True"
-call rtrav '{"jsonrpc":"2.0","id":40,"method":"resources/read","params":{"uri":"reeve://post/1/../../etc/passwd"}}'
+call rtrav '{"jsonrpc":"2.0","id":40,"method":"resources/read","params":{"uri":"gmcp://post/1/../../etc/passwd"}}'
 check "a traversal-shaped URI resolves to nothing" "$(py 'import json,sys;print("error" in json.load(sys.stdin))' rtrav)" "True"
 # Being gated by a tool is not the same as returning what the tool returns. This resource
 # read the comments directly and came back with author email addresses and raw untrimmed
 # bodies, both of which wp_get_comments withholds on purpose, for up to fifty unmoderated
 # messages written by strangers.
-call rcmt '{"jsonrpc":"2.0","id":46,"method":"resources/read","params":{"uri":"reeve://comments/pending"}}'
+call rcmt '{"jsonrpc":"2.0","id":46,"method":"resources/read","params":{"uri":"gmcp://comments/pending"}}'
 call tcmt '{"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"wp_get_comments","arguments":{"status":"hold","limit":50}}}'
 check "the comment resource is exactly what its tool returns" \
   "$(python3 -c "

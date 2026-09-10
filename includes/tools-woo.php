@@ -27,15 +27,15 @@ if ( !defined( 'ABSPATH' ) ) {
 * description, because "update the order status" and "send a stranger an email" look
 * like the same action from the call and are not the same action at all.
 */
-class REEVE_Tools_Woo {
+class GMCP_Tools_Woo {
 
   public function __construct() {
     add_action( 'rest_api_init', [ $this, 'rest_api_init' ] );
   }
 
   public function rest_api_init() {
-    add_filter( 'reeve_tools', [ $this, 'register_tools' ] );
-    add_filter( 'reeve_callback', [ $this, 'handle_call' ], 10, 4 );
+    add_filter( 'gmcp_tools', [ $this, 'register_tools' ] );
+    add_filter( 'gmcp_callback', [ $this, 'handle_call' ], 10, 4 );
   }
 
   public function register_tools( $tools ) {

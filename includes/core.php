@@ -11,9 +11,9 @@ if ( !defined( 'ABSPATH' ) ) {
 * Deliberately small. The MCP server, the OAuth module and the tool providers only
 * ever ask this class for get_option(), get_admin_user() and markdown_to_html().
 */
-class REEVE_Core {
+class GMCP_Core {
 
-  const OPTION_NAME = 'reeve_options';
+  const OPTION_NAME = 'gmcp_options';
 
   /**
   * Defaults for every option the plugin reads. Anything absent from the stored row
@@ -47,7 +47,7 @@ class REEVE_Core {
 
   private $options = null;
 
-  /** @var REEVE_Server|null Kept so the settings screen can reach the OAuth module. */
+  /** @var GMCP_Server|null Kept so the settings screen can reach the OAuth module. */
   public $server = null;
 
   public function __construct() {
@@ -67,7 +67,7 @@ class REEVE_Core {
   * The pattern list covers the same shape of secret in other plugins. It is a heuristic
   * and will occasionally block something harmless, which is the right way round: a
   * refused read is a sentence the agent can work around, a leaked API key is not.
-  * Sites that need a specific one can allow it through the reeve_protected_options filter.
+  * Sites that need a specific one can allow it through the gmcp_protected_options filter.
   *
   * This lives here rather than in the tool class because more than one caller has to
   * agree about it. The change journal records previous option values, and a journal
@@ -79,27 +79,27 @@ class REEVE_Core {
   public static function option_guard( string $key ) {
     $exact = [
       self::OPTION_NAME,
-      'reeve_oauth_db_version',
+      'gmcp_oauth_db_version',
     ];
     $patterns = [
       // This plugin's own rows, whatever they are called and however they are wrapped.
       //
       // Matched as a substring, not a prefix, and that is the point rather than a
       // shortcut: the one-time plaintext of a newly minted key lives at
-      // _transient_reeve_new_key_<user>, so a rule anchored to the start of the name
+      // _transient_gmcp_new_key_<user>, so a rule anchored to the start of the name
       // would miss the row it most needs to catch.
       //
       // It replaced a list of exact names, because the list was already wrong twice:
       // the change journal was readable until it was named, and the one-time plaintext of
-      // a new key sits in _transient_reeve_new_key, which no exact entry matched. A rule
+      // a new key sits in _transient_gmcp_new_key, which no exact entry matched. A rule
       // that covers rows added later is the only kind that stays correct, and the cost is
       // that an agent cannot read this plugin's own bookkeeping, which is not its business.
-      'reeve_',
+      'gmcp_',
       'password', 'secret', 'token', 'private_key', 'api_key', 'apikey', 'auth_key', 'salt', 'nonce_key',
     ];
 
-    $exact = apply_filters( 'reeve_protected_options', $exact, $key );
-    $patterns = apply_filters( 'reeve_protected_option_patterns', $patterns, $key );
+    $exact = apply_filters( 'gmcp_protected_options', $exact, $key );
+    $patterns = apply_filters( 'gmcp_protected_option_patterns', $patterns, $key );
 
     $needle = strtolower( $key );
     if ( in_array( $needle, array_map( 'strtolower', (array) $exact ), true ) ) {
@@ -107,57 +107,57 @@ class REEVE_Core {
     }
     foreach ( (array) $patterns as $pattern ) {
       if ( $pattern !== '' && strpos( $needle, strtolower( $pattern ) ) !== false ) {
-        return "The option \"{$key}\" looks like it holds a credential, so it is not readable or writable through the API. A site can allow specific keys with the reeve_protected_option_patterns filter.";
+        return "The option \"{$key}\" looks like it holds a credential, so it is not readable or writable through the API. A site can allow specific keys with the gmcp_protected_option_patterns filter.";
       }
     }
     return true;
   }
 
   public function init() {
-    load_plugin_textdomain( REEVE_DOMAIN, false, basename( REEVE_PATH ) . '/languages' );
+    load_plugin_textdomain( GMCP_DOMAIN, false, basename( GMCP_PATH ) . '/languages' );
 
     // The server registers its own routes on rest_api_init, so it has to exist on
     // every request that might be a REST request. Constructed before the settings
     // screen, which borrows its OAuth instance.
-    $this->server = new REEVE_Server( $this );
+    $this->server = new GMCP_Server( $this );
 
     if ( $this->get_option( 'mcp_activity_log' ) ) {
-      new REEVE_Activity();
+      new GMCP_Activity();
     }
 
     // What changed and how to put it back. Listens to WordPress rather than to the
     // tools, so it has to be constructed on every request a tool call might arrive on.
     if ( $this->get_option( 'mcp_change_journal' ) ) {
-      new REEVE_Journal();
+      new GMCP_Journal();
     }
 
     // Registered on every request, not just in admin: Site Health runs its direct
     // tests from an async admin-ajax call, and the filter has to be in place there.
-    REEVE_SelfTest::register_site_health();
+    GMCP_SelfTest::register_site_health();
 
     // Ready-made workflows the client offers alongside its own commands.
-    new REEVE_Prompts();
+    new GMCP_Prompts();
 
     if ( is_admin() ) {
-      new REEVE_Settings( $this );
+      new GMCP_Settings( $this );
     }
 
     if ( $this->get_option( 'mcp_tools_core' ) ) {
-      new REEVE_Tools_Core( $this );
+      new GMCP_Tools_Core( $this );
     }
 
     if ( $this->get_option( 'mcp_tools_admin' ) ) {
-      new REEVE_Tools_Admin( $this );
+      new GMCP_Tools_Admin( $this );
     }
 
     if ( $this->get_option( 'mcp_tools_rest' ) ) {
-      new REEVE_Tools_Rest();
+      new GMCP_Tools_Rest();
     }
 
     // Only when the shop is actually here. Registering the tools regardless would put
     // a dozen entries in front of a model that fail the moment it tries one.
     if ( $this->get_option( 'mcp_tools_woo' ) && class_exists( 'WooCommerce' ) ) {
-      new REEVE_Tools_Woo();
+      new GMCP_Tools_Woo();
     }
   }
 
