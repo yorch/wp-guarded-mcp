@@ -414,13 +414,31 @@ class GMCP_Audit {
   */
   public static function adopt_activity_option(): void {
     global $wpdb;
+
+    // Both names, because a site upgrading from the plugin's previous name may still
+    // carry the older one and nothing else looks at it any more.
     $old = get_option( 'gmcp_activity', null );
     if ( !is_array( $old ) || !$old ) {
+      $old = get_option( 'reeve_activity', null );
+    }
+
+    // Whatever happens below, these rows are retired. Deleting them only on the import
+    // path left them behind on every reactivation of a site whose table already had
+    // rows, so the option came back each time and nothing ever removed it.
+    $forget = function () {
+      delete_option( 'gmcp_activity' );
+      delete_option( 'reeve_activity' );
+    };
+
+    if ( !is_array( $old ) || !$old ) {
+      $forget();
       return;
     }
     if ( (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . self::table() ) > 0 ) {
+      $forget();
       return;
     }
+
     foreach ( $old as $entry ) {
       if ( empty( $entry['tool'] ) ) {
         continue;
@@ -438,6 +456,6 @@ class GMCP_Audit {
         'hash' => '',
       ] );
     }
-    delete_option( 'gmcp_activity' );
+    $forget();
   }
 }

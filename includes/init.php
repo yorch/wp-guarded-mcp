@@ -76,7 +76,11 @@ register_deactivation_hook( GMCP_ENTRY, function () {
 function gmcp_adopt_previous_data(): void {
   global $wpdb;
 
-  foreach ( [ 'options', 'activity', 'journal', 'tokens', 'oauth_db_version' ] as $name ) {
+  // 'activity' is deliberately absent. That option is retired in favour of the audit
+  // table, and carrying it across here resurrected it on every activation: the audit
+  // adoption below declines to import once the table has rows, so nothing ever cleared
+  // it again. GMCP_Audit::adopt_activity_option() reads the old name directly instead.
+  foreach ( [ 'options', 'journal', 'tokens', 'oauth_db_version' ] as $name ) {
     $old = get_option( 'reeve_' . $name, null );
     if ( $old !== null && get_option( 'gmcp_' . $name, null ) === null ) {
       // autoload false everywhere except the settings row, matching how each is written.
