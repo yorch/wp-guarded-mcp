@@ -60,6 +60,12 @@ class REEVE_Journal {
   public function __construct() {
     add_action( 'reeve_tool_start', [ $this, 'start' ], 10, 1 );
     add_action( 'reeve_tool_called', [ $this, 'stop' ], 99 );
+    // Belt and braces for worker SAPIs. Under mod_php or PHP-FPM a static dies with the
+    // request, so a fatal between start and stop costs nothing. Under FrankenPHP or
+    // RoadRunner the worker survives, and a fatal mid-tool would leave the flag set for
+    // whatever that worker served next, quietly attributing a person's own wp-admin save
+    // to the agent. Tools do die that way; the fatal net exists because of it.
+    add_action( 'shutdown', [ $this, 'stop' ], 0 );
     add_action( 'updated_option', [ $this, 'option_changed' ], 10, 3 );
     add_action( 'added_option', [ $this, 'option_added' ], 10, 2 );
     add_action( 'post_updated', [ $this, 'post_changed' ], 10, 3 );
@@ -230,7 +236,13 @@ class REEVE_Journal {
     }
     // A count on its own is a poor bound once post bodies are in here: forty entries
     // could be forty long articles. Drop the oldest until the row is a sane size.
-    while ( count( $log ) > 1 && strlen( maybe_serialize( $log ) ) > self::MAX_TOTAL ) {
+    //
+    // The size is measured per entry rather than by re-serializing the whole log on every
+    // iteration, which made trimming a full row quadratic in the number of entries.
+    $sizes = array_map( function ( $one ) { return strlen( maybe_serialize( $one ) ); }, $log );
+    $total = array_sum( $sizes );
+    while ( count( $log ) > 1 && $total > self::MAX_TOTAL ) {
+      $total -= array_shift( $sizes );
       array_shift( $log );
     }
     update_option( self::OPTION, $log, false );
@@ -263,6 +275,11 @@ class REEVE_Journal {
     if ( !empty( $entry['undone'] ) ) {
       return 'It has already been reverted.';
     }
+    foreach ( self::gates( $entry ) as $tool ) {
+      if ( !apply_filters( 'reeve_can_call_tool', false, $tool ) ) {
+        return "It needs {$tool}, which this connection cannot call.";
+      }
+    }
     if ( ( $entry['kind'] ?? '' ) === 'option' ) {
       if ( !empty( $entry['redacted'] ) ) {
         return 'The previous value looked like it held a credential, so it was never stored.';
@@ -288,6 +305,41 @@ class REEVE_Journal {
       return 'Every previous value was too large to keep.';
     }
     return 'Unknown change type.';
+  }
+
+  /**
+  * The tools a caller must be able to call before this entry may be reverted.
+  *
+  * Two of them, and both are needed.
+  *
+  * The recorded tool is what was in flight, which is not always what made the write. The
+  * journal listens at the WordPress level, so an option written by some other plugin
+  * hooked on save_post during a wp_update_post call is recorded against wp_update_post.
+  * Gating on that name alone let a write-level caller revert an admin-level option: a key
+  * refused wp_update_option outright set default_role to editor, which with open
+  * registration is a way in.
+  *
+  * So the entry's own kind decides the second gate, named for the operation the revert
+  * will actually perform. The recorded tool is kept as well, because a caller who could
+  * not have caused this change has no business reversing it either.
+  *
+  * @return string[]
+  */
+  private static function gates( array $entry ): array {
+    $byKind = [
+      'option' => 'wp_update_option',
+      'post' => 'wp_update_post',
+    ];
+    $tools = [];
+    $kind = (string) ( $entry['kind'] ?? '' );
+    // An unknown kind yields a tool name nothing registers, so the check refuses. A new
+    // kind added without a gate must fail closed rather than sail past an empty list.
+    $tools[] = $byKind[ $kind ] ?? 'reeve_unknown_change_kind';
+    $recorded = (string) ( $entry['tool'] ?? '' );
+    if ( $recorded !== '' && $recorded !== $tools[0] ) {
+      $tools[] = $recorded;
+    }
+    return $tools;
   }
 
   /**
@@ -324,14 +376,13 @@ class REEVE_Journal {
       // So ask whether this caller could call the tool that made the change. Defaults
       // to false: no server means no answer, and a security check with no answer must
       // refuse.
-      $tool = (string) ( $entry['tool'] ?? '' );
-      if ( !apply_filters( 'reeve_can_call_tool', false, $tool ) ) {
-        return [
-          'ok' => false,
-          'message' => $tool !== ''
-            ? "That change was made by {$tool}, and reverting it is the same write in reverse. This connection cannot call {$tool}, so it cannot undo what {$tool} did."
-            : 'That change has no recorded tool, so there is no way to tell whether you are allowed to reverse it.',
-        ];
+      foreach ( self::gates( $entry ) as $tool ) {
+        if ( !apply_filters( 'reeve_can_call_tool', false, $tool ) ) {
+          return [
+            'ok' => false,
+            'message' => "Reverting this is the same write in reverse, and it needs {$tool}, which this connection cannot call.",
+          ];
+        }
       }
 
       // A revert writes options and posts like anything else, and recording it would

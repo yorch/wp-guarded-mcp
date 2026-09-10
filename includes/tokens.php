@@ -60,7 +60,6 @@ class REEVE_Tokens {
       'created' => time(),
       'expires' => $expires_days > 0 ? time() + ( $expires_days * DAY_IN_SECONDS ) : 0,
       'last_used' => 0,
-      'uses' => 0,
     ];
     update_option( self::OPTION, $rows, false );
 
@@ -109,18 +108,38 @@ class REEVE_Tokens {
     return $row;
   }
 
-  /** Record use, rarely enough that it is not an option write per request. */
+  /**
+  * Record that a key was used, rarely enough that it is not an option write per request.
+  *
+  * There was a use counter here too. It was incremented and then thrown away on every
+  * throttled call, because the early return came after the increment and before the
+  * write, so it only ever counted one use per interval. Nothing displayed it. A counter
+  * that is wrong and unread is worse than no counter, so it is gone.
+  *
+  * The re-read matters. This is a read-modify-write of one option row holding every key,
+  * and writing back a copy fetched before the throttle check would resurrect a key
+  * revoked in between. The object cache has to be dropped first or the second read
+  * returns the same stale array. This narrows the window rather than closing it: two
+  * simultaneous first uses of different keys can still lose one update. Nothing here is
+  * a security boundary, only a "last used" hint, and revocation is checked on the next
+  * request either way.
+  */
   public static function touch( string $id ): void {
     $rows = self::all();
     if ( !isset( $rows[ $id ] ) ) {
       return;
     }
-    $rows[ $id ]['uses'] = (int) ( $rows[ $id ]['uses'] ?? 0 ) + 1;
     if ( time() - (int) ( $rows[ $id ]['last_used'] ?? 0 ) < self::TOUCH_INTERVAL ) {
       return;
     }
-    $rows[ $id ]['last_used'] = time();
-    update_option( self::OPTION, $rows, false );
+
+    wp_cache_delete( self::OPTION, 'options' );
+    $fresh = self::all();
+    if ( !isset( $fresh[ $id ] ) ) {
+      return;
+    }
+    $fresh[ $id ]['last_used'] = time();
+    update_option( self::OPTION, $fresh, false );
   }
 
   /**

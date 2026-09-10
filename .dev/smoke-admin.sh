@@ -562,6 +562,57 @@ call c_keys '{"jsonrpc":"2.0","id":149,"method":"tools/call","params":{"name":"w
 check "nor can the key table" "$(verdict c_keys)" "error"
 docker compose exec -T cli wp option delete acme_gateway_settings >/dev/null 2>&1
 
+# The recorded tool is what was IN FLIGHT, not always what made the write. The journal
+# listens at the WordPress level, so an option written by another plugin hooked on
+# save_post during a wp_update_post call is recorded against wp_update_post. Gating on
+# that name alone let a write-level caller revert an admin-level option: a key refused
+# wp_update_option outright set default_role to editor, which with open registration is a
+# way in. So the entry's kind decides a second gate, named for the operation the revert
+# actually performs.
+# Idempotent on purpose. A probe that flipped the value would be measuring its own
+# flipping rather than the revert, and the check would pass or fail for the wrong reason.
+docker compose exec -T wp sh -c 'mkdir -p /var/www/html/wp-content/mu-plugins && cat > /var/www/html/wp-content/mu-plugins/hookprobe.php <<"PHPEOF"
+<?php
+add_action( "save_post", function ( $id ) {
+  update_option( "default_role", "subscriber" );
+}, 10, 1 );
+PHPEOF' >/dev/null 2>&1
+M_POST=$(docker compose exec -T cli wp post create --post_title='Attribution probe' --post_status=publish --porcelain 2>/dev/null | tr -d '\r\n')
+# Set AFTER creating the post. Creating it fires save_post too, and if the value already
+# matched, the tool call below would change nothing and the journal would record nothing.
+# editor is what the revert would restore, so a successful revert is the escalation.
+docker compose exec -T cli wp option update default_role editor >/dev/null 2>&1
+docker compose exec -T cli wp option delete reeve_journal >/dev/null 2>&1
+call m_touch "{\"jsonrpc\":\"2.0\",\"id\":150,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$M_POST,\"post_title\":\"Touched\"}}}"
+call m_all '{"jsonrpc":"2.0","id":151,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+check "an option written during a post call is attributed to the post tool" \
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(any(x['tool']=='wp_update_post' and 'default_role' in x['what'] for x in e))" m_all)" "True"
+M_OPT=$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next(x['id'] for x in e if 'default_role' in x['what']))" m_all)
+K_MIX=$(docker compose exec -T cli wp eval '$a=REEVE_Tokens::create("Writer","readwrite",0,[]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+kcall m_direct "$K_MIX" '{"jsonrpc":"2.0","id":152,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"default_role","value":"editor"}}}'
+check "a write-level key cannot set default_role directly" "$(verdict m_direct)" "error"
+kcall m_undo "$K_MIX" "{\"jsonrpc\":\"2.0\",\"id\":153,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$M_OPT\"}}}"
+check "nor revert it just because a post tool was in flight" "$(verdict m_undo)" "error"
+check "default_role was not restored to the more privileged value" \
+  "$(docker compose exec -T cli wp option get default_role 2>/dev/null | tr -d '\r\n')" "subscriber"
+# Telling a caller something is reversible and then refusing is its own bug.
+kcall m_list "$K_MIX" '{"jsonrpc":"2.0","id":154,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+check "the listing already says it is not reversible for this caller" \
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(all(not x['reversible'] for x in e if 'default_role' in x['what']))" m_list)" "True"
+# The gate must not cost a caller the reverts it is entitled to.
+kcall m_post "$K_MIX" "{\"jsonrpc\":\"2.0\",\"id\":155,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next(x['id'] for x in e if x['what'].startswith('Post')))" m_all)\"}}}"
+check "a write-level key can still revert a post change" "$(verdict m_post)" "ok"
+docker compose exec -T wp sh -c 'rm -f /var/www/html/wp-content/mu-plugins/hookprobe.php' >/dev/null 2>&1
+docker compose exec -T cli wp post delete "$M_POST" --force >/dev/null 2>&1
+docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
+docker compose exec -T cli wp option update default_role subscriber >/dev/null 2>&1
+
+# touch() is a read-modify-write of the row holding every key. Writing back a copy
+# fetched before the throttle check resurrected a key revoked in between.
+check "a revoked key is not resurrected by a later touch" \
+  "$(docker compose exec -T cli wp eval '$a=REEVE_Tokens::create("Doomed","readonly",0,[]);$r=REEVE_Tokens::all();$r[$a["id"]]["last_used"]=0;update_option("reeve_tokens",$r,false);$stale=REEVE_Tokens::all();REEVE_Tokens::revoke($a["id"]);REEVE_Tokens::touch($a["id"]);echo isset(REEVE_Tokens::all()[$a["id"]])?1:0;' 2>/dev/null | tr -d '\r\n')" "0"
+docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
+
 echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
 # The hard flush is what writes .htaccess, and it only runs if save_mod_rewrite_rules()
 # exists. That lives in wp-admin/includes/misc.php and calls get_home_path() from
