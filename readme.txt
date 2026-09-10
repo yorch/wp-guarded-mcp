@@ -39,7 +39,7 @@ Content and site data: posts and pages, block content, taxonomies and terms, com
 
 Site administration, which is off by default and switched on from the settings screen: installing, activating, updating and deleting plugins and themes; navigation menus and their items; widgets and widget areas; the General, Reading and Discussion settings; the permalink structure; and a Site Health report.
 
-WooCommerce, on a switch of its own that only appears when the shop is installed: products, stock levels, orders, order notes, customers, and sales figures. Separate from site administration because the risk is a different shape. These tools read customer names, email addresses and delivery addresses. Refunds are deliberately not included, and anything that emails a customer says so.
+WooCommerce, on a switch of its own that only appears when the shop is installed: products, stock levels, orders, order notes, customers, and sales figures. Separate from site administration because the risk is a different shape. Anything carrying a customer's name, email address or delivery address needs full administrative access, the same level a list of usernames needs, so a read-only key sees products and sales figures and no personal data at all. Refunds are deliberately not included. Anything that emails a customer reports exactly who was written to, measured as it happens rather than guessed.
 
 One call orients an agent on the whole site: versions, theme, active plugins, post types with counts, the comment queue, the permalink structure and what changed recently. It replaces the half-dozen queries an agent otherwise makes at the start of every conversation.
 

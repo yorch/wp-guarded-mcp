@@ -25,6 +25,8 @@ verdict() { py 'import json,sys;d=json.load(sys.stdin);print("error" if ("error"
 # depends on where in the stack it was decided. Read the text from wherever it landed.
 body() { py 'import json,sys;d=json.load(sys.stdin);print(d["error"]["message"] if "error" in d else d["result"]["content"][0]["text"])' "$1"; }
 wpc() { docker compose exec -T cli wp "$@" 2>/dev/null | tr -d '\r\n'; }
+kcall() { curl -sS -X POST "$URL" -H "Authorization: Bearer $2" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d "$3" -o "$OUT/$1"; }
 
 if [ "$(wpc plugin is-active woocommerce >/dev/null 2>&1 && echo yes || echo no)" != "yes" ]; then
   echo "WooCommerce is not active. Install it first:"
@@ -114,6 +116,56 @@ check "the briefing reports order counts by real status names" \
   "$(py 'import json,sys;print("completed" in json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])["orders"])' s_brief)" "True"
 check "and flags the out-of-stock product" \
   "$(py 'import json,sys;print("Test Widget" in json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])["products"]["out_of_stock"])' s_brief)" "True"
+
+echo "-- who actually gets emailed --"
+# Predicting this from a list of statuses was wrong in both directions, and measuring it
+# on a real shop corrected both the code and the review that flagged it. on-hold and
+# failed do mail the customer; cancelled goes only to the shop; and whether refunded
+# mails depends on the transition, not the target status. Any list would also go stale
+# as shops add statuses and plugins add mail to transitions that had none.
+M_ORD=$(docker compose exec -T cli wp eval '
+  $o = wc_create_order();
+  $p = wc_get_products( [ "limit" => 1 ] );
+  if ( $p ) { $o->add_product( $p[0], 1 ); }
+  $o->set_address( [ "first_name" => "Ada", "email" => "customer@example.test" ], "billing" );
+  $o->calculate_totals(); $o->set_status( "pending" ); $o->save(); echo $o->get_id();' 2>/dev/null | tr -d '\r\n')
+call e_hold "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_order_status\",\"arguments\":{\"id\":$M_ORD,\"status\":\"on-hold\"}}}"
+# The status the old hardcoded list left out entirely, and the one a shop uses for bank
+# transfers, so it is not an exotic path.
+check "moving to on-hold reports the customer was emailed" \
+  "$(body e_hold | grep -c 'emailed the customer at customer@example.test')" "1"
+call e_cancel "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_order_status\",\"arguments\":{\"id\":$M_ORD,\"status\":\"cancelled\"}}}"
+# The old list claimed this one mailed the customer. It mails the shop.
+check "cancelling reports that the customer was not emailed" \
+  "$(body e_cancel | grep -c 'none of them to the customer')" "1"
+check "and does not claim the customer was reached" \
+  "$(body e_cancel | grep -c 'emailed the customer')" "0"
+
+# The flag was documented as emailing the note and was never read: set_status records
+# whatever it is given privately, so a note meant for the customer stayed internal.
+call e_priv "{\"jsonrpc\":\"2.0\",\"id\":32,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_order_status\",\"arguments\":{\"id\":$M_ORD,\"status\":\"processing\",\"note\":\"internal\"}}}"
+check "a note without the flag stays private" \
+  "$(docker compose exec -T cli wp eval "echo count(wc_get_order_notes(['order_id'=>$M_ORD,'type'=>'customer']));" 2>/dev/null | tr -d '\r\n')" "0"
+call e_cust "{\"jsonrpc\":\"2.0\",\"id\":33,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_order_status\",\"arguments\":{\"id\":$M_ORD,\"status\":\"completed\",\"note\":\"On its way\",\"customer_note\":true}}}"
+check "and customer_note really reaches the customer" \
+  "$(docker compose exec -T cli wp eval "echo count(wc_get_order_notes(['order_id'=>$M_ORD,'type'=>'customer']));" 2>/dev/null | tr -d '\r\n')" "1"
+docker compose exec -T cli wp post delete "$M_ORD" --force >/dev/null 2>&1
+
+echo "-- personal data is not cheaper than a username --"
+# wp_get_users is admin and returns no email at all. Orders and customers carry names,
+# email addresses and home addresses, so leaving them at read meant the lowest-privilege
+# key on the system read customers' addresses while being refused a list of usernames.
+K_RO=$(docker compose exec -T cli wp eval '$a=REEVE_Tokens::create("Read only","readonly",0,[]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+kcall pii_list "$K_RO" '{"jsonrpc":"2.0","id":34,"method":"tools/call","params":{"name":"wc_list_orders","arguments":{}}}'
+check "a readonly key cannot list orders" "$(verdict pii_list)" "error"
+kcall pii_cust "$K_RO" '{"jsonrpc":"2.0","id":35,"method":"tools/call","params":{"name":"wc_list_customers","arguments":{}}}'
+check "nor customers" "$(verdict pii_cust)" "error"
+# The shop still has to be usable at read level for everything that carries no PII.
+kcall pii_prod "$K_RO" '{"jsonrpc":"2.0","id":36,"method":"tools/call","params":{"name":"wc_list_products","arguments":{}}}'
+check "but can still read products" "$(verdict pii_prod)" "ok"
+kcall pii_sales "$K_RO" '{"jsonrpc":"2.0","id":37,"method":"tools/call","params":{"name":"wc_sales_summary","arguments":{}}}'
+check "and sales figures, which name nobody" "$(verdict pii_sales)" "ok"
+docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
 
 echo "-- the switch really is a switch --"
 docker compose exec -T cli wp eval '$o=get_option("reeve_options",[]);$o["mcp_tools_woo"]=false;update_option("reeve_options",$o);' >/dev/null 2>&1

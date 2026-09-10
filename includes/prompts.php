@@ -211,10 +211,22 @@ class REEVE_Prompts {
   *
   * @return array|null The messages payload, or null when the name is unknown.
   */
-  public static function render( string $name, array $args ): ?array {
+  public static function render( string $name, array $args, ?callable $permitted = null ): ?array {
     foreach ( self::all() as $prompt ) {
       if ( ( $prompt['name'] ?? '' ) !== $name ) {
         continue;
+      }
+      // Same gate as the listing. Without it the listing filter is decoration: a key
+      // that is not offered a prompt reaches the identical text through the other verb,
+      // by name. The client is not the boundary.
+      if ( $permitted !== null && !self::usable( $prompt, $permitted ) ) {
+        $missing = [];
+        foreach ( (array) ( $prompt['tools'] ?? [] ) as $tool ) {
+          if ( !is_string( $tool ) || !$permitted( $tool ) ) {
+            $missing[] = is_string( $tool ) ? $tool : '(unnamed)';
+          }
+        }
+        return [ '__reeve_unavailable' => $missing ];
       }
       $text = (string) ( $prompt['template'] ?? '' );
 

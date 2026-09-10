@@ -139,7 +139,7 @@ class REEVE_Tools_Woo {
             'page' => [ 'type' => 'integer' ],
           ],
         ],
-        'accessLevel' => 'read',
+        'accessLevel' => 'admin',
       ],
       'wc_get_order' => [
         'name' => 'wc_get_order',
@@ -149,18 +149,18 @@ class REEVE_Tools_Woo {
           'properties' => [ 'id' => [ 'type' => 'integer' ] ],
           'required' => [ 'id' ],
         ],
-        'accessLevel' => 'read',
+        'accessLevel' => 'admin',
       ],
       'wc_update_order_status' => [
         'name' => 'wc_update_order_status',
-        'description' => 'Move an order to another status. This can email the customer: WooCommerce sends its own notification for processing, completed, cancelled and refunded. Setting "refunded" marks the order as refunded and does NOT move any money; use your payment provider for an actual refund.',
+        'description' => 'Move an order to another status. This often emails the customer, and the reply says exactly who WooCommerce wrote to, measured during the change rather than guessed from the status. Setting "refunded" marks the order as refunded and does NOT move any money; use your payment provider for an actual refund.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
             'id' => [ 'type' => 'integer' ],
             'status' => [ 'type' => 'string' ],
             'note' => [ 'type' => 'string', 'description' => 'Recorded against the order. Private unless customer_note is true.' ],
-            'customer_note' => [ 'type' => 'boolean', 'description' => 'Email the note to the customer.' ],
+            'customer_note' => [ 'type' => 'boolean', 'description' => 'Send the note to the customer as well, which emails it to them.' ],
           ],
           'required' => [ 'id', 'status' ],
         ],
@@ -191,7 +191,7 @@ class REEVE_Tools_Woo {
             'page' => [ 'type' => 'integer' ],
           ],
         ],
-        'accessLevel' => 'read',
+        'accessLevel' => 'admin',
       ],
       'wc_sales_summary' => [
         'name' => 'wc_sales_summary',
@@ -636,12 +636,65 @@ class REEVE_Tools_Woo {
 
     $was = $order->get_status();
     $note = isset( $a['note'] ) ? sanitize_textarea_field( (string) $a['note'] ) : '';
-    $order->set_status( $status, $note, true );
-    $order->save();
+    $to_customer = !empty( $a['customer_note'] );
 
-    $sent = in_array( $status, [ 'processing', 'completed', 'cancelled', 'refunded' ], true );
+    // Watch what actually gets sent, rather than predicting it from a list of statuses.
+    //
+    // The list was wrong in both directions, and measuring it on a real shop corrected
+    // both this code and the review that flagged it: on-hold and failed do mail the
+    // customer, cancelled goes only to the shop, and a bare move to refunded sends
+    // nothing at all, because that customer mail fires from woocommerce_order_fully_
+    // refunded, which wc_create_refund() raises and a status change does not.
+    //
+    // Any list would also go stale. Shops add statuses, and plugins add mail to
+    // transitions that had none. Reporting who was written to cannot go stale.
+    $sent = [];
+    $capture = function ( $args ) use ( &$sent ) {
+      foreach ( (array) ( $args['to'] ?? [] ) as $to ) {
+        foreach ( explode( ',', (string) $to ) as $one ) {
+          $one = strtolower( trim( $one ) );
+          if ( $one !== '' ) {
+            $sent[] = $one;
+          }
+        }
+      }
+      return $args;
+    };
+    add_filter( 'wp_mail', $capture, PHP_INT_MAX );
+
+    // A private note goes through set_status. A customer note has to be added
+    // separately, because set_status records whatever it is given privately and the
+    // customer_note flag was documented but never read.
+    $order->set_status( $status, $to_customer ? '' : $note, true );
+    $order->save();
+    if ( $to_customer && $note !== '' ) {
+      $order->add_order_note( $note, 1, false );
+    }
+
+    remove_filter( 'wp_mail', $capture, PHP_INT_MAX );
+
     return $this->text( $r, 'Order #' . $order->get_id() . ' moved from ' . $was . ' to ' . $status . '.'
-      . ( $sent ? ' WooCommerce sends the customer an email for this status, so one has probably gone out.' : '' ) );
+      . ' ' . $this->describe_mail( $sent, $order ) );
+  }
+
+  /**
+  * Who was actually written to during the change.
+  *
+  * "Asked to send" rather than "sent": this sees the call into wp_mail, not the delivery.
+  * That is still the fact worth reporting, because the thing you cannot take back is the
+  * message leaving, and a silent success here would let an agent tell someone nobody was
+  * contacted when a stranger has a message in their inbox.
+  */
+  private function describe_mail( array $sent, $order ): string {
+    if ( !$sent ) {
+      return 'No email was sent.';
+    }
+    $sent = array_values( array_unique( $sent ) );
+    $customer = strtolower( trim( (string) $order->get_billing_email() ) );
+    if ( $customer !== '' && in_array( $customer, $sent, true ) ) {
+      return 'WooCommerce emailed the customer at ' . $customer . ', so this has reached a real person and cannot be taken back.';
+    }
+    return count( $sent ) . ' notification(s) went out, none of them to the customer.';
   }
 
   private function add_order_note( array $a, array $r ): array {

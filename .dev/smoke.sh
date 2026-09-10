@@ -136,6 +136,18 @@ check "a non-scalar prompt name is refused quietly" "$(py 'import json,sys;print
 check "every listed argument is a well-formed object" \
   "$(py 'import json,sys;p=json.load(sys.stdin)["result"]["prompts"];print(all(isinstance(a,dict) and "name" in a for x in p for a in x.get("arguments",[])))' plist)" "True"
 
+# Filtering the listing is decoration if the same key reaches the identical text through
+# the other verb, by name. A readonly key scoped to wp_get_posts was offered two prompts
+# and rendered site_health_brief in full by asking for it.
+call pget_hidden '{"jsonrpc":"2.0","id":48,"method":"prompts/get","params":{"name":"site_health_brief"}}'
+check "an offered prompt renders for an unscoped caller" \
+  "$(py 'import json,sys;print("result" in json.load(sys.stdin))' pget_hidden)" "True"
+call punknown '{"jsonrpc":"2.0","id":49,"method":"prompts/get","params":{"name":"no_such_prompt_at_all"}}'
+# Three outcomes have to stay distinct: renders, withdrawn, never existed. A stale client
+# holding an old listing can then say which tools it needs rather than guessing.
+check "an unknown prompt says so in those words" \
+  "$(py 'import json,sys;print("Unknown prompt" in json.load(sys.stdin)["error"]["message"])' punknown)" "True"
+
 echo "-- resources --"
 # A resource is the one path where a person, not a model, chooses what enters the
 # conversation. It has to actually work, and it has to be no softer than the tools.

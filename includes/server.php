@@ -625,15 +625,34 @@ class REEVE_Server {
           $prompt_name = isset( $params['name'] ) && is_scalar( $params['name'] ) ? (string) $params['name'] : '';
           $rendered = REEVE_Prompts::render(
             $prompt_name,
-            is_array( $params['arguments'] ?? null ) ? $params['arguments'] : []
+            is_array( $params['arguments'] ?? null ) ? $params['arguments'] : [],
+            [ $this, 'resource_permitted' ]
           );
-          $reply = $rendered === null
-            ? [
+          if ( $rendered === null ) {
+            $reply = [
               'jsonrpc' => '2.0',
               'id' => $id,
               'error' => [ 'code' => -32602, 'message' => 'Unknown prompt: ' . $prompt_name ],
-            ]
-            : [ 'jsonrpc' => '2.0', 'id' => $id, 'result' => $rendered ];
+            ];
+          }
+          elseif ( isset( $rendered['__reeve_unavailable'] ) ) {
+            // Deliberately distinct from "unknown", so a client holding a listing from
+            // when those tools were switched on can tell a withdrawn prompt from one
+            // that never existed, and can say which tools it needs.
+            $reply = [
+              'jsonrpc' => '2.0',
+              'id' => $id,
+              'error' => [
+                'code' => -32602,
+                'message' => 'The prompt "' . $prompt_name . '" drives tools this connection cannot reach: '
+                  . implode( ', ', (array) $rendered['__reeve_unavailable'] )
+                  . '. It is not offered in prompts/list for the same reason.',
+              ],
+            ];
+          }
+          else {
+            $reply = [ 'jsonrpc' => '2.0', 'id' => $id, 'result' => $rendered ];
+          }
           break;
 
         // A resource is the one path where a person, not a model, decides what enters

@@ -639,6 +639,22 @@ check "an ordinary settings array is still journalled and revertible" \
   "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next(x['reversible'] for x in e if 'probe_plain' in x['what']))" s_after)" "True"
 docker compose exec -T cli wp option delete probe_obj probe_json probe_smtp probe_deep probe_plain >/dev/null 2>&1
 
+echo "-- a hidden prompt cannot be fetched by name --"
+K_PR=$(docker compose exec -T cli wp eval '$a=REEVE_Tokens::create("Posts only","readonly",0,["wp_get_posts"]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+kcall pr_list "$K_PR" '{"jsonrpc":"2.0","id":170,"method":"prompts/list"}'
+check "the scoped key is offered only prompts it can drive" \
+  "$(py "import json,sys;print(','.join(sorted(x['name'] for x in json.load(sys.stdin)['result']['prompts'])))" pr_list)" \
+  "content_audit,stale_drafts"
+kcall pr_hidden "$K_PR" '{"jsonrpc":"2.0","id":171,"method":"prompts/get","params":{"name":"site_health_brief"}}'
+check "and cannot fetch a hidden one by name" "$(py 'import json,sys;print("error" in json.load(sys.stdin))' pr_hidden)" "True"
+# Distinct from "unknown", so a client holding a stale listing can tell a withdrawn
+# prompt from one that never existed, and can say which tools it needs.
+check "the refusal names the tool it cannot reach" \
+  "$(py 'import json,sys;print("wp_get_site_health" in json.load(sys.stdin)["error"]["message"])' pr_hidden)" "True"
+kcall pr_ok "$K_PR" '{"jsonrpc":"2.0","id":172,"method":"prompts/get","params":{"name":"stale_drafts"}}'
+check "an offered prompt still renders for it" "$(py 'import json,sys;print("result" in json.load(sys.stdin))' pr_ok)" "True"
+docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
+
 echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
 # The hard flush is what writes .htaccess, and it only runs if save_mod_rewrite_rules()
 # exists. That lives in wp-admin/includes/misc.php and calls get_home_path() from
