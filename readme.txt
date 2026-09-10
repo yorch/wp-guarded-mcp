@@ -71,9 +71,9 @@ It makes outbound requests in exactly three situations, all of them WordPress's 
 
 1. Install and activate the plugin.
 2. Open MCP Server in the admin menu.
-3. Copy the snippet for your client from the Connect a client section. It is filled in with this site's real endpoint, and with your token for clients that need one.
-4. Press "Run the setup checks" if anything does not connect. It walks the same steps a client does and tells you which one failed, rather than leaving you to guess.
-5. If you want an agent to manage plugins, themes, menus, widgets or settings, switch on the site administration tools. They are off by default.
+3. On the Connect tab, copy the snippet for your client. It is filled in with this site's real endpoint, and with your token for clients that need one.
+4. Press "Run the setup checks" on that same tab if anything does not connect. It walks the same steps a client does and tells you which one failed, rather than leaving you to guess.
+5. If you want an agent to manage plugins, themes, menus, widgets or settings, switch on the site administration tools on the Tools tab. They are off by default.
 
 == Frequently Asked Questions ==
 
@@ -123,9 +123,9 @@ It has not been tested on multisite. The code has network-aware branches, but un
 
 == Screenshots ==
 
-1. The settings screen: the endpoint to give your agent, ready-made snippets for Claude Desktop and Claude Code, the connection check, and the bearer token with its access level.
+1. The Connect tab: the endpoint to give your agent, ready-made snippets for Claude Desktop and Claude Code, and the connection check.
 2. The consent screen an administrator sees when an OAuth client asks to connect.
-3. Named keys, each with its own access level, expiry and tool list, above the activity history showing what agents did and what was refused.
+3. The Access tab, with the bearer token and named keys, and the Logs tab's audit log showing what agents did and what was refused.
 
 == Changelog ==
 

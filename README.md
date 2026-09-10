@@ -168,14 +168,21 @@ Optionally the plugin can also generate tools from the site's own REST API route
 
 ## The settings screen
 
-Everything is on one page, at **MCP Server** in the admin menu. It is top level rather
-than buried under Settings, because it is the first thing anyone needs after activating,
-and there is a Settings link on the plugin's row too.
+At **MCP Server** in the admin menu, in four tabs. It is top level rather than buried
+under Settings, because it is the first thing anyone needs after activating, and there is
+a Settings link on the plugin's row too.
 
-**Connect a client** gives you the exact thing to paste, filled in with this site's real
-endpoint and token: the address on its own for OAuth clients such as Claude Desktop, a
-ready `claude mcp add` command for Claude Code, and a JSON block for anything else. It
-also shows the `?rest_route=` form for sites where pretty permalinks are off or broken.
+The tabs are query arguments and each one is an ordinary link, so the screen works with
+JavaScript switched off and a tab can be bookmarked or sent to somebody else. Every form
+returns to the tab it was submitted from.
+
+### Connect
+
+The endpoint, and the exact thing to paste for each kind of client, filled in with this
+site's real address and token: the address on its own for OAuth clients such as Claude
+Desktop, a ready `claude mcp add` command for Claude Code, and a JSON block for anything
+else. It also shows the `?rest_route=` form for sites where pretty permalinks are off or
+broken.
 
 **Is this site ready** walks the same steps a client does when it configures itself and
 shows which one fails: HTTPS, whether the discovery documents are served at both the site
@@ -184,13 +191,31 @@ clients can register, and whether the bearer token path works. It distinguishes 
 failed" from "this could not be checked", because a host blocking loopback requests is
 common and is not a fault.
 
+### Access
+
+Who may connect, and how far each of them reaches: the shared bearer token with its
+access level and the controls that generate or clear it, then named keys, then the OAuth
+apps that have connected.
+
 **Keys** lists the named keys. Each row shows the label, its access level, the tools it is
 limited to, when it expires and when it was last used, with a control to revoke it. A new
 key's secret appears once, on creation, and is not recoverable afterwards.
 
-**Recent activity** is the audit log. Every tool call, refusals included, with the
-arguments it was given, what it changed, what made it, what it was aimed at, how long it
-took and why it was turned down. Without it an agent works with no visible record at all: you can see
+### Tools
+
+Which groups of tools an agent is offered, and nothing else. A group that is off is not
+merely hidden: its tools are refused if asked for by name.
+
+### Logs
+
+What the plugin records, and then the record. The audit log's switch and its retention
+window sit directly above the log they fill, which is the arrangement the old single page
+did not have: the two were four hundred lines apart, under a heading about tools. The
+change journal and debug logging are here too, because all three answer the same question.
+
+The audit log itself: every tool call, refusals included, with the arguments it was
+given, what it changed, what made it, what it was aimed at, how long it took and why it
+was turned down. Without it an agent works with no visible record at all: you can see
 that a plugin is gone, but not that your agent removed it, when, or that it tried three
 times first. Refusals are the interesting entries, which is why they are kept.
 
