@@ -369,19 +369,33 @@ class REEVE_Server {
   /**
   * Tools that may not be reached with a secret sitting in the request path.
   *
-  * A rule first, then a list. Every admin-level tool is blocked, because admin level is
-  * already this plugin's own answer to "what would you not want done on a misread
-  * instruction", and a token in the URL is a token in every proxy log, access log and
-  * browser history in front of the site.
+  * A rule plus a short list of exceptions, and both parts are needed.
   *
-  * It used to be a list of eleven names covering plugins, themes, settings and
-  * permalinks, and the list was wrong: menus and widgets were never on it. Both are
-  * admin level, and a widget is arbitrary markup on every page of the site, which is a
-  * larger blast radius than most of what the list did cover. The documentation had
-  * claimed for some time that none of the administration tools were reachable this way.
+  * The rule is that every admin-level tool is blocked, because admin level is already
+  * this plugin's own answer to "what would you not want done on a misread instruction",
+  * and a token in the URL is a token in every proxy log, access log and browser history
+  * in front of the site. It replaced a list of eleven names that was wrong by omission:
+  * menus and widgets were never on it, and a widget is arbitrary markup on every page.
   *
-  * Read-level tools stay reachable, so the route remains useful on a host that strips
-  * the Authorization header. It cannot change anything an administrator would care about.
+  * The exceptions exist because a declared access level describes what a tool changes,
+  * and two tools reach further than their level says:
+  *
+  * wp_get_site_health is read level, and it runs WordPress's own direct tests. Those
+  * include a loopback request to this site's REST API and a call to wordpress.org, so a
+  * read-level tool makes outbound requests, and the report it returns is a full account
+  * of versions, paths and configuration.
+  *
+  * wp_upload_request is write level, and it does not write anything. It mints a URL on a
+  * route whose permission callback returns true unconditionally, so the caller walks away
+  * holding an unauthenticated upload endpoint, and the file write then happens somewhere
+  * neither the role filter nor a key's tool list can see. Single use and MIME-checked, but
+  * a capability handed out over a logged secret is the shape this whole route is about.
+  *
+  * The filter adds to and removes from the exception list. It cannot unblock an
+  * admin-level tool: that decision is the rule, and a site whose host strips the
+  * Authorization header should fix the header rather than widen this. That is a
+  * deliberate change from the previous behaviour, where the filter received the whole
+  * blocked set and could empty it.
   */
   private function tool_requires_header_auth( string $tool ): bool {
     if ( empty( $this->tool_access_levels ) ) {
@@ -392,8 +406,12 @@ class REEVE_Server {
     // remembers to think about this.
     $level = $this->tool_access_levels[ $tool ] ?? 'admin';
 
-    $blocked = apply_filters( 'reeve_header_auth_only_tools', [], $level );
-    if ( in_array( $tool, (array) $blocked, true ) ) {
+    $exceptions = apply_filters( 'reeve_header_auth_only_tools', [
+      'wp_get_site_health',
+      'wp_upload_request',
+    ], $level );
+
+    if ( in_array( $tool, (array) $exceptions, true ) ) {
       return true;
     }
     return $level === 'admin';

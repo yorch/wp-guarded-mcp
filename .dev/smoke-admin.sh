@@ -694,7 +694,9 @@ for tool_call in \
   'wp_add_widget:{"sidebar":"sidebar-1","id_base":"text","settings":{"title":"x","text":"y"}}' \
   'wp_delete_plugin:{"plugin":"akismet/akismet.php"}' \
   'wp_update_option:{"key":"blogname","value":"pwned"}' \
-  'wp_get_users:{}' ; do
+  'wp_get_users:{}' \
+  'wp_get_site_health:{}' \
+  'wp_upload_request:{"filename":"x.png"}' ; do
   tool="${tool_call%%:*}"; args="${tool_call#*:}"
   call_url_token ut_one "{\"jsonrpc\":\"2.0\",\"id\":190,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}"
   check "$tool is refused over the URL-token route" "$(verdict ut_one)" "error"
@@ -710,6 +712,12 @@ call_url_token ut_read '{"jsonrpc":"2.0","id":191,"method":"tools/call","params"
 check "read-level tools still work there" "$(verdict ut_read)" "ok"
 call_url_token ut_ping '{"jsonrpc":"2.0","id":192,"method":"tools/call","params":{"name":"mcp_ping","arguments":{}}}'
 check "and so does the health check" "$(verdict ut_ping)" "ok"
+call_url_token ut_brief '{"jsonrpc":"2.0","id":193,"method":"tools/call","params":{"name":"wp_site_briefing","arguments":{}}}'
+check "and orientation, which changes nothing" "$(verdict ut_brief)" "ok"
+# wp_upload_request is write level and writes nothing: it mints a URL on a route whose
+# permission callback returns true unconditionally, so the caller walks away holding an
+# unauthenticated upload endpoint. A level rule cannot see that, hence the exception list.
+check "no upload URL was handed out" "$(grep -c upload_url "$OUT/ut_one" || true)" "0"
 
 echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
 # The hard flush is what writes .htaccess, and it only runs if save_mod_rewrite_rules()

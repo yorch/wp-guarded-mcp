@@ -93,6 +93,10 @@ The usual cause is that your server is not passing the Authorization header thro
 
 Yes. Nothing in the plugin is specific to one vendor. Any client that speaks the Model Context Protocol can connect.
 
+= What is the URL-token endpoint, and why can't it do everything? =
+
+If your server strips the Authorization header before PHP sees it, Reeve also answers on a URL that contains the token. That puts the secret in the request path, where proxies, access logs and browser history all keep it, so that route is deliberately limited to reading. It cannot install anything, change settings or users, touch menus or widgets, run the Site Health report, or hand out an upload link. Prefer the header, and press "Run the setup checks" if it is not arriving.
+
 = Can I limit what an agent is allowed to do? =
 
 Yes, three ways. The bearer token carries one of three access levels. The administration and WooCommerce tools are separate switches, both off by default. And a named key can be limited to a specific list of tools and given an expiry date. Developers can go further with filters: `reeve_tools` to change the catalog, `reeve_allow` to override the auth decision, and `reeve_header_auth_only_tools` to restrict what the URL-token endpoint can reach.

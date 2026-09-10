@@ -87,7 +87,7 @@ reading it back.
 - Changing the administration email takes a confirmation step and is rate limited, because it mails an arbitrary address from your domain with body text drawn from the site title.
 - Menu items refuse draft, private and password-protected targets, since a menu item stores its own copy of the title and WordPress renders it regardless of the target's status.
 - Settings are an allowlist, not a blocklist. `siteurl` and `home` are refused outright, since a wrong value makes the site and this endpoint unreachable with no way back. A default role that can edit content is refused, because open registration plus an editing default role is a way in.
-- None of them can change anything over the URL-token endpoint, since that endpoint puts the secret somewhere servers log it. Every `admin`-level tool is refused there, which is a rule rather than a list: the list this replaced named plugins, themes, settings and permalinks, and had never included menus or widgets, so a widget, which is arbitrary markup on every page, could be planted with a token out of an access log. Read-level tools still work, so the route remains useful on a host that strips the `Authorization` header.
+- None of them are reachable over the URL-token endpoint, since that endpoint puts the secret somewhere servers log it. Every `admin`-level tool is refused there, plus two whose declared level understates their reach: `wp_get_site_health`, which makes a loopback request and a wordpress.org call and returns a full account of your configuration, and `wp_upload_request`, which writes nothing itself but hands out an upload URL on a route that authenticates nobody. Read-level tools still work, so the route remains a usable fallback.
 
 None of this plugin's own rows are readable or writable through the option tools, so the bearer token cannot be read back out or overwritten through the API. Any option name containing `reeve_` is refused, anywhere in the name rather than only at the start, which is deliberate: the one-time plaintext of a newly minted key lives at `_transient_reeve_new_key_<user>`, and a rule anchored to the start of the name would miss the row it most needs to catch. It replaced a list of exact names, which had been wrong twice: the change journal was readable until somebody named it, and that transient was never on it.
 
@@ -192,7 +192,7 @@ Other hooks:
 | `reeve_protected_option_patterns` | Substrings that mark an option as credential-shaped |
 | `reeve_credential_field_patterns` | Field names inside a value that stop it being recorded in the change journal |
 | `reeve_can_call_tool` | Answers whether the caller could call a given tool. The change journal asks it before replaying a write, so this is the gate on undo |
-| `reeve_header_auth_only_tools` | Tools the URL-token endpoint may not reach |
+| `reeve_header_auth_only_tools` | Tools the URL-token endpoint may not reach, on top of every `admin`-level tool. Adds to and removes from the exception list; it cannot unblock an admin-level tool |
 | `reeve_allow_remote_install` | Permit installs from a URL rather than the wordpress.org repository |
 | `reeve_allow_unfiltered_post_html` | Store post HTML unfiltered |
 | `reeve_allow_unfiltered_widget_html` | Store widget HTML unfiltered |
@@ -204,6 +204,7 @@ Other hooks:
 - No row belonging to this plugin, and no option whose name looks like a credential, can be read or written through the option tools. The change journal additionally inspects the value it is about to record, so a settings array holding a `secret_key` or a `pass` field is not stored. That check reads field names, not content, so it will not catch a secret held as a bare string under an innocuous option name.
 - Tools do not execute arbitrary PHP or SQL. Every tool is a fixed WordPress operation with a schema.
 - An open stream holds one PHP worker for up to 180 seconds. Size your pool accordingly if several agents connect at once.
+- The URL-token endpoint can no longer perform any administrative operation. If your host strips the `Authorization` header and you were relying on that route for installs, settings or user changes, those now fail. The fix is the header, not the route: re-saving your permalink structure regenerates the `.htaccess` rule that forwards it, and the connection check on the settings screen tells you whether it worked. Earlier versions let `reeve_header_auth_only_tools` empty the blocked set entirely; it can no longer do that.
 
 ## Development
 
