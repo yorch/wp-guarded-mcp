@@ -224,3 +224,8 @@ Never run `wp plugin install --force` against that stack. Its plugin directory i
 mount of this repository, and WordPress deletes the old plugin directory before unpacking
 the new one. The delete goes straight through the mount and takes the source tree, `.git`
 included.
+
+## Licence
+
+GPLv2 or later. Parts of this plugin derive from prior GPL work; see `CREDITS.md` for the
+attribution and the statement of changes that licence requires.

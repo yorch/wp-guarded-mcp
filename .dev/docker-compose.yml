@@ -15,6 +15,10 @@ services:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 5s
       retries: 20
+  # The plugin directory must be named reeve. The plugin derives its own identity from
+  # the folder through plugin_basename(), and the guard that stops an agent deactivating
+  # or deleting itself mid-call compares against that, so under any other name the guard
+  # silently stops matching.
   wp:
     image: wordpress:php8.2-apache
     depends_on:
@@ -28,7 +32,7 @@ services:
       WORDPRESS_DEBUG: 1
     volumes:
       - wpdata:/var/www/html
-      - /Users/yorch/code-personal/ai-engine:/var/www/html/wp-content/plugins/wp-mcp-server
+      - ..:/var/www/html/wp-content/plugins/reeve
   cli:
     image: wordpress:cli-php8.2
     user: "33:33"
@@ -40,7 +44,7 @@ services:
       WORDPRESS_DB_NAME: wp
     volumes:
       - wpdata:/var/www/html
-      - /Users/yorch/code-personal/ai-engine:/var/www/html/wp-content/plugins/wp-mcp-server
+      - ..:/var/www/html/wp-content/plugins/reeve
     entrypoint: ["sleep", "infinity"]
 volumes:
   wpdata:

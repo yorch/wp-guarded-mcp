@@ -35,11 +35,17 @@ The MCP layer referenced only three methods from all of that (`get_option`,
 rewrite.
 
 **Dropped tools.** Two tools called the removed AI stack through a global and cannot work
-without it. The catalog went from 43 tools to 41.
+without it.
+
+**Added.** Work that is not derived from upstream at all: MCP prompts and resources, a
+one-call site briefing, a change journal with a gated undo, named keys with their own
+access level, expiry and tool list, preview mode on the tools whose effect is not visible
+from the call, and a WooCommerce group on its own switch. The catalog is 43 content tools,
+26 more with site administration switched on, and 12 more again with WooCommerce.
 
 **Renamed.** All classes, hooks, options, transients, database tables and CSS classes now
-use the `BRNBY_` / `brnby_` prefix. Options live in a `brnby_options` row; the OAuth
-tables are `{prefix}brnby_oauth_clients` and `{prefix}brnby_oauth_tokens`.
+use the `REEVE_` / `reeve_` prefix. Options live in a `reeve_options` row; the OAuth
+tables are `{prefix}reeve_oauth_clients` and `{prefix}reeve_oauth_tokens`.
 
 The REST namespace is deliberately unchanged at `mcp/v1`, so a client already pointed at
 `/wp-json/mcp/v1/http` keeps working. OAuth grants do not carry over, because the tables
@@ -50,7 +56,8 @@ were renamed: connected apps need to be approved once more.
 calls are gated. The settings screen is plain PHP instead of a minified JavaScript bundle.
 `get_admin_user()` resolves the lowest-ID administrator rather than assuming user 1.
 
-**Fixed.** Three bugs, each found by the smoke test in `.dev/`:
+**Fixed.** Bugs found by the smoke suites in `.dev/`, the first three inherited from
+upstream and the rest introduced here:
 
 - The media upload handler set the current user to a hardcoded user 1, which is often not
   an administrator and sometimes does not exist. It now resolves a real one and fails with

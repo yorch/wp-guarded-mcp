@@ -27,7 +27,7 @@ zip, which is the convention the common GitHub-to-SVN deploy actions expect.
 | `banner-772x250.png`, `banner-1544x500.png` | Standard and retina banners. Must be PNG or JPG; SVG is not accepted here. |
 | `screenshot-1.png` | The settings screen. |
 | `screenshot-2.png` | The OAuth consent screen an administrator sees. |
-| `screenshot-3.png` | Connected apps, with the account each acts as and a revoke control. |
+| `screenshot-3.png` | Named keys, with the access level, tool list and expiry of each, above the activity history. |
 
 Screenshot filenames must be lowercase and must match the numbered list in the
 `== Screenshots ==` section of `readme.txt`, in order.
@@ -52,6 +52,11 @@ CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 "$CHROME" --headless --disable-gpu --force-device-scale-factor=2 \
   --screenshot="$PWD/banner-1544x500.png" --window-size=772,250 "file://$PWD/banner.svg"
 ```
+
+Note the retina line uses the same 772x250 window with a 2x scale factor rather than a
+1544x500 window. The SVG carries its own dimensions, so a larger window renders it at its
+natural size and leaves the rest of the canvas white, which is a silently wrong render of
+exactly the kind this section warns about.
 
 Always open the result and look at it. A silently wrong render is the normal failure
 mode here, not an error message.
