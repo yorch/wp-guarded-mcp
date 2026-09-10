@@ -2,7 +2,13 @@
 # Smoke test for Guarded MCP. Responses go to files, never through shell
 # variables: a JSON body full of \/ and \n escapes does not survive echo.
 set -u
-URL='http://localhost:8080/wp-json/mcp/v1/http'
+# The site under test. Override to run against a second stack, which a parallel worktree
+# needs: this suite is destructive, and two runs sharing a database produce failures that
+# look like real regressions in both.
+#
+#   GMCP_URL=http://localhost:8081 ./smoke.sh
+BASE="${GMCP_URL:-http://localhost:8080}"
+URL="$BASE/wp-json/mcp/v1/http"
 TOK='testtoken1234567890'
 OUT=$(mktemp -d)
 pass=0; fail=0
@@ -245,13 +251,13 @@ check "tools, prompts and resources are all declared" \
 check "reject bad token" "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'Authorization: Bearer nope' -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":8,"method":"tools/list"}')" "401"
 check "reject absent token" "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":9,"method":"tools/list"}')" "401"
 
-curl -sS 'http://localhost:8080/wp-json/mcp/v1/.well-known/oauth-protected-resource' -o "$OUT/prm"
+curl -sS "$BASE/wp-json/mcp/v1/.well-known/oauth-protected-resource" -o "$OUT/prm"
 check "OAuth resource metadata" "$(py 'import json,sys;print("ok" if "authorization_servers" in json.load(sys.stdin) else "err")' prm)" "ok"
 # Regression guard: every URL the discovery document advertises must point at this
 # site. A stray absolute URL here would send clients somewhere we do not control.
 check "discovery URLs stay on this host" "$(python3 "$(dirname "$0")/check_urls.py" < "$OUT/prm")" "True"
 
-curl -sS 'http://localhost:8080/.well-known/oauth-authorization-server' -o "$OUT/asm"
+curl -sS "$BASE/.well-known/oauth-authorization-server" -o "$OUT/asm"
 check "OAuth server metadata at host root" "$(py 'import json,sys;print("ok" if "token_endpoint" in json.load(sys.stdin) else "err")' asm)" "ok"
 check "PKCE S256 advertised" "$(py 'import json,sys;print("S256" in json.load(sys.stdin).get("code_challenge_methods_supported",[]))' asm)" "True"
 

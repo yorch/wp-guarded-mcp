@@ -8,8 +8,14 @@
 # Responses go to files, never through shell variables: a JSON body full of \/ and \n
 # escapes does not survive echo.
 set -u
-URL='http://localhost:8080/wp-json/mcp/v1/http'
-URL_TOKEN='http://localhost:8080/wp-json/mcp/v1/testtoken1234567890'
+# The site under test. Override to run against a second stack, which a parallel worktree
+# needs: this suite is destructive, and two runs sharing a database produce failures that
+# look like real regressions in both.
+#
+#   GMCP_URL=http://localhost:8081 ./smoke-admin.sh
+BASE="${GMCP_URL:-http://localhost:8080}"
+URL="$BASE/wp-json/mcp/v1/http"
+URL_TOKEN="$BASE/wp-json/mcp/v1/testtoken1234567890"
 TOK='testtoken1234567890'
 OUT=$(mktemp -d)
 pass=0; fail=0
@@ -25,7 +31,7 @@ call() { # call <file> <json>
 # The API also answers on ?rest_route=, which is the only way in while .htaccess is
 # missing and pretty permalinks are broken. The recovery tests below depend on it.
 call_plain() { # call <file> <json>, without pretty permalinks
-  curl -sS -X POST 'http://localhost:8080/index.php?rest_route=/mcp/v1/http' \
+  curl -sS -X POST "$BASE/index.php?rest_route=/mcp/v1/http" \
     -H "Authorization: Bearer $TOK" \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
@@ -173,7 +179,7 @@ check "allowed settings written" \
 # siteurl and home would make the site and this endpoint unreachable with no undo.
 call s_url '{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"siteurl":"http://evil.invalid"}}}}'
 check "siteurl unchanged" \
-  "$(docker compose exec -T cli wp option get siteurl 2>/dev/null | tr -d '\r\n')" "http://localhost:8080"
+  "$(docker compose exec -T cli wp option get siteurl 2>/dev/null | tr -d '\r\n')" "$BASE"
 # Writing admin_email directly would silently repoint password recovery.
 call s_mail '{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"admin_email":"attacker@evil.invalid"}}}}'
 check "admin_email unchanged" \
@@ -220,7 +226,7 @@ check "non-unique structure refused" "$(verdict p_bad)" "error"
 call p_ok '{"jsonrpc":"2.0","id":38,"method":"tools/call","params":{"name":"wp_set_permalink_structure","arguments":{"structure":"/%postname%/"}}}'
 check "valid structure accepted" "$(verdict p_ok)" "ok"
 check "site still serving after the flush" \
-  "$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:8080/)" "200"
+  "$(curl -sS -o /dev/null -w '%{http_code}' $BASE/)" "200"
 
 echo "-- site health --"
 call h '{"jsonrpc":"2.0","id":39,"method":"tools/call","params":{"name":"wp_get_site_health","arguments":{}}}'
@@ -240,7 +246,7 @@ call m_new '{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"wp_
 check "menu created" "$(verdict m_new)" "ok"
 call m_dupe '{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"wp_create_menu","arguments":{"name":"Smoke Menu"}}}'
 check "duplicate menu name refused" "$(verdict m_dupe)" "error"
-call m_item '{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"wp_add_menu_item","arguments":{"menu":"Smoke Menu","title":"Home","type":"custom","url":"http://localhost:8080/"}}}'
+call m_item '{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"wp_add_menu_item","arguments":{"menu":"Smoke Menu","title":"Home","type":"custom","url":"$BASE/"}}}'
 check "custom item added" "$(verdict m_item)" "ok"
 call m_bad '{"jsonrpc":"2.0","id":53,"method":"tools/call","params":{"name":"wp_add_menu_item","arguments":{"menu":"Smoke Menu","type":"post_type","object_id":999999}}}'
 check "item for a missing post refused" "$(verdict m_bad)" "error"
@@ -287,7 +293,7 @@ check "unknown widget area refused" "$(verdict w_bad)" "error"
 check "_multiwidget preserved" \
   "$(docker compose exec -T cli wp eval 'echo (int) (get_option("widget_block")["_multiwidget"] ?? 0);' 2>/dev/null | tr -d '\r\n')" "1"
 check "widgets actually render on the page" \
-  "$(curl -sS http://localhost:8080/ | grep -c 'smoke-block-widget')" "1"
+  "$(curl -sS $BASE/ | grep -c 'smoke-block-widget')" "1"
 # Stored XSS. Both paths matter and they fail differently.
 # Block widgets: WP_Widget_Block::widget() echoes the content through
 # widget_block_content, whose core filters do not escape.
@@ -297,7 +303,7 @@ check "widgets actually render on the page" \
 # dropped for the write.
 call w_xss1 '{"jsonrpc":"2.0","id":65,"method":"tools/call","params":{"name":"wp_add_widget","arguments":{"sidebar":"sidebar-1","content":"<!-- wp:html --><script>alert(\"xssA\")</script><p>legitA</p><!-- /wp:html -->"}}}'
 call w_xss2 '{"jsonrpc":"2.0","id":66,"method":"tools/call","params":{"name":"wp_add_widget","arguments":{"sidebar":"sidebar-1","id_base":"text","settings":{"title":"T","text":"<script>alert(\"xssB\")</script>legitB"}}}}'
-curl -sS http://localhost:8080/ -o "$OUT/page.html"
+curl -sS $BASE/ -o "$OUT/page.html"
 check "block widget script is not executable" \
   "$(python3 "$(dirname "$0")/check_xss.py" xssA < "$OUT/page.html")" "safe"
 check "classic widget script is not executable" \
@@ -323,7 +329,7 @@ echo "-- post content sanitising --"
 # tag written through wp_create_post executed on the public page. These tools sit at the
 # "write" level, so even a deliberately limited token could do it.
 call xa '{"jsonrpc":"2.0","id":90,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Probe A","post_content":"<p>legit-a</p><script>alert(\"xss-a\")</script>","post_status":"publish","post_name":"probe-a"}}}'
-curl -sS "http://localhost:8080/probe-a/" -o "$OUT/pa.html"
+curl -sS "$BASE/probe-a/" -o "$OUT/pa.html"
 check "script in post content is not executable" \
   "$(python3 "$(dirname "$0")/check_xss.py" xss-a < "$OUT/pa.html")" "safe"
 check "legitimate body survives" "$(grep -c 'legit-a' "$OUT/pa.html")" "1"
@@ -331,7 +337,7 @@ check "legitimate body survives" "$(grep -c 'legit-a' "$OUT/pa.html")" "1"
 # Content with no recognised HTML took the markdown branch, and Parsedown runs without
 # safe mode, so a bare script tag bypassed sanitising entirely.
 call xb '{"jsonrpc":"2.0","id":91,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Probe B","post_content":"<script>alert(\"xss-b\")</script>","post_status":"publish","post_name":"probe-b"}}}'
-curl -sS "http://localhost:8080/probe-b/" -o "$OUT/pb.html"
+curl -sS "$BASE/probe-b/" -o "$OUT/pb.html"
 check "the markdown path is sanitised too" \
   "$(python3 "$(dirname "$0")/check_xss.py" xss-b < "$OUT/pb.html")" "safe"
 
@@ -339,7 +345,7 @@ check "the markdown path is sanitised too" \
 # delimiter comment containing HTML entities and escapes the opener, destroying the
 # block. Attributes must round-trip as JSON instead.
 call xc '{"jsonrpc":"2.0","id":92,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Probe C","post_content":"<!-- wp:paragraph --><p>legit-c</p><script>alert(\"xss-c\")</script><!-- /wp:paragraph -->","post_status":"publish","post_name":"probe-c"}}}'
-curl -sS "http://localhost:8080/probe-c/" -o "$OUT/pc.html"
+curl -sS "$BASE/probe-c/" -o "$OUT/pc.html"
 check "script inside a block is stripped" \
   "$(python3 "$(dirname "$0")/check_xss.py" xss-c < "$OUT/pc.html")" "safe"
 call xd '{"jsonrpc":"2.0","id":93,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Probe D","post_content":"<!-- wp:faq {\"q\":\"&lt;p&gt;hi&lt;/p&gt;\"} --><div>legit-d</div><!-- /wp:faq -->","post_status":"publish","post_name":"probe-d"}}}'
@@ -839,13 +845,13 @@ echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
 # so a front-page check did not catch it.
 docker compose exec -T wp rm -f /var/www/html/.htaccess
 check "inner URLs break without .htaccess" \
-  "$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:8080/hello-world/)" "404"
+  "$(curl -sS -o /dev/null -w '%{http_code}' $BASE/hello-world/)" "404"
 call_plain p_flush '{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"wp_set_permalink_structure","arguments":{"structure":"/%postname%/"}}}'
 check "the API is still reachable on ?rest_route=" "$(verdict p_flush)" "ok"
 check "hard flush writes .htaccess" \
   "$(docker compose exec -T wp sh -c 'test -f /var/www/html/.htaccess && echo yes || echo no' | tr -d '\r\n')" "yes"
 check "inner URLs resolve again" \
-  "$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:8080/hello-world/)" "200"
+  "$(curl -sS -o /dev/null -w '%{http_code}' $BASE/hello-world/)" "200"
 
 # Apache receives the Authorization header but does not place it in $_SERVER unless a
 # rewrite rule copies it there, and WordPress only reads $_SERVER. A site whose

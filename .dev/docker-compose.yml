@@ -1,6 +1,13 @@
 # Named so the stack is the same one whichever directory you run compose from.
 # Without this the project name comes from the directory, and `docker compose exec`
 # quietly reports "service not running" against a stack that is running fine.
+#
+# COMPOSE_PROJECT_NAME overrides this, and GMCP_PORT moves the site, so a second worktree
+# can bring up its own stack rather than fighting this one over the same database. The
+# admin suite is destructive, so two runs sharing a stack do not merely fail, they fail
+# in ways that look like real regressions in both.
+#
+#   COMPOSE_PROJECT_NAME=wptest2 GMCP_PORT=8081 docker compose up -d
 name: wptest
 
 services:
@@ -28,7 +35,7 @@ services:
     image: wordpress:php8.2-apache
     depends_on:
       db: { condition: service_healthy }
-    ports: ["8080:80"]
+    ports: ["${GMCP_PORT:-8080}:80"]
     environment:
       WORDPRESS_DB_HOST: db
       WORDPRESS_DB_USER: wp

@@ -56,6 +56,25 @@ discovery failed and the client will not say which step. `./diagnose-connector.s
 https://example.com` walks the same steps in order and stops at the first break. It is
 read-only and sends no credentials.
 
+## A second stack, for parallel work
+
+The suites are destructive: `smoke-admin.sh` deletes `.htaccess`, resets options and
+rebuilds rewrite rules. Two worktrees running them against one site do not merely fail,
+they fail in ways that look like real regressions in both. Give each its own:
+
+```
+COMPOSE_PROJECT_NAME=wptest2 GMCP_PORT=8081 docker compose up -d
+COMPOSE_PROJECT_NAME=wptest2 docker compose exec -T cli wp core install \
+  --url=http://localhost:8081 --title="MCP Test" \
+  --admin_user=admin --admin_password=admin --admin_email=a@b.test --skip-email
+
+GMCP_URL=http://localhost:8081 ./smoke.sh
+```
+
+Every `docker compose` command in that stack needs the same `COMPOSE_PROJECT_NAME`, and
+every suite run needs the matching `GMCP_URL`. Forgetting either points you back at the
+first stack, which is the failure mode this exists to avoid.
+
 ## Building an installable zip
 
 ```

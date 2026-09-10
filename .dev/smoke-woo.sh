@@ -10,7 +10,13 @@
 # Every check corresponds to something that was wrong or could quietly go wrong, and
 # each asserts the stored state rather than the wording of the reply.
 set -u
-URL='http://localhost:8080/wp-json/mcp/v1/http'
+# The site under test. Override to run against a second stack, which a parallel worktree
+# needs: this suite is destructive, and two runs sharing a database produce failures that
+# look like real regressions in both.
+#
+#   GMCP_URL=http://localhost:8081 ./smoke-woo.sh
+BASE="${GMCP_URL:-http://localhost:8080}"
+URL="$BASE/wp-json/mcp/v1/http"
 TOK='testtoken1234567890'
 OUT=$(mktemp -d)
 pass=0; fail=0
