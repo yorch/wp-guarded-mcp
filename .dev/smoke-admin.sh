@@ -671,6 +671,11 @@ done
 # filters, so it has to be refused by the same gate rather than sneaking round it.
 call g_raw '{"jsonrpc":"2.0","id":181,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"_transient_reeve_new_key_1","raw":true}}}'
 check "and the raw read is refused too" "$(verdict g_raw)" "error"
+# Substring, not prefix, and that is load-bearing rather than incidental: the row this
+# finding was about is named _transient_reeve_new_key_<user>, so a rule anchored to the
+# start of the option name would miss the one it most needs to catch.
+check "the match is not anchored to the start of the name" \
+  "$(docker compose exec -T cli wp eval 'echo REEVE_Core::option_guard("_transient_reeve_new_key_1")===true?"allowed":"refused";' 2>/dev/null | tr -d '\r\n')" "refused"
 # The opposite failure: a prefix rule broad enough to refuse everything would pass all of
 # the above and make the option tools useless.
 call g_ok '{"jsonrpc":"2.0","id":182,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"blogname"}}}'

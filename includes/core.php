@@ -83,7 +83,13 @@ class REEVE_Core {
     ];
     $patterns = [
       // This plugin's own rows, whatever they are called and however they are wrapped.
-      // A prefix rather than a list of names, because the list was already wrong twice:
+      //
+      // Matched as a substring, not a prefix, and that is the point rather than a
+      // shortcut: the one-time plaintext of a newly minted key lives at
+      // _transient_reeve_new_key_<user>, so a rule anchored to the start of the name
+      // would miss the row it most needs to catch.
+      //
+      // It replaced a list of exact names, because the list was already wrong twice:
       // the change journal was readable until it was named, and the one-time plaintext of
       // a new key sits in _transient_reeve_new_key, which no exact entry matched. A rule
       // that covers rows added later is the only kind that stays correct, and the cost is

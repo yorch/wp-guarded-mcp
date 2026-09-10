@@ -89,7 +89,7 @@ reading it back.
 - Settings are an allowlist, not a blocklist. `siteurl` and `home` are refused outright, since a wrong value makes the site and this endpoint unreachable with no way back. A default role that can edit content is refused, because open registration plus an editing default role is a way in.
 - None of them can change anything over the URL-token endpoint, since that endpoint puts the secret somewhere servers log it. Every `admin`-level tool is refused there, which is a rule rather than a list: the list this replaced named plugins, themes, settings and permalinks, and had never included menus or widgets, so a widget, which is arbitrary markup on every page, could be planted with a token out of an access log. Read-level tools still work, so the route remains useful on a host that strips the `Authorization` header.
 
-None of this plugin's own rows are readable or writable through the option tools, so the bearer token cannot be read back out or overwritten through the API. That is a prefix rule rather than a list of names, because a list was wrong twice: the change journal was readable until it was named, and the one-time plaintext of a newly minted key lives in a transient, which without a persistent object cache is an ordinary options row that no exact entry matched.
+None of this plugin's own rows are readable or writable through the option tools, so the bearer token cannot be read back out or overwritten through the API. Any option name containing `reeve_` is refused, anywhere in the name rather than only at the start, which is deliberate: the one-time plaintext of a newly minted key lives at `_transient_reeve_new_key_<user>`, and a rule anchored to the start of the name would miss the row it most needs to catch. It replaced a list of exact names, which had been wrong twice: the change journal was readable until somebody named it, and that transient was never on it.
 
 **WooCommerce**, off by default, and the switch only appears when the shop is installed: products, stock levels, orders, order notes, customers, a sales summary and a store briefing. Separate from site administration because the risk is a different shape. The administration tools can break a site; these read customer names, email addresses and delivery addresses and hand them to a model, which is a decision a shop owner should make deliberately rather than inherit.
 
@@ -190,6 +190,8 @@ Other hooks:
 | `reeve_prompts` | Add or replace the ready-made prompts |
 | `reeve_protected_options` | Option keys that must never be read, written or journalled |
 | `reeve_protected_option_patterns` | Substrings that mark an option as credential-shaped |
+| `reeve_credential_field_patterns` | Field names inside a value that stop it being recorded in the change journal |
+| `reeve_can_call_tool` | Answers whether the caller could call a given tool. The change journal asks it before replaying a write, so this is the gate on undo |
 | `reeve_header_auth_only_tools` | Tools the URL-token endpoint may not reach |
 | `reeve_allow_remote_install` | Permit installs from a URL rather than the wordpress.org repository |
 | `reeve_allow_unfiltered_post_html` | Store post HTML unfiltered |

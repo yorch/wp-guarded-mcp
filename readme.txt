@@ -61,7 +61,9 @@ For more than one client, create **named keys** instead. Each carries a label so
 
 = Privacy =
 
-Reeve sends nothing anywhere. It has no telemetry, contacts no external service, and stores no data beyond its own settings and, if you use OAuth, the tokens for the apps you have approved. The one outbound request it can make is to the wordpress.org repository, and only when you ask it to install or update a plugin or theme.
+Reeve has no telemetry. It sends nothing about you or your site anywhere, and stores no data beyond its own settings and, if you use OAuth, the tokens for the apps you have approved.
+
+It makes outbound requests in exactly three situations, all of them WordPress's own. Installing or updating a plugin or theme fetches it from the wordpress.org repository. The Site Health tool runs WordPress's own checks, two of which reach out: one asks your site for its own REST API to see whether it answers, and one asks wordpress.org whether automatic updates are working. And the connection check on the settings screen calls this site, and only this site, to see whether a client could.
 
 == Installation ==
 
