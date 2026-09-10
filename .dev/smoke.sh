@@ -255,7 +255,7 @@ curl -sS "$BASE/wp-json/mcp/v1/.well-known/oauth-protected-resource" -o "$OUT/pr
 check "OAuth resource metadata" "$(py 'import json,sys;print("ok" if "authorization_servers" in json.load(sys.stdin) else "err")' prm)" "ok"
 # Regression guard: every URL the discovery document advertises must point at this
 # site. A stray absolute URL here would send clients somewhere we do not control.
-check "discovery URLs stay on this host" "$(python3 "$(dirname "$0")/check_urls.py" < "$OUT/prm")" "True"
+check "discovery URLs stay on this host" "$(python3 "$(dirname "$0")/check_urls.py" "$BASE" < "$OUT/prm")" "True"
 
 curl -sS "$BASE/.well-known/oauth-authorization-server" -o "$OUT/asm"
 check "OAuth server metadata at host root" "$(py 'import json,sys;print("ok" if "token_endpoint" in json.load(sys.stdin) else "err")' asm)" "ok"
