@@ -125,6 +125,33 @@ check "the big-body preview left the post alone" \
   "$(docker compose exec -T cli wp post get "$BIG_ID" --field=post_status 2>/dev/null | tr -d '\r\n')" "draft"
 docker compose exec -T cli wp post delete "$BIG_ID" --force >/dev/null 2>&1
 
+# The preview has to agree with the write, and the one direction it must never be wrong
+# in is reporting safety. Computing the replacement by re-running preg_replace over the
+# matched fragment alone resolves lookaround against nothing: (?<=foo)bar matched the bar
+# after foo in the real body, but against the fragment "bar" the lookbehind had nothing
+# before it, so the preview reported that bar becomes bar. The operator reads "no change",
+# approves, and the write replaces it. The replacement is now expanded from the groups the
+# match actually captured in context.
+LB_ID=$(docker compose exec -T cli wp post create --post_title='Lookbehind' --post_status=draft --post_content='foobar and plain bar here' --porcelain 2>/dev/null | tr -d '\r\n')
+call pv_lb "{\"jsonrpc\":\"2.0\",\"id\":58,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":{\"ID\":$LB_ID,\"field\":\"post_content\",\"search\":\"(?<=foo)bar\",\"replace\":\"BAZ\",\"regex\":true,\"preview\":true}}}"
+check "a lookbehind preview shows the real replacement" \
+  "$(py 'import json,sys,re;t=json.load(sys.stdin)["result"]["content"][0]["text"];print(re.search(r"becomes: .*?\[(.*?)\]",t).group(1))' pv_lb)" "BAZ"
+call pv_lbw "{\"jsonrpc\":\"2.0\",\"id\":59,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":{\"ID\":$LB_ID,\"field\":\"post_content\",\"search\":\"(?<=foo)bar\",\"replace\":\"BAZ\",\"regex\":true}}}"
+check "and the write does exactly that" \
+  "$(docker compose exec -T cli wp post get "$LB_ID" --field=post_content 2>/dev/null | tr -d '\r\n')" "fooBAZ and plain bar here"
+# All three reference forms PHP accepts, plus a group that matched nothing.
+docker compose exec -T cli wp post update "$LB_ID" --post_content='The cat sat. Alice met Bob.' >/dev/null 2>&1
+call pv_brace "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":{\"ID\":$LB_ID,\"field\":\"post_content\",\"search\":\"(c)at\",\"replace\":\"\${1}ow\",\"regex\":true,\"preview\":true}}}"
+check "the \${n} reference form expands" \
+  "$(py 'import json,sys,re;t=json.load(sys.stdin)["result"]["content"][0]["text"];print(re.search(r"becomes: .*?\[(.*?)\]",t).group(1))' pv_brace)" "cow"
+call pv_swap "{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":{\"ID\":$LB_ID,\"field\":\"post_content\",\"search\":\"(Alice) met (Bob)\",\"replace\":\"\$2 met \$1\",\"regex\":true,\"preview\":true}}}"
+check "two groups swap in the right order" \
+  "$(py 'import json,sys,re;t=json.load(sys.stdin)["result"]["content"][0]["text"];print(re.search(r"becomes: .*?\[(.*?)\]",t).group(1))' pv_swap)" "Bob met Alice"
+call pv_unmatched "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":{\"ID\":$LB_ID,\"field\":\"post_content\",\"search\":\"(c)(z)?at\",\"replace\":\"\$1-\$2-ow\",\"regex\":true,\"preview\":true}}}"
+check "a group that matched nothing expands to nothing" \
+  "$(py 'import json,sys,re;t=json.load(sys.stdin)["result"]["content"][0]["text"];print(re.search(r"becomes: .*?\[(.*?)\]",t).group(1))' pv_unmatched)" "c--ow"
+docker compose exec -T cli wp post delete "$LB_ID" --force >/dev/null 2>&1
+
 echo "-- prompts --"
 call plist '{"jsonrpc":"2.0","id":30,"method":"prompts/list"}'
 check "prompts are listed" \

@@ -1335,12 +1335,17 @@ class REEVE_Tools_Core {
         return $r;
       }
       // Then walk out only the handful actually shown.
+      // Each match is found against the WHOLE subject at an offset, so its groups and any
+      // lookaround are resolved in the real context.
       $offset = 0;
       while ( count( $matches ) < self::PREVIEW_MATCHES
         && @preg_match( $pattern, $subject, $found, PREG_OFFSET_CAPTURE, $offset ) === 1 ) {
         $text = (string) $found[0][0];
         $at = (int) $found[0][1];
-        $matches[] = [ 'text' => $text, 'at' => $at, 'becomes' => preg_replace( $pattern, $replace, $text ) ];
+        $groups = array_map( function ( $group ) {
+          return is_array( $group ) ? (string) $group[0] : (string) $group;
+        }, $found );
+        $matches[] = [ 'text' => $text, 'at' => $at, 'becomes' => $this->expand_replacement( $replace, $groups ) ];
         // A zero-width match would leave the offset where it was and spin forever.
         $offset = $at + max( 1, strlen( $text ) );
       }
@@ -1466,6 +1471,43 @@ class REEVE_Tools_Core {
       $lines[] = $replies . ' direct repl(y/ies). WordPress leaves these in place, orphaned, rather than deleting them.';
     }
     return $this->preview_text( $r, implode( "\n", $lines ) );
+  }
+
+
+  /**
+  * Work out what a match becomes, from the groups it actually captured.
+  *
+  * The obvious version runs preg_replace over the matched fragment on its own, and it is
+  * wrong in the one direction a preview must never be wrong in. A pattern whose match
+  * depends on its surroundings resolves differently in isolation: (?<=foo)bar matches the
+  * bar after foo in the real body, but re-run against the fragment "bar" the lookbehind
+  * has nothing before it, so preg_replace returns the fragment unchanged and the preview
+  * reports that bar becomes bar. The operator reads "no change", approves, and the write
+  * replaces it. That is the failure the preview exists to prevent, inverted: it reported
+  * safety and the write was not safe.
+  *
+  * The match itself is found against the whole subject, so its groups are already correct.
+  * Only the substitution has to be done here, by expanding the replacement's references
+  * against those groups, the way PCRE would.
+  *
+  * Handles the three reference forms PHP accepts: \n, $n and ${n}. A backslash-escaped
+  * literal dollar is left alone, which matches PHP closely enough for a preview.
+  */
+  private function expand_replacement( string $replace, array $groups ): string {
+    $expanded = preg_replace_callback(
+      '/\\\\(\d{1,2})|\$\{(\d{1,2})\}|\$(\d{1,2})/',
+      function ( array $reference ) use ( $groups ) {
+        foreach ( [ 1, 2, 3 ] as $slot ) {
+          if ( isset( $reference[ $slot ] ) && $reference[ $slot ] !== '' ) {
+            $index = (int) $reference[ $slot ];
+            return isset( $groups[ $index ] ) ? $groups[ $index ] : '';
+          }
+        }
+        return '';
+      },
+      $replace
+    );
+    return $expanded === null ? $replace : $expanded;
   }
 
   /** A short, single-line version of a value, for showing inside a sentence. */

@@ -153,7 +153,7 @@ class REEVE_Tools_Woo {
       ],
       'wc_update_order_status' => [
         'name' => 'wc_update_order_status',
-        'description' => 'Move an order to another status. This often emails the customer, and the reply says exactly who WooCommerce wrote to, measured during the change rather than guessed from the status. Setting "refunded" marks the order as refunded and does NOT move any money; use your payment provider for an actual refund.',
+        'description' => 'Move an order to another status. This often emails the customer, and the reply says exactly who WooCommerce wrote to, measured during the change rather than guessed from the status. A plugin that bypasses wp_mail entirely is invisible to that measurement. Setting "refunded" marks the order as refunded and does NOT move any money; use your payment provider for an actual refund.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -689,6 +689,11 @@ class REEVE_Tools_Woo {
   * It follows that this reports an intention rather than a delivery, so the wording says
   * so. Over-reporting is the safe direction: an agent telling someone nobody was
   * contacted, when a stranger has a message in their inbox, is the failure that matters.
+  *
+  * Only pre_wp_mail is deliberately not hooked. A filter there that returns null falls
+  * through to wp_mail, so hooking both would count the same message twice and need
+  * deduplicating for no gain. A plugin that bypasses wp_mail altogether is outside what
+  * this can see, and the tool description says so rather than implying otherwise.
   */
   private function describe_mail( array $sent, $order ): string {
     if ( !$sent ) {
