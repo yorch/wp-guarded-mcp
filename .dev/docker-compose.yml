@@ -1,0 +1,46 @@
+# Named so the stack is the same one whichever directory you run compose from.
+# Without this the project name comes from the directory, and `docker compose exec`
+# quietly reports "service not running" against a stack that is running fine.
+name: wptest
+
+services:
+  db:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: wp
+      MARIADB_USER: wp
+      MARIADB_PASSWORD: wp
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      retries: 20
+  wp:
+    image: wordpress:php8.2-apache
+    depends_on:
+      db: { condition: service_healthy }
+    ports: ["8080:80"]
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: wp
+      WORDPRESS_DB_PASSWORD: wp
+      WORDPRESS_DB_NAME: wp
+      WORDPRESS_DEBUG: 1
+    volumes:
+      - wpdata:/var/www/html
+      - /Users/yorch/code-personal/ai-engine:/var/www/html/wp-content/plugins/wp-mcp-server
+  cli:
+    image: wordpress:cli-php8.2
+    user: "33:33"
+    depends_on: [wp]
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: wp
+      WORDPRESS_DB_PASSWORD: wp
+      WORDPRESS_DB_NAME: wp
+    volumes:
+      - wpdata:/var/www/html
+      - /Users/yorch/code-personal/ai-engine:/var/www/html/wp-content/plugins/wp-mcp-server
+    entrypoint: ["sleep", "infinity"]
+volumes:
+  wpdata:

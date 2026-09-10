@@ -109,9 +109,9 @@ It has not been tested on multisite. The code has network-aware branches, but un
 
 == Screenshots ==
 
-1. The settings screen: the endpoint to give your agent, the bearer token and its access level, and the tool groups you can switch on.
+1. The settings screen: the endpoint to give your agent, ready-made snippets for Claude Desktop and Claude Code, the connection check, and the bearer token with its access level.
 2. The consent screen an administrator sees when an OAuth client asks to connect.
-3. Connected apps, with the account each one acts as and a control to revoke it.
+3. Named keys, each with its own access level, expiry and tool list, above the activity history showing what agents did and what was refused.
 
 == Changelog ==
 

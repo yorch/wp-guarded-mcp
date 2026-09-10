@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 772 250" width="772" height="250" role="img" aria-label="Reeve, a safe MCP server for WordPress">
+  <!-- Drawn at 772x250 and rendered again at 2x for the retina banner, so every
+       measurement here is in banner units and scales cleanly. Type is kept large
+       because the directory shows this small on a listing page. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2c4a52"/>
+      <stop offset="1" stop-color="#16272e"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="772" height="250" fill="url(#bg)"/>
+
+  <!-- Mark: the same shield and keyhole as the icon, at banner scale. -->
+  <g transform="translate(56, 47) scale(0.61)">
+    <path d="M128 40 L196 66 V126 C196 168 166 199 128 214 C90 199 60 168 60 126 V66 Z"
+          fill="none" stroke="#e8d9a8" stroke-width="13" stroke-linejoin="round"/>
+    <circle cx="128" cy="118" r="21" fill="#e8d9a8"/>
+    <path d="M118 133 L110 174 H146 L138 133 Z" fill="#e8d9a8"/>
+  </g>
+
+  <g font-family="'Helvetica Neue', Helvetica, Arial, sans-serif">
+    <text x="232" y="112" font-size="66" font-weight="700" fill="#f4efe2" letter-spacing="-1">Reeve</text>
+    <text x="234" y="150" font-size="21" font-weight="500" fill="#e8d9a8">A safe MCP server for WordPress</text>
+    <text x="234" y="182" font-size="17" font-weight="400" fill="#9fb3ba">Let Claude administer your site, with guardrails on</text>
+    <text x="234" y="205" font-size="17" font-weight="400" fill="#9fb3ba">everything you would not want done by mistake.</text>
+  </g>
+</svg>

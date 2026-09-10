@@ -1070,7 +1070,7 @@ class REEVE_OAuth {
     echo '<div><span class="reeve-oauth-label">Permissions</span><span class="reeve-oauth-value">' . esc_html( $role_label ) . '</span></div>';
     echo '</div>';
 
-    echo '<p class="reeve-oauth-note">The app will be able to call MCP tools using your account. You can revoke access at any time from Settings &rarr; MCP Server.</p>';
+    echo '<p class="reeve-oauth-note">The app will be able to call MCP tools using your account. You can revoke access at any time from the MCP Server screen in your site&rsquo;s admin menu.</p>';
 
     echo '<form method="POST" action="' . esc_url( $action_url ) . '">';
     foreach ( $hidden_fields as $name => $value ) {

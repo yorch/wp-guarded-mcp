@@ -1,0 +1,544 @@
+#!/bin/bash
+# Smoke test for the site-administration tools and the guards around them.
+#
+# Separate from smoke.sh because these need the admin tools switched on and some of
+# them reach wordpress.org. Every check here corresponds to a defect that was found
+# and fixed, so a failure means a regression, not a flaky network.
+#
+# Responses go to files, never through shell variables: a JSON body full of \/ and \n
+# escapes does not survive echo.
+set -u
+URL='http://localhost:8080/wp-json/mcp/v1/http'
+URL_TOKEN='http://localhost:8080/wp-json/mcp/v1/testtoken1234567890'
+TOK='testtoken1234567890'
+OUT=$(mktemp -d)
+pass=0; fail=0
+
+call() { # call <file> <json>
+  curl -sS -X POST "$URL" \
+    -H "Authorization: Bearer $TOK" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -d "$2" -o "$OUT/$1"
+}
+
+# The API also answers on ?rest_route=, which is the only way in while .htaccess is
+# missing and pretty permalinks are broken. The recovery tests below depend on it.
+call_plain() { # call <file> <json>, without pretty permalinks
+  curl -sS -X POST 'http://localhost:8080/index.php?rest_route=/mcp/v1/http' \
+    -H "Authorization: Bearer $TOK" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -d "$2" -o "$OUT/$1"
+}
+
+call_url_token() { # same, but authenticating through the token-in-path route
+  curl -sS -X POST "$URL_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -d "$2" -o "$OUT/$1"
+}
+
+check() { # check <label> <actual> <expected>
+  if [ "$2" = "$3" ]; then
+    printf '  PASS  %s\n' "$1"; pass=$((pass+1))
+  else
+    printf '  FAIL  %s (got %s, want %s)\n' "$1" "$2" "$3"; fail=$((fail+1))
+  fi
+}
+
+py() { python3 -c "$1" < "$OUT/$2"; }
+# "error" when the call was refused, "ok" when it went through.
+# A refusal arrives as a tool-level isError result rather than a JSON-RPC error,
+# because clients treat protocol errors as a broken server and may never show the
+# text to the model. The two-step confirmation depends on that text being read.
+verdict() { py 'import json,sys;d=json.load(sys.stdin);print("error" if ("error" in d or d.get("result",{}).get("isError")) else "ok")' "$1"; }
+# The refusal text, wherever it ended up.
+refusal() { py 'import json,sys;d=json.load(sys.stdin);print(d["error"]["message"] if "error" in d else d["result"]["content"][0]["text"])' "$1"; }
+
+# Reset anything a previous run left behind. A smoke suite you cannot run twice is
+# not much of a smoke suite, and every failure on the second run was this rather than
+# a real regression: a menu that already existed, widgets that had accumulated, a
+# widget the last run had already deleted.
+reset_state() {
+  docker compose exec -T cli wp theme activate twentytwentyfive >/dev/null 2>&1
+  docker compose exec -T cli wp eval '
+    foreach ( wp_get_nav_menus() as $m ) { wp_delete_nav_menu( $m->term_id ); }
+    $s = wp_get_sidebars_widgets();
+    foreach ( array_keys( $s ) as $k ) { if ( $k !== "array_version" ) { $s[ $k ] = []; } }
+    wp_set_sidebars_widgets( $s );
+    update_option( "widget_block", [ "_multiwidget" => 1 ] );
+    update_option( "widget_text", [ "_multiwidget" => 1 ] );
+    foreach ( [ "classic-editor" ] as $slug ) {
+      if ( is_plugin_active( $slug . "/" . $slug . ".php" ) ) { deactivate_plugins( [ $slug . "/" . $slug . ".php" ] ); }
+    }
+  ' >/dev/null 2>&1
+  docker compose exec -T cli wp plugin delete classic-editor >/dev/null 2>&1
+  docker compose exec -T cli wp option update blogdescription "reset" >/dev/null 2>&1
+  docker compose exec -T cli wp option update default_role subscriber >/dev/null 2>&1
+  docker compose exec -T cli wp option update users_can_register 0 >/dev/null 2>&1
+  docker compose exec -T cli wp transient delete reeve_admin_email_cooldown >/dev/null 2>&1
+  docker compose exec -T cli wp option delete adminhash >/dev/null 2>&1
+  docker compose exec -T cli wp option delete reeve_journal >/dev/null 2>&1
+  docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
+  # A role that is dangerous WITHOUT holding edit_posts: the case the first guard missed.
+  docker compose exec -T cli wp eval 'remove_role("api_admin"); add_role("api_admin","API Admin",["read"=>true,"manage_options"=>true]);' >/dev/null 2>&1
+}
+reset_state
+
+echo "-- credential protection (privilege escalation) --"
+call opt_read '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"reeve_options"}}}'
+check "own options are unreadable" "$(verdict opt_read)" "error"
+call opt_raw '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"reeve_options","raw":true}}}'
+check "raw read cannot bypass it" "$(verdict opt_raw)" "error"
+call opt_write '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"reeve_options","value":{"mcp_bearer_token":"pwned","mcp_role":"admin"}}}}'
+check "own options are unwritable" "$(verdict opt_write)" "error"
+call opt_cred '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"some_plugin_api_key"}}}'
+check "credential-shaped keys refused" "$(verdict opt_cred)" "error"
+call opt_ok '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"blogname"}}}'
+check "ordinary options still readable" "$(verdict opt_ok)" "ok"
+
+echo "-- the identifier the plugin tools need --"
+call plist '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"wp_list_plugins","arguments":{}}}'
+check "wp_list_plugins returns the plugin file" \
+  "$(py 'import json,sys;d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(all("plugin" in x and "active" in x for x in d))' plist)" "True"
+
+echo "-- theme activation guards --"
+call t_missing '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"wp_activate_theme","arguments":{"stylesheet":"no-such-theme"}}}'
+check "missing theme refused" "$(verdict t_missing)" "error"
+# The one that matters: WP_Theme::errors() says nothing about "Requires PHP", so
+# without validate_theme_requirements() this switch succeeds and the next request
+# fatals, taking the front end, wp-admin and this API down with no way back.
+call t_future '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"wp_activate_theme","arguments":{"stylesheet":"futuretheme"}}}'
+check "theme needing a newer PHP refused" "$(verdict t_future)" "error"
+# wp theme list --field=name yields the stylesheet directory, not the display name.
+check "active theme unchanged" \
+  "$(docker compose exec -T cli wp theme list --status=active --field=name 2>/dev/null | tr -d '\r\n')" "twentytwentyfive"
+call t_active '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"wp_delete_theme","arguments":{"stylesheet":"twentytwentyfive"}}}'
+check "deleting the active theme refused" "$(verdict t_active)" "error"
+
+echo "-- self-protection --"
+call self_off '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"wp_deactivate_plugin","arguments":{"plugin":"reeve"}}}'
+check "cannot deactivate itself" "$(verdict self_off)" "error"
+call self_del '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"reeve"}}}'
+check "cannot delete itself" "$(verdict self_del)" "error"
+
+echo "-- install source restriction --"
+call url_inst '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"url":"https://example.invalid/x.zip"}}}'
+check "arbitrary ZIP URL refused" "$(verdict url_inst)" "error"
+
+echo "-- URL-token endpoint ceiling --"
+call_url_token ut_read '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"posts_per_page":1}}}'
+check "URL token may still read" "$(verdict ut_read)" "ok"
+call_url_token ut_inst '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"hello-dolly"}}}'
+check "URL token may not install" "$(verdict ut_inst)" "error"
+call_url_token ut_theme '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"wp_activate_theme","arguments":{"stylesheet":"twentytwentyfour"}}}'
+check "URL token may not switch theme" "$(verdict ut_theme)" "error"
+
+echo "-- two-step confirmation (needs the network: installs from wordpress.org) --"
+call inst '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"classic-editor","activate":true}}}'
+check "install from wordpress.org" \
+  "$(py 'import json,sys;d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(d.get("activated"))' inst)" "True"
+call deact '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"wp_deactivate_plugin","arguments":{"plugin":"classic-editor"}}}'
+check "deactivate" "$(verdict deact)" "ok"
+
+call mint '{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"classic-editor"}}}'
+check "first delete call changes nothing" "$(verdict mint)" "error"
+check "plugin still installed after step one" \
+  "$(docker compose exec -T cli wp plugin list --format=csv 2>/dev/null | grep -c '^classic-editor,')" "1"
+# Echoing the target's own name must NOT work: that is the design this replaced.
+call guess '{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"classic-editor","confirm":"classic-editor/classic-editor.php"}}}'
+check "guessing the confirmation refused" "$(verdict guess)" "error"
+# Refusals must be readable tool results, not transport errors the client may swallow.
+check "the refusal is a tool result, not a protocol error" \
+  "$(py 'import json,sys;print("error" not in json.load(sys.stdin))' guess)" "True"
+
+TOKEN=$(python3 "$(dirname "$0")/extract_token.py" < "$OUT/guess")
+call real "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_plugin\",\"arguments\":{\"plugin\":\"classic-editor\",\"confirm\":\"$TOKEN\"}}}"
+check "minted token completes the delete" "$(verdict real)" "ok"
+check "plugin gone" \
+  "$(docker compose exec -T cli wp plugin list --format=csv 2>/dev/null | grep -c '^classic-editor,')" "0"
+call replay "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_plugin\",\"arguments\":{\"plugin\":\"akismet\",\"confirm\":\"$TOKEN\"}}}"
+check "token cannot be replayed on another target" "$(verdict replay)" "error"
+check "akismet untouched" \
+  "$(docker compose exec -T cli wp plugin list --format=csv 2>/dev/null | grep -c '^akismet,')" "1"
+
+echo "-- settings allowlist --"
+call s_read '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"wp_get_settings","arguments":{"group":"general"}}}'
+check "settings readable" "$(verdict s_read)" "ok"
+call s_write '{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"blogdescription":"smoke","posts_per_page":25}}}}'
+check "allowed settings written" \
+  "$(docker compose exec -T cli wp option get blogdescription 2>/dev/null | tr -d '\r\n')" "smoke"
+# siteurl and home would make the site and this endpoint unreachable with no undo.
+call s_url '{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"siteurl":"http://evil.invalid"}}}}'
+check "siteurl unchanged" \
+  "$(docker compose exec -T cli wp option get siteurl 2>/dev/null | tr -d '\r\n')" "http://localhost:8080"
+# Writing admin_email directly would silently repoint password recovery.
+call s_mail '{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"admin_email":"attacker@evil.invalid"}}}}'
+check "admin_email unchanged" \
+  "$(docker compose exec -T cli wp option get admin_email 2>/dev/null | tr -d '\r\n')" "a@b.test"
+# The supported route runs WordPress's own confirmation flow, which needs the wp-admin
+# handler called explicitly because REST never loads the hook that fires it. It is also
+# a mailer aimed at an arbitrary address, so it takes a token and then a cooldown.
+call s_new '{"jsonrpc":"2.0","id":34,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"new_admin_email":"pending@example.test"}}}}'
+check "nothing is mailed before confirming" \
+  "$(docker compose exec -T cli wp option get adminhash --format=json 2>/dev/null | grep -c 'pending@example.test' || true)" "0"
+MAILTOK=$(python3 "$(dirname "$0")/extract_token.py" not_changed.new_admin_email < "$OUT/s_new")
+call s_new2 "{\"jsonrpc\":\"2.0\",\"id\":39,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_settings\",\"arguments\":{\"settings\":{\"new_admin_email\":\"pending@example.test\"},\"confirm\":\"$MAILTOK\"}}}"
+check "confirming makes the change pending" \
+  "$(docker compose exec -T cli wp option get adminhash --format=json 2>/dev/null | grep -c 'pending@example.test')" "1"
+check "admin_email still not changed" \
+  "$(docker compose exec -T cli wp option get admin_email 2>/dev/null | tr -d '\r\n')" "a@b.test"
+# A second address immediately after must be refused, or this is a spray tool.
+call s_new3 '{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"new_admin_email":"other@example.test"},"confirm":"x"}}}'
+check "a second address is rate limited" \
+  "$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print("last 15 minutes" in t["not_changed"]["new_admin_email"] or "confirm set to" in t["not_changed"]["new_admin_email"])' s_new3)" "True"
+# Open registration plus a privileged default role is the escalation pair.
+call s_role '{"jsonrpc":"2.0","id":35,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"default_role":"administrator"}}}}'
+check "escalating default_role refused" \
+  "$(docker compose exec -T cli wp option get default_role 2>/dev/null | tr -d '\r\n')" "subscriber"
+# The guard originally tested edit_posts, which is the wrong capability. A role can hold
+# manage_options without it, and such a role as the registration default turns the public
+# form into an administrator factory. Reproduced before the fix.
+call s_role2 '{"jsonrpc":"2.0","id":36,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"users_can_register":1,"default_role":"api_admin"}}}}'
+check "privileged role without edit_posts refused" \
+  "$(docker compose exec -T cli wp option get default_role 2>/dev/null | tr -d '\r\n')" "subscriber"
+call s_role3 '{"jsonrpc":"2.0","id":37,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"default_role":"subscriber"}}}}'
+check "an ordinary default role is still allowed" "$(verdict s_role3)" "ok"
+
+# The admin-email flow mails an arbitrary address from this domain, with body text
+# drawn from blogname, which this same tool can rewrite. It needs a token and a cooldown.
+
+
+echo "-- permalinks --"
+call p_read '{"jsonrpc":"2.0","id":36,"method":"tools/call","params":{"name":"wp_get_permalink_structure","arguments":{}}}'
+check "permalink structure readable" "$(verdict p_read)" "ok"
+# A date-only structure gives two posts published the same day the same URL.
+call p_bad '{"jsonrpc":"2.0","id":37,"method":"tools/call","params":{"name":"wp_set_permalink_structure","arguments":{"structure":"/%year%/%monthnum%/"}}}'
+check "non-unique structure refused" "$(verdict p_bad)" "error"
+call p_ok '{"jsonrpc":"2.0","id":38,"method":"tools/call","params":{"name":"wp_set_permalink_structure","arguments":{"structure":"/%postname%/"}}}'
+check "valid structure accepted" "$(verdict p_ok)" "ok"
+check "site still serving after the flush" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:8080/)" "200"
+
+echo "-- site health --"
+call h '{"jsonrpc":"2.0","id":39,"method":"tools/call","params":{"name":"wp_get_site_health","arguments":{}}}'
+check "site health runs its direct tests" \
+  "$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(sum(t["summary"].values())>10)' h)" "True"
+check "site health reports the environment" \
+  "$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(all(k in t["environment"] for k in ("wordpress","php","active_theme")))' h)" "True"
+
+echo "-- URL-token ceiling covers reconfiguration too --"
+call_url_token ut_set '{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"blogdescription":"via url token"}}}}'
+check "URL token may not change settings" "$(verdict ut_set)" "error"
+call_url_token ut_perm '{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"wp_set_permalink_structure","arguments":{"structure":""}}}'
+check "URL token may not change permalinks" "$(verdict ut_perm)" "error"
+
+echo "-- menus --"
+call m_new '{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"wp_create_menu","arguments":{"name":"Smoke Menu"}}}'
+check "menu created" "$(verdict m_new)" "ok"
+call m_dupe '{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"wp_create_menu","arguments":{"name":"Smoke Menu"}}}'
+check "duplicate menu name refused" "$(verdict m_dupe)" "error"
+call m_item '{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"wp_add_menu_item","arguments":{"menu":"Smoke Menu","title":"Home","type":"custom","url":"http://localhost:8080/"}}}'
+check "custom item added" "$(verdict m_item)" "ok"
+call m_bad '{"jsonrpc":"2.0","id":53,"method":"tools/call","params":{"name":"wp_add_menu_item","arguments":{"menu":"Smoke Menu","type":"post_type","object_id":999999}}}'
+check "item for a missing post refused" "$(verdict m_bad)" "error"
+# A menu item stores its own copy of the title, and core's front-end filter only drops
+# missing or trashed targets. A draft target therefore puts its headline in the public
+# navigation behind a link visitors cannot open.
+DRAFT_ID=$(docker compose exec -T cli wp post create --post_title="Smoke Draft Title" --post_status=draft --porcelain 2>/dev/null | tr -d '\r\n')
+call m_draft "{\"jsonrpc\":\"2.0\",\"id\":58,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_menu_item\",\"arguments\":{\"menu\":\"Smoke Menu\",\"type\":\"post_type\",\"object_id\":$DRAFT_ID}}}"
+check "draft target refused for a menu item" "$(verdict m_draft)" "error"
+docker compose exec -T cli wp post delete "$DRAFT_ID" --force >/dev/null 2>&1
+# menu-item-status defaults to draft, which renders nothing and looks like a no-op.
+call m_list '{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"wp_get_menu_items","arguments":{"menu":"Smoke Menu"}}}'
+check "item is published, not draft" \
+  "$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(len(t["items"])==1)' m_list)" "True"
+call m_loc '{"jsonrpc":"2.0","id":55,"method":"tools/call","params":{"name":"wp_assign_menu_location","arguments":{"location":"nope","menu":"Smoke Menu"}}}'
+check "unknown menu location refused" "$(verdict m_loc)" "error"
+call m_del '{"jsonrpc":"2.0","id":56,"method":"tools/call","params":{"name":"wp_delete_menu","arguments":{"menu":"Smoke Menu"}}}'
+check "deleting a menu needs confirming" "$(verdict m_del)" "error"
+
+echo "-- widgets on a block theme --"
+check "block theme is active" \
+  "$(docker compose exec -T cli wp theme list --status=active --field=name 2>/dev/null | tr -d '\r\n')" "twentytwentyfive"
+# A block theme still has sidebars registered: _wp_block_theme_register_classic_sidebars()
+# rebuilds the previous classic theme's areas so widgets survive a switch. They accept
+# writes and display nothing, so listing must keep working (to clean them up) while
+# reporting that nothing renders them.
+call w_none '{"jsonrpc":"2.0","id":57,"method":"tools/call","params":{"name":"wp_list_sidebars","arguments":{}}}'
+check "listing says widgets do not render here" \
+  "$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(t["widgets_render"] is False and "block theme" in t.get("note",""))' w_none)" "True"
+# Writing sidebars_widgets on a block theme stores data nothing ever reads.
+call w_ref '{"jsonrpc":"2.0","id":58,"method":"tools/call","params":{"name":"wp_add_widget","arguments":{"sidebar":"sidebar-1","content":"<!-- wp:paragraph --><p>x</p><!-- /wp:paragraph -->"}}}'
+check "adding a widget refused, not silently stored" "$(verdict w_ref)" "error"
+
+echo "-- widgets on a classic theme --"
+call w_theme '{"jsonrpc":"2.0","id":59,"method":"tools/call","params":{"name":"wp_install_theme","arguments":{"slug":"twentytwentyone","activate":true}}}'
+check "classic theme installed and active" "$(verdict w_theme)" "ok"
+call w_block '{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"wp_add_widget","arguments":{"sidebar":"sidebar-1","content":"<!-- wp:paragraph --><p>smoke-block-widget</p><!-- /wp:paragraph -->"}}}'
+check "block widget added" "$(verdict w_block)" "ok"
+call w_classic '{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"wp_add_widget","arguments":{"sidebar":"sidebar-1","id_base":"text","settings":{"title":"Smoke","text":"smoke-classic-widget"}}}}'
+check "classic widget added" "$(verdict w_classic)" "ok"
+call w_bad '{"jsonrpc":"2.0","id":62,"method":"tools/call","params":{"name":"wp_add_widget","arguments":{"sidebar":"not-a-sidebar","content":"x"}}}'
+check "unknown widget area refused" "$(verdict w_bad)" "error"
+# Losing _multiwidget makes core read the row as pre-2.8 format and mangle it.
+check "_multiwidget preserved" \
+  "$(docker compose exec -T cli wp eval 'echo (int) (get_option("widget_block")["_multiwidget"] ?? 0);' 2>/dev/null | tr -d '\r\n')" "1"
+check "widgets actually render on the page" \
+  "$(curl -sS http://localhost:8080/ | grep -c 'smoke-block-widget')" "1"
+# Stored XSS. Both paths matter and they fail differently.
+# Block widgets: WP_Widget_Block::widget() echoes the content through
+# widget_block_content, whose core filters do not escape.
+# Classic widgets: WP_Widget_Text::update() only sanitizes when the caller lacks
+# unfiltered_html, and every caller here is an administrator, so that branch was never
+# taken. Routing through update() is not enough on its own; the capability has to be
+# dropped for the write.
+call w_xss1 '{"jsonrpc":"2.0","id":65,"method":"tools/call","params":{"name":"wp_add_widget","arguments":{"sidebar":"sidebar-1","content":"<!-- wp:html --><script>alert(\"xssA\")</script><p>legitA</p><!-- /wp:html -->"}}}'
+call w_xss2 '{"jsonrpc":"2.0","id":66,"method":"tools/call","params":{"name":"wp_add_widget","arguments":{"sidebar":"sidebar-1","id_base":"text","settings":{"title":"T","text":"<script>alert(\"xssB\")</script>legitB"}}}}'
+curl -sS http://localhost:8080/ -o "$OUT/page.html"
+check "block widget script is not executable" \
+  "$(python3 "$(dirname "$0")/check_xss.py" xssA < "$OUT/page.html")" "safe"
+check "classic widget script is not executable" \
+  "$(python3 "$(dirname "$0")/check_xss.py" xssB < "$OUT/page.html")" "safe"
+check "legitimate widget markup survives" \
+  "$(grep -c 'legitA' "$OUT/page.html")" "1"
+call w_unreg '{"jsonrpc":"2.0","id":67,"method":"tools/call","params":{"name":"wp_add_widget","arguments":{"sidebar":"sidebar-1","id_base":"not_a_widget","settings":{}}}}'
+check "unregistered widget type refused" "$(verdict w_unreg)" "error"
+
+call w_del '{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"wp_delete_widget","arguments":{"widget_id":"text-1"}}}'
+check "widget removed" "$(verdict w_del)" "ok"
+check "its settings removed too" \
+  "$(docker compose exec -T cli wp eval 'echo isset(get_option("widget_text")[1]) ? "still-there" : "gone";' 2>/dev/null | tr -d '\r\n')" "gone"
+
+# Put the site back so a re-run starts from the same place.
+call w_restore '{"jsonrpc":"2.0","id":64,"method":"tools/call","params":{"name":"wp_activate_theme","arguments":{"stylesheet":"twentytwentyfive"}}}'
+check "restored the block theme" "$(verdict w_restore)" "ok"
+
+
+echo "-- post content sanitising --"
+# The guard here used to be current_user_can('unfiltered_html'), which is always true
+# for any caller that reaches these tools, so the sanitiser was unreachable and a script
+# tag written through wp_create_post executed on the public page. These tools sit at the
+# "write" level, so even a deliberately limited token could do it.
+call xa '{"jsonrpc":"2.0","id":90,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Probe A","post_content":"<p>legit-a</p><script>alert(\"xss-a\")</script>","post_status":"publish","post_name":"probe-a"}}}'
+curl -sS "http://localhost:8080/probe-a/" -o "$OUT/pa.html"
+check "script in post content is not executable" \
+  "$(python3 "$(dirname "$0")/check_xss.py" xss-a < "$OUT/pa.html")" "safe"
+check "legitimate body survives" "$(grep -c 'legit-a' "$OUT/pa.html")" "1"
+
+# Content with no recognised HTML took the markdown branch, and Parsedown runs without
+# safe mode, so a bare script tag bypassed sanitising entirely.
+call xb '{"jsonrpc":"2.0","id":91,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Probe B","post_content":"<script>alert(\"xss-b\")</script>","post_status":"publish","post_name":"probe-b"}}}'
+curl -sS "http://localhost:8080/probe-b/" -o "$OUT/pb.html"
+check "the markdown path is sanitised too" \
+  "$(python3 "$(dirname "$0")/check_xss.py" xss-b < "$OUT/pb.html")" "safe"
+
+# wp_kses_post cannot be pointed at block markup wholesale: it does not recognise a
+# delimiter comment containing HTML entities and escapes the opener, destroying the
+# block. Attributes must round-trip as JSON instead.
+call xc '{"jsonrpc":"2.0","id":92,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Probe C","post_content":"<!-- wp:paragraph --><p>legit-c</p><script>alert(\"xss-c\")</script><!-- /wp:paragraph -->","post_status":"publish","post_name":"probe-c"}}}'
+curl -sS "http://localhost:8080/probe-c/" -o "$OUT/pc.html"
+check "script inside a block is stripped" \
+  "$(python3 "$(dirname "$0")/check_xss.py" xss-c < "$OUT/pc.html")" "safe"
+call xd '{"jsonrpc":"2.0","id":93,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Probe D","post_content":"<!-- wp:faq {\"q\":\"&lt;p&gt;hi&lt;/p&gt;\"} --><div>legit-d</div><!-- /wp:faq -->","post_status":"publish","post_name":"probe-d"}}}'
+check "block attributes survive sanitising" \
+  "$(docker compose exec -T cli wp eval '$p=get_page_by_path("probe-d",OBJECT,"post"); $b=parse_blocks($p->post_content)[0]; echo ($b["blockName"]==="core/faq" && ($b["attrs"]["q"]??"")==="&lt;p&gt;hi&lt;/p&gt;") ? "ok" : "lost";' 2>/dev/null | tr -d '\r\n')" "ok"
+docker compose exec -T cli wp eval 'foreach(["probe-a","probe-b","probe-c","probe-d"] as $s){ $p=get_page_by_path($s,OBJECT,"post"); if($p) wp_delete_post($p->ID,true); }' >/dev/null 2>&1
+
+echo "-- activity history --"
+docker compose exec -T cli wp option delete reeve_activity >/dev/null 2>&1
+call act1 '{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Activity Probe","post_status":"draft"}}}'
+# A refusal must be recorded too: those are the entries worth having.
+call act2 '{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"wp_deactivate_plugin","arguments":{"plugin":"reeve"}}}'
+check "successful call recorded" \
+  "$(docker compose exec -T cli wp eval '$l=get_option("reeve_activity",[]); echo (int) (bool) array_filter($l, fn($e)=>$e["tool"]==="wp_create_post" && $e["ok"]);' 2>/dev/null | tr -d '\r\n')" "1"
+check "refused call recorded as refused" \
+  "$(docker compose exec -T cli wp eval '$l=get_option("reeve_activity",[]); echo (int) (bool) array_filter($l, fn($e)=>$e["tool"]==="wp_deactivate_plugin" && !$e["ok"]);' 2>/dev/null | tr -d '\r\n')" "1"
+check "the target is captured, not just the tool" \
+  "$(docker compose exec -T cli wp eval '$l=get_option("reeve_activity",[]); $m=array_values(array_filter($l, fn($e)=>$e["tool"]==="wp_deactivate_plugin")); echo $m ? $m[0]["target"] : "";' 2>/dev/null | tr -d '\r\n')" "reeve"
+# Full arguments must not be stored: they can carry a whole post body.
+check "arguments are not stored wholesale" \
+  "$(docker compose exec -T cli wp eval '$l=get_option("reeve_activity",[]); echo (int) (bool) array_filter($l, fn($e)=>isset($e["args"]));' 2>/dev/null | tr -d '\r\n')" "0"
+check "the log option is not autoloaded" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb; echo $wpdb->get_var("SELECT autoload FROM {$wpdb->options} WHERE option_name=\"reeve_activity\"");' 2>/dev/null | tr -d '\r\n' | grep -qE '^(no|off)$' && echo no || echo yes)" "no"
+
+echo "-- site briefing --"
+# One call has to answer "what am I looking at", or an agent spends five round trips
+# on orientation at the start of every conversation and pays for all of them in context.
+call brief '{"jsonrpc":"2.0","id":90,"method":"tools/call","params":{"name":"wp_site_briefing","arguments":{}}}'
+check "the briefing answers" "$(verdict brief)" "ok"
+brief() { py "import json,sys;d=json.load(sys.stdin);b=json.loads(d['result']['content'][0]['text']);print($1)" brief; }
+check "it reports the real WordPress version" \
+  "$(brief "b['versions']['wordpress']")" \
+  "$(docker compose exec -T cli wp core version 2>/dev/null | tr -d '\r\n')"
+check "it names the active theme" "$(brief "b['theme']['stylesheet']")" "twentytwentyfive"
+check "it lists this plugin as active" "$(brief "'yes' if any(p.startswith('Reeve') for p in b['plugins']['active']) else 'no'")" "yes"
+check "it counts published posts" \
+  "$(brief "b['content']['post_types'][0]['published']")" \
+  "$(docker compose exec -T cli wp post list --post_type=post --post_status=publish --format=count 2>/dev/null | tr -d '\r\n')"
+# The rule, not a fixed list: a taxonomy is reported only if it attaches to a post type
+# that was also reported. Naming category and post_tag instead would fail the moment a
+# plugin adds a legitimate one of its own, which WooCommerce does.
+check "every taxonomy listed attaches to a listed post type" \
+  "$(brief "'yes' if all(set(t['applies_to']) & set(p['type'] for p in b['content']['post_types']) for t in b['content']['taxonomies']) else 'no'")" "yes"
+check "and the machinery ones are still gone" \
+  "$(brief "'yes' if not set(['link_category','wp_pattern_category']) & set(t['taxonomy'] for t in b['content']['taxonomies']) else 'no'")" "yes"
+# Reporting zero pending updates when nothing ever checked would tell someone their
+# site is current while it rots. The absence of a check has to be visible.
+check "update figures say whether a check happened" "$(brief "b['updates'].get('checked')")" "True"
+# The briefing walks options and transients. None of that may carry the token out.
+check "the briefing does not leak the token" \
+  "$(grep -c "$TOK" "$OUT/brief" || true)" "0"
+
+echo "-- change journal --"
+# The activity log answers "what did my agent do". This answers the question you ask in
+# a hurry: put it back. Every check here is about it being trustworthy enough to use
+# under pressure.
+docker compose exec -T cli wp option update blogdescription "before the agent" >/dev/null 2>&1
+call j_opt '{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"blogdescription","value":"after the agent"}}}'
+check "the option write went through" \
+  "$(docker compose exec -T cli wp option get blogdescription 2>/dev/null | tr -d '\r\n')" "after the agent"
+call j_list '{"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+J_ID=$(py "import json,sys;d=json.load(sys.stdin);print(json.loads(d['result']['content'][0]['text'])[0]['id'])" j_list)
+check "the change is on record" "$(test -n "$J_ID" && echo yes || echo no)" "yes"
+call j_undo "{\"jsonrpc\":\"2.0\",\"id\":102,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$J_ID\"}}}"
+# Assert the stored value, not the reported success. The first version of this reported
+# a successful restore while leaving the post body exactly as the agent had left it.
+check "reverting really restores the value" \
+  "$(docker compose exec -T cli wp option get blogdescription 2>/dev/null | tr -d '\r\n')" "before the agent"
+call j_replay "{\"jsonrpc\":\"2.0\",\"id\":103,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$J_ID\"}}}"
+check "a revert cannot be applied twice" "$(verdict j_replay)" "error"
+call j_unknown '{"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"wp_undo_change","arguments":{"id":"nosuchchange"}}}'
+check "an unknown change id is refused" "$(verdict j_unknown)" "error"
+
+# Posts: title, body and status all have to come back. Leaning on post revisions looks
+# like the shortcut and is wrong, because by the time post_updated fires the newest
+# revision holds the NEW body. That version restored the title and silently left the
+# body rewritten.
+call j_new '{"jsonrpc":"2.0","id":105,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Journal subject","post_content":"<p>Original body.</p>","post_status":"publish"}}}'
+J_POST=$(py "import json,sys,re;d=json.load(sys.stdin);print(re.search(r'\d+',d['result']['content'][0]['text']).group())" j_new)
+call j_edit "{\"jsonrpc\":\"2.0\",\"id\":106,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$J_POST,\"post_title\":\"Rewritten\",\"post_content\":\"<p>Replaced.</p>\",\"post_status\":\"draft\"}}}"
+call j_list2 '{"jsonrpc":"2.0","id":107,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":1}}}'
+J_ID2=$(py "import json,sys;d=json.load(sys.stdin);print(json.loads(d['result']['content'][0]['text'])[0]['id'])" j_list2)
+call j_undo2 "{\"jsonrpc\":\"2.0\",\"id\":108,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$J_ID2\"}}}"
+check "reverting restores the post title" \
+  "$(docker compose exec -T cli wp post get "$J_POST" --field=post_title 2>/dev/null | tr -d '\r\n')" "Journal subject"
+check "reverting restores the post body" \
+  "$(docker compose exec -T cli wp post get "$J_POST" --field=post_content 2>/dev/null | tr -d '\r\n')" "<p>Original body.</p>"
+check "reverting restores the post status" \
+  "$(docker compose exec -T cli wp post get "$J_POST" --field=post_status 2>/dev/null | tr -d '\r\n')" "publish"
+docker compose exec -T cli wp post delete "$J_POST" --force >/dev/null 2>&1
+
+# Only the agent's writes. A person saving a settings page is not the agent's to undo,
+# and listing it would make the history untrustworthy at exactly the wrong moment.
+docker compose exec -T cli wp option update blogname "Edited by a person" >/dev/null 2>&1
+call j_list3 '{"jsonrpc":"2.0","id":109,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+check "a person's own edit is not recorded" "$(grep -c blogname "$OUT/j_list3" || true)" "0"
+docker compose exec -T cli wp option update blogname "MCP Test" >/dev/null 2>&1
+
+# The journal writes previous values into an option row. Anything credential-shaped that
+# reaches it is a second copy of a secret, sitting somewhere nothing expects one.
+check "credential-shaped keys are never journalled" \
+  "$(docker compose exec -T cli wp eval '$r=new ReflectionClass("REEVE_Journal");$m=$r->getMethod("skip_option");$m->setAccessible(true);$j=$r->newInstanceWithoutConstructor();$bad=0;foreach(["my_api_key","some_secret","reeve_options","_transient_x","rewrite_rules","active_plugins"] as $k){if(!$m->invoke($j,$k))$bad++;}echo $bad;' 2>/dev/null | tr -d '\r\n')" "0"
+check "the journal row does not contain the token" \
+  "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("reeve_journal",[])),"'"$TOK"'")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
+
+echo "-- named keys: reach and lifetime --"
+# One shared secret with one access level is fine until there are two of anything.
+# These check that a key's stated limits are real, not decoration.
+KEYS=$(docker compose exec -T cli wp eval '
+  $a = REEVE_Tokens::create("Scoped reader","readonly",0,["wp_get_posts"]);
+  $b = REEVE_Tokens::create("Already expired","admin",0,[]);
+  $rows = REEVE_Tokens::all(); $rows[$b["id"]]["expires"] = time() - 60; update_option("reeve_tokens",$rows,false);
+  $c = REEVE_Tokens::create("Admin but scoped","admin",0,["wp_get_posts"]);
+  echo $a["secret"], " ", $b["secret"], " ", $c["secret"];
+' 2>/dev/null | tr -d '\r\n')
+K_SCOPED=$(echo "$KEYS" | cut -d' ' -f1)
+K_EXPIRED=$(echo "$KEYS" | cut -d' ' -f2)
+K_ADMIN_SCOPED=$(echo "$KEYS" | cut -d' ' -f3)
+
+kcall() { # kcall <file> <key> <json>
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $2" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d "$3" -o "$OUT/$1"
+}
+
+kcall k_list "$K_SCOPED" '{"jsonrpc":"2.0","id":120,"method":"tools/list"}'
+# Hiding the tools is not the boundary, but a model offered a menu of things that will
+# be refused wastes a turn on each of them.
+check "a scoped key is offered only its own tools" \
+  "$(py "import json,sys;d=json.load(sys.stdin);print(','.join(sorted(t['name'] for t in d['result']['tools'])))" k_list)" \
+  "mcp_ping,wp_get_posts"
+kcall k_allowed "$K_SCOPED" '{"jsonrpc":"2.0","id":121,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"limit":1}}}'
+check "a scoped key can call the tool it is scoped to" "$(verdict k_allowed)" "ok"
+# The real boundary. An admin-level key is past the access-level filter entirely, so if
+# the scope check sat behind that filter it would not run at all for this caller.
+kcall k_denied "$K_ADMIN_SCOPED" '{"jsonrpc":"2.0","id":122,"method":"tools/call","params":{"name":"wp_delete_theme","arguments":{"stylesheet":"twentytwentyfour"}}}'
+check "an admin-level key is still held to its tool list" "$(verdict k_denied)" "error"
+check "the theme was not deleted" \
+  "$(docker compose exec -T cli wp theme is-installed twentytwentyfour >/dev/null 2>&1 && echo yes || echo no)" "yes"
+# mcp_ping is what every tool description tells a model to call when something fails.
+kcall k_ping "$K_SCOPED" '{"jsonrpc":"2.0","id":123,"method":"tools/call","params":{"name":"mcp_ping","arguments":{}}}'
+check "ping works whatever the key is scoped to" "$(verdict k_ping)" "ok"
+check "an expired key is refused at the door" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H "Authorization: Bearer $K_EXPIRED" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" "401"
+check "a made-up key is refused" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'Authorization: Bearer reeve_00000000_deadbeef' -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" "401"
+# A key readable back out of the database is a key that leaks with the database.
+check "keys are stored hashed, never in the clear" \
+  "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("reeve_tokens",[])),"'"$K_SCOPED"'")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
+check "revoking a key locks it out immediately" \
+  "$(docker compose exec -T cli wp eval '$r=REEVE_Tokens::all();foreach($r as $k=>$v){REEVE_Tokens::revoke($k);}echo count(REEVE_Tokens::all());' 2>/dev/null | tr -d '\r\n')" "0"
+check "the revoked key no longer authenticates" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H "Authorization: Bearer $K_SCOPED" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" "401"
+
+echo "-- resources are no softer than the tools --"
+# A resource is a second way to reach the same data. If it does not go through the same
+# gate it is a second door into the same room with a different lock on it.
+K_RES=$(docker compose exec -T cli wp eval '$a=REEVE_Tokens::create("Comments only","readonly",0,["wp_get_comments"]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+kcall r_list "$K_RES" '{"jsonrpc":"2.0","id":130,"method":"resources/list"}'
+check "a scoped key is offered only the resources it could already read" \
+  "$(py "import json,sys;d=json.load(sys.stdin);print(','.join(r['uri'] for r in d['result']['resources']))" r_list)" \
+  "reeve://comments/pending"
+kcall r_post "$K_RES" '{"jsonrpc":"2.0","id":131,"method":"resources/read","params":{"uri":"reeve://post/1"}}'
+check "and cannot read a post through one" "$(py 'import json,sys;print("error" in json.load(sys.stdin))' r_post)" "True"
+kcall r_brief "$K_RES" '{"jsonrpc":"2.0","id":132,"method":"resources/read","params":{"uri":"reeve://site/briefing"}}'
+check "nor the site briefing" "$(py 'import json,sys;print("error" in json.load(sys.stdin))' r_brief)" "True"
+kcall r_tpl "$K_RES" '{"jsonrpc":"2.0","id":133,"method":"resources/templates/list"}'
+check "nor is it offered the post template" \
+  "$(py 'import json,sys;print(len(json.load(sys.stdin)["result"]["resourceTemplates"]))' r_tpl)" "0"
+docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
+
+echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
+# The hard flush is what writes .htaccess, and it only runs if save_mod_rewrite_rules()
+# exists. That lives in wp-admin/includes/misc.php and calls get_home_path() from
+# file.php, neither of which a REST request loads. Without both requires the flush
+# degraded silently to soft, .htaccess was never written, and every inner URL 404'd
+# while the tool reported success. The home page still resolved through DirectoryIndex,
+# so a front-page check did not catch it.
+docker compose exec -T wp rm -f /var/www/html/.htaccess
+check "inner URLs break without .htaccess" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:8080/hello-world/)" "404"
+call_plain p_flush '{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"wp_set_permalink_structure","arguments":{"structure":"/%postname%/"}}}'
+check "the API is still reachable on ?rest_route=" "$(verdict p_flush)" "ok"
+check "hard flush writes .htaccess" \
+  "$(docker compose exec -T wp sh -c 'test -f /var/www/html/.htaccess && echo yes || echo no' | tr -d '\r\n')" "yes"
+check "inner URLs resolve again" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:8080/hello-world/)" "200"
+
+# Apache receives the Authorization header but does not place it in $_SERVER unless a
+# rewrite rule copies it there, and WordPress only reads $_SERVER. A site whose
+# .htaccess was hand-written or reset loses bearer auth entirely and sees a 401 that
+# looks like a bad token. The server falls back to apache_request_headers().
+docker compose exec -T wp sh -c "sed -i '/HTTP_AUTHORIZATION/d' /var/www/html/.htaccess"
+check "bearer auth survives a stripped header rule" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" "200"
+check "a wrong token is still rejected" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'Authorization: Bearer wrong' -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" "401"
+call p_restore '{"jsonrpc":"2.0","id":81,"method":"tools/call","params":{"name":"wp_set_permalink_structure","arguments":{"structure":"/%postname%/"}}}'
+check "regenerating restores the header rule" \
+  "$(docker compose exec -T wp sh -c 'grep -c HTTP_AUTHORIZATION /var/www/html/.htaccess' | tr -d '\r\n')" "1"
+
+printf '\n  %d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
