@@ -714,10 +714,30 @@ call_url_token ut_ping '{"jsonrpc":"2.0","id":192,"method":"tools/call","params"
 check "and so does the health check" "$(verdict ut_ping)" "ok"
 call_url_token ut_brief '{"jsonrpc":"2.0","id":193,"method":"tools/call","params":{"name":"wp_site_briefing","arguments":{}}}'
 check "and orientation, which changes nothing" "$(verdict ut_brief)" "ok"
+call_url_token ut_brief2 '{"jsonrpc":"2.0","id":194,"method":"tools/call","params":{"name":"wp_site_briefing","arguments":{}}}'
+call_url_token ut_write '{"jsonrpc":"2.0","id":195,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Written over the URL token route","post_status":"publish","post_content":"body"}}}'
+check "the route is not read-only, and the docs say so" "$(verdict ut_write)" "ok"
+check "a post written there really lands" \
+  "$(docker compose exec -T cli wp post list --post_status=publish --title='Written over the URL token route' --format=count 2>/dev/null | tr -d '\r\n')" "1"
+docker compose exec -T cli wp eval '$p=get_page_by_title("Written over the URL token route","OBJECT","post"); if($p){wp_delete_post($p->ID,true);}' >/dev/null 2>&1
 # wp_upload_request is write level and writes nothing: it mints a URL on a route whose
 # permission callback returns true unconditionally, so the caller walks away holding an
 # unauthenticated upload endpoint. A level rule cannot see that, hence the exception list.
 check "no upload URL was handed out" "$(grep -c upload_url "$OUT/ut_one" || true)" "0"
+
+echo "-- what two-step confirmation does and does not cover --"
+# The readmes led with "deleting takes two calls" for a long time. It is true of plugins,
+# themes, menus and the administration email, and false of content: wp_delete_post with
+# force destroys a post in one call. Pinning both halves, because the sentence read as
+# universal and nothing in the suite contradicted it.
+call cf_plugin '{"jsonrpc":"2.0","id":200,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"akismet/akismet.php"}}}'
+check "deleting a plugin is refused without a token" "$(verdict cf_plugin)" "error"
+check "and the refusal offers one" "$(refusal cf_plugin | grep -c 'confirm')" "1"
+CF_POST=$(docker compose exec -T cli wp post create --post_title='One call delete' --post_status=publish --porcelain 2>/dev/null | tr -d '\r\n')
+call cf_post "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$CF_POST,\"force\":true}}}"
+check "deleting a post permanently takes one call, as documented" "$(verdict cf_post)" "ok"
+check "and the post really is gone" \
+  "$(docker compose exec -T cli wp post list --post__in="$CF_POST" --format=count 2>/dev/null | tr -d '\r\n')" "0"
 
 echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
 # The hard flush is what writes .htaccess, and it only runs if save_mod_rewrite_rules()
