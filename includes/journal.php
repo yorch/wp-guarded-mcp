@@ -129,25 +129,89 @@ class REEVE_Journal {
   }
 
   /**
+  * Field names that mark a value as credential-shaped.
+  *
+  * Separate from REEVE_Core::option_guard()'s list, which matches whole OPTION names and
+  * is applied to reads and writes. These match FIELD names inside a value, where the
+  * conventions are shorter and the cost of a false positive is only that one change
+  * cannot be undone. That asymmetry is why "key" and "pass" belong here and would be far
+  * too broad on the option-name list, where they would make ordinary options unreadable.
+  *
+  * The short forms are the ones that matter. The guard matches by substring, so the
+  * pattern "password" does not match a field called "pass", and wp_mail_smtp stores its
+  * password under exactly that. The motivating example was slipping past the check
+  * written to catch it.
+  */
+  private static function field_patterns(): array {
+    return apply_filters( 'reeve_credential_field_patterns', [
+      'pass', 'pwd', 'secret', 'token', 'key', 'auth', 'salt', 'nonce',
+      'credential', 'bearer', 'signature', 'licence', 'license', 'private',
+    ] );
+  }
+
+  /**
   * Whether a value carries something credential-shaped, judged by the names inside it.
   *
-  * Deliberately about structure rather than content: guessing whether a bare string is
-  * a secret means guessing, and guessing wrong in the permissive direction stores the
-  * secret. Settings arrays are how plugins actually hold these, and their keys say so.
+  * Deliberately about structure rather than content: guessing whether a bare string is a
+  * secret means guessing, and guessing wrong in the permissive direction stores the
+  * secret. Settings hold these under named fields, and the names say so.
+  *
+  * It has to walk more than arrays. An option holding a stdClass and an option holding a
+  * JSON string are two of the three commonest ways plugins store settings, and checking
+  * only arrays left both unguarded. Serialized strings are unpacked for the same reason.
+  *
+  * Running past the depth limit redacts rather than permits. Returning false there meant
+  * a credential nested deeply enough was stored, which is a limit that fails open.
   */
   private static function holds_credential( $value, int $depth = 0 ): bool {
-    if ( $depth > 6 || !is_array( $value ) ) {
+    if ( $depth > 6 ) {
+      return true;
+    }
+
+    if ( is_string( $value ) ) {
+      $trimmed = trim( $value );
+      if ( $trimmed === '' ) {
+        return false;
+      }
+      if ( function_exists( 'is_serialized' ) && is_serialized( $trimmed ) ) {
+        $unpacked = @unserialize( $trimmed, [ 'allowed_classes' => false ] );
+        return $unpacked === false ? false : self::holds_credential( $unpacked, $depth + 1 );
+      }
+      if ( $trimmed[0] === '{' || $trimmed[0] === '[' ) {
+        $decoded = json_decode( $trimmed, true );
+        return is_array( $decoded ) ? self::holds_credential( $decoded, $depth + 1 ) : false;
+      }
       return false;
     }
+
+    if ( is_object( $value ) ) {
+      $value = get_object_vars( $value );
+    }
+    if ( !is_array( $value ) ) {
+      return false;
+    }
+
     foreach ( $value as $key => $inner ) {
-      if ( is_string( $key ) && REEVE_Core::option_guard( $key ) !== true ) {
+      if ( is_string( $key ) && self::field_looks_secret( $key ) ) {
         return true;
       }
-      if ( is_array( $inner ) && self::holds_credential( $inner, $depth + 1 ) ) {
+      if ( self::holds_credential( $inner, $depth + 1 ) ) {
         return true;
       }
     }
     return false;
+  }
+
+  private static function field_looks_secret( string $field ): bool {
+    $needle = strtolower( $field );
+    foreach ( (array) self::field_patterns() as $pattern ) {
+      if ( $pattern !== '' && strpos( $needle, strtolower( (string) $pattern ) ) !== false ) {
+        return true;
+      }
+    }
+    // Still honour the option-name guard, so a site that protects a name through
+    // reeve_protected_options also has that name redacted when it turns up as a field.
+    return REEVE_Core::option_guard( $field ) !== true;
   }
 
   public function option_added( $key, $value ): void {

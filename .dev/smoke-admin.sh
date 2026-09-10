@@ -613,6 +613,32 @@ check "a revoked key is not resurrected by a later touch" \
   "$(docker compose exec -T cli wp eval '$a=REEVE_Tokens::create("Doomed","readonly",0,[]);$r=REEVE_Tokens::all();$r[$a["id"]]["last_used"]=0;update_option("reeve_tokens",$r,false);$stale=REEVE_Tokens::all();REEVE_Tokens::revoke($a["id"]);REEVE_Tokens::touch($a["id"]);echo isset(REEVE_Tokens::all()[$a["id"]])?1:0;' 2>/dev/null | tr -d '\r\n')" "0"
 docker compose exec -T cli wp option delete reeve_tokens >/dev/null 2>&1
 
+# The guard matches field names inside a value. Options hold settings as arrays, as
+# stdClass and as JSON strings, and checking only arrays left two of those three
+# unguarded. The short forms matter most: the guard matches by substring, so "password"
+# does not match a field called "pass", and wp_mail_smtp stores its password under
+# exactly that. The example named in the comment was the one slipping past the check.
+docker compose exec -T cli wp option delete reeve_journal >/dev/null 2>&1
+docker compose exec -T cli wp eval-file /var/www/html/wp-content/plugins/reeve/.dev/credential-shapes.php >/dev/null 2>&1
+call s_obj '{"jsonrpc":"2.0","id":160,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"probe_obj","value":{"secret_key":"rotated"}}}}'
+call s_json '{"jsonrpc":"2.0","id":161,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"probe_json","value":"{}"}}}'
+call s_smtp '{"jsonrpc":"2.0","id":162,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"probe_smtp","value":{"smtp":{"pass":"rotated"}}}}}'
+call s_deep '{"jsonrpc":"2.0","id":163,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"probe_deep","value":{"x":1}}}}'
+call s_plain '{"jsonrpc":"2.0","id":164,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"probe_plain","value":{"mode":"test"}}}}'
+leaked() { docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("reeve_journal",[])),"'"$1"'")===false?0:1;' 2>/dev/null | tr -d '\r\n'; }
+check "a credential in a stdClass is not journalled" "$(leaked OBJ_LEAK_1)" "0"
+check "a credential in a JSON string is not journalled" "$(leaked JSON_LEAK_2)" "0"
+check "a password under the short field name pass is not journalled" "$(leaked SMTP_LEAK_3)" "0"
+# Running past the depth limit has to redact. Returning false there is a limit that
+# fails open, and a credential nested deeply enough was stored.
+check "a credential deeper than the walk limit is not journalled" "$(leaked DEEP_LEAK_4)" "0"
+# The opposite failure: a check broad enough to redact everything would pass all four
+# above and quietly make undo useless.
+call s_after '{"jsonrpc":"2.0","id":165,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+check "an ordinary settings array is still journalled and revertible" \
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next(x['reversible'] for x in e if 'probe_plain' in x['what']))" s_after)" "True"
+docker compose exec -T cli wp option delete probe_obj probe_json probe_smtp probe_deep probe_plain >/dev/null 2>&1
+
 echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
 # The hard flush is what writes .htaccess, and it only runs if save_mod_rewrite_rules()
 # exists. That lives in wp-admin/includes/misc.php and calls get_home_path() from
