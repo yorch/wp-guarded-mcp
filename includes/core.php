@@ -101,6 +101,7 @@ class GMCP_Core {
       'password', 'secret', 'token', 'private_key', 'api_key', 'apikey', 'auth_key', 'salt', 'nonce_key',
     ];
 
+
     $exact = apply_filters( 'gmcp_protected_options', $exact, $key );
     $patterns = apply_filters( 'gmcp_protected_option_patterns', $patterns, $key );
 
@@ -108,6 +109,38 @@ class GMCP_Core {
     if ( in_array( $needle, array_map( 'strtolower', (array) $exact ), true ) ) {
       return "The option \"{$key}\" holds this plugin's own credentials and is not readable or writable through the API.";
     }
+    // Backup plugins, by namespace rather than by row, and with their own refusal.
+    //
+    // None of these rows is credential-shaped by name, so the list above misses every one
+    // of them. On a site with offsite storage configured, wp_get_option returned the FTP
+    // password out of backuply_remote_backup_locs, the access key and secret key out of
+    // updraft_s3, and the archive encryption passphrase out of updraft_encryptionphrase,
+    // which is the single thing making a stored archive safe at rest. backuply_config_keys
+    // holds the key authenticating Backuply's own self-call endpoints, and
+    // updraft_backup_history hands over archive filenames including the job nonce, which
+    // is precisely what wp_list_backups spends its existence withholding. Worse than a
+    // reply: the audit log records a tool's response, so every one of those was also
+    // written to the database in plaintext and readable afterwards through
+    // wp_get_audit_log.
+    //
+    // By prefix on purpose. Listing the rows individually is the same mistake in a smaller
+    // font, because these names change between plugin versions and a row added next
+    // release would be unprotected until somebody noticed. This guard has already been
+    // wrong twice that way.
+    //
+    // It gates writes too, which is worth having on its own: an agent that can rewrite
+    // updraft_backup_history can erase a site's record of its own backups.
+    $backup_prefixes = apply_filters( 'gmcp_backup_option_prefixes', [
+      'updraft', 'backuply', 'backwpup', 'ai1wm', 'duplicator',
+    ], $key );
+    foreach ( (array) $backup_prefixes as $prefix ) {
+      if ( $prefix !== '' && strpos( $needle, strtolower( (string) $prefix ) ) !== false ) {
+        // Says what to do instead. A refusal an agent cannot act on gets worked around by
+        // guessing at another row, which is the behaviour this is trying to stop.
+        return "The option \"{$key}\" belongs to a backup plugin. Those rows hold storage credentials, archive encryption passphrases and archive filenames, so they are not readable or writable through the API. Ask wp_backup_status or wp_list_backups instead, which answer the same questions without handing over anything that would let the archives be fetched. A site can narrow this with the gmcp_backup_option_prefixes filter.";
+      }
+    }
+
     foreach ( (array) $patterns as $pattern ) {
       if ( $pattern !== '' && strpos( $needle, strtolower( $pattern ) ) !== false ) {
         return "The option \"{$key}\" looks like it holds a credential, so it is not readable or writable through the API. A site can allow specific keys with the gmcp_protected_option_patterns filter.";

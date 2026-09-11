@@ -977,6 +977,83 @@ check "nor is a deletion" \
 check "but the audit log has all three" \
   "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(DISTINCT tool) FROM {$wpdb->prefix}gmcp_audit WHERE tool IN (\"wp_create_post\",\"wp_update_post\",\"wp_delete_post\")");' 2>/dev/null | tr -d '\r\n')" "3"
 
+echo "-- a backup plugin's own rows are not a way round the backup tools --"
+# wp_list_backups withholds archive filenames because the name is what makes the archive
+# fetchable. That was worth nothing while wp_get_option would hand over the same plugin's
+# option rows: the filenames and job nonce out of updraft_backup_history, and on a site
+# with offsite storage configured the FTP password, the S3 access and secret keys, and the
+# archive encryption passphrase, which is the one thing making a stored archive safe at
+# rest. None of those names contains "password", "secret" or "key", so the credential
+# heuristic matched none of them.
+#
+# Seeded with the shapes these plugins really store, because a site with no remote storage
+# configured has no such rows and the check would pass on a site that could not fail.
+docker compose exec -T cli wp eval '
+  update_option( "backuply_remote_backup_locs", [ 1 => [ "name" => "Offsite", "protocol" => "ftp", "ftp_user" => "u", "ftp_pass" => "SMOKE-FTP-PASSWORD" ] ] );
+  update_option( "updraft_s3", [ "settings" => [ "x" => [ "accesskey" => "SMOKE-ACCESS-KEY", "secretkey" => "SMOKE-SECRET-KEY" ] ] ] );
+  update_option( "updraft_encryptionphrase", "SMOKE-ENCRYPTION-PHRASE" );
+' >/dev/null 2>&1
+# The control: every planted secret really is in the database, so an absence below is the
+# guard withholding it rather than there being nothing to withhold.
+check "control: the planted backup secrets really are stored" \
+  "$(docker compose exec -T cli wp eval '
+      $n = 0;
+      $locs = (array) get_option( "backuply_remote_backup_locs", [] );
+      if ( isset( $locs[1]["ftp_pass"] ) && $locs[1]["ftp_pass"] === "SMOKE-FTP-PASSWORD" ) { $n++; }
+      $s3 = (array) get_option( "updraft_s3", [] );
+      if ( ( $s3["settings"]["x"]["secretkey"] ?? "" ) === "SMOKE-SECRET-KEY" ) { $n++; }
+      if ( get_option( "updraft_encryptionphrase" ) === "SMOKE-ENCRYPTION-PHRASE" ) { $n++; }
+      echo $n;' 2>/dev/null | tr -d '\r\n')" "3"
+
+bs_read() { call "$1" "{\"jsonrpc\":\"2.0\",\"id\":270,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_option\",\"arguments\":{\"key\":\"$2\"}}}"; }
+bs_read bs_hist updraft_backup_history
+check "the archive filenames and nonce are refused" "$(verdict bs_hist)" "error"
+bs_read bs_s3 updraft_s3
+check "the storage access and secret keys are refused" "$(verdict bs_s3)" "error"
+bs_read bs_phrase updraft_encryptionphrase
+check "the archive encryption passphrase is refused" "$(verdict bs_phrase)" "error"
+bs_read bs_locs backuply_remote_backup_locs
+check "the offsite FTP password is refused" "$(verdict bs_locs)" "error"
+bs_read bs_keys backuply_config_keys
+check "and the key authenticating Backuply's own endpoints is refused" "$(verdict bs_keys)" "error"
+# A refusal an agent cannot act on gets worked around by guessing at another row.
+check "the refusal names the tools that do answer the question" \
+  "$(refusal bs_hist | grep -c 'wp_list_backups')" "1"
+# raw:true is a separate code path and was how the credential guard was first bypassed.
+call bs_raw '{"jsonrpc":"2.0","id":271,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"updraft_s3","raw":true}}}'
+check "and a raw read cannot go round it" "$(verdict bs_raw)" "error"
+
+# Writing matters on its own: an agent that can rewrite the history can erase a site's
+# record of its own backups.
+call bs_write '{"jsonrpc":"2.0","id":272,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"updraft_backup_history","value":{}}}}'
+check "rewriting the backup history is refused" "$(verdict bs_write)" "error"
+check "and the history is still there" \
+  "$(docker compose exec -T cli wp eval 'echo count( (array) get_option( "updraft_backup_history", [] ) ) > 0 ? 1 : 0;' 2>/dev/null | tr -d '\r\n')" "1"
+
+# The audit log records a tool's response, so before this the secrets were not merely
+# returned, they were written to the database and readable again through wp_get_audit_log.
+check "no planted secret reaches any reply" \
+  "$(cat "$OUT/bs_hist" "$OUT/bs_s3" "$OUT/bs_phrase" "$OUT/bs_locs" "$OUT/bs_keys" "$OUT/bs_raw" | grep -c 'SMOKE-FTP-PASSWORD\|SMOKE-SECRET-KEY\|SMOKE-ACCESS-KEY\|SMOKE-ENCRYPTION-PHRASE')" "0"
+check "nor the audit log that stores the replies" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb; $t = $wpdb->prefix . "gmcp_audit";
+      $all = implode( "", (array) $wpdb->get_col( "SELECT CONCAT(COALESCE(args,\"\"),COALESCE(detail,\"\"),COALESCE(changes,\"\")) FROM $t" ) );
+      $hit = 0; foreach ( [ "SMOKE-FTP-PASSWORD", "SMOKE-SECRET-KEY", "SMOKE-ACCESS-KEY", "SMOKE-ENCRYPTION-PHRASE" ] as $n ) { if ( strpos( $all, $n ) !== false ) { $hit++; } }
+      echo $hit;' 2>/dev/null | tr -d '\r\n')" "0"
+# A scan over an empty column reports every secret safe, so prove the column has content.
+check "control: the audit log did record these calls" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb; $t = $wpdb->prefix . "gmcp_audit";
+      echo (int) $wpdb->get_var( "SELECT COUNT(*) FROM $t WHERE tool IN (\"wp_get_option\",\"wp_update_option\") AND target LIKE \"updraft%\"" ) > 0 ? 1 : 0;' 2>/dev/null | tr -d '\r\n')" "1"
+
+# Ordinary options are untouched. A guard that blocked everything would pass every check
+# above and be useless.
+call bs_ok '{"jsonrpc":"2.0","id":273,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"blogname"}}}'
+check "control: an unrelated option is still readable" "$(verdict bs_ok)" "ok"
+docker compose exec -T cli wp eval '
+  delete_option( "backuply_remote_backup_locs" );
+  delete_option( "updraft_s3" );
+  delete_option( "updraft_encryptionphrase" );
+' >/dev/null 2>&1
+
 echo "-- backups: reporting, never pretending --"
 # The dangerous failure here is a false yes. Every other guard in this plugin fails
 # closed; a backup tool that claims a backup exists when it does not fails OPEN, because
@@ -1193,6 +1270,12 @@ echo "-- a listing is reduced to shape, not asked to behave --"
 # untouched and then had that sentence appended to it. The audit log stores the reply, so
 # a leak there is written to the database and readable afterwards. This plants an adapter
 # that returns everything the rule forbids and asserts none of it survives.
+# The cli container runs as uid 33 and wp-content/mu-plugins can be root-owned, depending
+# on what created it. The write then fails silently and the probe never loads, which the
+# control below catches as "Backuply answered" rather than as a missing file. Claim the
+# directory first so the section works on any stack.
+docker compose exec -T --user root wp mkdir -p /var/www/html/wp-content/mu-plugins >/dev/null 2>&1
+docker compose exec -T --user root wp chown 33:33 /var/www/html/wp-content/mu-plugins >/dev/null 2>&1
 docker compose exec -T cli bash -c 'mkdir -p /var/www/html/wp-content/mu-plugins && cat > /var/www/html/wp-content/mu-plugins/gmcp-probe-provider.php <<"PROBE"
 <?php
 add_filter( "gmcp_backup_providers", function ( $p ) {
