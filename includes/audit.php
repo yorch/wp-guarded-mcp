@@ -348,7 +348,17 @@ class GMCP_Audit {
     if ( $text === '' ) {
       $text = (string) ( $call['result']['result']['content'][0]['text'] ?? '' );
     }
-    return mb_substr( wp_strip_all_tags( $text ), 0, 1000 );
+    // Cut before stripping, not after. wp_strip_all_tags() runs strip_tags plus two PCRE
+    // passes over whatever it is handed, and what it is handed here is the tool's entire
+    // reply: a chunked read of a 15MB meta value arrives as 21MB of response text, all of
+    // it stripped so that 1000 characters can be kept. Measured, that is the first thing
+    // to fail on a mid-sized host, and it fails in the worst available way, taking the
+    // request down as an HTTP 500 with an empty body, so the caller is told nothing at
+    // all. A generous pre-cut bounds the work without changing what a reader sees: the
+    // margin is wide enough that the second cut, not the first, decides the result for
+    // anything but text that is almost entirely markup, where a shorter line is the
+    // right answer anyway.
+    return mb_substr( wp_strip_all_tags( mb_substr( $text, 0, 8000 ) ), 0, 1000 );
   }
 
   /**

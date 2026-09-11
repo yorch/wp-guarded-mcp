@@ -1064,6 +1064,21 @@ check "and a raw read cannot go round it" "$(verdict bs_raw)" "error"
 
 # Writing matters on its own: an agent that can rewrite the history can erase a site's
 # record of its own backups.
+# The check below asserts the refusal left the history alone, so there has to be a history
+# to leave alone. It is normally built earlier in this run by a backup that completes, and
+# on a site where that never happened the check reduces to "an empty thing is still empty",
+# which passes whatever the guard does. That is why it failed on the first run against
+# three separate fresh stacks and passed on every second one: flakiness in appearance, a
+# missing precondition in fact.
+#
+# Planted BEFORE the hostile write, never after. Repairing afterwards would put back
+# precisely the damage the check exists to detect, so a broken guard would read as a pass.
+docker compose exec -T cli wp eval '
+  if ( ! (array) get_option( "updraft_backup_history", [] ) ) {
+    update_option( "updraft_backup_history", [ time() => [ "nonce" => "smoketest" ] ] );
+  }' >/dev/null 2>&1
+check "there is a history to protect in the first place" \
+  "$(docker compose exec -T cli wp eval 'echo count( (array) get_option( "updraft_backup_history", [] ) ) > 0 ? 1 : 0;' 2>/dev/null | tr -d '\r\n')" "1"
 call bs_write '{"jsonrpc":"2.0","id":272,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"updraft_backup_history","value":{}}}}'
 check "rewriting the backup history is refused" "$(verdict bs_write)" "error"
 check "and the history is still there" \
@@ -1737,6 +1752,31 @@ check "a wrong token is still rejected" \
 call p_restore '{"jsonrpc":"2.0","id":81,"method":"tools/call","params":{"name":"wp_set_permalink_structure","arguments":{"structure":"/%postname%/"}}}'
 check "regenerating restores the header rule" \
   "$(docker compose exec -T wp sh -c 'grep -c HTTP_AUTHORIZATION /var/www/html/.htaccess' | tr -d '\r\n')" "1"
+
+echo "-- what the audit log does with a very large reply --"
+# detail() used to strip tags across the whole response text and only then keep 1000
+# characters. A chunked read of a multi-megabyte value arrives as tens of megabytes of
+# text, and on a mid-sized host that fatals inside wp_strip_all_tags, taking the request
+# down as a 500 with an empty body: the caller is told nothing at all. The cut comes first
+# now. Ordinary text is asserted too, because a fix that quietly shortened every detail
+# line, or stopped stripping markup, would be its own defect. Nothing asserts a duration:
+# the speed is the point, but a timing assertion on a shared machine is a flaky test.
+audit_detail() { # audit_detail <php expression yielding the text>
+  docker compose exec -T cli wp eval "
+    \$m = new ReflectionMethod( 'GMCP_Audit', 'detail' );
+    \$m->setAccessible( true );
+    \$call = [ 'result' => [ 'result' => [ 'content' => [ [ 'text' => $1 ] ] ] ] ];
+    echo mb_strlen( \$m->invoke( new GMCP_Audit(), \$call, false ) );" 2>/dev/null | tr -d '\r\n'
+}
+check "a short reply is recorded whole" "$(audit_detail "'Post created ID 16'")" "18"
+check "a long one is still cut to a thousand" "$(audit_detail "str_repeat('a',50000)")" "1000"
+check "and a multi-megabyte one survives" "$(audit_detail "str_repeat('z',8000000)")" "1000"
+check "markup is still stripped out" \
+  "$(docker compose exec -T cli wp eval "
+     \$m = new ReflectionMethod( 'GMCP_Audit', 'detail' );
+     \$m->setAccessible( true );
+     \$call = [ 'result' => [ 'result' => [ 'content' => [ [ 'text' => '<b>bold</b> and <i>italic</i>' ] ] ] ] ];
+     echo \$m->invoke( new GMCP_Audit(), \$call, false );" 2>/dev/null | tr -d '\r\n')" "bold and italic"
 
 echo "-- deleting an option --"
 docker compose exec -T cli wp option add gmcp_smoke_removable "bye" >/dev/null 2>&1

@@ -155,6 +155,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * Copy post meta between posts, duplicate a post, and write or read an oversized value across several calls, so a large or heavily escaped design never has to pass through a tool argument. A duplicate is a draft unless you ask otherwise.
 * Delete an option, not only set one, so a stale cache that only clears by removing the row can be cleared. Nine options are refused, each with what breaks if it goes. The reply carries the removed value, because undo cannot put it back.
 * Flush the object cache, expired transients or one post, and say plainly which CDN or reverse proxy it could not reach and you still have to purge yourself.
+* Meta keys are matched exactly rather than lowercased, and a write that lands under a different spelling than you asked for says so.
 * A folded page says how many refusals sit on other pages, a row opens in place to show its reason and what it changed, and a chain check that covered only part of the log says so and offers to walk the rest.
 * The audit log screen folds repeated identical calls into one counted row, says on the row why a call was refused, names the way a caller got in beside the client, searches the small columns by default with a checkbox for the rest, and exports the filtered view as CSV or JSON.
 * Elementor tools on their own switch: theme-builder conditions written to both the template and Elementor's cached registry, regenerate CSS, and apply a library template to a page without the design passing through a tool argument.

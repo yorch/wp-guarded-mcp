@@ -419,6 +419,95 @@ class GMCP_Tools_Core {
   }
 
   /**
+  * Whether a post meta key can be stored as the caller wrote it, and if not, why not.
+  *
+  * The five meta tools used to put the key through sanitize_key(), which lowercases and
+  * drops everything outside a-z, 0-9, "_" and "-". WordPress stores far more than that,
+  * so "myPlugin_Data" was unreachable: a read addressed "myplugin_data" and got the wrong
+  * row or none, a write created that other row instead, and nothing said the key had been
+  * changed. The key is now kept exactly as given, and the two cases below are refused
+  * rather than rewritten, because both end with a row under a name nobody asked for.
+  *
+  * No unslashing happens here, and that is deliberate. Arguments reach this class from
+  * json_decode() of the raw request body in GMCP_Server, never from $_POST, so nothing
+  * added slashes on the way in and wp_unslash() would eat the backslashes out of a key
+  * that has them of its own. Slashing on the way OUT is a different question and belongs
+  * at each call site, because the two halves of WordPress disagree: add_metadata(),
+  * update_metadata() and delete_metadata() all unslash the key, and get_metadata() does
+  * not. So a write passes wp_slash( $key ) and a read passes $key, and only then do the
+  * writer and the reader mean the same row.
+  *
+  * There is nothing to smuggle past by keeping the case. No guard stands in front of a
+  * meta key at any access level, and the one case-sensitive comparison in this file,
+  * META_KEYS_NEVER_COPIED, is made against keys already present on the source post rather
+  * than against anything a caller typed. GMCP_Core::field_looks_secret() lowercases what
+  * it is handed before matching, so redaction is unaffected either way.
+  *
+  * @return true|string True if the key is usable, otherwise the refusal message.
+  */
+  private function meta_key_allowed( string $key ) {
+    // Both strings WordPress itself calls "no key". add_metadata(), update_metadata(),
+    // delete_metadata() and get_metadata_raw() all gate on ! $meta_key, which is false for
+    // "" and for "0" alike. Measured: update_post_meta( $id, "0", ... ) returns false and
+    // writes nothing, and a row forced into wp_postmeta under "0" cannot be read back or
+    // deleted through WordPress at all, because get_post_meta( $id, "0" ) answers with the
+    // whole set instead. Refusing says that; letting it through would have this tool
+    // report a write that cannot happen, or answer a read of one key with every key.
+    if ( $key === '' || $key === '0' ) {
+      return 'A meta key is required, and ' . ( $key === '' ? 'the empty string' : 'the string "0"' )
+        . ' is not one: WordPress tests a meta key for truth before using it, so "" and "0" both mean "no key given" to it. Nothing can be written under either, and a read of one answers with every key on the post instead.';
+    }
+    // wp_postmeta.meta_key is varchar(255), counted in characters and not in bytes: a
+    // 255-character multibyte key stores whole, measured. Past 255 nothing is truncated,
+    // which is the good news and the reason to refuse here rather than let it through:
+    // wpdb rejects the field ("Processing the value for the following field failed:
+    // meta_key"), update_post_meta() returns false and writes nothing, and these tools do
+    // not read that return value, so the answer would have been "Meta updated" over an
+    // empty result. Refusing on the way in is the same outcome with the truth attached.
+    $length = mb_strlen( $key );
+    if ( $length > 255 ) {
+      return 'The meta key is ' . $length . ' characters. wp_postmeta.meta_key holds 255, and a longer one is refused by the database rather than shortened, so no row can exist under it and no write to it would store anything. Use a key of 255 characters or fewer.';
+    }
+    return true;
+  }
+
+  /**
+  * The spelling a post's meta is actually filed under, when it is not the one asked for.
+  *
+  * Keeping the key verbatim fixes the half of this that was the plugin's doing. The other
+  * half belongs to the database and cannot be fixed from here, only reported. Row lookup
+  * uses the column's collation, utf8mb4_unicode_520_ci on a stock WordPress, so
+  * "myPlugin_Data" and "myplugin_data" are one row to every SELECT, UPDATE and DELETE
+  * WordPress runs. Reads are not: get_metadata() answers out of the meta cache, a PHP
+  * array keyed by the spelling in the row, and PHP array keys compare exactly.
+  *
+  * So a write aimed at a key that differs only in case from one already on the post lands
+  * in that row, leaves its spelling alone, and is then invisible to a read of the key that
+  * was just written. Measured, not reasoned: writing "Existing_Key" over a row stored as
+  * "existing_key" leaves one row, still called "existing_key", holding the new value,
+  * and get_post_meta( $id, "Existing_Key" ) then answers "". Nothing errors anywhere.
+  *
+  * The writers call this after the write and say so when it happened, which is the one
+  * thing the caller cannot find out for itself.
+  *
+  * @return string The differing spelling, or '' when the row is filed exactly as asked.
+  */
+  private function meta_key_stored_as( int $post_id, string $key ): string {
+    global $wpdb;
+    $found = $wpdb->get_col( $wpdb->prepare(
+      "SELECT DISTINCT meta_key FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s",
+      $post_id,
+      $key
+    ) );
+    // A site on a case-sensitive collation can hold both spellings at once, and then the
+    // exact one is the row that was written and there is nothing to report.
+    if ( !$found || in_array( $key, $found, true ) ) {
+      return '';
+    }
+    return (string) reset( $found );
+  }
+
+  /**
   * @see GMCP_Core::option_guard() for the rule and why it lives there.
   * @return true|string True if the key is allowed, otherwise the refusal message.
   */
@@ -581,7 +670,11 @@ class GMCP_Tools_Core {
       foreach ( (array) $rows as $value ) {
         // Bytes are counted on the stored row, which is what actually moved.
         $bytes += strlen( (string) $value );
-        add_post_meta( $to, $key, wp_slash( maybe_unserialize( $value ) ) );
+        // The KEY needs wp_slash as much as the value does: add_metadata() unslashes both,
+        // so a source key holding a backslash arrived on the target without it, under a
+        // name the report did not mention. Measured: copying a key spelled back\slash_Key
+        // filed it as backslash_Key while answering that back\slash_Key had been copied.
+        add_post_meta( $to, wp_slash( $key ), wp_slash( maybe_unserialize( $value ) ) );
       }
       $copied[ $key ] = [ 'bytes' => $bytes, 'rows' => count( (array) $rows ) ];
     }
@@ -606,11 +699,41 @@ class GMCP_Tools_Core {
   // How much one chunked READ hands back at a time.
   //
   // 64KB by default because the answer is read by a model and has to fit in what it can
-  // hold. 262144 is the ceiling because the slice travels base64, four bytes of response
-  // for every three bytes of value, and because a larger one defeats the point of asking
-  // for a value in pieces at all. A longer length is clamped rather than refused:
-  // bytes_returned reports what actually came back, so a caller that adds it to offset
-  // still walks to the end and never skips the bytes it did not get.
+  // hold. The 256KB ceiling is not where the response path breaks, and it would be
+  // dishonest to imply that it is. It was measured, against WordPress 7.1 on PHP 8.2
+  // with the web SAPI at memory_limit 256M, by raising this constant and walking the
+  // slice size up through the real endpoint:
+  //
+  //   256KB  ->   350KB response, 26ms, peak 57.7MB
+  //     4MB  ->  5.59MB response,        peak 72.4MB
+  //     8MB  -> 11.2MB  response,        peak 89.1MB
+  //    15MB  -> 21.0MB  response, 430ms, peak 118.5MB
+  //
+  // Nothing failed. 15MB is not an arbitrary stopping point either: it is very near the
+  // largest value that can exist to be read, because the row has to arrive through
+  // MySQL's max_allowed_packet, 16MB on a stock MariaDB. So on a default-sized host this
+  // tool can hand back any meta value a site can hold, in one call, and the ceiling is a
+  // policy rather than a limit.
+  //
+  // What the sweep does establish is the slope, which is the useful number: each byte of
+  // slice costs about 4 bytes of peak memory (base64, then the inner JSON, then the
+  // response JSON that escapes it) and about 1.33 bytes of response. That is what makes
+  // a ceiling worth keeping on a smaller host. Lowering memory_limit and repeating the
+  // sweep against a 15MB value, the first failure is at 4MB of slice on a 64M host; 2MB
+  // still succeeds. The failure is worth knowing because it is not uniform: between
+  // roughly 96M and 112M the fatal lands inside the audit log's wp_strip_all_tags() over
+  // the whole response text, and the request dies as an HTTP 500 with an empty body, so
+  // the caller gets nothing rather than an error it can read.
+  //
+  // 256KB is therefore kept for the caller, not for the server: it is 1MB of peak memory
+  // and 350KB of response, sixteen times under the smallest failure measured, and already
+  // more base64 than a model has any use for in one answer. Latency is not a reason in
+  // either direction; at 256KB the slice size is not measurable next to the cost of
+  // loading the value (26ms on a 512KB value, 107ms on a 15MB one, whatever the length).
+  //
+  // A longer length is clamped rather than refused: bytes_returned reports what actually
+  // came back, so a caller that adds it to offset still walks to the end and never skips
+  // the bytes it did not get.
   private const META_READ_CHUNK_BYTES = 65536;
   private const META_READ_CHUNK_MAX_BYTES = 262144;
 
@@ -1010,7 +1133,7 @@ class GMCP_Tools_Core {
             ],
             'meta_input' => [
               'type' => 'object',
-              'description' => 'Associative array of custom fields.'
+              'description' => 'Associative array of custom fields. Keys are written exactly as given, case included; an empty key, the key "0", or one longer than 255 characters refuses the whole call before anything is written.'
             ],
             'schedule_for' => [
               'type' => 'string',
@@ -1104,7 +1227,7 @@ class GMCP_Tools_Core {
       /* -------- Post-meta -------- */
       'wp_get_post_meta' => [
         'name' => 'wp_get_post_meta',
-        'description' => 'Get specific post meta field(s). Provide "key" to fetch a single value; omit to fetch all custom fields. If you need ALL meta along with post data and terms, use wp_get_post_snapshot instead for efficiency.',
+        'description' => 'Get specific post meta field(s). Provide "key" to fetch a single value; omit to fetch all custom fields. The key is matched EXACTLY as given, case and punctuation included, so "myPlugin_Data" and "myplugin_data" are different rows here; earlier versions lowercased the key, so one that seemed to work before may now correctly return nothing, and the spelling to use is the one this tool lists when you omit "key". If you need ALL meta along with post data and terms, use wp_get_post_snapshot instead for efficiency.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1117,7 +1240,7 @@ class GMCP_Tools_Core {
       ],
       'wp_update_post_meta' => [
         'name' => 'wp_update_post_meta',
-        'description' => 'Update post meta efficiently. Use "meta" object to update MULTIPLE fields at once (e.g., {_price: "19.99", _stock: "50", _sku: "WIDGET"}), or use "key"+"value" for a single field. Essential for WooCommerce products and custom post types.',
+        'description' => 'Update post meta efficiently. Use "meta" object to update MULTIPLE fields at once (e.g., {_price: "19.99", _stock: "50", _sku: "WIDGET"}), or use "key"+"value" for a single field. Essential for WooCommerce products and custom post types. Keys are written EXACTLY as given, case included, so "myPlugin_Data" creates that key and not the "myplugin_data" earlier versions silently wrote instead. One thing is not decided here: the database matches an existing row case-insensitively, so writing "myPlugin_Data" where "myplugin_data" is already on the post updates that row and leaves its spelling alone, and reads are exact and would then miss it. That is reported in the answer when it happens, naming the row the value is really in. An empty key, the key "0" (WordPress cannot address either), or one longer than 255 characters (the width of wp_postmeta.meta_key) is refused and nothing at all is written.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1132,7 +1255,7 @@ class GMCP_Tools_Core {
       ],
       'wp_delete_post_meta' => [
         'name' => 'wp_delete_post_meta',
-        'description' => 'Delete custom field(s) from a post. Provide value to remove a single row; omit value to delete all rows for the key.',
+        'description' => 'Delete custom field(s) from a post. Provide value to remove a single row; omit value to delete all rows for the key. The key is passed through EXACTLY as given; earlier versions lowercased it first. Matching is then left to the database, which ignores case, so this deletes a row spelled "myplugin_data" when asked for "myPlugin_Data". List the keys on the post first if which row goes matters.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1146,7 +1269,7 @@ class GMCP_Tools_Core {
       ],
       'wp_copy_post_meta' => [
         'name' => 'wp_copy_post_meta',
-        'description' => 'Copy custom fields from one post to another inside PHP, so a value too large to survive a tool argument never has to leave the server: an Elementor _elementor_data blob is routinely over 100KB and cannot be read out and written back reliably. Copies every key by default; pass "keys" to copy only some. A key that already exists on the target is SKIPPED, not merged, unless overwrite is true. _edit_lock and _edit_last are never copied because they say who is editing the source, not what it contains. A key with several rows keeps all of them. Reports bytes copied per key and the reason for every skip. Post meta is not journalled, so this cannot be undone with wp_undo_change.',
+        'description' => 'Copy custom fields from one post to another inside PHP, so a value too large to survive a tool argument never has to leave the server: an Elementor _elementor_data blob is routinely over 100KB and cannot be read out and written back reliably. Copies every key by default; pass "keys" to copy only some, spelled exactly as they are on the source, case included, and a key that does not match is reported as skipped rather than guessed at. A key that already exists on the target is SKIPPED, not merged, unless overwrite is true. _edit_lock and _edit_last are never copied because they say who is editing the source, not what it contains. A key with several rows keeps all of them. Reports bytes copied per key and the reason for every skip. Post meta is not journalled, so this cannot be undone with wp_undo_change.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1165,7 +1288,7 @@ class GMCP_Tools_Core {
       ],
       'wp_write_post_meta_chunk' => [
         'name' => 'wp_write_post_meta_chunk',
-        'description' => 'Write a post meta value that is too large to pass in one tool argument, a piece at a time. Pick any "session" id and send successive calls with the same session, ID and key; each call appends and answers with chunk_index, bytes_written and total_bytes staged. Nothing touches the post until the call that sets final: true, which assembles the staged bytes, writes the meta row and clears the staging, so an abandoned or half-sent value can never be read as real. A session is bound to the post and key it opened with and refuses a chunk aimed anywhere else. If the assembled string is valid JSON for an array or object it is decoded before storing, the same way wp_update_option decodes a JSON string, so a JSON-encoded Elementor payload becomes the array WordPress expects instead of a string; anything else is stored verbatim. Staging is capped and abandoned sessions expire. Post meta is not journalled, so the final write CANNOT be undone with wp_undo_change.',
+        'description' => 'Write a post meta value that is too large to pass in one tool argument, a piece at a time. Pick any "session" id and send successive calls with the same session, ID and key; each call appends and answers with chunk_index, bytes_written and total_bytes staged. Nothing touches the post until the call that sets final: true, which assembles the staged bytes, writes the meta row and clears the staging, so an abandoned or half-sent value can never be read as real. A session is bound to the post and key it opened with and refuses a chunk aimed anywhere else. If the assembled string is valid JSON for an array or object it is decoded before storing, the same way wp_update_option decodes a JSON string, so a JSON-encoded Elementor payload becomes the array WordPress expects instead of a string; anything else is stored verbatim. Staging is capped and abandoned sessions expire. The key is written EXACTLY as given, case included (earlier versions lowercased it), and an empty key, the key "0", or one longer than 255 characters is refused. "written_to" in the final answer names the row the bytes actually went into: if the post already held a key differing only in case, the database counts that as the same key and the value lands there under the old spelling, which is the name to read it back by. Post meta is not journalled, so the final write CANNOT be undone with wp_undo_change.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1182,7 +1305,7 @@ class GMCP_Tools_Core {
 
       'wp_read_post_meta_chunk' => [
         'name' => 'wp_read_post_meta_chunk',
-        'description' => 'Read a post meta value that is too large to return in one response, a piece at a time: the mirror of wp_write_post_meta_chunk. Every call answers with offset, bytes_returned, total_bytes and more; walk the value by calling again with offset set to offset + bytes_returned, until more is false. "data" is ALWAYS base64: decode each piece and concatenate the DECODED bytes. It is base64 because a slice can end in the middle of a multibyte character, and only base64 carries those bytes through a JSON response unchanged. "represents" says what the bytes are, so a caller never has to guess: "raw" for a value stored as a string, or "json" when WordPress stored an array or an object, in which case the bytes are the same JSON that wp_get_post_meta prints for that row and can be handed straight back to wp_write_post_meta_chunk to reproduce it. A key with several rows is addressed with "index", and "rows" says how many there are. "sha256" hashes the WHOLE value rather than the piece, so it is identical on every call of one walk: if it changes, the value was rewritten mid-walk and the pieces already collected belong to a different document, so start again. Refuses a key the post does not have, an index that does not exist and an offset past the end. length defaults to 65536 bytes and is capped at 262144; a longer request is clamped, and bytes_returned says what came back.',
+        'description' => 'Read a post meta value that is too large to return in one response, a piece at a time: the mirror of wp_write_post_meta_chunk. Every call answers with offset, bytes_returned, total_bytes and more; walk the value by calling again with offset set to offset + bytes_returned, until more is false. "data" is ALWAYS base64: decode each piece and concatenate the DECODED bytes. It is base64 because a slice can end in the middle of a multibyte character, and only base64 carries those bytes through a JSON response unchanged. "represents" says what the bytes are, so a caller never has to guess: "raw" for a value stored as a string, or "json" when WordPress stored an array or an object, in which case the bytes are the same JSON that wp_get_post_meta prints for that row and can be handed straight back to wp_write_post_meta_chunk to reproduce it. A key with several rows is addressed with "index", and "rows" says how many there are. "sha256" hashes the WHOLE value rather than the piece, so it is identical on every call of one walk: if it changes, the value was rewritten mid-walk and the pieces already collected belong to a different document, so start again. The key is matched EXACTLY, case included (earlier versions lowercased it), so spell it as wp_get_post_meta lists it; a refusal names the near-miss spelling on the post when there is one. Refuses a key the post does not have, an index that does not exist and an offset past the end. length defaults to 65536 bytes and is capped at 262144; a longer request is clamped, and bytes_returned says what came back.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -2934,6 +3057,27 @@ class GMCP_Tools_Core {
           break;
         }
 
+        // Meta keys are checked here, before the post fields are written, because this
+        // tool writes the two in one call and a key refused after wp_update_post() has
+        // run would leave the post half updated. wp_create_post already stores these keys
+        // verbatim, since wp_insert_post() writes meta_input itself; this tool used to
+        // sanitize_key() them, so the same key meant two different rows depending on
+        // which tool the caller reached for. @see meta_key_allowed().
+        if ( $has_meta ) {
+          $meta_refusal = null;
+          foreach ( array_keys( $meta_input ) as $meta_k ) {
+            $meta_why = $this->meta_key_allowed( (string) $meta_k );
+            if ( $meta_why !== true ) {
+              $meta_refusal = $meta_why;
+              break;
+            }
+          }
+          if ( $meta_refusal !== null ) {
+            $r = $this->error( $r, $meta_refusal . ' Nothing was written, post fields included.', -32602 );
+            break;
+          }
+        }
+
         // Detect trash / untrash transitions and route through wp_trash_post() /
         // wp_untrash_post() so the proper hooks fire (ACF cleanup, search-index purges,
         // SEO plugins, etc.). A bare wp_update_post( ['post_status' => 'trash'] ) just
@@ -2974,11 +3118,18 @@ class GMCP_Tools_Core {
         }
 
         // Update meta if any
+        $meta_notes = [];
         if ( $has_meta ) {
           foreach ( $meta_input as $k => $v ) {
             // Pass the value as-is: update_post_meta() serializes arrays itself.
             // maybe_serialize() here double-serialized nested arrays.
-            update_post_meta( $u, sanitize_key( $k ), $v );
+            // wp_slash on the key alone, because update_metadata() unslashes it.
+            update_post_meta( $u, wp_slash( (string) $k ), $v );
+            $meta_elsewhere = $this->meta_key_stored_as( (int) $u, (string) $k );
+            if ( $meta_elsewhere !== '' ) {
+              $meta_notes[ (string) $k ] = 'went into the row already spelled "' . $meta_elsewhere
+                . '", which the database treats as the same key; read it back under that name.';
+            }
           }
         }
 
@@ -2990,6 +3141,9 @@ class GMCP_Tools_Core {
           'post_id' => $u,
           'post_modified' => $updated_post->post_modified,
         ];
+        if ( $meta_notes ) {
+          $result['meta_key_notes'] = $meta_notes;
+        }
 
         // Verify content was saved correctly if we tried to update it
         if ( $content_to_verify !== null ) {
@@ -3100,7 +3254,23 @@ class GMCP_Tools_Core {
           break;
         }
         $pid = intval( $a['ID'] );
-        $out = ( $a['key'] ?? '' ) ? get_post_meta( $pid, sanitize_key( $a['key'] ), true ) : get_post_meta( $pid );
+        // Compared against '' rather than tested for truthiness. The difference is "0",
+        // which is falsy in PHP and which WordPress cannot address either: this way it
+        // reaches meta_key_allowed() and is refused by name, instead of quietly turning
+        // into "no key given" and answering a read of one key with every key.
+        $get_key = (string) ( $a['key'] ?? '' );
+        if ( $get_key === '' ) {
+          $out = get_post_meta( $pid );
+        }
+        else {
+          $get_why = $this->meta_key_allowed( $get_key );
+          if ( $get_why !== true ) {
+            $r = $this->error( $r, $get_why, -32602 );
+            break;
+          }
+          // No wp_slash: get_metadata() does not unslash the key. @see meta_key_allowed().
+          $out = get_post_meta( $pid, $get_key, true );
+        }
         $this->add_result_text( $r, wp_json_encode( $out, JSON_PRETTY_PRINT ) );
         break;
 
@@ -3120,27 +3290,68 @@ class GMCP_Tools_Core {
         // Pass values as-is: update_post_meta() serializes arrays itself, so
         // maybe_serialize() here double-serialized nested arrays into a string.
         if ( !empty( $meta ) && is_array( $meta ) ) {
+          $pairs = [];
           foreach ( $meta as $k => $v ) {
-            update_post_meta( $pid, sanitize_key( $k ), $v );
+            $pairs[ (string) $k ] = $v;
           }
         }
         elseif ( isset( $a['key'], $a['value'] ) ) {
-          update_post_meta( $pid, sanitize_key( $a['key'] ), $a['value'] );
+          $pairs = [ (string) $a['key'] => $a['value'] ];
         }
         else {
           $r = $this->error( $r, 'meta array or key/value required', -32602 );
           break;
         }
-        $this->add_result_text( $r, 'Meta updated for post #' . $pid );
+
+        // Every key is checked before any of them is written. A refusal halfway through a
+        // "meta" object would leave the post holding some of the call and not the rest,
+        // with the answer describing neither.
+        $bad_key = null;
+        foreach ( array_keys( $pairs ) as $k ) {
+          $why = $this->meta_key_allowed( $k );
+          if ( $why !== true ) {
+            $bad_key = $why;
+            break;
+          }
+        }
+        if ( $bad_key !== null ) {
+          $r = $this->error( $r, $bad_key . ' Nothing was written.', -32602 );
+          break;
+        }
+        $meta_lines = [ 'Meta updated for post #' . $pid ];
+        foreach ( $pairs as $k => $v ) {
+          // wp_slash on the KEY only: update_metadata() unslashes it, so a key holding a
+          // backslash would otherwise be stored without it, under a name no reader asks
+          // for. @see meta_key_allowed(). The value is left exactly as it arrives, which
+          // is the behaviour every existing caller already writes against.
+          update_post_meta( $pid, wp_slash( $k ), $v );
+          $elsewhere = $this->meta_key_stored_as( $pid, $k );
+          if ( $elsewhere !== '' ) {
+            $meta_lines[] = 'Note: "' . $k . '" went into the row already spelled "' . $elsewhere
+              . '". The database treats the two as one key, so the value is stored, but a read of "'
+              . $k . '" will not find it. Read it back as "' . $elsewhere . '".';
+          }
+        }
+        $this->add_result_text( $r, implode( "\n", $meta_lines ) );
         break;
 
       case 'wp_delete_post_meta':
-        if ( empty( $a['ID'] ) || empty( $a['key'] ) ) {
+        // The key is tested against '' rather than with empty(), so "0" gets the refusal
+        // from meta_key_allowed() that says why WordPress cannot address it, rather than
+        // this generic line. @see meta_key_allowed().
+        if ( empty( $a['ID'] ) || (string) ( $a['key'] ?? '' ) === '' ) {
           $r = $this->error( $r, 'ID & key required', -32602 );
           break;
         }
         $pid = intval( $a['ID'] );
-        $key = sanitize_key( $a['key'] );
+        $key = (string) $a['key'];
+        $del_why = $this->meta_key_allowed( $key );
+        if ( $del_why !== true ) {
+          $r = $this->error( $r, $del_why, -32602 );
+          break;
+        }
+        // wp_slash on the key because delete_metadata() unslashes it. @see meta_key_allowed().
+        $key = wp_slash( $key );
         // delete_post_meta() serializes the match value itself; don't pre-serialize.
         $done = isset( $a['value'] ) ? delete_post_meta( $pid, $key, $a['value'] ) : delete_post_meta( $pid, $key );
         if ( $done ) {
@@ -3195,7 +3406,7 @@ class GMCP_Tools_Core {
       case 'wp_write_post_meta_chunk':
         $chunk_session = (string) ( $a['session'] ?? '' );
         $chunk_pid = intval( $a['ID'] ?? 0 );
-        $chunk_key = sanitize_key( $a['key'] ?? '' );
+        $chunk_key = (string) ( $a['key'] ?? '' );
         $chunk_data = $a['data'] ?? null;
         $chunk_name = $this->meta_chunk_transient( $chunk_session );
         if ( $chunk_name === $this->meta_chunk_transient( '' ) ) {
@@ -3206,8 +3417,9 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'No post with ID ' . $chunk_pid . '.', -32602 );
           break;
         }
-        if ( $chunk_key === '' ) {
-          $r = $this->error( $r, 'key required', -32602 );
+        $chunk_why = $this->meta_key_allowed( $chunk_key );
+        if ( $chunk_why !== true ) {
+          $r = $this->error( $r, $chunk_why, -32602 );
           break;
         }
         if ( !is_string( $chunk_data ) ) {
@@ -3274,7 +3486,14 @@ class GMCP_Tools_Core {
         }
         // wp_slash for the reason copy_post_meta() gives: update_post_meta() unslashes,
         // and an unslashed JSON payload loses the backslashes that make it valid JSON.
-        update_post_meta( $chunk_pid, $chunk_key, wp_slash( $chunk_value ) );
+        // The key needs it for the same reason and is easier to miss, because a key with
+        // a backslash in it would be stored without one and the reader would never find
+        // it. @see meta_key_allowed().
+        update_post_meta( $chunk_pid, wp_slash( $chunk_key ), wp_slash( $chunk_value ) );
+        // written_to names the row the bytes are in, not the row that was asked for, so a
+        // caller can hand it straight to wp_read_post_meta_chunk. @see meta_key_stored_as().
+        $chunk_elsewhere = $this->meta_key_stored_as( $chunk_pid, $chunk_key );
+        $chunk_filed_as = $chunk_elsewhere !== '' ? $chunk_elsewhere : $chunk_key;
         delete_transient( $chunk_name );
         $this->bust_post_cache( $chunk_pid, [ 'tool' => 'wp_write_post_meta_chunk' ] );
 
@@ -3284,9 +3503,10 @@ class GMCP_Tools_Core {
           'bytes_written' => strlen( $chunk_data ),
           'total_bytes' => strlen( $staged['data'] ),
           'final' => true,
-          'written_to' => [ 'ID' => $chunk_pid, 'key' => $chunk_key ],
+          'written_to' => [ 'ID' => $chunk_pid, 'key' => $chunk_filed_as ],
           'stored_as' => $chunk_stored_as,
-          'note' => 'Post meta is not journalled; wp_undo_change cannot reverse this write.',
+          'note' => ( $chunk_elsewhere !== '' ? 'The post already held a row spelled "' . $chunk_elsewhere . '", which the database treats as the same key as "' . $chunk_key . '", so the value went there and that row keeps its own spelling; read it back under written_to.key. ' : '' )
+            . 'Post meta is not journalled; wp_undo_change cannot reverse this write.',
         ], JSON_PRETTY_PRINT ) );
         break;
 
@@ -3298,13 +3518,14 @@ class GMCP_Tools_Core {
         // already ask for in one call. If a guard is ever put on post meta reads it has
         // to be put on both tools, or this one becomes the way around it.
         $read_pid = intval( $a['ID'] ?? 0 );
-        $read_key = sanitize_key( $a['key'] ?? '' );
+        $read_key = (string) ( $a['key'] ?? '' );
         if ( !$read_pid || !get_post( $read_pid ) ) {
           $r = $this->error( $r, 'No post with ID ' . $read_pid . '.', -32602 );
           break;
         }
-        if ( $read_key === '' ) {
-          $r = $this->error( $r, 'key required', -32602 );
+        $read_why = $this->meta_key_allowed( $read_key );
+        if ( $read_why !== true ) {
+          $r = $this->error( $r, $read_why, -32602 );
           break;
         }
 
@@ -3312,9 +3533,20 @@ class GMCP_Tools_Core {
         // rows and can be addressed one at a time. wp_get_post_meta's single read hands
         // back row 0 and never mentions the others, which is the thing worth not
         // repeating in a tool whose job is to return a value completely.
+        // No wp_slash: get_metadata() does not unslash the key. @see meta_key_allowed().
         $read_rows = get_post_meta( $read_pid, $read_key );
         if ( !is_array( $read_rows ) || $read_rows === [] ) {
-          $r = $this->error( $r, 'Post #' . $read_pid . ' has no meta key "' . $read_key . '".', -32602 );
+          // Reads compare the spelling exactly and the database does not, so the likeliest
+          // reason a key is missing is that it is there under another capitalisation. Say
+          // which one, or the caller is left guessing at the tool that used to lowercase
+          // for it. @see meta_key_stored_as().
+          $read_elsewhere = $this->meta_key_stored_as( $read_pid, $read_key );
+          $r = $this->error(
+            $r,
+            'Post #' . $read_pid . ' has no meta key "' . $read_key . '".'
+              . ( $read_elsewhere !== '' ? ' It does have "' . $read_elsewhere . '", which differs only in ways the database ignores; keys are matched exactly here, so ask for that spelling.' : '' ),
+            -32602
+          );
           break;
         }
         $read_count = count( $read_rows );
