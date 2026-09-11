@@ -37,7 +37,7 @@ You can also see what actually happened. The settings screen keeps a full audit 
 
 Content and site data: posts and pages, block content, taxonomies and terms, comments, media including uploads, users, post meta, site options, post types and block patterns.
 
-Site administration, which is off by default and switched on from the settings screen: installing, activating, updating and deleting plugins and themes; navigation menus and their items; widgets and widget areas; the General, Reading and Discussion settings; the permalink structure; and a Site Health report.
+Site administration, which is off by default and switched on from the settings screen: installing, activating, updating and deleting plugins and themes; navigation menus and their items; widgets and widget areas; the General, Reading and Discussion settings; the permalink structure; the site's scheduled events; and a Site Health report.
 
 WooCommerce, on a switch of its own that only appears when the shop is installed: products, stock levels, orders, order notes, customers, and sales figures. Separate from site administration because the risk is a different shape. Anything carrying a customer's name, email address or delivery address needs full administrative access, the same level a list of usernames needs, so a read-only key sees products and sales figures and none of your customers. That is a statement about the shop tools, not about the whole plugin: a read-only key can still read your comments, and a comment carries the name its author put on it, which is already published on the page. Refunds are deliberately not included. Anything that emails a customer reports exactly who was written to, measured as it happens rather than guessed.
 
@@ -145,6 +145,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * MCP prompts for common upkeep jobs, and MCP resources for attaching site content to a conversation.
 * A one-call site briefing, so an agent orients in one request rather than six.
 * Tool failures arrive as results the model can read, with isError set, rather than as JSON-RPC errors a client may discard along with the rest of the response.
+* Scheduled events can be listed, run and removed, so a cron event Site Health keeps flagging can be diagnosed and cleared. Only events the site already scheduled can be run, and removing one takes a confirmation step.
 
 == Upgrade Notice ==
 

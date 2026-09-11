@@ -641,6 +641,41 @@ class GMCP_Tools_Admin {
         ],
         'accessLevel' => 'admin',
       ],
+
+      /* -------- Cron -------- */
+      'wp_list_cron_events' => [
+        'name' => 'wp_list_cron_events',
+        'description' => 'List the site\'s scheduled events: hook, next run as a UTC timestamp and a UTC date, how overdue it is, the schedule name and interval, the arguments, and whether the hook has any callback registered right now. An event whose callbacks went away with a deactivated plugin can never succeed and will keep failing Site Health, and that is what has_callback is for; it is read on an API request rather than a cron request, so a callback a plugin only registers in another context can read as absent when it is not. Also reports whether cron is disabled on this site, in which case every event is overdue by design. Changes nothing.',
+        'inputSchema' => [ 'type' => 'object', 'properties' => [] ],
+        'accessLevel' => 'admin',
+      ],
+      'wp_run_cron_event' => [
+        'name' => 'wp_run_cron_event',
+        'description' => 'Run a scheduled event now, the way WP-CLI\'s "wp cron event run" does: take the occurrence off the schedule first (rescheduling a recurring one for its next run) so a failure cannot leave it due twice, then fire the hook. Only hooks the site has already scheduled can be run; this will not fire an arbitrary WordPress action, and it refuses this plugin\'s own gmcp_ hooks. A cron callback can do anything the site\'s plugins can do, including sending email, deleting files and calling remote services, so the blast radius is whatever that hook\'s callbacks do. None of it is undoable here.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'hook' => [ 'type' => 'string', 'description' => 'Hook name as listed by wp_list_cron_events.' ],
+            'args' => [ 'type' => 'array', 'description' => 'The event\'s arguments, to pick one event when several are scheduled under the same hook. Must match exactly.' ],
+          ],
+          'required' => [ 'hook' ],
+        ],
+        'accessLevel' => 'admin',
+      ],
+      'wp_unschedule_cron_event' => [
+        'name' => 'wp_unschedule_cron_event',
+        'description' => 'Remove a scheduled event so WordPress stops retrying it. Two steps: call it once to get a confirmation token, then call again with that token. Removes the next occurrence of the hook, which for a recurring event stops it recurring. The undo journal cannot put this back, because WordPress keeps the schedule in the "cron" option and the journal ignores that row. Refuses this plugin\'s own gmcp_ hooks.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'hook' => [ 'type' => 'string', 'description' => 'Hook name as listed by wp_list_cron_events.' ],
+            'args' => [ 'type' => 'array', 'description' => 'The event\'s arguments, to pick one event when several are scheduled under the same hook. Must match exactly.' ],
+            'confirm' => [ 'type' => 'string', 'description' => 'Confirmation token. Call without it first; the response supplies the token.' ],
+          ],
+          'required' => [ 'hook' ],
+        ],
+        'accessLevel' => 'admin',
+      ],
     ];
   }
 
@@ -656,7 +691,9 @@ class GMCP_Tools_Admin {
       $readonly = strpos( $name, 'wp_list_' ) === 0 || strpos( $name, 'wp_get_' ) === 0;
       $tool['annotations'] = [
         'readOnlyHint' => $readonly,
-        'destructiveHint' => strpos( $name, 'wp_delete_' ) === 0,
+        // Named as well as prefixed: unscheduling an event destroys something the
+        // journal cannot put back, so the naming convention is not enough to catch it.
+        'destructiveHint' => strpos( $name, 'wp_delete_' ) === 0 || $name === 'wp_unschedule_cron_event',
         'openWorldHint' => strpos( $name, 'wp_install_' ) === 0 || strpos( $name, 'wp_update_' ) === 0,
       ];
     }
@@ -782,6 +819,15 @@ class GMCP_Tools_Admin {
 
       case 'wp_delete_widget':
         return $this->delete_widget( $r, $a );
+
+      case 'wp_list_cron_events':
+        return $this->list_cron_events( $r );
+
+      case 'wp_run_cron_event':
+        return $this->run_cron_event( $r, $a );
+
+      case 'wp_unschedule_cron_event':
+        return $this->unschedule_cron_event( $r, $a );
     }
 
     return $this->error( $r, 'Unknown tool', -32601 );
@@ -798,7 +844,7 @@ class GMCP_Tools_Admin {
   private const READ_ONLY_TOOLS = [
     'wp_list_themes', 'wp_get_settings', 'wp_get_permalink_structure', 'wp_get_site_health',
     'wp_list_menus', 'wp_get_menu_items', 'wp_list_sidebars', 'wp_site_briefing',
-    'wp_get_audit_log', 'wp_backup_status',
+    'wp_get_audit_log', 'wp_backup_status', 'wp_list_cron_events',
   ];
 
   private function is_mutating_tool( string $tool ): bool {
@@ -2554,6 +2600,270 @@ class GMCP_Tools_Admin {
       update_option( $option, $stored );
     }
     return $this->text( $r, "Removed the widget \"{$widget_id}\"." );
+  }
+
+  #endregion
+
+  #region Cron
+
+  /**
+  * The scheduled events, and the environment facts that decide whether any of them run.
+  *
+  * The diagnostic missing from every other view of cron is has_callback. WordPress keeps
+  * running an event whose plugin has gone away: the hook fires, nothing is listening, a
+  * recurring event schedules its next occurrence, and Site Health reports a failure that
+  * no amount of retrying will ever clear. Naming those events is why this tool exists.
+  *
+  * It is an honest "nothing is listening here, now" rather than proof of absence. This
+  * runs on a REST request, so a plugin that adds its cron callback only under admin_init,
+  * or only when wp_doing_cron() is true, reads as having none when it has one.
+  *
+  * The environment block matters for the opposite reason. On a site with cron disabled
+  * every event is overdue by design, and a reader who does not know that will go looking
+  * for a fault that is not there.
+  */
+  private function list_cron_events( array $r ): array {
+    $schedules = wp_get_schedules();
+    $now = time();
+
+    $events = [];
+    $orphaned = 0;
+    foreach ( _get_cron_array() as $timestamp => $hooks ) {
+      foreach ( $hooks as $hook => $instances ) {
+        $has_callback = has_action( $hook ) !== false;
+        foreach ( (array) $instances as $instance ) {
+          if ( !$has_callback ) {
+            $orphaned++;
+          }
+          $schedule = $instance['schedule'] ?? false;
+          $events[] = [
+            'hook' => $hook,
+            'next_run_timestamp' => (int) $timestamp,
+            // Cron timestamps are UTC and nothing here converts them. An event read in
+            // site time looks hours early or late for no reason, so both forms are given
+            // and the second one carries its zone in the field name.
+            'next_run_utc' => gmdate( 'Y-m-d H:i:s', (int) $timestamp ),
+            'overdue_seconds' => $timestamp < $now ? $now - (int) $timestamp : 0,
+            'schedule' => $schedule ? (string) $schedule : 'one-off',
+            'schedule_display' => $schedule && isset( $schedules[ $schedule ]['display'] ) ? (string) $schedules[ $schedule ]['display'] : null,
+            'interval_seconds' => isset( $instance['interval'] ) ? (int) $instance['interval'] : null,
+            'args' => $instance['args'] ?? [],
+            'has_callback' => $has_callback,
+          ];
+        }
+      }
+    }
+
+    $disabled = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
+    $disallow = defined( 'DISALLOW_WP_CRON' ) && DISALLOW_WP_CRON;
+    $alternate = defined( 'ALTERNATE_WP_CRON' ) && ALTERNATE_WP_CRON;
+    $lock = get_transient( 'doing_cron' );
+
+    $notes = [];
+    if ( $disabled ) {
+      $notes[] = 'DISABLE_WP_CRON is set, so WordPress does not spawn cron from page loads. Events stay overdue here until something outside WordPress requests wp-cron.php, which on a well-run site is a real system cron. Overdue events on this site are expected and are not by themselves a fault.';
+    }
+    // DISALLOW_WP_CRON is the name people reach for, by analogy with DISALLOW_FILE_MODS,
+    // and WordPress has never read it. Left unmentioned, a site owner who set it believes
+    // cron is off while it is still running on every page load.
+    if ( $disallow && !$disabled ) {
+      $notes[] = 'DISALLOW_WP_CRON is defined in wp-config.php, but WordPress does not read that constant; the one that turns cron off is DISABLE_WP_CRON, which is not set. Cron is still running on this site.';
+    }
+    if ( $alternate ) {
+      $notes[] = 'ALTERNATE_WP_CRON is set, so cron is run by redirecting a visitor\'s GET request rather than by a loopback call. It only fires on GET requests from real visitors.';
+    }
+    if ( is_string( $lock ) && $lock !== '' ) {
+      $timeout = defined( 'WP_CRON_LOCK_TIMEOUT' ) ? (int) WP_CRON_LOCK_TIMEOUT : 60;
+      $notes[] = "A cron run currently holds the lock: the doing_cron marker reads {$lock}. WordPress lets another run start once it is {$timeout} seconds old.";
+    }
+    if ( $orphaned > 0 ) {
+      $notes[] = "{$orphaned} of these events have no callback registered on this request. Where that is because the plugin that scheduled them is deactivated or gone, they can never succeed, they will keep failing Site Health, and wp_unschedule_cron_event is the way to stop them.";
+    }
+    $timezone = wp_timezone_string();
+    if ( $timezone !== 'UTC' && $timezone !== '+00:00' ) {
+      $notes[] = "Every time in this response is UTC, which is what WordPress stores. The site displays times as {$timezone}.";
+    }
+
+    return $this->json( $r, [
+      'now_utc' => gmdate( 'Y-m-d H:i:s', $now ),
+      'site_timezone' => $timezone,
+      'cron_disabled' => $disabled,
+      'constants' => [
+        'DISABLE_WP_CRON' => $disabled,
+        'DISALLOW_WP_CRON' => $disallow,
+        'ALTERNATE_WP_CRON' => $alternate,
+      ],
+      'doing_cron' => is_string( $lock ) && $lock !== '' ? $lock : null,
+      'notes' => $notes,
+      'count' => count( $events ),
+      'events' => $events,
+    ] );
+  }
+
+  private function run_cron_event( array $r, array $a ): array {
+    $may = $this->may( 'manage_options', 'running a scheduled event' );
+    if ( $may !== true ) {
+      return $this->error( $r, $may );
+    }
+    $hook = trim( (string) ( $a['hook'] ?? '' ) );
+    if ( $hook === '' ) {
+      return $this->error( $r, 'A hook name is required. wp_list_cron_events shows what is scheduled.' );
+    }
+    $refused = $this->refuse_own_hook( $hook, 'run' );
+    if ( $refused !== true ) {
+      return $this->error( $r, $refused );
+    }
+    $args = (array) ( $a['args'] ?? [] );
+
+    // Only work the site itself already scheduled. do_action_ref_array() on a name the
+    // caller chose would be a tool for firing any action in WordPress, and the premise
+    // of this plugin is that the name may have arrived inside a comment somebody wrote.
+    $event = wp_get_scheduled_event( $hook, $args );
+    if ( !$event ) {
+      return $this->error( $r, $this->not_scheduled_message( $hook, 'run' ) );
+    }
+
+    // Core's update checks and a great many plugins' callbacks test wp_doing_cron()
+    // before doing anything, so firing one from a plain REST request would report a
+    // success having done no work at all. WP-CLI defines it for the same reason. It is a
+    // constant, so it stays defined for whatever remains of this request.
+    if ( !defined( 'DOING_CRON' ) ) {
+      define( 'DOING_CRON', true );
+    }
+
+    // WP-CLI's order, and the order is the point. The occurrence comes off the schedule
+    // before its callbacks run, so a callback that fatals or times out cannot leave an
+    // event still due for the next cron spawn to run a second time.
+    if ( $event->schedule !== false ) {
+      wp_reschedule_event( $event->timestamp, $event->schedule, $hook, $args );
+    }
+    wp_unschedule_event( $event->timestamp, $hook, $args );
+
+    $due = $event->timestamp <= time();
+    $had_callbacks = has_action( $hook ) !== false;
+
+    $started = microtime( true );
+    try {
+      do_action_ref_array( $hook, $args );
+    }
+    catch ( Throwable $e ) {
+      $elapsed = (int) round( ( microtime( true ) - $started ) * 1000 );
+      return $this->error( $r, "\"{$hook}\" threw after {$elapsed}ms: " . $e->getMessage() . ' ' . $this->post_run_schedule_line( $hook, $args ) );
+    }
+    $elapsed = (int) round( ( microtime( true ) - $started ) * 1000 );
+
+    $next = wp_next_scheduled( $hook, $args );
+    return $this->json( $r, [
+      'hook' => $hook,
+      'args' => $args,
+      'was_due' => $due,
+      'duration_ms' => $elapsed,
+      'had_callbacks' => $had_callbacks,
+      'schedule' => $event->schedule !== false ? (string) $event->schedule : 'one-off',
+      'next_run_utc' => $next ? gmdate( 'Y-m-d H:i:s', (int) $next ) : null,
+      'note' => $had_callbacks
+        ? null
+        : "Nothing is listening on \"{$hook}\" in this request, so the hook fired and no work was done. If the plugin that scheduled it is gone, running it again will not help.",
+    ] );
+  }
+
+  private function unschedule_cron_event( array $r, array $a ): array {
+    $may = $this->may( 'manage_options', 'unscheduling an event' );
+    if ( $may !== true ) {
+      return $this->error( $r, $may );
+    }
+    $hook = trim( (string) ( $a['hook'] ?? '' ) );
+    if ( $hook === '' ) {
+      return $this->error( $r, 'A hook name is required. wp_list_cron_events shows what is scheduled.' );
+    }
+    $refused = $this->refuse_own_hook( $hook, 'unscheduled' );
+    if ( $refused !== true ) {
+      return $this->error( $r, $refused );
+    }
+    $args = (array) ( $a['args'] ?? [] );
+    $event = wp_get_scheduled_event( $hook, $args );
+    if ( !$event ) {
+      return $this->error( $r, $this->not_scheduled_message( $hook, 'remove' ) );
+    }
+
+    $when = gmdate( 'Y-m-d H:i:s', (int) $event->timestamp );
+    $recurrence = $event->schedule !== false
+      ? "It recurs on the \"{$event->schedule}\" schedule, so this stops it recurring."
+      : 'It is a one-off.';
+    // Keyed on hook and arguments together, because that pair is what identifies an
+    // event: a token minted to drop one event under a hook must not drop another.
+    $ok = $this->confirmed(
+      'wp_unschedule_cron_event',
+      $hook . ' ' . wp_json_encode( $args ),
+      $a,
+      "This removes the scheduled event \"{$hook}\", next due {$when} UTC. {$recurrence} The undo journal cannot put it back, because WordPress keeps the schedule in the \"cron\" option and the journal ignores that row. Whether it returns depends on the plugin that scheduled it, and many schedule only on activation."
+    );
+    if ( $ok !== true ) {
+      return $this->error( $r, $ok );
+    }
+
+    $result = wp_unschedule_event( $event->timestamp, $hook, $args, true );
+    if ( is_wp_error( $result ) ) {
+      return $this->error( $r, 'Could not unschedule the event: ' . $result->get_error_message() );
+    }
+    if ( $result === false ) {
+      return $this->error( $r, "WordPress declined to unschedule \"{$hook}\". A pre_unschedule_event filter on this site is holding it." );
+    }
+
+    $next = wp_next_scheduled( $hook, $args );
+    return $this->json( $r, [
+      'hook' => $hook,
+      'args' => $args,
+      'removed_run_utc' => $when,
+      // One occurrence comes off, which is what was asked for. Saying whether another is
+      // still queued under the same hook and arguments is cheaper than a second listing.
+      'still_scheduled_utc' => $next ? gmdate( 'Y-m-d H:i:s', (int) $next ) : null,
+    ] );
+  }
+
+  /**
+  * This plugin's own scheduled work is not the caller's to drive.
+  *
+  * gmcp_audit_prune trims the activity log. An instruction to run or unschedule it is
+  * far likelier to have arrived inside content this agent read than from the person
+  * operating it, and the audit log is the record of what that agent did.
+  *
+  * @return true|string True to proceed, otherwise the refusal.
+  */
+  private function refuse_own_hook( string $hook, string $verb ) {
+    if ( strpos( $hook, 'gmcp_' ) !== 0 ) {
+      return true;
+    }
+    return "\"{$hook}\" is one of this plugin's own scheduled events. Hooks with the gmcp_ prefix cannot be {$verb} through this API, so that an instruction this agent read somewhere cannot turn the plugin on itself.";
+  }
+
+  /**
+  * Why a hook could not be found, told apart from a hook that is scheduled under
+  * different arguments. Those are different mistakes and they have different fixes.
+  */
+  private function not_scheduled_message( string $hook, string $verb ): string {
+    $sets = [];
+    foreach ( _get_cron_array() as $hooks ) {
+      foreach ( (array) ( $hooks[ $hook ] ?? [] ) as $instance ) {
+        $sets[] = $instance['args'] ?? [];
+      }
+    }
+    if ( $sets ) {
+      return "\"{$hook}\" is scheduled, but not with those arguments, and the arguments are part of what identifies an event. Currently scheduled under it: " . wp_json_encode( $sets, JSON_UNESCAPED_SLASHES ) . '.';
+    }
+    return "\"{$hook}\" is not in this site's cron array, so there is nothing to {$verb}. This tool acts only on events the site has already scheduled; it will not fire or remove an arbitrary WordPress action. wp_list_cron_events shows what is scheduled.";
+  }
+
+  /**
+  * Where the schedule stands after a callback threw, which is the part the caller cannot
+  * infer: the event was taken off the schedule before it ran.
+  */
+  private function post_run_schedule_line( string $hook, array $args ): string {
+    $next = wp_next_scheduled( $hook, $args );
+    if ( $next ) {
+      return 'It had already been taken off the schedule before it ran, and its next run is ' . gmdate( 'Y-m-d H:i:s', (int) $next ) . ' UTC.';
+    }
+    return 'It had already been taken off the schedule before it ran, and nothing is scheduled under that hook now.';
   }
 
   #endregion
