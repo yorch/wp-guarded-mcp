@@ -41,6 +41,8 @@ Site administration, which is off by default and switched on from the settings s
 
 WooCommerce, on a switch of its own that only appears when the shop is installed: products, stock levels, orders, order notes, customers, and sales figures. Separate from site administration because the risk is a different shape. Anything carrying a customer's name, email address or delivery address needs full administrative access, the same level a list of usernames needs, so a read-only key sees products and sales figures and none of your customers. That is a statement about the shop tools, not about the whole plugin: a read-only key can still read your comments, and a comment carries the name its author put on it, which is already published on the page. Refunds are deliberately not included. Anything that emails a customer reports exactly who was written to, measured as it happens rather than guessed.
 
+Elementor, on a switch of its own that only appears when Elementor is installed: theme-builder conditions, regenerating Elementor's CSS, and putting a library template on a page. Setting a header through the generic tools looks like it worked and does not, because Elementor keeps a cached copy of which template applies where and writing only the template leaves that cache stale. These write both halves together and say what the cache holds. The design itself is copied inside PHP rather than through a tool argument, which would silently strip every escape in it.
+
 Backups, if you have a backup plugin it can drive. An agent can ask for one before doing something risky, and see when one last completed. It starts a backup; it never claims one finished, because a backup takes minutes to hours and a tool call takes seconds. When it cannot see your backup plugin it says so rather than reporting that you have no backups. There is no restore tool, deliberately.
 
 One call orients an agent on the whole site: versions, theme, active plugins, post types with counts, the comment queue, the permalink structure and what changed recently. It replaces the half-dozen queries an agent otherwise makes at the start of every conversation.
@@ -146,6 +148,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * A one-call site briefing, so an agent orients in one request rather than six.
 * Tool failures arrive as results the model can read, with isError set, rather than as JSON-RPC errors a client may discard along with the rest of the response.
 * Scheduled events can be listed, run and removed, so a cron event Site Health keeps flagging can be diagnosed and cleared. Only events the site already scheduled can be run, and removing one takes a confirmation step.
+* Elementor tools on their own switch: theme-builder conditions written to both the template and Elementor's cached registry, regenerate CSS, and apply a library template to a page without the design passing through a tool argument.
 
 == Upgrade Notice ==
 

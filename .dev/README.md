@@ -46,6 +46,9 @@ docker compose exec -T cli wp plugin install updraftplus backuply --activate
 
 docker compose exec -T cli wp plugin install woocommerce --activate
 ./smoke-woo.sh      # the shop tools; needs WooCommerce
+
+docker compose exec -T cli wp plugin install elementor --activate
+./smoke-elementor.sh  # the Elementor tools; needs Elementor
 ```
 
 `smoke-admin.sh` also expects a theme named `futuretheme` that declares a PHP version this

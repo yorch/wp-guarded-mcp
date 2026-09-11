@@ -196,6 +196,7 @@ class GMCP_Settings {
       'mcp_tools_admin' => 'bool',
       'mcp_tools_rest' => 'bool',
       'mcp_tools_woo' => 'bool',
+      'mcp_tools_elementor' => 'bool',
       'mcp_debug_mode' => 'bool',
       'mcp_activity_log' => 'bool',
       'mcp_audit_days' => 'days',
@@ -867,6 +868,7 @@ class GMCP_Settings {
   /** What a connected agent is offered. Nothing on this tab is about who may connect. */
   private function render_tools( array $options ): void {
     $woo = class_exists( 'WooCommerce' );
+    $elementor = did_action( 'elementor/loaded' );
 
     // Only the groups actually rendered are declared to the save. A checkbox that was
     // never on screen must keep its stored value rather than read as unticked, which is
@@ -874,6 +876,9 @@ class GMCP_Settings {
     $keys = [ 'mcp_tools_core', 'mcp_tools_admin', 'mcp_tools_rest' ];
     if ( $woo ) {
       $keys[] = 'mcp_tools_woo';
+    }
+    if ( $elementor ) {
+      $keys[] = 'mcp_tools_elementor';
     }
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'Which groups of tools an agent is offered. A group that is off is not merely hidden: its tools are refused if asked for by name.', 'guarded-mcp' ); ?></p>
@@ -904,6 +909,12 @@ class GMCP_Settings {
                   <?php esc_html_e( 'WooCommerce (products, stock, orders, customers, sales figures)', 'guarded-mcp' ); ?>
                 </label>
               <?php endif; ?>
+              <?php if ( $elementor ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_elementor" value="1" <?php checked( !empty( $options['mcp_tools_elementor'] ) ); ?>>
+                  <?php esc_html_e( 'Elementor (theme-builder conditions, regenerate CSS, apply a library template to a page)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
               <label>
                 <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>
                 <?php esc_html_e( 'Generate tools from this site\'s REST API routes', 'guarded-mcp' ); ?>
@@ -915,6 +926,11 @@ class GMCP_Settings {
             <?php if ( $woo ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The WooCommerce tools are separate because the risk is a different shape: they read customer names, email addresses and delivery addresses and hand them to a model. Refunds are deliberately not included, and any action that emails a customer says so in its own description.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $elementor ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The Elementor tools exist because setting a header or footer through the generic tools appears to work and does not: Elementor keeps a cached copy of which template applies where, and writing only the template leaves that cache stale. These write both halves together, and say what the cache holds.', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
             <p class="description">
