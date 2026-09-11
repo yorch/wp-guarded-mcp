@@ -426,6 +426,30 @@ class GMCP_Tools_Core {
     return GMCP_Core::option_guard( $key );
   }
 
+  /**
+  * Options that may not be deleted, each with what actually breaks if it goes.
+  *
+  * These are separate from option_guard(), which is about secrecy. These are rows
+  * WordPress either cannot run without or cannot rebuild, so losing one is not a
+  * recoverable mistake. The value is the sentence the refusal says, so the reason and
+  * the rule cannot drift apart.
+  *
+  * rewrite_rules is deliberately NOT here. It is a derived cache, WordPress regenerates
+  * it on the next permalink flush, and deleting it is a normal repair for broken
+  * permalinks rather than damage.
+  */
+  private const OPTIONS_NEVER_DELETED = [
+    'siteurl' => 'WordPress builds every URL from it, so with the row gone the site cannot resolve its own address; wp-admin and this endpoint included, which means there is no way back in through the API that deleted it.',
+    'home' => 'Same as siteurl: the front page and every link on it become unreachable, and so does the route this request arrived on.',
+    'template' => 'It names the active theme. With no theme WordPress has nothing to render the front end with.',
+    'stylesheet' => 'It names the active child or parent theme. Removing it leaves WordPress looking for a theme directory that is not identified anywhere.',
+    'active_plugins' => 'Every plugin deactivates at once, this one among them, so the API that deleted the row is no longer running to restore it.',
+    'db_version' => 'It records which schema the database is on. Missing, WordPress runs its upgrade routine against a schema it can no longer place.',
+    'initial_db_version' => 'It records the schema the site was installed at, which upgrade routines read to decide what to skip.',
+    'cron' => 'The entire schedule is this one row. Deleting it silently drops every scheduled event on the site: publishing, backups, renewals, WooCommerce actions. Nothing errors; things just stop happening.',
+    'admin_email' => 'It is where recovery mail, password resets and fatal-error notices go. Without it nobody is told when the site is in trouble.',
+  ];
+
   private function bust_post_cache( int $post_id, array $context = [] ): void {
     if ( $post_id <= 0 ) {
       return;
@@ -447,6 +471,149 @@ class GMCP_Tools_Core {
     if ( function_exists( 'rocket_clean_post' ) ) {
       rocket_clean_post( $post_id );
     }
+  }
+
+  /**
+  * Purge the whole-site page caches this plugin can name, and say which ones did anything.
+  *
+  * Same stance as bust_post_cache(): purge what we can name and hand the rest to a hook.
+  * Every entry is guarded, so a name that has since changed is a no-op instead of a fatal,
+  * and a plugin that is not installed is simply never reported as purged. What is returned
+  * is what actually ran, because the caller has to be able to tell what is still stale.
+  *
+  * @return string[] Names of the caches that were purged.
+  */
+  private function purge_page_caches(): array {
+    $purged = [];
+
+    // LiteSpeed documents its purge as an action, and has_action() both guards the call
+    // and answers whether anything listened. docs.litespeedtech.com/lscache/lscwp/api/
+    if ( has_action( 'litespeed_purge_all' ) ) {
+      do_action( 'litespeed_purge_all' );
+      $purged[] = 'LiteSpeed Cache (whole site)';
+    }
+    // WP Rocket's documented whole-domain purge, the site-wide sibling of the
+    // rocket_clean_post() that bust_post_cache() already calls.
+    // docs.wp-rocket.me/article/92-rocketcleandomain
+    if ( function_exists( 'rocket_clean_domain' ) ) {
+      rocket_clean_domain();
+      $purged[] = 'WP Rocket (whole domain)';
+    }
+    // W3 Total Cache's public API function, declared in its w3-total-cache-api.php.
+    if ( function_exists( 'w3tc_flush_all' ) ) {
+      w3tc_flush_all();
+      $purged[] = 'W3 Total Cache (all engines)';
+    }
+    // WP Super Cache's own clear, from wp-cache-phase2.php. Despite the name it has
+    // nothing to do with core's wp_cache_flush(): this one empties the static page files.
+    if ( function_exists( 'wp_cache_clear_cache' ) ) {
+      wp_cache_clear_cache();
+      $purged[] = 'WP Super Cache (static page files)';
+    }
+    // SpeedyCache 1.4 keeps its purge on a static class in main/delete.php rather than
+    // behind a function or an action, so this is the only public entry point it offers.
+    if ( is_callable( [ '\SpeedyCache\Delete', 'all_cache' ] ) ) {
+      call_user_func( [ '\SpeedyCache\Delete', 'all_cache' ] );
+      $purged[] = 'SpeedyCache (cached HTML)';
+    }
+    return $purged;
+  }
+
+  /** Meta keys that say who is editing the source post rather than what it contains. */
+  private const META_KEYS_NEVER_COPIED = [ '_edit_lock', '_edit_last' ];
+
+  /**
+  * Copy meta rows from one post to another.
+  *
+  * get_post_meta( $id ) with no key returns every key as a LIST of its rows, and those
+  * rows are the raw database strings: WordPress only unserializes when you name a key.
+  * Both facts are load-bearing. Keeping the list is what makes a key with several rows
+  * arrive as several rows instead of collapsing into one, and the raw strings have to be
+  * put back through maybe_unserialize() before they are written, because maybe_serialize()
+  * on the way in deliberately re-serializes a string that already looks serialized. Handing
+  * it the raw row stored s:48:"a:2:{...}" and an array key read back as a string. Nothing
+  * is serialized here, for the reason the wp_update_post_meta handler gives: WordPress
+  * serializes arrays itself, so doing it here would double-serialize them instead.
+  *
+  * wp_slash() is not decoration. add_post_meta() runs wp_unslash() on the value, which
+  * would strip the backslashes out of an Elementor JSON payload (\/ and <) and
+  * corrupt it silently. Slashing first makes the round trip exact.
+  *
+  * @return array{0: array<string,array{bytes:int,rows:int}>, 1: array<string,string>} what was copied, and key => why it was skipped.
+  */
+  private function copy_post_meta( int $from, int $to, array $only, bool $overwrite ): array {
+    $source = get_post_meta( $from );
+    $copied = [];
+    $skipped = [];
+
+    // Requested keys are matched against the source verbatim rather than sanitize_key()'d.
+    // The only keys ever written are keys that already exist on the source, so there is
+    // nothing to sanitize, and lowercasing the request would just fail to find a
+    // mixed-case key that is really there.
+    $wanted = [];
+    foreach ( $only as $key ) {
+      $key = (string) $key;
+      if ( $key === '' ) {
+        continue;
+      }
+      $wanted[ $key ] = true;
+      if ( !isset( $source[ $key ] ) ) {
+        $skipped[ $key ] = 'not set on post #' . $from;
+      }
+    }
+
+    foreach ( $source as $key => $rows ) {
+      if ( $wanted && !isset( $wanted[ $key ] ) ) {
+        continue;
+      }
+      if ( in_array( $key, self::META_KEYS_NEVER_COPIED, true ) ) {
+        $skipped[ $key ] = 'names whoever is editing post #' . $from . ', so it belongs to that post and not to its content';
+        continue;
+      }
+      if ( !$overwrite && metadata_exists( 'post', $to, $key ) ) {
+        $skipped[ $key ] = 'already set on post #' . $to . '; pass overwrite to replace it';
+        continue;
+      }
+      // Replace rather than append, so overwriting a multi-valued key leaves the target
+      // holding the source's rows and not both sets. A no-op when the key is absent.
+      delete_post_meta( $to, $key );
+      $bytes = 0;
+      foreach ( (array) $rows as $value ) {
+        // Bytes are counted on the stored row, which is what actually moved.
+        $bytes += strlen( (string) $value );
+        add_post_meta( $to, $key, wp_slash( maybe_unserialize( $value ) ) );
+      }
+      $copied[ $key ] = [ 'bytes' => $bytes, 'rows' => count( (array) $rows ) ];
+    }
+    return [ $copied, $skipped ];
+  }
+
+  // How much one chunked meta value may stage, and how long an unfinished one survives.
+  //
+  // 4MB is measured against the real constraint. A staged value is one row in wp_options,
+  // which is LONGTEXT, so what actually binds is MySQL's max_allowed_packet: 16MB on a
+  // stock MariaDB/MySQL, and the whole INSERT has to fit inside it. 4MB leaves room for
+  // that and is still an order of magnitude past the largest Elementor page anyone
+  // reports, which is a few hundred KB.
+  //
+  // 15 minutes is chosen because a chunked write is one continuous exchange, so a longer
+  // gap means the caller went away. The expiry is the only thing keeping abandoned
+  // sessions from accumulating in wp_options, which is how this could otherwise be used
+  // to fill the database.
+  private const META_CHUNK_MAX_BYTES = 4194304;
+  private const META_CHUNK_TTL = 900;
+
+  /**
+  * Where a half-written meta value waits.
+  *
+  * A transient, for two reasons. It expires on its own, so an abandoned session cleans
+  * itself up with no cron and no bookkeeping of its own. And the name starts with "gmcp_",
+  * which GMCP_Core::option_guard() refuses, so the staging buffer cannot be read or
+  * rewritten through wp_get_option and wp_update_option. The one place it must never live
+  * is the live meta row, where a reader would take a partial value for the finished one.
+  */
+  private function meta_chunk_transient( string $session ): string {
+    return 'gmcp_meta_chunk_' . substr( preg_replace( '/[^A-Za-z0-9_\-]/', '', $session ), 0, 64 );
   }
   #endregion
 
@@ -647,6 +814,36 @@ class GMCP_Tools_Core {
         ],
         'accessLevel' => 'admin',
       ],
+      'wp_delete_option' => [
+        'name' => 'wp_delete_option',
+        'description' => 'Delete a WordPress option row outright. Use this when a stored value has to be ABSENT rather than empty, because some code only rebuilds a cache when it finds nothing: Elementor regenerates its theme-builder conditions cache only when the stored value is not an array, so a stored empty array reads as "already computed" and never self-heals, and removing the row is the only way back. Refuses the same credential-shaped keys wp_get_option and wp_update_option refuse, plus a short list of options WordPress cannot run without or cannot rebuild (siteurl, home, template, stylesheet, active_plugins, db_version, initial_db_version, cron, admin_email). rewrite_rules IS deletable: WordPress regenerates it, and deleting it is a normal permalink repair. A deletion is written to the audit log, but the undo journal keeps created and updated options only, so the deletion does NOT appear in wp_list_changes and wp_undo_change CANNOT put it back. Read the value with wp_get_option first if you might want it again. Reports honestly when the option did not exist; that is not a failure and nothing was deleted.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'key' => [ 'type' => 'string', 'description' => 'Option name to delete.' ],
+          ],
+          'required' => [ 'key' ],
+        ],
+        'accessLevel' => 'admin',
+      ],
+
+      /* -------- Caches -------- */
+      'wp_flush_cache' => [
+        'name' => 'wp_flush_cache',
+        'description' => 'Empty caches so the next request rebuilds from the database. scope "object" calls wp_cache_flush(): on a shared Redis or Memcached that can evict OTHER sites\' entries too, and every subsequent request on this site rebuilds from the database until the cache refills, so it is a real load spike, not a free operation. scope "transients" removes only EXPIRED transients, which is stale data; unexpired ones are left alone because they hold work already done. scope "post" purges the caches for one post (pass ID). scope "all" (default) does object plus transients. Every scope also purges the page-cache plugins this plugin can name (LiteSpeed, WP Rocket, W3 Total Cache, WP Super Cache, SpeedyCache) and fires the gmcp_cache_flushed action. It does NOT purge any CDN or reverse proxy (Cloudflare, Varnish, Fastly, a host edge cache), nor caches already handed to visitors: the result lists exactly what was purged and what was not, and you must purge the rest yourself.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'scope' => [
+              'type' => 'string',
+              'enum' => [ 'object', 'transients', 'post', 'all' ],
+              'description' => 'What to empty. Default "all" (object cache + expired transients).',
+            ],
+            'ID' => [ 'type' => 'integer', 'description' => 'Post ID. Required when scope is "post".' ],
+          ],
+        ],
+        'accessLevel' => 'admin',
+      ],
 
       /* -------- Counts -------- */
       'wp_count_posts' => [
@@ -762,6 +959,22 @@ class GMCP_Tools_Core {
             'meta_input' => [ 'type' => 'object', 'description' => 'Associative array of custom fields.' ],
           ],
           'required' => [ 'post_title' ],
+        ],
+        'accessLevel' => 'write',
+      ],
+      'wp_duplicate_post' => [
+        'name' => 'wp_duplicate_post',
+        'description' => 'Duplicate an existing post, page or custom post type, copying its content, excerpt, type, parent, menu order and comment/ping settings. The copy is a DRAFT unless you pass post_status, whatever the source\'s status was: a duplicate going live on a misread instruction is exactly what this plugin exists to prevent, so publishing is always a separate, deliberate call. include_meta (default true) copies every meta key except _edit_lock and _edit_last; the copy happens inside PHP, so an Elementor _elementor_data blob of any size moves without passing through a tool argument. include_terms (default true) copies the term assignments of every taxonomy registered to the post type. Returns the new post ID. The new post is journalled and can be removed with wp_delete_post, but the copied meta is not journalled.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'ID' => [ 'type' => 'integer', 'description' => 'Post to duplicate.' ],
+            'post_title' => [ 'type' => 'string', 'description' => 'Title for the copy. Defaults to the source title.' ],
+            'post_status' => [ 'type' => 'string', 'description' => 'Status for the copy. Defaults to "draft"; the source status is never inherited.' ],
+            'include_meta' => [ 'type' => 'boolean', 'description' => 'Copy custom fields (default true).' ],
+            'include_terms' => [ 'type' => 'boolean', 'description' => 'Copy taxonomy assignments (default true).' ],
+          ],
+          'required' => [ 'ID' ],
         ],
         'accessLevel' => 'write',
       ],
@@ -919,6 +1132,41 @@ class GMCP_Tools_Core {
           'required' => [ 'ID', 'key' ],
         ],
         'accessLevel' => 'admin',
+      ],
+      'wp_copy_post_meta' => [
+        'name' => 'wp_copy_post_meta',
+        'description' => 'Copy custom fields from one post to another inside PHP, so a value too large to survive a tool argument never has to leave the server: an Elementor _elementor_data blob is routinely over 100KB and cannot be read out and written back reliably. Copies every key by default; pass "keys" to copy only some. A key that already exists on the target is SKIPPED, not merged, unless overwrite is true. _edit_lock and _edit_last are never copied because they say who is editing the source, not what it contains. A key with several rows keeps all of them. Reports bytes copied per key and the reason for every skip. Post meta is not journalled, so this cannot be undone with wp_undo_change.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'from_id' => [ 'type' => 'integer', 'description' => 'Post to copy meta from.' ],
+            'to_id' => [ 'type' => 'integer', 'description' => 'Post to copy meta to.' ],
+            'keys' => [
+              'type' => 'array',
+              'items' => [ 'type' => 'string' ],
+              'description' => 'Meta keys to copy. Omit to copy every key on the source.',
+            ],
+            'overwrite' => [ 'type' => 'boolean', 'description' => 'Replace keys that already exist on the target (default false, which skips them).' ],
+          ],
+          'required' => [ 'from_id', 'to_id' ],
+        ],
+        'accessLevel' => 'write',
+      ],
+      'wp_write_post_meta_chunk' => [
+        'name' => 'wp_write_post_meta_chunk',
+        'description' => 'Write a post meta value that is too large to pass in one tool argument, a piece at a time. Pick any "session" id and send successive calls with the same session, ID and key; each call appends and answers with chunk_index, bytes_written and total_bytes staged. Nothing touches the post until the call that sets final: true, which assembles the staged bytes, writes the meta row and clears the staging, so an abandoned or half-sent value can never be read as real. A session is bound to the post and key it opened with and refuses a chunk aimed anywhere else. If the assembled string is valid JSON for an array or object it is decoded before storing, the same way wp_update_option decodes a JSON string, so a JSON-encoded Elementor payload becomes the array WordPress expects instead of a string; anything else is stored verbatim. Staging is capped and abandoned sessions expire. Post meta is not journalled, so the final write CANNOT be undone with wp_undo_change.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'session' => [ 'type' => 'string', 'description' => 'Any id you choose, reused for every chunk of one value.' ],
+            'ID' => [ 'type' => 'integer', 'description' => 'Target post ID.' ],
+            'key' => [ 'type' => 'string', 'description' => 'Target meta key.' ],
+            'data' => [ 'type' => 'string', 'description' => 'This chunk of the value, appended to what is already staged.' ],
+            'final' => [ 'type' => 'boolean', 'description' => 'True on the last chunk: assemble and write the meta row (default false).' ],
+          ],
+          'required' => [ 'session', 'ID', 'key', 'data' ],
+        ],
+        'accessLevel' => 'write',
       ],
 
       /* -------- Featured image -------- */
@@ -1907,6 +2155,145 @@ class GMCP_Tools_Core {
         }
         break;
 
+      case 'wp_delete_option':
+        $key = $this->clean_option_key( $a['key'] ?? '' );
+        if ( $key === '' ) {
+          $r = $this->error( $r, 'key required', -32602 );
+          break;
+        }
+        // The same guard wp_get_option and wp_update_option pass. There is one
+        // sensitivity list on this site and this is it.
+        $permitted = $this->option_allowed( $key );
+        if ( $permitted !== true ) {
+          $r = $this->error( $r, $permitted, -32600 );
+          break;
+        }
+        if ( isset( self::OPTIONS_NEVER_DELETED[ strtolower( $key ) ] ) ) {
+          $r = $this->error(
+            $r,
+            'The option "' . $key . '" cannot be deleted through this API: '
+              . self::OPTIONS_NEVER_DELETED[ strtolower( $key ) ]
+              . ' Change it with wp_update_option if you need a different value.',
+            -32600
+          );
+          break;
+        }
+        // "Absent" and "stored as false" are different states and get_option() returns
+        // false for both, so ask with a default nothing can legitimately hold. Saying a
+        // row was deleted when there was none to delete is the one answer this tool must
+        // not give: the caller is deleting precisely because absence is what it needs.
+        $absent = '__gmcp_option_absent__';
+        $previous = get_option( $key, $absent );
+        if ( $previous === $absent ) {
+          $this->add_result_text( $r, 'Option "' . $key . '" does not exist; nothing was deleted.' );
+          break;
+        }
+        // delete_option() fires deleted_option, which is what carries the deletion into
+        // the audit log. The undo journal deliberately records created and updated
+        // options only, so the deletion is on record but wp_undo_change cannot reverse it.
+        if ( delete_option( $key ) ) {
+          $text = 'Option "' . $key . '" deleted. The deletion is in the audit log, but it is not in the undo journal, so wp_undo_change cannot put it back.';
+          // Which is exactly why the value comes back with the answer: nothing else kept a
+          // copy, so this reply is the only chance to put the row back by hand. Withheld
+          // when it looks credential-shaped, by the same test that keeps such values out
+          // of the journal, so deleting cannot become a way to read one out. Withheld too
+          // when it is large, on the journal's threshold, since a reply is a worse place
+          // to carry a megabyte than the journal was.
+          $encoded = wp_json_encode( $previous, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
+          if ( GMCP_Core::holds_credential( $previous ) ) {
+            $text .= ' The value is not repeated here because it holds something credential-shaped.';
+          }
+          elseif ( !is_string( $encoded ) || strlen( $encoded ) > GMCP_Journal::MAX_VALUE ) {
+            $text .= ' The value was too large to repeat here, so it is gone.';
+          }
+          else {
+            $text .= "\n\nWhat was removed, since nothing else kept it:\n" . $encoded;
+          }
+          $this->add_result_text( $r, $text );
+        }
+        else {
+          $r = $this->error( $r, 'Deleting option "' . $key . '" failed.', -32603 );
+        }
+        break;
+
+        /* ===== Caches ===== */
+      case 'wp_flush_cache':
+        // An unrecognised scope is refused rather than quietly treated as "all". "all" is
+        // the widest thing this tool does, and a typo should never widen what was asked
+        // for; failing the call costs one retry and cannot surprise anyone.
+        $scope = (string) ( $a['scope'] ?? 'all' );
+        if ( !in_array( $scope, [ 'object', 'transients', 'post', 'all' ], true ) ) {
+          $r = $this->error( $r, 'Unknown scope "' . $scope . '". Use object, transients, post or all.', -32602 );
+          break;
+        }
+        $purged = [];
+        $unpurged = [];
+
+        if ( $scope === 'post' ) {
+          $flush_id = intval( $a['ID'] ?? 0 );
+          if ( !$flush_id || !get_post( $flush_id ) ) {
+            $r = $this->error( $r, 'scope "post" needs the ID of an existing post.', -32602 );
+            break;
+          }
+          // The existing per-post buster, which already fans out to the post-level
+          // purges of LiteSpeed and WP Rocket and to gmcp_post_changed. A site-wide
+          // page purge is deliberately NOT fired here: the caller asked about one post.
+          // Note that bust_post_cache() ignores a repeat for the same post within one
+          // PHP request, so flushing a post a tool just wrote in the same batched call
+          // is already done rather than done twice.
+          $this->bust_post_cache( $flush_id, [ 'tool' => 'wp_flush_cache' ] );
+          $purged[] = 'Post #' . $flush_id . ': object cache entries, plus the per-post purges of any LiteSpeed or WP Rocket install';
+          $unpurged[] = 'Every other post, and any site-wide page cache. Use scope "all" for those.';
+        }
+        else {
+          if ( $scope === 'object' || $scope === 'all' ) {
+            if ( wp_cache_flush() ) {
+              $purged[] = 'Object cache: every entry, so the next request rebuilds from the database';
+            }
+            else {
+              $unpurged[] = 'Object cache: wp_cache_flush() reported failure, so assume it still holds its entries';
+            }
+          }
+          if ( $scope === 'transients' || $scope === 'all' ) {
+            // Expired transients only. Deleting unexpired ones throws away work that has
+            // already been done rather than data that has gone stale, which is a cost
+            // with no cache-correctness benefit, so this tool does not offer it.
+            delete_expired_transients();
+            $purged[] = wp_using_ext_object_cache()
+              ? 'Expired transients: this site keeps transients in the object cache, where they expire on their own, so there was nothing in the database to remove'
+              : 'Expired transients (unexpired ones are left alone: they hold work already done, not stale data)';
+          }
+          $page_caches = $this->purge_page_caches();
+          if ( $page_caches ) {
+            $purged[] = 'Page caches: ' . implode( ', ', $page_caches );
+          }
+          else {
+            $unpurged[] = 'No page-cache plugin this tool can recognise is active (it knows LiteSpeed, WP Rocket, W3 Total Cache, WP Super Cache and SpeedyCache). Any other one is untouched.';
+          }
+        }
+
+        // The delegation half of the plugin's cache stance: anything we cannot name is
+        // somebody else's to purge, and this is where they hook to do it.
+        do_action( 'gmcp_cache_flushed', $scope, [ 'source' => 'mcp', 'tool' => 'wp_flush_cache', 'ID' => intval( $a['ID'] ?? 0 ) ] );
+
+        $unpurged[] = 'Any CDN or reverse proxy: Cloudflare, Varnish, Fastly, a host edge cache. None of these can be reached from PHP, so PURGE THESE YOURSELF or the front end keeps serving the old page. A site can wire the gmcp_cache_flushed action to do it automatically.';
+        $unpurged[] = 'Pages already delivered to visitors: browser caches and service workers keep serving what they have until it expires.';
+
+        $lines = [ 'Scope: ' . $scope, '', 'Purged:' ];
+        foreach ( $purged as $line ) {
+          $lines[] = '- ' . $line;
+        }
+        if ( !$purged ) {
+          $lines[] = '- nothing';
+        }
+        $lines[] = '';
+        $lines[] = 'NOT purged, and still stale until you deal with it:';
+        foreach ( $unpurged as $line ) {
+          $lines[] = '- ' . $line;
+        }
+        $this->add_result_text( $r, implode( "\n", $lines ) );
+        break;
+
         /* ===== Counts ===== */
       case 'wp_count_posts':
         $pt = sanitize_key( $a['post_type'] ?? 'post' );
@@ -2198,6 +2585,74 @@ class GMCP_Tools_Core {
           $this->bust_post_cache( (int) $new, [ 'tool' => 'wp_create_post' ] );
           $this->add_result_text( $r, 'Post created ID ' . $new );
         }
+        break;
+
+        /* ===== Posts: duplicate ===== */
+      case 'wp_duplicate_post':
+        $src = get_post( intval( $a['ID'] ?? 0 ) );
+        if ( !$src ) {
+          $r = $this->error( $r, 'No post with ID ' . intval( $a['ID'] ?? 0 ) . '.', -32602 );
+          break;
+        }
+        $dup = [
+          'post_title' => ( $a['post_title'] ?? '' ) !== '' ? sanitize_text_field( $a['post_title'] ) : $src->post_title,
+          // A copy is a draft unless the caller says otherwise, and the source's own
+          // status is never inherited. The whole premise of this plugin is that one
+          // misread sentence should not put something in front of the public, and
+          // "duplicate this page" read off a comment would otherwise publish a second
+          // live page nobody asked for. Going live stays a separate, deliberate call.
+          'post_status' => sanitize_key( $a['post_status'] ?? 'draft' ),
+          'post_type' => $src->post_type,
+          // Stored content is copied verbatim, not re-sanitized. It is already on this
+          // site and store_html() is about markup an agent is introducing; running it
+          // over an existing page would quietly rewrite the original's markup in the copy.
+          'post_content' => $src->post_content,
+          'post_excerpt' => $src->post_excerpt,
+          'post_parent' => $src->post_parent,
+          'menu_order' => $src->menu_order,
+          'comment_status' => $src->comment_status,
+          'ping_status' => $src->ping_status,
+        ];
+        // wp_insert_post rather than a direct write, so the change listener sees the
+        // creation and the undo journal can account for it.
+        $copy_id = wp_insert_post( wp_slash( $dup ), true );
+        if ( is_wp_error( $copy_id ) ) {
+          $r = $this->error( $r, $copy_id->get_error_message(), $copy_id->get_error_code() );
+          break;
+        }
+        $copy_id = (int) $copy_id;
+
+        $dup_lines = [ 'Duplicated post #' . $src->ID . ' as new post ID ' . $copy_id . ' ("' . $dup['post_title'] . '", status ' . $dup['post_status'] . ').' ];
+
+        if ( !isset( $a['include_meta'] ) || $a['include_meta'] ) {
+          // The target is brand new, so overwrite is the honest setting: there is
+          // nothing of its own to protect.
+          [ $dup_copied, $dup_skipped ] = $this->copy_post_meta( (int) $src->ID, $copy_id, [], true );
+          $dup_lines[] = 'Meta: ' . count( $dup_copied ) . ' key(s) copied, ' . array_sum( array_column( $dup_copied, 'bytes' ) ) . ' bytes'
+            . ( $dup_skipped ? ', skipped ' . implode( ', ', array_keys( $dup_skipped ) ) : '' ) . '.';
+        }
+        else {
+          $dup_lines[] = 'Meta: not copied (include_meta false).';
+        }
+
+        if ( !isset( $a['include_terms'] ) || $a['include_terms'] ) {
+          $dup_terms = [];
+          foreach ( get_object_taxonomies( $src->post_type ) as $dup_tax ) {
+            $dup_ids = wp_get_object_terms( $src->ID, $dup_tax, [ 'fields' => 'ids' ] );
+            if ( is_wp_error( $dup_ids ) || !$dup_ids ) {
+              continue;
+            }
+            wp_set_object_terms( $copy_id, $dup_ids, $dup_tax );
+            $dup_terms[] = $dup_tax . ' (' . count( $dup_ids ) . ')';
+          }
+          $dup_lines[] = 'Terms: ' . ( $dup_terms ? implode( ', ', $dup_terms ) : 'none assigned on the source' ) . '.';
+        }
+        else {
+          $dup_lines[] = 'Terms: not copied (include_terms false).';
+        }
+
+        $this->bust_post_cache( $copy_id, [ 'tool' => 'wp_duplicate_post' ] );
+        $this->add_result_text( $r, implode( "\n", $dup_lines ) );
         break;
 
         /* ===== Posts: write blocks ===== */
@@ -2621,6 +3076,145 @@ class GMCP_Tools_Core {
         else {
           $r = $this->error( $r, 'Deletion failed', -32603 );
         }
+        break;
+
+      case 'wp_copy_post_meta':
+        $from_id = intval( $a['from_id'] ?? 0 );
+        $to_id = intval( $a['to_id'] ?? 0 );
+        if ( !$from_id || !get_post( $from_id ) ) {
+          $r = $this->error( $r, 'No source post with ID ' . $from_id . '.', -32602 );
+          break;
+        }
+        if ( !$to_id || !get_post( $to_id ) ) {
+          $r = $this->error( $r, 'No target post with ID ' . $to_id . '.', -32602 );
+          break;
+        }
+        // Some MCP clients send arrays as JSON strings.
+        $copy_keys = $a['keys'] ?? [];
+        if ( is_string( $copy_keys ) ) {
+          $copy_keys = json_decode( $copy_keys, true ) ?? [];
+        }
+        [ $copied, $skipped ] = $this->copy_post_meta( $from_id, $to_id, (array) $copy_keys, !empty( $a['overwrite'] ) );
+
+        $copy_lines = [];
+        if ( $copied ) {
+          $copy_lines[] = 'Copied ' . count( $copied ) . ' key(s) from post #' . $from_id . ' to post #' . $to_id
+            . ', ' . array_sum( array_column( $copied, 'bytes' ) ) . ' bytes in total:';
+          foreach ( $copied as $copy_key => $copy_stat ) {
+            $copy_lines[] = '- ' . $copy_key . ': ' . $copy_stat['bytes'] . ' bytes'
+              . ( $copy_stat['rows'] > 1 ? ' across ' . $copy_stat['rows'] . ' rows' : '' );
+          }
+        }
+        else {
+          $copy_lines[] = 'Nothing was copied from post #' . $from_id . ' to post #' . $to_id . '.';
+        }
+        if ( $skipped ) {
+          $copy_lines[] = '';
+          $copy_lines[] = 'Skipped:';
+          foreach ( $skipped as $copy_key => $copy_why ) {
+            $copy_lines[] = '- ' . $copy_key . ': ' . $copy_why;
+          }
+        }
+        $this->bust_post_cache( $to_id, [ 'tool' => 'wp_copy_post_meta' ] );
+        $this->add_result_text( $r, implode( "\n", $copy_lines ) );
+        break;
+
+      case 'wp_write_post_meta_chunk':
+        $chunk_session = (string) ( $a['session'] ?? '' );
+        $chunk_pid = intval( $a['ID'] ?? 0 );
+        $chunk_key = sanitize_key( $a['key'] ?? '' );
+        $chunk_data = $a['data'] ?? null;
+        $chunk_name = $this->meta_chunk_transient( $chunk_session );
+        if ( $chunk_name === $this->meta_chunk_transient( '' ) ) {
+          $r = $this->error( $r, 'session required, and it must contain letters, digits, "-" or "_".', -32602 );
+          break;
+        }
+        if ( !$chunk_pid || !get_post( $chunk_pid ) ) {
+          $r = $this->error( $r, 'No post with ID ' . $chunk_pid . '.', -32602 );
+          break;
+        }
+        if ( $chunk_key === '' ) {
+          $r = $this->error( $r, 'key required', -32602 );
+          break;
+        }
+        if ( !is_string( $chunk_data ) ) {
+          $r = $this->error( $r, 'data must be a string; send the value in pieces, not as an object.', -32602 );
+          break;
+        }
+
+        $staged = get_transient( $chunk_name );
+        if ( !is_array( $staged ) ) {
+          $staged = [ 'ID' => $chunk_pid, 'key' => $chunk_key, 'chunks' => 0, 'data' => '' ];
+        }
+        // A session stands for one value. Letting a later chunk point somewhere else
+        // would splice two payloads together and write the result to whichever target
+        // the last call named, which is a corrupt value on a post nobody was writing to.
+        if ( $staged['ID'] !== $chunk_pid || $staged['key'] !== $chunk_key ) {
+          $r = $this->error(
+            $r,
+            'Session "' . $chunk_session . '" is staging post #' . $staged['ID'] . ' meta "' . $staged['key']
+              . '", and this chunk targets post #' . $chunk_pid . ' meta "' . $chunk_key
+              . '". Use a different session id for a different value.',
+            -32600
+          );
+          break;
+        }
+        if ( strlen( $staged['data'] ) + strlen( $chunk_data ) > self::META_CHUNK_MAX_BYTES ) {
+          $r = $this->error(
+            $r,
+            'This chunk would take session "' . $chunk_session . '" past the ' . self::META_CHUNK_MAX_BYTES
+              . '-byte staging limit. Nothing was appended; the ' . strlen( $staged['data'] )
+              . ' bytes already staged are untouched and expire on their own.',
+            -32600
+          );
+          break;
+        }
+
+        $staged['data'] .= $chunk_data;
+        $staged['chunks']++;
+
+        if ( empty( $a['final'] ) ) {
+          // Re-setting the transient also restarts the expiry, so a session that is
+          // still being fed stays alive and one that stops being fed goes away.
+          set_transient( $chunk_name, $staged, self::META_CHUNK_TTL );
+          $this->add_result_text( $r, wp_json_encode( [
+            'session' => $chunk_session,
+            'chunk_index' => $staged['chunks'] - 1,
+            'bytes_written' => strlen( $chunk_data ),
+            'total_bytes' => strlen( $staged['data'] ),
+            'final' => false,
+          ], JSON_PRETTY_PRINT ) );
+          break;
+        }
+
+        $chunk_value = $staged['data'];
+        $chunk_stored_as = 'string';
+        // Same decode wp_update_option does, for the same reason: a caller that sends an
+        // Elementor payload as JSON must not end up with a JSON string in a meta row that
+        // every reader expects to hold an array.
+        if ( isset( $chunk_value[0] ) && ( $chunk_value[0] === '[' || $chunk_value[0] === '{' ) ) {
+          $chunk_decoded = json_decode( $chunk_value, true );
+          if ( json_last_error() === JSON_ERROR_NONE && is_array( $chunk_decoded ) ) {
+            $chunk_value = $chunk_decoded;
+            $chunk_stored_as = 'array';
+          }
+        }
+        // wp_slash for the reason copy_post_meta() gives: update_post_meta() unslashes,
+        // and an unslashed JSON payload loses the backslashes that make it valid JSON.
+        update_post_meta( $chunk_pid, $chunk_key, wp_slash( $chunk_value ) );
+        delete_transient( $chunk_name );
+        $this->bust_post_cache( $chunk_pid, [ 'tool' => 'wp_write_post_meta_chunk' ] );
+
+        $this->add_result_text( $r, wp_json_encode( [
+          'session' => $chunk_session,
+          'chunk_index' => $staged['chunks'] - 1,
+          'bytes_written' => strlen( $chunk_data ),
+          'total_bytes' => strlen( $staged['data'] ),
+          'final' => true,
+          'written_to' => [ 'ID' => $chunk_pid, 'key' => $chunk_key ],
+          'stored_as' => $chunk_stored_as,
+          'note' => 'Post meta is not journalled; wp_undo_change cannot reverse this write.',
+        ], JSON_PRETTY_PRINT ) );
         break;
 
         /* ===== Featured image ===== */

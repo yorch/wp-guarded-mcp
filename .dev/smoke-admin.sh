@@ -1395,6 +1395,68 @@ call p_restore '{"jsonrpc":"2.0","id":81,"method":"tools/call","params":{"name":
 check "regenerating restores the header rule" \
   "$(docker compose exec -T wp sh -c 'grep -c HTTP_AUTHORIZATION /var/www/html/.htaccess' | tr -d '\r\n')" "1"
 
+echo "-- deleting an option --"
+docker compose exec -T cli wp option add gmcp_smoke_removable "bye" >/dev/null 2>&1
+call do_ok '{"jsonrpc":"2.0","id":85,"method":"tools/call","params":{"name":"wp_delete_option","arguments":{"key":"gmcp_smoke_removable"}}}'
+# The plugin's own rows are unreadable and unwritable, and deleting is a write. A tool that
+# could drop them would be a way to remove the guard rather than pass it.
+check "a gmcp_ row is refused like any other access to one" "$(verdict do_ok)" "error"
+docker compose exec -T cli wp option add smoke_removable "bye" >/dev/null 2>&1
+call do_ok2 '{"jsonrpc":"2.0","id":86,"method":"tools/call","params":{"name":"wp_delete_option","arguments":{"key":"smoke_removable"}}}'
+check "an ordinary option is deleted" "$(verdict do_ok2)" "ok"
+check "and the row is really gone" \
+  "$(docker compose exec -T cli wp option get smoke_removable >/dev/null 2>&1 && echo present || echo absent | tr -d '\r\n')" "absent"
+# Nothing was deleted, so saying so is the honest answer. Reporting a deletion that did not
+# happen would have a caller believe a stale value is gone when it never existed.
+call do_again '{"jsonrpc":"2.0","id":87,"method":"tools/call","params":{"name":"wp_delete_option","arguments":{"key":"smoke_removable"}}}'
+check "deleting one that is not there says so rather than claiming a deletion" \
+  "$(refusal do_again | grep -c 'does not exist; nothing was deleted')" "1"
+# Undo cannot put a deleted option back, so the reply carries the value: it is the only
+# copy anyone gets. That makes the reply a read of the row, which is why the credential
+# test that keeps values out of the journal has to apply here too.
+docker compose exec -T cli wp eval 'update_option("smoke_value_back","the old value",false);' >/dev/null 2>&1
+call do_val '{"jsonrpc":"2.0","id":92,"method":"tools/call","params":{"name":"wp_delete_option","arguments":{"key":"smoke_value_back"}}}'
+check "the deleted value comes back with the answer" \
+  "$(refusal do_val | grep -c 'the old value')" "1"
+check "and the reply says undo cannot restore it" \
+  "$(refusal do_val | grep -c 'wp_undo_change cannot put it back')" "1"
+docker compose exec -T cli wp eval 'update_option("smoke_endpoint_config",["endpoint"=>"https://x.test","api_key"=>"sk-live-123"],false);' >/dev/null 2>&1
+call do_sec '{"jsonrpc":"2.0","id":93,"method":"tools/call","params":{"name":"wp_delete_option","arguments":{"key":"smoke_endpoint_config"}}}'
+# The option name is innocuous, so option_guard lets the delete through. The value is not
+# innocuous, and repeating it would make deleting a way to read a credential out.
+check "but a credential-shaped value is withheld" \
+  "$(refusal do_sec | grep -c 'sk-live-123')" "0"
+check "and the reply says why it was withheld" \
+  "$(refusal do_sec | grep -c 'credential-shaped')" "1"
+
+# siteurl is the row that makes the site and this endpoint resolvable. There is no way back
+# in through the API that deleted it, so it cannot be deleted through the API at all.
+call do_site '{"jsonrpc":"2.0","id":88,"method":"tools/call","params":{"name":"wp_delete_option","arguments":{"key":"siteurl"}}}'
+check "siteurl cannot be deleted" "$(verdict do_site)" "error"
+check "and it is still there" \
+  "$(docker compose exec -T cli wp option get siteurl >/dev/null 2>&1 && echo present || echo absent | tr -d '\r\n')" "present"
+call do_cron '{"jsonrpc":"2.0","id":89,"method":"tools/call","params":{"name":"wp_delete_option","arguments":{"key":"cron"}}}'
+# Deleting the cron row drops every scheduled event on the site and nothing errors.
+check "and neither can the whole cron schedule" "$(verdict do_cron)" "error"
+
+echo "-- flushing caches --"
+docker compose exec -T cli wp eval 'set_transient("smoke_fresh","keep",3600); set_transient("smoke_stale","go",1); update_option("_transient_timeout_smoke_stale", time()-60);' >/dev/null 2>&1
+call fc '{"jsonrpc":"2.0","id":90,"method":"tools/call","params":{"name":"wp_flush_cache","arguments":{"scope":"transients"}}}'
+check "wp_flush_cache clears expired transients" "$(verdict fc)" "ok"
+check "the expired one is gone" \
+  "$(docker compose exec -T cli wp eval 'echo get_transient("smoke_stale")===false?"gone":"kept";' | tr -d '\r\n')" "gone"
+# Throwing away unexpired transients discards work rather than stale data, so the expired
+# sweep must leave them alone.
+check "and a live one is left alone" \
+  "$(docker compose exec -T cli wp eval 'echo get_transient("smoke_fresh")==="keep"?"kept":"gone";' | tr -d '\r\n')" "kept"
+call fc2 '{"jsonrpc":"2.0","id":91,"method":"tools/call","params":{"name":"wp_flush_cache","arguments":{"scope":"all"}}}'
+check "a full flush succeeds" "$(verdict fc2)" "ok"
+# The reason the field report had to be told twice to purge by hand. A CDN or a Varnish in
+# front of WordPress is not reachable from here, and the reply has to say so rather than
+# leave a caller believing the page is fresh.
+check "and it names the CDN it cannot reach" \
+  "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["content"][0]["text"];print("NOT purged" in t and "CDN" in t)' fc2)" "True"
+
 echo "-- scheduled events --"
 # Site Health flags a cron event that keeps failing and there was no way to look at it,
 # run it or stop it. The guards matter more than the happy path here: the run tool fires
