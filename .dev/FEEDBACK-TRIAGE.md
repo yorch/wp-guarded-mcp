@@ -36,6 +36,29 @@ rewrite; a short hash does not.
 | 9, template references | fixed, `feat(elementor): answer what still points at a template` |
 | 12, client notification | fixed, `feat(server): tell a connected client when the tool list changes`; both halves are now done |
 | the WooCommerce mutation probe | fixed, `test(woo): install the mutation probe instead of assuming a directory`; it silently never installed, so two assertions reported a bug that was not there. Note that main fixed the same directory bug independently, so what this commit still contributes is the control check proving the probe is present |
+| 6, meta journalling and grouping | fixed, `feat(journal): journal post meta, and make one call one unit of undo` |
+
+Still open: 4 (backup scope; the listing half already shipped and the download-URL half
+should stay refused), 7 (batch create), and 10 (kit operations).
+
+Also open, and narrower than an item: nothing refuses to delete a template that other
+posts still render. `elementor_template_references` answers the question and says in its
+own description that it refuses nothing, so the answer is only as good as the caller's
+habit of asking. A guard belongs in the always-on content tools rather than with the
+Elementor group, because the delete that breaks the page comes from there and a guard that
+disappears when an optional group is switched off is not one.
+
+## A note on doing this twice
+
+Items 5, 8 and 9 were each built twice, in parallel, by two sessions working from this
+document at the same time. Both versions worked and both were tested; the ones that landed
+are the better of each pair, and roughly a day of the other was thrown away.
+
+Two things would have prevented it, and neither is subtle. This file lists what is open
+and nothing claims an item before starting one, so two readers pick the same next task.
+And a branch stacked on another had features added to its base after it forked, so the
+duplication was invisible until the base merged. Claiming an item here before starting it
+costs one commit and would have caught both.
 
 Everything else below is untouched and still describes what is true today.
 

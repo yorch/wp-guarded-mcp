@@ -47,8 +47,13 @@ $gmcp_core = new GMCP_Core();
 register_activation_hook( GMCP_ENTRY, function () {
   require_once( GMCP_PATH . '/includes/oauth.php' );
   require_once( GMCP_PATH . '/includes/audit.php' );
+  require_once( GMCP_PATH . '/includes/journal.php' );
   gmcp_adopt_previous_data();
   GMCP_Audit::install();
+  // The journal's meta snapshots. Created here as well as lazily from the journal's own
+  // constructor, so a site that has the change journal switched off still has the table
+  // waiting rather than creating it on the first request after somebody switches it on.
+  GMCP_Journal::install();
   GMCP_Audit::adopt_activity_option();
   GMCP_Audit::schedule();
   GMCP_OAuth::purge_discovery_cache();

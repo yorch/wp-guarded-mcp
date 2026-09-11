@@ -1121,13 +1121,13 @@ class GMCP_Tools_Core {
       ],
       'wp_undo_change' => [
         'name' => 'wp_undo_change',
-        'description' => 'Put one recorded change back the way it was, by the id from wp_list_changes. Restores only the fields that changed, so later unrelated edits are left alone. Cannot be applied twice.',
+        'description' => 'Put one recorded change back the way it was, by the id from wp_list_changes. Restores only the fields that changed, so later unrelated edits are left alone. Cannot be applied twice. Pass "call" instead of "id" to put back everything one tool call did: a single call routinely changes several things, since writing a page can move an option another plugin keeps in step with it and a page-builder save writes a handful of meta keys, and those arrive as separate entries sharing a call id. Reverting a whole call goes newest first, because two entries can touch the same row and replaying them in the order they happened leaves the value the call set rather than the value it found. Partial success is reported as partial: an individual entry can still be irreversible on its own.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
             'id' => [ 'type' => 'string', 'description' => 'The change id from wp_list_changes.' ],
+            'call' => [ 'type' => 'string', 'description' => 'A call id from wp_list_changes, to put back every change that call made. Use instead of id, not with it.' ],
           ],
-          'required' => [ 'id' ],
         ],
         'accessLevel' => 'write',
       ],
@@ -1329,7 +1329,7 @@ class GMCP_Tools_Core {
       ],
       'wp_duplicate_post' => [
         'name' => 'wp_duplicate_post',
-        'description' => 'Duplicate an existing post, page or custom post type, copying its content, excerpt, type, parent, menu order and comment/ping settings. The copy is a DRAFT unless you pass post_status, whatever the source\'s status was: a duplicate going live on a misread instruction is exactly what this plugin exists to prevent, so publishing is always a separate, deliberate call. include_meta (default true) copies every meta key except _edit_lock and _edit_last; the copy happens inside PHP, so an Elementor _elementor_data blob of any size moves without passing through a tool argument. include_terms (default true) copies the term assignments of every taxonomy registered to the post type. Returns the new post ID. The new post is journalled and can be removed with wp_delete_post, but the copied meta is not journalled.',
+        'description' => 'Duplicate an existing post, page or custom post type, copying its content, excerpt, type, parent, menu order and comment/ping settings. The copy is a DRAFT unless you pass post_status, whatever the source\'s status was: a duplicate going live on a misread instruction is exactly what this plugin exists to prevent, so publishing is always a separate, deliberate call. include_meta (default true) copies every meta key except _edit_lock and _edit_last; the copy happens inside PHP, so an Elementor _elementor_data blob of any size moves without passing through a tool argument. include_terms (default true) copies the term assignments of every taxonomy registered to the post type. Returns the new post ID. The new post is journalled and can be removed with wp_delete_post. The copied meta is journalled too, one entry per key, so an individual field can be put back with wp_undo_change; a value larger than a megabyte is recorded as changed without a copy and says so.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1471,7 +1471,7 @@ class GMCP_Tools_Core {
       ],
       'wp_update_post_meta' => [
         'name' => 'wp_update_post_meta',
-        'description' => 'Update post meta efficiently. Use "meta" object to update MULTIPLE fields at once (e.g., {_price: "19.99", _stock: "50", _sku: "WIDGET"}), or use "key"+"value" for a single field. Essential for WooCommerce products and custom post types. A value may be an array or object, and a string that is valid JSON for one is decoded before storing, the same way wp_update_option and wp_write_post_meta_chunk do, so a small Elementor payload no longer needs the chunk API. Backslashes are preserved, so a regex, a Windows path or a JSON payload is stored as it was sent. Keys are written EXACTLY as given, case included, so "myPlugin_Data" creates that key and not the "myplugin_data" earlier versions silently wrote instead. One thing is not decided here: the database matches an existing row case-insensitively, so writing "myPlugin_Data" where "myplugin_data" is already on the post updates that row and leaves its spelling alone, and reads are exact and would then miss it. That is reported in the answer when it happens, naming the row the value is really in. An empty key, the key "0" (WordPress cannot address either), or one longer than 255 characters (the width of wp_postmeta.meta_key) is refused and nothing at all is written. Use wp_write_post_meta_chunk instead when the value is too large to pass in one tool argument. Post meta is not journalled, so this CANNOT be undone with wp_undo_change.',
+        'description' => 'Update post meta efficiently. Use "meta" object to update MULTIPLE fields at once (e.g., {_price: "19.99", _stock: "50", _sku: "WIDGET"}), or use "key"+"value" for a single field. Essential for WooCommerce products and custom post types. A value may be an array or object, and a string that is valid JSON for one is decoded before storing, the same way wp_update_option and wp_write_post_meta_chunk do, so a small Elementor payload no longer needs the chunk API. Backslashes are preserved, so a regex, a Windows path or a JSON payload is stored as it was sent. Keys are written EXACTLY as given, case included, so "myPlugin_Data" creates that key and not the "myplugin_data" earlier versions silently wrote instead. One thing is not decided here: the database matches an existing row case-insensitively, so writing "myPlugin_Data" where "myplugin_data" is already on the post updates that row and leaves its spelling alone, and reads are exact and would then miss it. That is reported in the answer when it happens, naming the row the value is really in. An empty key, the key "0" (WordPress cannot address either), or one longer than 255 characters (the width of wp_postmeta.meta_key) is refused and nothing at all is written. Use wp_write_post_meta_chunk instead when the value is too large to pass in one tool argument. The previous value is journalled, so wp_undo_change can put it back; a value larger than a megabyte, or one whose field name or contents look like a credential, is recorded as changed without a copy and says which.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1500,7 +1500,7 @@ class GMCP_Tools_Core {
       ],
       'wp_copy_post_meta' => [
         'name' => 'wp_copy_post_meta',
-        'description' => 'Copy custom fields from one post to another inside PHP, so a value too large to survive a tool argument never has to leave the server: an Elementor _elementor_data blob is routinely over 100KB and cannot be read out and written back reliably. Copies every key by default; pass "keys" to copy only some, spelled exactly as they are on the source, case included, and a key that does not match is reported as skipped rather than guessed at. A key that already exists on the target is SKIPPED, not merged, unless overwrite is true. _edit_lock and _edit_last are never copied because they say who is editing the source, not what it contains. A key with several rows keeps all of them. Reports bytes copied per key and the reason for every skip. Post meta is not journalled, so this cannot be undone with wp_undo_change.',
+        'description' => 'Copy custom fields from one post to another inside PHP, so a value too large to survive a tool argument never has to leave the server: an Elementor _elementor_data blob is routinely over 100KB and cannot be read out and written back reliably. Copies every key by default; pass "keys" to copy only some, spelled exactly as they are on the source, case included, and a key that does not match is reported as skipped rather than guessed at. A key that already exists on the target is SKIPPED, not merged, unless overwrite is true. _edit_lock and _edit_last are never copied because they say who is editing the source, not what it contains. A key with several rows keeps all of them. Reports bytes copied per key and the reason for every skip. Each key written is journalled separately, so wp_undo_change can put one field back at a time; a key larger than a megabyte is recorded as changed without a copy and says so.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1519,7 +1519,7 @@ class GMCP_Tools_Core {
       ],
       'wp_write_post_meta_chunk' => [
         'name' => 'wp_write_post_meta_chunk',
-        'description' => 'Write a post meta value that is too large to pass in one tool argument, a piece at a time. Pick any "session" id and send successive calls with the same session, ID and key; each call appends and answers with chunk_index, bytes_written and total_bytes staged. Nothing touches the post until the call that sets final: true, which assembles the staged bytes, writes the meta row and clears the staging, so an abandoned or half-sent value can never be read as real. A session is bound to the post and key it opened with and refuses a chunk aimed anywhere else. If the assembled string is valid JSON for an array or object it is decoded before storing, the same way wp_update_option decodes a JSON string, so a JSON-encoded Elementor payload becomes the array WordPress expects instead of a string; anything else is stored verbatim. Staging is capped and abandoned sessions expire. The key is written EXACTLY as given, case included (earlier versions lowercased it), and an empty key, the key "0", or one longer than 255 characters is refused. "written_to" in the final answer names the row the bytes actually went into: if the post already held a key differing only in case, the database counts that as the same key and the value lands there under the old spelling, which is the name to read it back by. Post meta is not journalled, so the final write CANNOT be undone with wp_undo_change.',
+        'description' => 'Write a post meta value that is too large to pass in one tool argument, a piece at a time. Pick any "session" id and send successive calls with the same session, ID and key; each call appends and answers with chunk_index, bytes_written and total_bytes staged. Nothing touches the post until the call that sets final: true, which assembles the staged bytes, writes the meta row and clears the staging, so an abandoned or half-sent value can never be read as real. A session is bound to the post and key it opened with and refuses a chunk aimed anywhere else. If the assembled string is valid JSON for an array or object it is decoded before storing, the same way wp_update_option decodes a JSON string, so a JSON-encoded Elementor payload becomes the array WordPress expects instead of a string; anything else is stored verbatim. Staging is capped and abandoned sessions expire. The key is written EXACTLY as given, case included (earlier versions lowercased it), and an empty key, the key "0", or one longer than 255 characters is refused. "written_to" in the final answer names the row the bytes actually went into: if the post already held a key differing only in case, the database counts that as the same key and the value lands there under the old spelling, which is the name to read it back by. The final write is journalled, so wp_undo_change can put the previous value back, unless it was larger than a megabyte, which is likely for the payloads this tool exists for; the entry says so either way.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -2482,7 +2482,21 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'The change journal is switched off for this site, so there is nothing on record to revert.', -32603 );
           break;
         }
-        $undo = GMCP_Journal::revert( (string) ( $a['id'] ?? '' ) );
+        $undo_id = (string) ( $a['id'] ?? '' );
+        $undo_call = (string) ( $a['call'] ?? '' );
+        if ( $undo_id === '' && $undo_call === '' ) {
+          $r = $this->error( $r, 'Pass id to put back one change, or call to put back everything one tool call did. Both come from wp_list_changes.', -32602 );
+          break;
+        }
+        // Refused rather than resolved to one of them. The two mean different amounts of
+        // undo, and guessing which was meant is the wrong way to be helpful about a write.
+        if ( $undo_id !== '' && $undo_call !== '' ) {
+          $r = $this->error( $r, 'Pass id or call, not both: one puts back a single change and the other puts back every change from one call.', -32602 );
+          break;
+        }
+        $undo = $undo_call !== ''
+          ? GMCP_Journal::revert_call( $undo_call )
+          : GMCP_Journal::revert( $undo_id );
         if ( !$undo['ok'] ) {
           $r = $this->error( $r, $undo['message'], -32602 );
           break;
@@ -3860,7 +3874,7 @@ class GMCP_Tools_Core {
           'written_to' => [ 'ID' => $chunk_pid, 'key' => $chunk_filed_as ],
           'stored_as' => $chunk_stored_as,
           'note' => ( $chunk_elsewhere !== '' ? 'The post already held a row spelled "' . $chunk_elsewhere . '", which the database treats as the same key as "' . $chunk_key . '", so the value went there and that row keeps its own spelling; read it back under written_to.key. ' : '' )
-            . 'Post meta is not journalled; wp_undo_change cannot reverse this write.',
+            . 'The previous value of each key is journalled, so wp_undo_change can put a field back. A value past a megabyte, or one that looks credential-shaped, is recorded without a copy and the entry says so.',
         ], JSON_PRETTY_PRINT ) );
         break;
 
