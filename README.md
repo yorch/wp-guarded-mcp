@@ -194,13 +194,19 @@ passes is worse than an absent one because it gets counted.
 A listing must not hand out the keys. `wp_list_backups` returns when each backup finished,
 what it contains, how big it is and where it went. It never returns the archive's filename
 or path, and that omission is the design rather than an oversight. UpdraftPlus writes
-`backup_<date>_<site>_<nonce>-db.gz` into `wp-content/updraft`, where the nonce is the only
-thing making the URL unguessable: the `.htaccess` there says `deny from all`, which nginx
-never reads. Backuply inverts the arrangement, with a predictable filename inside a
-directory whose random suffix is the secret. Either way the on-disk name is a capability,
-and a database archive holds every user row and password hash on the site. So a backup is
-identified by when it finished, which answers every question an agent has a reason to ask
-and cannot be turned into a URL.
+`backup_<date>_<site>_<nonce>-db.gz` into `wp-content/updraft`, where a 48-bit job nonce
+makes the URL unguessable. Backuply inverts the arrangement, with a filename derivable from
+the timestamp inside a directory whose 36-bit suffix is the secret, one suffix shared by
+every archive on the site.
+
+Neither is the only protection, and the wording here used to say it was. Both plugins drop
+an `.htaccess` saying `deny from all` in the directory, and Backuply also writes archives
+mode 0600. Apache honours the first and nginx does not read it at all, so on an nginx site
+the unguessable name is the last thing standing rather than the only one. Either way the
+on-disk name is a capability rather than a label, and a database archive holds every user
+row and password hash on the site. So a backup is identified by when it finished, which
+answers every question an agent has a reason to ask, cannot be turned into a URL, and
+reduces neither secret.
 
 That rule is enforced rather than asserted. `gmcp_backup_providers` is a public filter, so
 a sentence promising no filenames would only describe the two shipped adapters; every entry

@@ -1130,9 +1130,9 @@ check "and a set holding mu-plugins says so" \
 # backup is the false yes this whole file is arranged against, so the reply separates the
 # ones that could actually put the site back.
 check "and the reply counts how many hold a database" \
-  "$(lb "str(d['with_database'] <= d['count'])" lb_up)" "True"
+  "$(lb "str(d['with_database'] <= d['shown'])" lb_up)" "True"
 check "and says so in the summary when some do not" \
-  "$(lb "'yes' if (d['with_database'] == d['count']) or ('cannot put the site back' in d['summary']) else 'no'" lb_up)" "yes"
+  "$(lb "'yes' if (d['with_database'] == d['shown']) or ('cannot put the site back' in d['summary']) else 'no'" lb_up)" "yes"
 
 # A scan for something that must be absent is worth nothing without a control proving the
 # thing exists and is findable. Both halves are asserted, in that order.
@@ -1167,11 +1167,16 @@ check "nor is any wp__<date> or tar.gz shape at all" "$(grep -ciE 'wp__[0-9]{4}-
 # came back, which cannot tell "that is all of them" from "the adapter stopped there".
 call lb_two '{"jsonrpc":"2.0","id":252,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{"limit":100}}}'
 check "there are at least two Backuply backups to order" "$(lb "str(d['total'] >= 2)" lb_two)" "True"
+# A sort assertion over a list whose values are all equal passes on any order, because
+# Python's sort is stable. The control asserts the timestamps actually differ, so the
+# comparison below is doing work.
+check "control: the timestamps to order by are actually distinct" \
+  "$(lb "str(len({b['completed'] for b in d['backups'] if b['completed']}) >= 2)" lb_two)" "True"
 check "and they come back newest first" \
   "$(lb "str([b['completed'] for b in d['backups'] if b['completed']] == sorted([b['completed'] for b in d['backups'] if b['completed']], reverse=True))" lb_two)" "True"
 TOTAL=$(py "import json,sys;print(json.loads(json.load(sys.stdin)['result']['content'][0]['text'])['total'])" lb_two)
 call lb_one '{"jsonrpc":"2.0","id":253,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{"limit":1}}}'
-check "a capped listing says it was capped and how many exist" "$(lb "str(d['count']) + ',' + str(d['truncated']) + ',' + str(d['total'])" lb_one)" "1,True,$TOTAL"
+check "a capped listing says it was capped and how many exist" "$(lb "str(d['shown']) + ',' + str(d['truncated']) + ',' + str(d['total'])" lb_one)" "1,True,$TOTAL"
 # The case the old contract got wrong in the reassuring direction: asking for exactly as
 # many as exist must not claim there may be older ones.
 call lb_exact "{\"jsonrpc\":\"2.0\",\"id\":258,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_list_backups\",\"arguments\":{\"limit\":$TOTAL}}}"
@@ -1227,6 +1232,26 @@ check "no planted secret survives anywhere in the reply" \
 check "and none of it reaches the audit log" \
   "$(docker compose exec -T cli wp eval 'global $wpdb; $a = implode( "", (array) $wpdb->get_col( "SELECT COALESCE(detail,\"\") FROM {$wpdb->prefix}gmcp_audit" ) ); echo strpos( $a, "deadbeefcafe" ) === false ? 0 : 1;' 2>/dev/null | tr -d '\r\n')" "0"
 docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-probe-provider.php >/dev/null 2>&1
+
+# An adapter registered without a name must not answer with the value that means "no
+# backup plugin recognised". Those are opposite situations and they read identically.
+docker compose exec -T cli bash -c 'cat > /var/www/html/wp-content/mu-plugins/gmcp-noname-provider.php <<"NONAME"
+<?php
+add_filter( "gmcp_backup_providers", function ( $p ) {
+  return [ "nameless" => [
+    "installed" => function () { return true; },
+    "start" => null, "state" => null, "list" => null,
+  ] ];
+}, 99 );
+NONAME
+echo ok' >/dev/null 2>&1
+call lb_noname '{"jsonrpc":"2.0","id":262,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{}}}'
+check "an unnamed adapter is not reported as no adapter at all" \
+  "$(lb "str(d['provider'] is not None)" lb_noname)" "True"
+check "and it falls back to the slug it was registered under" "$(lb "d['provider']" lb_noname)" "nameless"
+check "and its summary does not start on a bare space" \
+  "$(lb "str(d['summary'][:1] != ' ')" lb_noname)" "True"
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-noname-provider.php >/dev/null 2>&1
 
 echo "-- a listing survives records it cannot read --"
 # Backuply pushes json_decode()'s return without checking it, so an info file truncated
