@@ -404,12 +404,47 @@ because of last year. So retention in days (90 by default, configurable), a hard
 50,000 entries and one of 50 MB of recorded arguments and changes, whichever is hit first, pruned by
 a daily WP-Cron event. There are Prune now and Clear everything buttons on the screen.
 
+*The log can leave the screen,* as CSV or JSON, and both export the rows the current filters
+select rather than the whole table, so what you get is what you were looking at. A match too
+large to send is cut at its oldest end and the file name says so, because a file outlives the
+screen that would otherwise have carried that caveat. An export cannot give up a secret: the
+redaction happened on the way in, so there is no unredacted copy to export. Cells that open
+with `=`, `+`, `-`, `@`, a tab or a carriage return are written with a leading apostrophe, which
+is visible in the file and deliberate. A spreadsheet treats such a cell as a formula and runs
+it, and this log carries post titles, refusal messages and comment text that an anonymous
+person wrote, which is the same reason the rest of the plugin is careful.
+
 *Who is not overclaimed.* Two columns, because the honest answer needs both. `called_by`
 is the OAuth application, the named key's label, or the authentication method a shared
-token used: it is the closest this site has to who was driving. `acted_as` is the
+token used: it is the closest this site has to who was driving. The screen names the way in
+alongside it rather than instead of it, because the three are not equivalent: OAuth is a
+consent that stops working when the account stops being an administrator, a bearer token is
+a shared secret, and the URL-token route puts that secret somewhere servers log. `acted_as` is the
 WordPress account the call ran as, and a static bearer token borrows the lowest-numbered
 administrator, so that name is the same whoever sent the request. The reply says so in
 as many words rather than leaving a reader to infer it.
+
+*The screen is built for the way agents actually behave.* Agent traffic is repetitive: a
+reader who asked for the log after twenty-eight polling calls used to get a page of
+twenty-eight identical rows and found the refusals three pages later. Consecutive identical
+calls now fold into one row carrying a count, expandable in place, with a link that unfolds
+the whole page. The item total always reports the true number of entries, because a log that
+rounds down what it holds is not a log. Anything that recorded a change never folds, however
+alike two such calls look: five writes of the same option are five different before-and-after
+pairs, and merging them would hide exactly what the log exists to show.
+
+*A refusal says why on the row.* Refusals are the interesting entries, and they used to all
+render as the single word "Refused" with the reason a page load away. The reason now sits
+under the row, cut to a readable length with the whole of it on the entry page. It is a
+full-width line rather than another column because the Result column is about a hundred
+pixels wide and a two-hundred-character refusal wrapped to eight lines in it, which made the
+rows that mattered the hardest ones to read.
+
+*Searching is narrow by default.* The log holds up to 50 MB of recorded arguments, and a
+substring search across all of it is a full scan of the table. The search box reads the
+target and the result, both small, and a checkbox puts the arguments and the changes back
+when you need to ask what touched post 12. The `outcome` column is indexed, so the Refusals
+view reads the page it returns rather than scanning to find it.
 
 An agent can read the log through `wp_get_audit_log` at `admin` level, filtered by tool,
 outcome, date or free text, and the reply carries the tamper verdict so a caller is told

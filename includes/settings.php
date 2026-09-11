@@ -270,6 +270,12 @@ class GMCP_Settings {
           )
         : __( 'Nothing needed pruning.', 'guarded-mcp' );
     }
+    elseif ( $action === 'export_csv' || $action === 'export_json' ) {
+      // Sends a file and exits, so it never reaches the redirect below. Capability and
+      // nonce were settled at the top of this method, the same two gates the prune and
+      // clear buttons pass through, and nothing has been printed yet on admin_init.
+      $this->export_log( $action === 'export_csv' ? 'csv' : 'json' );
+    }
     elseif ( $action === 'create_key' ) {
       $this->create_key();
     }
@@ -326,6 +332,188 @@ class GMCP_Settings {
     // keys exists to avoid.
     set_transient( self::new_key_transient(), $key['secret'], MINUTE_IN_SECONDS );
     $this->notice = __( 'Key created. Copy it now: it is stored hashed and cannot be shown again.', 'guarded-mcp' );
+  }
+
+  /**
+  * The log the filters select, as a file.
+  *
+  * Exactly the rows on screen rather than the whole table, because an operator who has
+  * narrowed to four refusals wants those four, and a fifty-thousand-row file is not an
+  * answer to the question they asked. The filters arrive posted back from the form they
+  * were entered in and go through the same reader the list uses, so the two cannot
+  * disagree about what a value meant.
+  */
+  private function export_log( string $format ): void {
+    $filters = self::log_filters( $_POST );
+    $rows = GMCP_Audit::export_rows( $filters );
+
+    // export_rows() stops on a byte budget as well as a row ceiling, so a short return
+    // is not the same as a small match and the row count cannot tell the two apart.
+    // Counting the match is the only way to know, and a truncated export that looks
+    // complete is the one outcome worth paying a second query to avoid. What is missing
+    // is always the oldest end, since the walk comes newest first.
+    $matching = GMCP_Audit::count( $filters );
+    $exported = count( $rows );
+    $complete = $exported >= $matching;
+
+    // Said in the file name, because a file outlives the screen it was taken from and
+    // has nowhere else to carry the caveat.
+    $name = 'guarded-mcp-audit-log-' . wp_date( 'Y-m-d-Hi' )
+      . ( $complete ? '' : '-newest-' . $exported . '-of-' . $matching ) . '.' . $format;
+
+    // Anything already buffered would be written into the file ahead of the headers.
+    while ( ob_get_level() > 0 ) {
+      ob_end_clean();
+    }
+    nocache_headers();
+    header( 'Content-Type: ' . ( $format === 'csv' ? 'text/csv' : 'application/json' ) . '; charset=utf-8' );
+    header( 'Content-Disposition: attachment; filename="' . $name . '"' );
+    header( 'X-Content-Type-Options: nosniff' );
+
+    if ( $format === 'csv' ) {
+      self::write_csv( $rows );
+    }
+    else {
+      self::write_json( $rows, $filters, $matching );
+    }
+    exit;
+  }
+
+  /**
+  * One line per entry, for somebody who is going to open this in a spreadsheet.
+  *
+  * The columns the table shows, plus the two the screen keeps for a different question:
+  * the reason a call was refused, and the pair of hashes, so a file taken today can be
+  * checked against the live table later.
+  *
+  * Arguments and changes are not here. They are nested structures, and a cell holding a
+  * JSON blob is neither readable nor sortable; the JSON export is where they belong.
+  */
+  private static function write_csv( array $rows ): void {
+    $out = fopen( 'php://output', 'w' );
+    // Excel reads a UTF-8 file as the system code page unless a byte order mark says
+    // otherwise, and post titles and comment text arrive in any script.
+    fwrite( $out, "\xEF\xBB\xBF" );
+    self::csv_line( $out, [
+      __( 'Entry', 'guarded-mcp' ),
+      __( 'When', 'guarded-mcp' ),
+      __( 'Tool', 'guarded-mcp' ),
+      __( 'Target', 'guarded-mcp' ),
+      __( 'Result', 'guarded-mcp' ),
+      __( 'Client', 'guarded-mcp' ),
+      __( 'Let in by', 'guarded-mcp' ),
+      __( 'Ran as', 'guarded-mcp' ),
+      __( 'WordPress user ID', 'guarded-mcp' ),
+      __( 'Took (ms)', 'guarded-mcp' ),
+      __( 'Reason', 'guarded-mcp' ),
+      __( 'Follows hash', 'guarded-mcp' ),
+      __( 'Entry hash', 'guarded-mcp' ),
+    ] );
+    foreach ( $rows as $row ) {
+      self::csv_line( $out, [
+        (int) ( $row['id'] ?? 0 ),
+        // Stored UTC, written in the site's timezone with the offset spelled out: the
+        // same reading as the screen, and still unambiguous in a file that travels.
+        wp_date( 'c', strtotime( (string) ( $row['ts'] ?? '' ) . ' UTC' ) ),
+        (string) ( $row['tool'] ?? '' ),
+        (string) ( $row['target'] ?? '' ),
+        (string) ( $row['outcome'] ?? '' ) === 'ok'
+          ? __( 'Done', 'guarded-mcp' )
+          : __( 'Refused', 'guarded-mcp' ),
+        (string) ( $row['client'] ?? '' ),
+        (string) ( $row['auth_method'] ?? '' ),
+        (string) ( $row['actor_name'] ?? '' ),
+        (int) ( $row['actor'] ?? 0 ),
+        (int) ( $row['ms'] ?? 0 ),
+        (string) ( $row['detail'] ?? '' ),
+        (string) ( $row['prev_hash'] ?? '' ),
+        (string) ( $row['hash'] ?? '' ),
+      ] );
+    }
+    fclose( $out );
+  }
+
+  /**
+  * One row, every cell defused first.
+  *
+  * The escape character is disabled rather than left at PHP's default backslash, which
+  * is not what RFC 4180 says and mangles any value containing a backslash before a
+  * quote into something a reader decodes differently from what was stored.
+  */
+  private static function csv_line( $handle, array $cells ): void {
+    fputcsv( $handle, array_map( [ self::class, 'csv_cell' ], $cells ), ',', '"', '' );
+  }
+
+  /**
+  * One cell, made inert.
+  *
+  * A spreadsheet reads a cell that opens with =, +, - or @ as a formula and evaluates
+  * it. This log carries post titles, refusal messages and comment text that an
+  * anonymous person wrote, which is the same reason the plugin exists, so opening the
+  * export would be handing that person the spreadsheet. Tab and carriage return count
+  * as well: Excel skips them and reads what follows the same way.
+  *
+  * A leading apostrophe makes the cell literal text. It is visible in the file, which is
+  * the honest half of the trade against a spreadsheet that executes the audit log.
+  * Numbers are left alone, since no formula is one.
+  */
+  private static function csv_cell( $value ): string {
+    $value = (string) $value;
+    if ( $value === '' || is_numeric( $value ) ) {
+      return $value;
+    }
+    return preg_match( '/^[=+\-@\t\r]/', $value ) ? "'" . $value : $value;
+  }
+
+  /**
+  * The same rows, for something that is going to read them rather than look at them.
+  *
+  * Written out a row at a time rather than encoded in one go. export_rows() already holds
+  * twenty megabytes of payload in memory; encoding all of it into one more string before
+  * anything is sent doubles that for no gain, and the reader is downloading a file rather
+  * than waiting on a response that has to arrive whole.
+  *
+  * `args` and `changes` are decoded back into structures. They are stored as JSON text,
+  * and passing the text straight through would give the reader JSON quoted inside JSON
+  * to unpick a second time.
+  */
+  private static function write_json( array $rows, array $filters, int $matching ): void {
+    $flags = JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
+    $active = array_filter( $filters, static function ( $value ) {
+      return $value !== '' && $value !== 0 && $value !== false;
+    } );
+
+    echo "{\n";
+    echo '  "site": ' . wp_json_encode( home_url() ) . ",\n";
+    echo '  "exported": ' . wp_json_encode( gmdate( 'c' ) ) . ",\n";
+    // Named so a file found later says what it is a view of, not just that it is a log.
+    echo '  "filters": ' . wp_json_encode( (object) $active ) . ",\n";
+    echo '  "entries_exported": ' . count( $rows ) . ",\n";
+    echo '  "entries_matching": ' . $matching . ",\n";
+    echo '  "complete": ' . ( count( $rows ) >= $matching ? 'true' : 'false' ) . ",\n";
+    echo '  "entries": [';
+
+    $separator = "\n";
+    foreach ( $rows as $row ) {
+      $row['id'] = (int) ( $row['id'] ?? 0 );
+      $row['actor'] = (int) ( $row['actor'] ?? 0 );
+      $row['ms'] = (int) ( $row['ms'] ?? 0 );
+      $row['args'] = self::decoded( $row['args'] ?? null );
+      $row['changes'] = self::decoded( $row['changes'] ?? null );
+      echo $separator . wp_json_encode( $row, $flags );
+      $separator = ",\n";
+    }
+
+    echo "\n  ]\n}\n";
+  }
+
+  /** A stored JSON column as data, or the text itself when it will not decode. */
+  private static function decoded( $json ) {
+    if ( (string) $json === '' ) {
+      return null;
+    }
+    $value = json_decode( (string) $json, true );
+    return json_last_error() === JSON_ERROR_NONE ? $value : (string) $json;
   }
 
   private function save_settings() {
@@ -1149,7 +1337,10 @@ class GMCP_Settings {
       </tbody>
     </table>
 
-    <?php $changes = $this->change_records( $e['changes'] ?? null ); ?>
+    <?php
+    $changes = $this->change_records( $e['changes'] ?? null );
+    $asked = $this->asked_for( $e['args'] ?? null, $changes );
+    ?>
     <h4><?php esc_html_e( 'What changed', 'guarded-mcp' ); ?></h4>
     <?php if ( !$changes ) : ?>
       <p class="gmcp-muted"><?php esc_html_e( 'Nothing was recorded as changed. A read changes nothing, and a refused call did not get far enough to.', 'guarded-mcp' ); ?></p>
@@ -1196,14 +1387,29 @@ class GMCP_Settings {
                   <?php $first = false; ?>
                 <?php endif; ?>
                 <td><code><?php echo esc_html( (string) $field ); ?></code></td>
-                <td><?php echo $this->value_cell( $pair['from'] ?? null, __( 'not set', 'guarded-mcp' ) ); ?></td>
-                <td><?php echo $this->value_cell( $pair['to'] ?? null, __( 'removed', 'guarded-mcp' ) ); ?></td>
+                <td><?php echo $this->value_cell( $pair['from'] ?? null,
+                  __( 'not set', 'guarded-mcp' ), __( 'empty', 'guarded-mcp' ) ); ?></td>
+                <td><?php echo $this->value_cell( $pair['to'] ?? null,
+                  __( 'removed', 'guarded-mcp' ), __( 'empty', 'guarded-mcp' ) ); ?>
+                  <?php if ( isset( $asked[ $field ] ) ) : ?>
+                    <br><span class="gmcp-detail"><?php printf(
+                      /* translators: %s: the value the call sent, as it was sent. */
+                      esc_html__( 'the call sent %s', 'guarded-mcp' ),
+                      '<code>' . esc_html( self::shorten( $asked[ $field ] ) ) . '</code>'
+                    ); ?></span>
+                  <?php endif; ?>
+                </td>
               </tr>
             <?php endforeach; ?>
           <?php endif; ?>
         <?php endforeach; ?>
         </tbody>
       </table>
+      <?php if ( $asked ) : ?>
+        <?php // Only when a field really does differ. Saying it on every entry would
+        // train the reader to skip the one line on this screen worth stopping at. ?>
+        <p class="description"><?php esc_html_e( 'A field was stored as something other than what the call sent. Values are filtered on the way in, so a call can be recorded as done and still not have stored what it asked for.', 'guarded-mcp' ); ?></p>
+      <?php endif; ?>
     <?php endif; ?>
 
     <h4><?php esc_html_e( 'Arguments it was given', 'guarded-mcp' ); ?></h4>
@@ -1239,10 +1445,22 @@ class GMCP_Settings {
     <?php
   }
 
-  /** A recorded value, or a word for its absence. */
-  private function value_cell( $value, string $absent ): string {
-    if ( $value === null || $value === '' ) {
+  /**
+  * A recorded value, or a word for what it is instead.
+  *
+  * Absent and empty are two different things and were shown as one word. A post created
+  * with markup in its title stores an empty title, because the plugin's own filter
+  * strips the markup; the record reads from null to "", and rendering that as
+  * "Was: not set, Became: removed" told the reader somebody deleted a title that had
+  * never existed. Null is the absence, the empty string is a value, and the column
+  * headings mean the two of them differently either side, so the words are passed in.
+  */
+  private function value_cell( $value, string $absent, string $empty ): string {
+    if ( $value === null ) {
       return '<span class="gmcp-muted">' . esc_html( $absent ) . '</span>';
+    }
+    if ( $value === '' ) {
+      return '<span class="gmcp-muted">' . esc_html( $empty ) . '</span>';
     }
     if ( (string) $value === '[redacted]' ) {
       return '<span class="gmcp-muted" title="' . esc_attr__( 'Recorded as changed, but the value looked like a credential and was not kept.', 'guarded-mcp' ) . '">[redacted]</span>';
@@ -1250,10 +1468,153 @@ class GMCP_Settings {
     return '<code>' . esc_html( (string) $value ) . '</code>';
   }
 
+  /**
+  * Fields the call asked for one value and the site stored another.
+  *
+  * This entry is the only place both halves are in scope: every other screen has the
+  * arguments or the result, never the pair. The plugin strips markup out of values on
+  * the way in, so an agent that was told to put a script tag in a title gets a
+  * successful call and an empty title, and nothing on the site says the two differ.
+  *
+  * Nothing here is inferred. A field is compared only against an argument spelled
+  * exactly the same, which is how the write tools spell them: wp_create_post takes
+  * post_title, not title. The argument may be nested, since wp_update_post accepts its
+  * fields either at the top level or under "fields", so the whole tree is searched, but
+  * only for that exact name.
+  *
+  * Attempted only when the entry records one changed object. A call that created three
+  * posts carries one set of arguments and three records, and there is no honest way to
+  * say which record a given post_title belongs to.
+  *
+  * @return array<string,string> field name to the value the call sent
+  */
+  private function asked_for( $args_json, array $changes ): array {
+    if ( count( $changes ) !== 1 || empty( $changes[0]['fields'] ) ) {
+      return [];
+    }
+    $args = json_decode( (string) $args_json, true );
+    if ( !is_array( $args ) ) {
+      return [];
+    }
+
+    $out = [];
+    foreach ( (array) $changes[0]['fields'] as $field => $pair ) {
+      $stored = $pair['to'] ?? null;
+      if ( $stored === null || !is_scalar( $stored ) ) {
+        continue;
+      }
+      $sent = self::arg_named( $args, (string) $field );
+      // A redacted argument says a secret was passed and nothing about its value, so
+      // it can never be compared against what was stored.
+      if ( $sent === null || $sent === '[redacted]' || $sent === (string) $stored ) {
+        continue;
+      }
+      $out[ (string) $field ] = $sent;
+    }
+    return $out;
+  }
+
+  /**
+  * The one value given under this exact argument name, or null.
+  *
+  * Null when the name was not given, and equally when it was given twice with different
+  * values: ambiguous is not an answer, and picking either one would be the guesswork
+  * this comparison exists to avoid.
+  */
+  private static function arg_named( array $args, string $name ): ?string {
+    $found = [];
+    $walk = static function ( $node ) use ( &$walk, $name, &$found ) {
+      foreach ( (array) $node as $key => $value ) {
+        if ( $key === $name && is_scalar( $value ) ) {
+          $found[] = (string) $value;
+        }
+        if ( is_array( $value ) ) {
+          $walk( $value );
+        }
+      }
+    };
+    $walk( $args );
+
+    $found = array_values( array_unique( $found ) );
+    return count( $found ) === 1 ? $found[0] : null;
+  }
+
+  /**
+  * A value short enough to sit in a table cell, with an ellipsis if it was cut.
+  *
+  * Counted in characters rather than bytes, so a cut never lands inside a multi-byte
+  * one and leaves the cell holding a broken sequence. WordPress supplies mb_substr and
+  * mb_strlen where the extension is missing.
+  */
+  private static function shorten( string $value, int $limit = 120 ): string {
+    $flat = preg_replace( '/\s+/', ' ', $value );
+    $flat = trim( $flat === null ? $value : $flat );
+    return mb_strlen( $flat ) > $limit ? mb_substr( $flat, 0, $limit ) . '…' : $flat;
+  }
+
   /** The changes column, decoded, or an empty list if it holds nothing usable. */
   private function change_records( $json ): array {
     $records = $json ? json_decode( (string) $json, true ) : null;
     return is_array( $records ) ? $records : [];
+  }
+
+  /**
+  * What a request is allowed to say about which entries to look at.
+  *
+  * Taken from a supplied array rather than $_GET directly, because the export posts the
+  * same filters back and has to select the rows the reader was looking at, not a wider
+  * set. One place decides what a value may mean, so the list and the export cannot come
+  * to different conclusions about the same query string.
+  */
+  private static function log_filters( array $source ): array {
+    $outcome = isset( $source['gmcp_outcome'] ) ? sanitize_key( wp_unslash( $source['gmcp_outcome'] ) ) : '';
+    $days = isset( $source['gmcp_since'] ) ? sanitize_key( wp_unslash( $source['gmcp_since'] ) ) : '';
+    $filters = [
+      'search' => isset( $source['s'] ) ? sanitize_text_field( wp_unslash( $source['s'] ) ) : '',
+      'outcome' => in_array( $outcome, [ 'ok', 'refused' ], true ) ? $outcome : '',
+      'tool' => isset( $source['gmcp_tool'] ) ? sanitize_key( wp_unslash( $source['gmcp_tool'] ) ) : '',
+      'actor' => isset( $source['gmcp_actor'] ) ? (int) $source['gmcp_actor'] : 0,
+      'since_days' => in_array( $days, [ '1', '7', '30' ], true ) ? $days : '',
+      // The wide search. Truthy rather than compared against a value, because it arrives
+      // from a checkbox, and an unticked box sends nothing at all rather than a false.
+      // The query layer reads it only when there is a search to widen.
+      'deep' => !empty( $source['gmcp_deep'] ),
+    ];
+    if ( $filters['since_days'] !== '' ) {
+      $filters['since'] = gmdate( 'Y-m-d H:i:s', time() - ( (int) $filters['since_days'] * DAY_IN_SECONDS ) );
+    }
+    return $filters;
+  }
+
+  /**
+  * The filters as hidden fields, under the names they arrived by.
+  *
+  * So a form that is not the search form still submits the view the reader is looking
+  * at. Named for the request rather than for the filter array, because log_filters()
+  * reads them back out under those same names.
+  */
+  private static function filter_fields( array $filters ): void {
+    $names = [
+      's' => 'search',
+      'gmcp_outcome' => 'outcome',
+      'gmcp_tool' => 'tool',
+      'gmcp_actor' => 'actor',
+      'gmcp_since' => 'since_days',
+      // Carried like the rest, or an export would quietly select the narrow match while
+      // the screen it claims to copy was showing the wide one, at a row count plausible
+      // enough that nothing would look wrong.
+      'gmcp_deep' => 'deep',
+    ];
+    foreach ( $names as $name => $key ) {
+      if ( empty( $filters[ $key ] ) ) {
+        continue;
+      }
+      printf(
+        '<input type="hidden" name="%s" value="%s">',
+        esc_attr( $name ),
+        esc_attr( (string) $filters[ $key ] )
+      );
+    }
   }
 
   /**
@@ -1264,18 +1625,8 @@ class GMCP_Settings {
   * check again.
   */
   private function render_entry_list(): void {
-    $outcome = isset( $_GET['gmcp_outcome'] ) ? sanitize_key( wp_unslash( $_GET['gmcp_outcome'] ) ) : '';
-    $days = isset( $_GET['gmcp_since'] ) ? sanitize_key( wp_unslash( $_GET['gmcp_since'] ) ) : '';
-    $filters = [
-      'search' => isset( $_GET['s'] ) ? sanitize_text_field( wp_unslash( $_GET['s'] ) ) : '',
-      'outcome' => in_array( $outcome, [ 'ok', 'refused' ], true ) ? $outcome : '',
-      'tool' => isset( $_GET['gmcp_tool'] ) ? sanitize_key( wp_unslash( $_GET['gmcp_tool'] ) ) : '',
-      'actor' => isset( $_GET['gmcp_actor'] ) ? (int) $_GET['gmcp_actor'] : 0,
-      'since_days' => in_array( $days, [ '1', '7', '30' ], true ) ? $days : '',
-    ];
-    if ( $filters['since_days'] !== '' ) {
-      $filters['since'] = gmdate( 'Y-m-d H:i:s', time() - ( (int) $filters['since_days'] * DAY_IN_SECONDS ) );
-    }
+    $filters = self::log_filters( $_GET );
+    $outcome = $filters['outcome'];
 
     $table = new GMCP_Audit_Table( $filters );
     $table->prepare_items();
@@ -1364,9 +1715,27 @@ class GMCP_Settings {
         <?php $this->form_head( 'clear_activity', 'logs' ); ?>
         <button type="submit" class="button"><?php esc_html_e( 'Clear everything', 'guarded-mcp' ); ?></button>
       </form>
+      <?php // Each carries the filters it was pressed under, so the file holds the rows
+      // on screen. A separate form per button because the action is a hidden field. ?>
+      <form method="post">
+        <?php $this->form_head( 'export_csv', 'logs' ); ?>
+        <?php self::filter_fields( $filters ); ?>
+        <button type="submit" class="button"><?php esc_html_e( 'Export as CSV', 'guarded-mcp' ); ?></button>
+      </form>
+      <form method="post">
+        <?php $this->form_head( 'export_json', 'logs' ); ?>
+        <?php self::filter_fields( $filters ); ?>
+        <button type="submit" class="button"><?php esc_html_e( 'Export as JSON', 'guarded-mcp' ); ?></button>
+      </form>
     </div>
     <p class="description gmcp-intro">
       <?php esc_html_e( 'Every call, including the refused ones, with the arguments it was given. Anything that looks like a password or a key is replaced before the entry is written, so what you see here is what was recorded, not a redacted view of something fuller. Each entry hashes the one before it, so a row that is edited or removed later shows up as a break in the chain rather than disappearing quietly.', 'guarded-mcp' ); ?>
+    </p>
+    <?php // After the paragraph above rather than before it, so the sentence about what
+    // an export cannot hand over can lean on the one that says why, instead of saying
+    // the same thing a second time a paragraph away from the first. ?>
+    <p class="description gmcp-intro">
+      <?php esc_html_e( 'An export holds the entries the filters above select: not the whole log, and not only the page you are looking at. The CSV is one line per entry for reading, the JSON carries the arguments and the changes as well, and a match too large to send in one file is cut at its oldest end with the file name saying so. Because the redaction happened on the way in rather than on the way out, an export cannot give up a secret the table never held.', 'guarded-mcp' ); ?>
     </p>
     <?php
   }
