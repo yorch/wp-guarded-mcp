@@ -129,7 +129,9 @@ It has not been tested on multisite. The code has network-aware branches, but un
 
 1. The Connect tab: the endpoint to give your agent, ready-made snippets for Claude Desktop and Claude Code, and the connection check.
 2. The consent screen an administrator sees when an OAuth client asks to connect.
-3. The Access tab, with the bearer token and named keys, and the Logs tab's audit log, which pages and filters and opens any entry in full.
+3. The Access tab: the shared bearer token with its access level, and named keys with their own level, tool list and expiry.
+4. The Logs tab: every call an agent made, refusals included, with the reason each was turned down. Filter by tool, account or recency, and search.
+5. One entry in full: what changed, field by field, with the values before and after, the arguments as they were recorded, and the entry's place in the hash chain.
 
 == Changelog ==
 
