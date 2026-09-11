@@ -43,7 +43,7 @@ The settings screen shows the endpoint URL. There are two ways in.
 
 **OAuth**, for clients that support it (Claude Desktop, the Claude web connector). Paste the endpoint URL into the client. It discovers the authorization server, sends you to a WordPress login, and shows a consent screen. Nothing to configure, and no shared secret. Only administrators can approve a connection, and the resulting token keeps working only while that account is still an administrator.
 
-**Bearer token**, for clients that cannot do OAuth, such as a CLI agent. Generate one on the settings screen and give it to the client:
+**A named key**, for clients that cannot do OAuth, such as a CLI agent. Create one on the Access tab and give it to the client. A key is shown once and stored only as a hash, so keep it wherever the client keeps its configuration:
 
 ```json
 {
@@ -72,8 +72,11 @@ The token access level applies to bearer-token callers only. OAuth callers alway
 A **named key** narrows this further. It carries its own level, an optional expiry date,
 and an optional list of the only tools it may call, so a key handed to a deploy script
 can be limited to reading posts and nothing else. Keys are stored hashed and shown once.
-The shared bearer token above is unchanged and still displayed, because people rely on
-reading it back.
+There is no shared token. There was one, and it was retired rather than hardened: it sat
+in the options table in the clear because the screen showed it back, it carried no identity
+so the log could not say who acted, it could not expire, and it could not be limited to
+anything. A key answers all four, and an existing shared token is carried over into one on
+upgrade so nothing stops working.
 
 ## Tools
 
@@ -102,7 +105,7 @@ That last detail is not fussiness. A chunk boundary falls wherever the byte coun
 - Menu items refuse draft, private and password-protected targets, since a menu item stores its own copy of the title and WordPress renders it regardless of the target's status.
 - Settings are an allowlist, not a blocklist. `siteurl` and `home` are refused outright, since a wrong value makes the site and this endpoint unreachable with no way back. A default role that can edit content is refused, because open registration plus an editing default role is a way in.
 - Those refusals belong to the option, not to the tool that asks. Every one of them lived in the settings tool and nowhere else, so naming the same row through the generic `wp_update_option` went straight through: the site URL, the administration email past the confirmation that exists to protect it, and a registration default of `administrator`. Undo was a third way in, since putting a value back is still writing it. All three now ask one policy, and a tool added later gets the rule by asking rather than by remembering to reimplement it.
-- None of them are reachable over the URL-token endpoint, since that endpoint puts the secret somewhere servers log it. Every `admin`-level tool is refused there, plus two whose declared level understates their reach: `wp_get_site_health`, which makes a loopback request and a wordpress.org call and returns a full account of your configuration, and `wp_upload_request`, which writes nothing itself but hands out an upload URL on a route that authenticates nobody. It cannot *change* anything on the list above, and it cannot read your settings or obtain an upload URL. It is not otherwise restricted, and that is worth stating rather than implying: a token recovered from an access log can create and edit posts, run a search and replace, post comments, and list your menus, widget areas, themes and permalink structure. Those last four are already in `wp_site_briefing`, which is read level and deliberately reachable there, so blocking them one at a time would draw a line where nothing changes. The settings tool is the exception because it returns the administration email, which is a person's address rather than a fact about the site.
+- There is no token-in-URL endpoint any more, so there is no reduced ceiling to describe. It existed for hosts that strip the `Authorization` header, and it put the credential in the request path, where every proxy and web server in front of the site wrote a copy into its access log, one per request. Measured on a development site: 27 copies of a working administrator credential in the access log, and none in the plugin's own debug trace. What made it removable rather than merely unwise is that the plugin recovers the header from `REDIRECT_HTTP_AUTHORIZATION` and `apache_request_headers()`, which is where Apache usually hides it.
 
 None of this plugin's own rows are readable or writable through the option tools, so the bearer token cannot be read back out or overwritten through the API. Any option name containing `gmcp_` is refused, anywhere in the name rather than only at the start, which is deliberate: the one-time plaintext of a newly minted key lives at `_transient_gmcp_new_key_<user>`, and a rule anchored to the start of the name would miss the row it most needs to catch. It replaced a list of exact names, which had been wrong twice: the change journal was readable until somebody named it, and that transient was never on it.
 
@@ -282,9 +285,8 @@ common and is not a fault.
 
 ### Access
 
-Who may connect, and how far each of them reaches: the shared bearer token with its
-access level and the controls that generate or clear it, then named keys, then the OAuth
-apps that have connected.
+Who may connect, and how far each of them reaches: named keys, then the OAuth apps that
+have connected.
 
 **Keys** lists the named keys. Each row shows the label, its access level, the tools it is
 limited to, when it expires and when it was last used, with a control to revoke it. A new
@@ -449,8 +451,8 @@ is the OAuth application, the named key's label, or the authentication method a 
 token used: it is the closest this site has to who was driving. The screen names the way in
 alongside it rather than instead of it, because the three are not equivalent: OAuth is a
 consent that stops working when the account stops being an administrator, a bearer token is
-a shared secret, and the URL-token route puts that secret somewhere servers log. `acted_as` is the
-WordPress account the call ran as, and a static bearer token borrows the lowest-numbered
+a shared secret. `acted_as` is the
+WordPress account the call ran as, and a key carries its own owner rather than borrowing the lowest-numbered
 administrator, so that name is the same whoever sent the request. The reply says so in
 as many words rather than leaving a reader to infer it.
 
@@ -568,7 +570,6 @@ Other hooks:
 | `gmcp_audit_prune` | The daily cron event. Hook it to forward or archive entries before they are pruned |
 | `gmcp_backup_providers` | Register an adapter for a backup plugin this one cannot drive |
 | `gmcp_can_call_tool` | Answers whether the caller could call a given tool. The change journal asks it before replaying a write, so this is the gate on undo |
-| `gmcp_header_auth_only_tools` | Tools the URL-token endpoint may not reach, on top of every `admin`-level tool. Adds to and removes from the exception list; it cannot unblock an admin-level tool |
 | `gmcp_allow_remote_install` | Permit installs from a URL rather than the wordpress.org repository |
 | `gmcp_allow_unfiltered_post_html` | Store post HTML unfiltered |
 | `gmcp_allow_unfiltered_widget_html` | Store widget HTML unfiltered |
@@ -576,11 +577,11 @@ Other hooks:
 ## Security notes
 
 - Only administrators can authorize an OAuth client, checked both at authorize time and again on every request.
-- The shared bearer token is compared with `hash_equals` and stored in the options table in the clear, because the settings screen shows it back to you. Anyone who can read the database can read it, so rotate it if that changes. Named keys are different: they are stored as a SHA-256 hash and shown once, so the database holds nothing that can be replayed.
+- Keys are stored as a SHA-256 hash and shown once, so the database holds nothing that can be replayed. A key also records the administrator who created it and acts as that account, which is what lets the log name a person; it stops working the moment that account stops holding `manage_options`, so revoking somebody's access revokes their agent with it.
 - No row belonging to this plugin, and no option whose name looks like a credential, can be read or written through the option tools. The change journal additionally inspects the value it is about to record, so a settings array holding a `secret_key` or a `pass` field is not stored. That check reads field names, not content, so it will not catch a secret held as a bare string under an innocuous option name.
 - Tools do not execute arbitrary PHP or SQL. Every tool is a fixed WordPress operation with a schema.
 - An open stream holds one PHP worker for up to 180 seconds. Size your pool accordingly if several agents connect at once.
-- The URL-token endpoint can no longer perform any administrative *write*, and can no longer read your settings. If your host strips the `Authorization` header and you were relying on that route for installs, settings or user changes, those now fail. The fix is the header, not the route: re-saving your permalink structure regenerates the `.htaccess` rule that forwards it, and the connection check on the settings screen tells you whether it worked. Earlier versions let `gmcp_header_auth_only_tools` empty the blocked set entirely; it can no longer do that.
+- **The token-in-URL endpoint is gone, and so is the shared bearer token.** If you were connecting over either, connect with a named key in the `Authorization` header instead. An existing shared token is carried over into a key on upgrade, so it keeps working through the header without you doing anything; it is no longer readable back from the screen or the database. If your host strips the header, the fix is the header: re-saving your permalink structure regenerates the `.htaccess` rule that forwards it, and the connection check on the settings screen tells you whether it worked.
 
 ## Development
 

@@ -9,8 +9,40 @@ set -u
 #   GMCP_URL=http://localhost:8081 ./smoke.sh
 BASE="${GMCP_URL:-http://localhost:8080}"
 URL="$BASE/wp-json/mcp/v1/http"
-URL_TOKEN_ROUTE="$BASE/wp-json/mcp/v1/testtoken1234567890"
-TOK='testtoken1234567890'
+# The suite mints itself a key. There is no shared token any more, and a key is shown
+# once, so there is nothing to read back out of the database and hardcode here.
+#
+# Recreated under the same label each run rather than reused, and the shape is asserted:
+# without the guard, a failure to create one leaves TOK empty, every request 401s, and a
+# suite that reports a hundred failures is describing one missing credential.
+gmcp_make_key() { # gmcp_make_key <label>
+  docker compose exec -T cli wp eval '
+    $label = "'"$1"'";
+    foreach ( GMCP_Tokens::all() as $k ) {
+      if ( ( $k["label"] ?? "" ) === $label ) { GMCP_Tokens::revoke( $k["id"] ); }
+    }
+    $admins = get_users( [ "role" => "administrator", "number" => 1, "orderby" => "ID", "order" => "ASC" ] );
+    $a = GMCP_Tokens::create( $label, "admin", 0, [], $admins ? $admins[0]->ID : 0 );
+    echo $a["secret"];' 2>/dev/null | tr -d '\r\n'
+}
+# Every key except the suite's own. Blocks that test key behaviour used to wipe the whole
+# option, which was harmless while the suite authenticated with a shared token kept
+# elsewhere. The suite's credential is now a key too, so a blanket wipe revokes it
+# mid-run, every later request 401s, and the checks report the features as broken rather
+# than the credential as gone.
+gmcp_clear_other_keys() { # gmcp_clear_other_keys <keep-label>
+  docker compose exec -T cli wp eval '
+    $keep = "'"$1"'";
+    foreach ( GMCP_Tokens::all() as $k ) {
+      if ( ( $k["label"] ?? "" ) !== $keep ) { GMCP_Tokens::revoke( $k["id"] ); }
+    }' >/dev/null 2>&1
+}
+
+TOK=$(gmcp_make_key "smoke suite")
+case "$TOK" in
+  gmcp_*) ;;
+  *) echo "Could not create an API key for the suite. Is the plugin active?" >&2; exit 1 ;;
+esac
 OUT=$(mktemp -d)
 pass=0; fail=0
 
@@ -311,40 +343,19 @@ check "tools, prompts and resources are all declared" \
 check "reject bad token" "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'Authorization: Bearer nope' -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":8,"method":"tools/list"}')" "401"
 check "reject absent token" "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":9,"method":"tools/list"}')" "401"
 
-# The token-in-URL fallback exists for hosts that strip the Authorization header, and it
-# is registered on every site that has a bearer token whether that site needs it or not.
-# A URL ends up in access logs, browser history and referrer headers in a way a header
-# does not, so a site that connects with the header should be able to decline the route.
-#
-# The fixture is a file copied in rather than a heredoc written inline. The inline
-# version needed a heredoc inside a single-quoted sh -c inside a docker exec, the
-# terminator did not survive that, and the rest of this script was written into the PHP
-# file. Every request for the remainder of the run then returned 500, which reads as the
-# plugin being broken rather than the harness.
-#
-# Copied and removed as root. `docker cp` creates any missing parent as root, the cli
-# service runs as www-data, and removing a file needs write permission on its DIRECTORY
-# rather than on the file. So the www-data rm failed with "Permission denied", the suite
-# ignored the exit status, the fixture stayed installed, and the next check saw a 404 it
-# read as the route failing to come back. Worse, it left the stack with the route
-# disabled for every later run.
-MU_DIR=/var/www/html/wp-content/mu-plugins
-CLI="${COMPOSE_PROJECT_NAME:-wptest}-cli-1"
-docker exec -u 0 "$CLI" mkdir -p "$MU_DIR"
-docker cp "$(dirname "$0")/fixtures/gmcp-nourl.php" "$CLI:$MU_DIR/gmcp-nourl.php" >/dev/null
-check "control: the filter is actually registered" \
-  "$(docker compose exec -T cli wp eval 'echo has_filter("gmcp_url_token_route") ? "yes" : "no";' 2>/dev/null | tr -d '\r\n')" "yes"
-check "the URL-token route can be declined" \
-  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL_TOKEN_ROUTE" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":10,"method":"tools/list"}')" "404"
-check "control: the header route still answers with it off" \
-  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":11,"method":"tools/list"}')" "200"
-docker exec -u 0 "$CLI" rm -f "$MU_DIR/gmcp-nourl.php"
-# Asserted rather than assumed. A removal that fails quietly leaves the site filtered for
-# every run after this one, and the symptom appears on a different check.
-check "control: the fixture really was removed" \
-  "$(docker exec "$CLI" sh -c "test -e $MU_DIR/gmcp-nourl.php && echo present || echo gone")" "gone"
-check "and it comes back when the filter goes" \
-  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL_TOKEN_ROUTE" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":12,"method":"tools/list"}')" "200"
+# The token-in-URL route is gone. It put the credential in the request path, where every
+# proxy and web server in front of the site wrote a copy into its access log, one per
+# request. Asserted as absent rather than trusted to be, because the route was registered
+# from the token's own value and an upgrade that left it behind would be invisible.
+check "there is no token-in-URL route" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/wp-json/mcp/v1/$TOK" \
+    -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":10,"method":"tools/list"}')" "404"
+check "nor a ?token= query fallback" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL?token=$TOK" \
+    -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":11,"method":"tools/list"}')" "401"
+check "control: the same key does work in the header" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H "Authorization: Bearer $TOK" \
+    -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":12,"method":"tools/list"}')" "200"
 
 curl -sS "$BASE/wp-json/mcp/v1/.well-known/oauth-protected-resource" -o "$OUT/prm"
 check "OAuth resource metadata" "$(py 'import json,sys;print("ok" if "authorization_servers" in json.load(sys.stdin) else "err")' prm)" "ok"

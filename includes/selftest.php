@@ -138,21 +138,19 @@ class GMCP_SelfTest {
       ];
     }
 
-    // 5. The bearer path, which is separate from OAuth and fails differently.
-    $token = $core ? (string) $core->get_option( 'mcp_bearer_token' ) : '';
-    if ( $token === '' ) {
-      $checks[] = [ 'id' => 'bearer', 'status' => 'skip', 'label' => 'No bearer token set, so nothing to check', 'detail' => 'OAuth clients do not need one. Generate a token below if you want to connect a command-line agent.' ];
-    }
-    else {
-      $result = self::run();
-      $map = [ 'ok' => 'ok', 'error' => 'fail', 'warning' => 'warn', 'unknown' => 'skip' ];
-      $checks[] = [
-        'id' => 'bearer',
-        'status' => $map[ $result['status'] ] ?? 'skip',
-        'label' => $result['summary'],
-        'detail' => $result['detail'],
-      ];
-    }
+    // 5. The key path, which is separate from OAuth and fails differently. Always run
+    // now: it mints its own short-lived key, so there is no "no credential is set, so
+    // there is nothing to check" case, and the check answers on a site that has only
+    // ever used OAuth. That is the site most likely to discover a stripped header the
+    // hard way.
+    $result = self::run();
+    $map = [ 'ok' => 'ok', 'error' => 'fail', 'warning' => 'warn', 'unknown' => 'skip' ];
+    $checks[] = [
+      'id' => 'bearer',
+      'status' => $map[ $result['status'] ] ?? 'skip',
+      'label' => $result['summary'],
+      'detail' => $result['detail'],
+    ];
 
     return $checks;
   }
@@ -197,18 +195,31 @@ class GMCP_SelfTest {
   *   status is one of ok, warning, error, unknown.
   */
   public static function run(): array {
-    $core = $GLOBALS['gmcp_core'] ?? null;
-    $token = $core ? (string) $core->get_option( 'mcp_bearer_token' ) : '';
     $url = rest_url( 'mcp/v1/http' );
 
-    if ( $token === '' ) {
+    // A key made for this one request and revoked at the end, rather than the site's own
+    // credential. Keys are stored hashed, so there is no long-lived secret to borrow any
+    // more, and this is better than borrowing one anyway: the check no longer depends on
+    // a credential existing, so it answers on a site that has only ever used OAuth. It is
+    // scoped to mcp_ping and read level, so the worst a leaked probe could do is say
+    // hello.
+    if ( !class_exists( 'GMCP_Tokens' ) ) {
       return [
         'status' => 'unknown',
-        'summary' => 'No bearer token is set, so there is nothing to test.',
-        'detail' => 'This check exercises the bearer token path. OAuth clients authenticate differently and are not covered. Generate a token if you want to test this way.',
+        'summary' => 'Cannot test the key path on this install.',
+        'detail' => 'The key store is not loaded, so there is nothing to authenticate with.',
         'tools' => null,
       ];
     }
+    $admins = get_users( [ 'role' => 'administrator', 'number' => 1, 'orderby' => 'ID', 'order' => 'ASC' ] );
+    $probe = GMCP_Tokens::create(
+      __( 'Connection check', 'guarded-mcp' ), 'readonly', 0, [ 'mcp_ping' ],
+      $admins ? (int) $admins[0]->ID : 0
+    );
+    $token = $probe['secret'];
+    // Revoked however this returns, including on an early return below. A probe key left
+    // behind would be a credential nobody made a decision about, sitting on the list.
+    $revoke = function () use ( $probe ) { GMCP_Tokens::revoke( $probe['id'] ); };
 
     // TLS is verified, because this request carries the site's bearer token, which is
     // the most valuable secret the plugin holds. An earlier version turned verification
@@ -228,9 +239,14 @@ class GMCP_SelfTest {
       'body' => wp_json_encode( [
         'jsonrpc' => '2.0',
         'id' => 1,
-        'method' => 'tools/list',
+        // Not tools/list: the probe key is scoped, and listing would return only what it
+        // may call, which is one tool. This asks the question the check is actually
+        // about, which is whether the credential arrived at all.
+        'method' => 'tools/call',
+        'params' => [ 'name' => 'mcp_ping', 'arguments' => new stdClass() ],
       ] ),
     ] );
+    $revoke();
 
     if ( is_wp_error( $response ) ) {
       // A certificate failure is worth naming, because the fix is completely different

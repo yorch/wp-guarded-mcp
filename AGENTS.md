@@ -92,6 +92,16 @@ the shop suite needs WooCommerce, and the base suite expects post 1 to still be 
 "Hello world!". Confirm by installing the dependency and re-running, never by explaining the
 failure away.
 
+**The suite's own credential is a named key it mints at startup.** So anything that clears
+keys wholesale clears the suite out from under itself: every later request comes back 401,
+and the checks describe features as broken. Use `gmcp_clear_other_keys` rather than deleting
+the key store. This is not hypothetical; it turned one deleted credential into 226 failures
+that all looked like regressions.
+
+**Run one suite at a time against a stack.** They are destructive and share a database.
+Running two concurrently produces failures in both that look exactly like real ones, which
+is a mistake worth naming because the compose file warns about it and it still happened.
+
 ## Parallel work
 
 One Compose project per worktree, always both variables, on every command including the

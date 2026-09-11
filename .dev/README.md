@@ -18,21 +18,30 @@ docker compose exec -T cli wp plugin activate guarded-mcp
 
 The repository is bind-mounted as the plugin directory, so edits apply immediately.
 
-Set a token and call the server:
+Make a key and call the server. There is no shared token to set any more, and a key is
+shown once, so capture it when you create it:
 
 ```
-docker compose exec -T cli wp eval '
-  $o = get_option("gmcp_options", []);
-  $o["mcp_bearer_token"] = "testtoken1234567890";
-  update_option("gmcp_options", $o, false);
-'
+KEY=$(docker compose exec -T cli wp eval '
+  $a = get_users( [ "role" => "administrator", "number" => 1, "orderby" => "ID", "order" => "ASC" ] );
+  $k = GMCP_Tokens::create( "local", "admin", 0, [], $a ? $a[0]->ID : 0 );
+  echo $k["secret"];
+' | tr -d '\r\n')
 
 curl -sS -X POST 'http://localhost:8080/wp-json/mcp/v1/http' \
-  -H 'Authorization: Bearer testtoken1234567890' \
+  -H "Authorization: Bearer $KEY" \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
+
+The suites do not need this: each one mints its own key under the label `smoke suite` and
+asserts the shape of what it got back, so a failure to create one stops the run instead of
+producing a hundred 401s that read as a hundred broken features.
+
+A key acts as the administrator who created it and stops working when that account stops
+holding `manage_options`, which is worth remembering on a test site where the suites
+create and delete users.
 
 Run the suites:
 

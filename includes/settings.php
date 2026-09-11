@@ -216,8 +216,6 @@ class GMCP_Settings {
   */
   private static function field_kinds(): array {
     return [
-      'mcp_bearer_token' => 'text',
-      'mcp_role' => 'role',
       'mcp_tools_core' => 'bool',
       'mcp_tools_admin' => 'bool',
       'mcp_tools_rest' => 'bool',
@@ -243,14 +241,6 @@ class GMCP_Settings {
 
     if ( $action === 'save' ) {
       $this->save_settings();
-    }
-    elseif ( $action === 'generate_token' ) {
-      $this->core->update_option( 'mcp_bearer_token', wp_generate_password( 48, false, false ) );
-      $this->notice = __( 'A new bearer token was generated. Update any client that used the old one.', 'guarded-mcp' );
-    }
-    elseif ( $action === 'clear_token' ) {
-      $this->core->update_option( 'mcp_bearer_token', '' );
-      $this->notice = __( 'Bearer token cleared. Clients must now connect through OAuth.', 'guarded-mcp' );
     }
     elseif ( $action === 'revoke_app' ) {
       $this->revoke_app();
@@ -695,8 +685,10 @@ class GMCP_Settings {
   private function render_connect(): void {
     $endpoint = $this->endpoint_url();
     $fallback = home_url( '/index.php?rest_route=/mcp/v1/http' );
-    $token = (string) $this->core->get_option( 'mcp_bearer_token' );
-    $token_display = $token !== '' ? $token : 'YOUR_TOKEN';
+    // A placeholder, always. Keys are stored hashed and shown once, so there is no
+    // secret here to print back, which is the point of them. The snippet says where to
+    // get one rather than quietly producing a config that does not work.
+    $token_display = 'YOUR_KEY';
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'Connect an AI agent to this site. Point the client at the endpoint below.', 'guarded-mcp' ); ?></p>
 
@@ -739,7 +731,11 @@ class GMCP_Settings {
     <div class="gmcp-recipe">
       <h3><?php esc_html_e( 'Claude Code', 'guarded-mcp' ); ?></h3>
       <p class="description">
-        <?php esc_html_e( 'Run this in your project. It stores the token in Claude Code\'s own configuration.', 'guarded-mcp' ); ?>
+        <?php printf(
+          /* translators: %s: a link to the Access tab. */
+          esc_html__( 'Run this in your project, with a key from %s in place of YOUR_KEY. It stores the key in Claude Code\'s own configuration.', 'guarded-mcp' ),
+          '<a href="' . esc_url( self::page_url( 'access' ) ) . '">' . esc_html__( 'the Access tab', 'guarded-mcp' ) . '</a>'
+        ); ?>
       </p>
       <label class="screen-reader-text" for="gmcp_recipe_cli"><?php esc_html_e( 'Command for Claude Code', 'guarded-mcp' ); ?></label>
       <textarea id="gmcp_recipe_cli" class="large-text code" rows="2" readonly onfocus="this.select()"><?php
@@ -839,78 +835,14 @@ class GMCP_Settings {
 
   /** Who may connect, and how far each of them reaches. */
   private function render_access( array $options ): void {
-    $token = (string) $options['mcp_bearer_token'];
     ?>
-    <p class="gmcp-intro"><?php esc_html_e( 'Three ways in, in increasing order of how much you can tell apart afterwards: one shared token, named keys, and OAuth.', 'guarded-mcp' ); ?></p>
+    <p class="gmcp-intro"><?php esc_html_e( 'Two ways in. A named key, for clients that cannot do OAuth, and OAuth itself for clients that can.', 'guarded-mcp' ); ?></p>
 
-    <h2 class="title"><?php esc_html_e( 'Bearer token', 'guarded-mcp' ); ?></h2>
-    <form method="post">
-      <?php
-      $this->form_head( 'save', 'access' );
-      $this->form_fields( [ 'mcp_bearer_token', 'mcp_role' ] );
-      ?>
-      <table class="form-table" role="presentation">
-        <tr>
-          <th scope="row"><label for="mcp_bearer_token"><?php esc_html_e( 'Token', 'guarded-mcp' ); ?></label></th>
-          <td>
-            <input type="text" id="mcp_bearer_token" name="mcp_bearer_token" class="large-text code"
-              value="<?php echo esc_attr( $token ); ?>" autocomplete="off" spellcheck="false">
-            <p class="description">
-              <?php esc_html_e( 'Optional. A static token for clients that cannot do OAuth, such as a local CLI agent. Leave empty to require OAuth. Treat it like a password: it grants the access level selected below.', 'guarded-mcp' ); ?>
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <th scope="row"><?php esc_html_e( 'Access level', 'guarded-mcp' ); ?></th>
-          <td>
-            <fieldset class="gmcp-choices">
-              <legend class="screen-reader-text"><?php esc_html_e( 'What the bearer token may do', 'guarded-mcp' ); ?></legend>
-              <?php
-              $levels = [
-                'admin' => __( 'Admin. Every tool, including deleting content and changing users and options.', 'guarded-mcp' ),
-                'readwrite' => __( 'Read and write. Create and update, but no destructive tools.', 'guarded-mcp' ),
-                'readonly' => __( 'Read only. Nothing on the site can be changed.', 'guarded-mcp' ),
-              ];
-              foreach ( $levels as $value => $label ) : ?>
-                <label>
-                  <input type="radio" name="mcp_role" value="<?php echo esc_attr( $value ); ?>"
-                    <?php checked( $options['mcp_role'], $value ); ?>>
-                  <?php echo esc_html( $label ); ?>
-                </label>
-              <?php endforeach; ?>
-            </fieldset>
-            <p class="description">
-              <?php esc_html_e( 'Applies to the bearer token only. OAuth connections always act as the administrator who approved them.', 'guarded-mcp' ); ?>
-            </p>
-          </td>
-        </tr>
-      </table>
-      <?php submit_button(); ?>
-    </form>
-
-    <div class="gmcp-actions">
-      <form method="post">
-        <?php $this->form_head( 'generate_token', 'access' ); ?>
-        <button type="submit" class="button"><?php esc_html_e( 'Generate a new token', 'guarded-mcp' ); ?></button>
-      </form>
-      <?php if ( $token !== '' ) : ?>
-        <form method="post">
-          <?php $this->form_head( 'clear_token', 'access' ); ?>
-          <button type="submit" class="button"><?php esc_html_e( 'Clear the token', 'guarded-mcp' ); ?></button>
-        </form>
-      <?php endif; ?>
-    </div>
-    <p class="description"><?php esc_html_e( 'These two act immediately and do not wait for Save changes.', 'guarded-mcp' ); ?></p>
-
-    <?php if ( $token !== '' && apply_filters( 'gmcp_url_token_route', true ) ) : ?>
-      <?php // Said here because a person who sets a token has no other way to find out
-      // that the token is also a URL on their site. It is a deliberate fallback, not a
-      // leak, but "deliberate" is only true of whoever chose it, and nobody chose it. ?>
-      <p class="description gmcp-intro">
-        <strong><?php esc_html_e( 'The token is also a URL.', 'guarded-mcp' ); ?></strong>
-        <?php esc_html_e( 'While a token is set, the server also answers at an address containing it, for hosts that strip the Authorization header before PHP can read it. That address is not advertised anywhere and every administration tool is refused on it, but a URL ends up in server logs, browser history and referrer headers in a way a header does not. Most sites do not need it: the plugin already recovers the header from the two places Apache hides it. If yours connects with the header, switch the fallback off with the gmcp_url_token_route filter.', 'guarded-mcp' ); ?>
-      </p>
-    <?php endif; ?>
+    <?php // The shared bearer token that used to sit above the keys is gone. It was
+    // stored in the clear because this screen showed it back, it carried no identity so
+    // the log could not say who acted, it could not expire, and it could not be limited
+    // to anything. A key answers all four, and one shared secret that does none of them
+    // is not a simpler option, only a quieter one. ?>
 
     <h2 class="title"><?php esc_html_e( 'Named keys', 'guarded-mcp' ); ?></h2>
     <?php $this->render_keys(); ?>
@@ -1149,7 +1081,7 @@ class GMCP_Settings {
               </label>
             </fieldset>
             <p class="description">
-              <?php esc_html_e( 'Administration tools install code on this site, so they are off by default. Installs are restricted to the wordpress.org repository, deletions take two steps, and they are refused entirely over the URL-token endpoint.', 'guarded-mcp' ); ?>
+              <?php esc_html_e( 'Administration tools install code on this site, so they are off by default. Installs are restricted to the wordpress.org repository, and deletions take two steps.', 'guarded-mcp' ); ?>
             </p>
             <?php if ( $woo ) : ?>
               <p class="description">

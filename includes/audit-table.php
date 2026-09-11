@@ -362,7 +362,7 @@ class GMCP_Audit_Table extends WP_List_Table {
   * Both, where before naming the client hid the method. They are different facts and the
   * method is the one that decides what the call could do at all: oauth is a grant one
   * administrator gave, and it stops working the moment that account stops being an
-  * administrator; bearer is a secret that works for whoever holds it; bearer_url is that
+  * administrator; bearer is a key, which works for whoever holds it but names the
   * same secret sent in the URL, where every proxy and access log in front of the site
   * writes it down, and which this plugin therefore holds to a lower ceiling. "Claude
   * Desktop" says none of that, and it was all the cell said.
@@ -394,7 +394,7 @@ class GMCP_Audit_Table extends WP_List_Table {
     }
     return $out . sprintf(
       '<br><span class="gmcp-muted" title="%s">%s</span>',
-      esc_attr__( 'How the call authenticated, and the WordPress account it ran as. oauth is a grant one administrator approved; bearer is a shared secret; bearer_url is that secret sent in the URL, where servers log it. A shared token borrows one administrator account, so the account does not identify a person.', 'guarded-mcp' ),
+      esc_attr__( 'How the call authenticated, and the WordPress account it ran as. oauth is a grant one administrator approved; bearer is a named key, which works for whoever holds it and acts as the administrator who created it. Entries older than this plugin\'s key-only releases may name an account that was simply borrowed, and those do not identify a person.', 'guarded-mcp' ),
       esc_html( implode( ' · ', $notes ) )
     );
   }
