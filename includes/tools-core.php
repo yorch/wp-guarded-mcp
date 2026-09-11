@@ -548,7 +548,7 @@ class GMCP_Tools_Core {
       ],
       'wp_delete_comment' => [
         'name' => 'wp_delete_comment',
-        'description' => 'Delete a comment. `force` true bypasses trash. Set preview to true to be shown the comment and what would happen to its replies, without deleting it.',
+        'description' => 'Delete a comment. Without force it goes to the trash IF this site has the trash enabled; a site with EMPTY_TRASH_DAYS set to 0 has no trash and the comment is destroyed either way. The reply says which happened. `force` true always destroys it. Set preview to true to be shown the comment and what would happen to its replies, without deleting it.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -769,7 +769,7 @@ class GMCP_Tools_Core {
       ],
       'wp_delete_post' => [
         'name' => 'wp_delete_post',
-        'description' => 'Delete, trash, or remove a post, page, or any custom post type by ID. Without force, the post is moved to trash (can be restored). With force: true, the post is permanently destroyed (bypasses trash, irreversible). Works for posts, pages, products, events, attachments, or any registered CPT. Set preview to true to be told what would be deleted, including anything attached to it, without deleting anything.',
+        'description' => 'Delete, trash, or remove a post, page, or any custom post type by ID. Without force the post normally goes to the trash and can be restored, but not always: attachments have no trash in WordPress, and neither does a site with EMPTY_TRASH_DAYS set to 0. In both cases a call without force destroys the post. The reply says which of the two happened, so do not assume it was reversible. With force: true it is always permanently destroyed. Works for posts, pages, products, events, attachments, or any registered CPT. Set preview to true to be told what would be deleted, including anything attached to it, without deleting anything.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1084,7 +1084,7 @@ class GMCP_Tools_Core {
       ],
       'wp_delete_media' => [
         'name' => 'wp_delete_media',
-        'description' => 'Delete/trash an attachment. Set preview to true to be told what the file is and where it is used, without deleting it.',
+        'description' => 'Delete an attachment and its files from disk. This is always permanent: WordPress has no trash for attachments, so there is nothing to restore from and force makes no difference. Set preview to true to be told what the file is and where it is used, without deleting it.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1199,6 +1199,31 @@ class GMCP_Tools_Core {
     }
     $r['error'] = [ 'code' => -32603, 'message' => "No preview is implemented for {$tool}." ];
     return $r;
+  }
+
+  /**
+  * Say which of the two very different things a delete just did.
+  *
+  * "Deleted" was the answer for both, and they are not the same event. Without `force`
+  * these tools normally trash, and the description said so flatly, so an agent reported
+  * "moved to the trash, you can restore it" to a person whose post no longer existed.
+  *
+  * Two ways a delete that reads as reversible is not. Attachments have no trash in
+  * WordPress at all, so wp_delete_post on one always destroys it, and wp_delete_post's
+  * own description listed attachments among the things it works on. And a site with
+  * EMPTY_TRASH_DAYS set to 0 has no trash for anything: core's wp_trash_post sees the
+  * zero and deletes outright. That is an ordinary hardening setting, not an exotic one.
+  *
+  * Reporting what happened rather than refusing is deliberate. Refusing would be the
+  * stronger guard and would also mean a site with the trash switched off cannot delete
+  * anything without passing a flag that means "I accept this is irreversible", which it
+  * would then have to pass every time, which is how a flag stops being read. The audit
+  * log and the reply now carry the truth, and the truth is what reaches the person.
+  */
+  private function deletion_outcome( string $subject, bool $trashed ): string {
+    return $trashed
+      ? $subject . ' moved to the trash. It can be restored from there.'
+      : $subject . ' permanently deleted. There is no trash to restore it from.';
   }
 
   /** Every preview says the same thing at the end, so a model cannot read one as done. */
@@ -1769,9 +1794,12 @@ class GMCP_Tools_Core {
           $r['error'] = [ 'code' => -32602, 'message' => 'comment_ID required' ];
           break;
         }
-        $done = wp_delete_comment( intval( $a['comment_ID'] ), !empty( $a['force'] ) );
+        $comment_id = intval( $a['comment_ID'] );
+        $done = wp_delete_comment( $comment_id, !empty( $a['force'] ) );
         if ( $done ) {
-          $this->add_result_text( $r, 'Comment #' . $a['comment_ID'] . ' deleted' );
+          $after = get_comment( $comment_id );
+          $this->add_result_text( $r, $this->deletion_outcome(
+            'Comment #' . $comment_id, $after && $after->comment_approved === 'trash' ) );
         }
         else {
           $r['error'] = [ 'code' => -32603, 'message' => 'Deletion failed' ];
@@ -2463,7 +2491,11 @@ class GMCP_Tools_Core {
         $del = wp_delete_post( $delete_id, !empty( $a['force'] ) );
         if ( $del ) {
           $this->bust_post_cache( $delete_id, [ 'tool' => 'wp_delete_post' ] );
-          $this->add_result_text( $r, 'Post #' . $a['ID'] . ' deleted' );
+          // Asked of the database after the fact rather than inferred from the flag,
+          // because the flag is not what decides it. @see deletion_outcome().
+          $after = get_post( $delete_id );
+          $this->add_result_text( $r, $this->deletion_outcome(
+            'Post #' . $delete_id, $after && $after->post_status === 'trash' ) );
         }
         else {
           $r['error'] = [ 'code' => -32603, 'message' => 'Deletion failed' ];
@@ -2899,9 +2931,16 @@ class GMCP_Tools_Core {
           $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
           break;
         }
-        $d = wp_delete_post( intval( $a['ID'] ), !empty( $a['force'] ) );
+        $media_id = intval( $a['ID'] );
+        $d = wp_delete_post( $media_id, !empty( $a['force'] ) );
         if ( $d ) {
-          $this->add_result_text( $r, 'Media #' . $a['ID'] . ' deleted' );
+          // An attachment has no trash, so this is always the permanent branch. Asked
+          // the same way as the others anyway: a claim worth making is worth checking,
+          // and a future WordPress that grows a trash for attachments would otherwise
+          // leave this saying the wrong thing forever.
+          $after = get_post( $media_id );
+          $this->add_result_text( $r, $this->deletion_outcome(
+            'Media #' . $media_id, $after && $after->post_status === 'trash' ) );
         }
         else {
           $r['error'] = [ 'code' => -32603, 'message' => 'Deletion failed' ];

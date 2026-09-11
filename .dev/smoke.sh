@@ -65,6 +65,65 @@ check "unknown tool reports isError" "$(py 'import json,sys;print(json.load(sys.
 call missing '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"value":"x"}}}'
 check "missing required arg is named" "$(py 'import json,sys;d=json.load(sys.stdin);print("ok" if d["result"].get("isError") and "key" in d["result"]["content"][0]["text"] else "err")' missing)" "ok"
 
+echo "-- a delete says which of the two things it did --"
+# "Deleted" was the answer for both trashing and destroying, and they are not the same
+# event. The description promised the trash flatly, so an agent could truthfully relay
+# "moved to the trash, you can restore it" about a post that no longer existed.
+#
+# Each check compares the REPLY against the DATABASE rather than against the flag that
+# was passed, because the flag is not what decides it.
+DP=$(docker compose exec -T cli wp post create --post_title='delete probe' --post_status=publish --porcelain 2>/dev/null | tr -d '\r\n')
+call d_trash "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$DP}}}"
+check "a post without force says it was trashed" \
+  "$(py 'import json,sys;print("moved to the trash" in json.load(sys.stdin)["result"]["content"][0]["text"])' d_trash)" "True"
+check "and the database agrees" \
+  "$(docker compose exec -T cli wp eval "\$p=get_post($DP); echo \$p ? \$p->post_status : 'gone';" 2>/dev/null | tr -d '\r\n')" "trash"
+
+call d_force "{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$DP,\"force\":true}}}"
+check "with force it says permanently deleted" \
+  "$(py 'import json,sys;print("permanently deleted" in json.load(sys.stdin)["result"]["content"][0]["text"])' d_force)" "True"
+check "and the database agrees" \
+  "$(docker compose exec -T cli wp eval "\$p=get_post($DP); echo \$p ? \$p->post_status : 'gone';" 2>/dev/null | tr -d '\r\n')" "gone"
+
+# An attachment has no trash in WordPress at all, and wp_delete_post's own description
+# lists attachments among the things it works on, so this is the case where a caller
+# doing the careful thing got the irreversible one.
+DA=$(docker compose exec -T cli wp eval 'echo wp_insert_attachment(["post_title"=>"delete probe media","post_mime_type"=>"image/png","post_status"=>"inherit"], false, 0);' 2>/dev/null | tr -d '\r\n')
+call d_media "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_media\",\"arguments\":{\"ID\":$DA}}}"
+check "an attachment without force says permanently deleted" \
+  "$(py 'import json,sys;print("permanently deleted" in json.load(sys.stdin)["result"]["content"][0]["text"])' d_media)" "True"
+check "and it really is gone, not trashed" \
+  "$(docker compose exec -T cli wp eval "\$p=get_post($DA); echo \$p ? \$p->post_status : 'gone';" 2>/dev/null | tr -d '\r\n')" "gone"
+
+DC_ID=$(docker compose exec -T cli wp comment create --comment_post_ID=1 --comment_content='delete probe comment' --porcelain 2>/dev/null | tr -d '\r\n')
+call d_comment "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_comment\",\"arguments\":{\"comment_ID\":$DC_ID}}}"
+check "a comment without force says it was trashed" \
+  "$(py 'import json,sys;print("moved to the trash" in json.load(sys.stdin)["result"]["content"][0]["text"])' d_comment)" "True"
+check "and the database agrees" \
+  "$(docker compose exec -T cli wp eval "\$c=get_comment($DC_ID); echo \$c ? \$c->comment_approved : 'gone';" 2>/dev/null | tr -d '\r\n')" "trash"
+
+# The reply must track the database rather than the flag. Without the trash there is
+# nothing to restore from, and the old wording called that outcome "deleted" too.
+#
+# EMPTY_TRASH_DAYS lands in wp-config.php, which the web container holds in opcache for
+# up to revalidate_freq seconds, so a probe run immediately still sees the old value and
+# proves nothing. Hence the wait, and hence asserting the two against EACH OTHER rather
+# than against the constant: whichever value is live, they must not disagree.
+docker compose exec -T cli wp config set EMPTY_TRASH_DAYS 0 --raw --type=constant >/dev/null 2>&1
+sleep 4
+DN=$(docker compose exec -T cli wp post create --post_title='no trash probe' --post_status=publish --porcelain 2>/dev/null | tr -d '\r\n')
+call d_notrash "{\"jsonrpc\":\"2.0\",\"id\":64,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$DN}}}"
+D_SAYS=$(py 'import json,sys;print("trash" if "moved to the trash" in json.load(sys.stdin)["result"]["content"][0]["text"] else "gone")' d_notrash)
+D_IS=$(docker compose exec -T cli wp eval "\$p=get_post($DN); echo \$p && \$p->post_status === 'trash' ? 'trash' : 'gone';" 2>/dev/null | tr -d '\r\n')
+check "with the trash switched off the reply still matches the database" "$D_SAYS" "$D_IS"
+# The comparison above passes on any build that never claims the trash, so on its own it
+# would be a check that cannot fail for the reason it exists. This one says the reply is
+# actually answering the question: both sentences speak about restoring, and the old
+# "Post #N deleted" says nothing either way.
+check "control: the reply says something about restoring at all" \
+  "$(py 'import json,sys;print("restore" in json.load(sys.stdin)["result"]["content"][0]["text"])' d_notrash)" "True"
+docker compose exec -T cli wp config delete EMPTY_TRASH_DAYS >/dev/null 2>&1
+
 echo "-- preview: say what would happen, change nothing --"
 # A preview that quietly performs the write is worse than no preview, so every check
 # here asserts the stored state afterwards rather than trusting the wording.
