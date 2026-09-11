@@ -46,14 +46,17 @@ if ( !defined( 'ABSPATH' ) ) {
 class GMCP_Audit {
 
   /**
-  * 2 added the changes column.
+  * 2 added the changes column, and with it the canonical hash encoding.
   *
-  * The column is nullable and the hash chain reads a row without it the way it always
-  * did, so an existing log verifies unchanged across the upgrade rather than announcing
-  * on day one that every row has been tampered with. @see hash().
+  * The column is nullable, and rows written before the upgrade keep verifying under the
+  * construction that signed them, so an existing log verifies unchanged rather than
+  * announcing on day one that every row has been tampered with. @see hash().
   */
   const DB_VERSION = '2';
   const CRON_HOOK = 'gmcp_audit_prune';
+
+  /** The last row written under the old hash construction. @see hash_boundary(). */
+  const BOUNDARY_OPTION = 'gmcp_audit_hash_boundary';
 
   /** Per-entry cap on the recorded arguments, before the row is written. */
   const MAX_ARGS = 64000;
@@ -108,6 +111,7 @@ class GMCP_Audit {
     $table = self::table();
     $collate = $wpdb->get_charset_collate();
 
+
     dbDelta( "CREATE TABLE {$table} (
       id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
       ts datetime NOT NULL,
@@ -129,6 +133,15 @@ class GMCP_Audit {
       KEY tool (tool),
       KEY actor (actor)
     ) {$collate};" );
+
+    // Which rows predate the canonical hash encoding, noted after the table exists and
+    // before anything new is written, so verify() can check them the way the version that
+    // wrote them checked them. Recorded once and never overwritten: running this again
+    // once new rows existed would sweep them into the old construction and report the lot
+    // as broken. A fresh install finds an empty table and records 0, which is right.
+    if ( get_option( self::BOUNDARY_OPTION, null ) === null ) {
+      update_option( self::BOUNDARY_OPTION, (int) $wpdb->get_var( "SELECT MAX(id) FROM {$table}" ), false );
+    }
 
     update_option( 'gmcp_audit_db_version', self::DB_VERSION );
   }
@@ -306,35 +319,61 @@ class GMCP_Audit {
   /**
   * One row's link in the chain.
   *
-  * Fixed field order, because a hash over an associative array would depend on insertion
-  * order and a later refactor would silently break every existing row.
+  * Two constructions, and which one a row uses is decided by its id rather than by its
+  * contents. Everything at or below the boundary recorded at upgrade time was written by
+  * the version that hashed eleven columns joined by a separator, and is verified exactly
+  * as that version verified it. Everything above it uses the canonical encoding below.
   *
-  * The changes column arrived after rows had already been written, and that is the
-  * awkward part. Hashing it unconditionally would have recomputed every existing row
-  * differently from the hash it was stored with, so an upgraded site would open the
-  * screen and be told its entire audit log had been tampered with. Re-signing the old
-  * rows would be worse: a chain the plugin rewrites on demand proves nothing.
+  * The old construction is not re-signed and not reinterpreted, because a chain the
+  * plugin rewrites on demand proves nothing, and an upgraded site being told on day one
+  * that its whole audit log has been tampered with is no better.
   *
-  * So the field list follows the row rather than the schema. A row with nothing in the
-  * changes column hashes over eleven fields exactly as it always did; a row with
-  * something in it covers twelve. Both rules are derived from the row's own contents, so
-  * verify() needs no record of when the column landed.
-  *
-  * This does not open a way out of the chain. Blanking the column on a row that had
-  * changes recorded makes the eleven-field recomputation disagree with the twelve-field
-  * hash that was stored, so the row is reported as altered, which is what it is.
+  * THE CANONICAL ENCODING. Each field contributes its name, the byte length of its
+  * value, and the value; the whole is prefixed with a version tag and the field count.
+  * Length prefixes are the point rather than decoration. A plain separator join says
+  * only "these pieces in this order", so content can be moved from one column into the
+  * next behind a separator, and while a fixed field list survives that, a list whose
+  * length varies does not: an entry written with a changes column could have its changes
+  * appended to the detail column and the column blanked, and the shorter recomputation
+  * would rebuild the same string and call the row intact. That was reachable, since a
+  * refusal message quotes what the caller asked for. Committing to each field's name and
+  * length makes every input unambiguous, so no rearrangement between columns produces the
+  * same digest and a thirteenth column later needs no further thought.
   */
-  private static function hash( array $row, string $prev ): string {
-    $fields = [ 'ts', 'actor', 'actor_name', 'client', 'auth_method', 'tool',
-      'target', 'outcome', 'ms', 'args', 'detail' ];
-    if ( (string) ( $row['changes'] ?? '' ) !== '' ) {
-      $fields[] = 'changes';
+  const HASH_FIELDS = [ 'ts', 'actor', 'actor_name', 'client', 'auth_method', 'tool',
+    'target', 'outcome', 'ms', 'args', 'changes', 'detail' ];
+
+  /** How the rows written before the canonical encoding were hashed. Unchanged, forever. */
+  const LEGACY_HASH_FIELDS = [ 'ts', 'actor', 'actor_name', 'client', 'auth_method', 'tool',
+    'target', 'outcome', 'ms', 'args', 'detail' ];
+
+  private static function hash( array $row, string $prev, bool $legacy = false ): string {
+    if ( $legacy ) {
+      $parts = [];
+      foreach ( self::LEGACY_HASH_FIELDS as $field ) {
+        $parts[] = (string) ( $row[ $field ] ?? '' );
+      }
+      return hash( 'sha256', $prev . "\x1f" . implode( "\x1f", $parts ) );
     }
     $parts = [];
-    foreach ( $fields as $field ) {
-      $parts[] = (string) ( $row[ $field ] ?? '' );
+    foreach ( self::HASH_FIELDS as $field ) {
+      $value = (string) ( $row[ $field ] ?? '' );
+      $parts[] = $field . ':' . strlen( $value ) . ':' . $value;
     }
-    return hash( 'sha256', $prev . "\x1f" . implode( "\x1f", $parts ) );
+    return hash( 'sha256', 'gmcp/2' . "\x1f" . count( self::HASH_FIELDS ) . "\x1f"
+      . $prev . "\x1f" . implode( "\x1f", $parts ) );
+  }
+
+  /**
+  * The last row written before the canonical encoding, or 0 when there is none.
+  *
+  * Recorded once, at the upgrade that added the changes column, because a row cannot say
+  * for itself which construction signed it. It is not a secret and not a second chain:
+  * moving it only makes rows verify under the wrong construction and fail, which is a
+  * false alarm rather than a way past one.
+  */
+  public static function hash_boundary(): int {
+    return (int) get_option( self::BOUNDARY_OPTION, 0 );
   }
 
   #endregion
@@ -463,6 +502,9 @@ class GMCP_Audit {
       ) );
     }
 
+    // Rows at or below this were signed by the older construction. @see hash().
+    $boundary = self::hash_boundary();
+
     $prev = '';
     $checked = 0;
     $imported = 0;
@@ -493,7 +535,7 @@ class GMCP_Audit {
           return self::verdict( false, $checked, $imported, $total, $scope, (int) $row['id'],
             'a row is missing before this one, or its link was rewritten' );
         }
-        if ( self::hash( $row, $prev ) !== (string) $row['hash'] ) {
+        if ( self::hash( $row, $prev, (int) $row['id'] <= $boundary ) !== (string) $row['hash'] ) {
           return self::verdict( false, $checked, $imported, $total, $scope, (int) $row['id'],
             'this row does not match its own hash, so its contents changed after it was written' );
         }
@@ -575,6 +617,12 @@ class GMCP_Audit {
   public static function clear(): void {
     global $wpdb;
     $wpdb->query( 'TRUNCATE TABLE ' . self::table() );
+    // TRUNCATE resets the auto-increment, so the next row written takes an id that used
+    // to belong to a row signed by the older construction. Leaving the boundary where it
+    // was would have verify() check brand new rows the old way and report every one of
+    // them as tampered with. Nothing older survives a clear, so nothing needs the old
+    // construction any more.
+    update_option( self::BOUNDARY_OPTION, 0, false );
   }
 
   #endregion

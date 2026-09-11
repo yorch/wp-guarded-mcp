@@ -54,6 +54,16 @@ class GMCP_Changes {
   /** Records observed during the current call. */
   private static $seen = [];
 
+  /**
+  * How many further changes there were after the cap.
+  *
+  * A counter rather than more records. Holding a placeholder per observation meant a
+  * call that wrote ten thousand options kept ten thousand arrays alive to say a number
+  * the summary prints once, which turned a bounded record list back into an unbounded
+  * one by the back door.
+  */
+  private static $overflow = 0;
+
   /** Term and comment diffs need the row as it was, which only a pre-write hook has. */
   private static $before = [];
 
@@ -127,6 +137,7 @@ class GMCP_Changes {
     self::$recording = true;
     self::$tool = (string) $tool;
     self::$seen = [];
+    self::$overflow = 0;
     self::$before = [];
   }
 
@@ -150,9 +161,13 @@ class GMCP_Changes {
     self::$recording = $was;
   }
 
-  /** The records observed during the call now ending. */
+  /** The records observed during the call now ending, and how many did not fit. */
   public static function captured(): array {
-    return self::$seen;
+    $out = self::$seen;
+    if ( self::$overflow ) {
+      $out[] = [ 'kind' => 'overflow', 'count' => self::$overflow ];
+    }
+    return $out;
   }
 
   #endregion
@@ -164,13 +179,13 @@ class GMCP_Changes {
   */
   private function record( array $record ): void {
     $record['tool'] = self::$tool;
-    // Counted before the cap is applied, so a truncated summary can say how many were
-    // left out rather than implying the call changed forty things exactly.
+    // Counted past the cap, so a truncated summary can say how many were left out rather
+    // than implying the call changed forty things exactly.
     if ( count( self::$seen ) < self::MAX_RECORDS ) {
       self::$seen[] = $record;
     }
     else {
-      self::$seen[] = [ 'kind' => 'overflow' ];
+      self::$overflow++;
     }
     // The journal keeps its own view of which of these it can undo, so it gets every
     // record and decides. Anything else that wants to watch an agent's writes can hook
@@ -197,8 +212,9 @@ class GMCP_Changes {
   /**
   * Option names that are noise rather than change.
   *
-  * Not the same list as the journal's, which is about what can be put back. This one is
-  * about what a reader would call a change at all.
+  * Public and static because the journal needs the same list: it adds what undo cannot
+  * sensibly put back on top of this, rather than keeping a second copy that drifts. That
+  * is how option_guard() ended up in GMCP_Core, and it had already drifted twice by then.
   *
   * This plugin's own rows are excluded because they are its bookkeeping rather than the
   * agent's doing: a named key updates its last-used stamp on every single call, and an
@@ -211,7 +227,7 @@ class GMCP_Changes {
   * from 45 bytes to 90, and every term write produced two entries about a hierarchy
   * cache. The one that reads like what happened is kept.
   */
-  private function skip_option( string $key ): bool {
+  public static function is_noise( string $key ): bool {
     if ( strpos( $key, '_transient' ) === 0 || strpos( $key, '_site_transient' ) === 0 ) {
       return true;
     }
@@ -249,7 +265,7 @@ class GMCP_Changes {
   }
 
   public function option_changed( $key, $old, $new ): void {
-    if ( !self::$recording || !is_string( $key ) || $this->skip_option( $key ) || $old === $new ) {
+    if ( !self::$recording || !is_string( $key ) || self::is_noise( $key ) || $old === $new ) {
       return;
     }
     [ $subject, $label ] = $this->option_subject( $key );
@@ -264,7 +280,7 @@ class GMCP_Changes {
   }
 
   public function option_added( $key, $value ): void {
-    if ( !self::$recording || !is_string( $key ) || $this->skip_option( $key ) ) {
+    if ( !self::$recording || !is_string( $key ) || self::is_noise( $key ) ) {
       return;
     }
     [ $subject, $label ] = $this->option_subject( $key );
@@ -281,7 +297,7 @@ class GMCP_Changes {
   }
 
   public function option_deleted( $key ): void {
-    if ( !self::$recording || !is_string( $key ) || $this->skip_option( $key ) ) {
+    if ( !self::$recording || !is_string( $key ) || self::is_noise( $key ) ) {
       return;
     }
     [ $subject, $label ] = $this->option_subject( $key );
@@ -663,8 +679,15 @@ class GMCP_Changes {
   * it. Anything long or structured becomes its size, which is what makes "the title
   * changed and the body did not" answerable without keeping a copy of the body.
   */
-  private static function describe( string $field, $value ) {
-    if ( GMCP_Core::field_looks_secret( $field ) || GMCP_Core::holds_credential( $value ) ) {
+  private static function describe( string $field, $value, string $context = '' ) {
+    // The context is the name of the thing the field belongs to, and for an option it is
+    // the only name that says anything. An option record's field is always called
+    // "value", so testing the field name alone asked whether "value" looks like a secret,
+    // which it never does, while the option was called mailchimp_key and said so plainly.
+    // Both names are tested, and either one is enough to redact.
+    if ( GMCP_Core::field_looks_secret( $field )
+      || ( $context !== '' && GMCP_Core::field_looks_secret( $context ) )
+      || GMCP_Core::holds_credential( $value ) ) {
       return '[redacted]';
     }
     if ( $value === null ) {
@@ -710,14 +733,17 @@ class GMCP_Changes {
     $dropped = 0;
     foreach ( $records as $record ) {
       if ( ( $record['kind'] ?? '' ) === 'overflow' ) {
-        $dropped++;
+        $dropped += max( 1, (int) ( $record['count'] ?? 1 ) );
         continue;
       }
+      // An option's own name decides whether its value is credential-shaped. Nothing
+      // else identifies itself that way, so nothing else supplies a context.
+      $context = ( $record['kind'] ?? '' ) === 'option' ? (string) ( $record['id'] ?? '' ) : '';
       $fields = [];
       foreach ( (array) ( $record['fields'] ?? [] ) as $field => $pair ) {
         $fields[ $field ] = [
-          'from' => self::describe( (string) $field, $pair['from'] ?? null ),
-          'to' => self::describe( (string) $field, $pair['to'] ?? null ),
+          'from' => self::describe( (string) $field, $pair['from'] ?? null, $context ),
+          'to' => self::describe( (string) $field, $pair['to'] ?? null, $context ),
         ];
       }
       $out[] = [
@@ -731,17 +757,25 @@ class GMCP_Changes {
 
     // Trimmed from the end, oldest change first: the first thing a call did is usually
     // the thing it was asked to do, and the rest are consequences.
-    while ( $out && strlen( (string) wp_json_encode( $out, JSON_UNESCAPED_SLASHES ) ) > $maxBytes ) {
+    //
+    // The marker is measured along with what it describes rather than added afterwards.
+    // Appending it once the loop had finished pushed the row back over the cap by the
+    // length of the marker, which is a small overshoot and still an unenforced limit.
+    $encode = function ( array $items, int $short ) {
+      if ( $short ) {
+        $items[] = [ '__gmcp_more' => $short,
+          'note' => 'more changes were made than fit in one entry' ];
+      }
+      return (string) wp_json_encode( $items, JSON_UNESCAPED_SLASHES );
+    };
+
+    $json = $encode( $out, $dropped );
+    while ( $out && strlen( $json ) > $maxBytes ) {
       array_pop( $out );
       $dropped++;
+      $json = $encode( $out, $dropped );
     }
-    if ( $dropped ) {
-      $out[] = [ '__gmcp_more' => $dropped,
-        'note' => 'more changes were made than fit in one entry' ];
-    }
-
-    $json = wp_json_encode( $out, JSON_UNESCAPED_SLASHES );
-    return $json === false ? null : $json;
+    return $json === '' ? null : $json;
   }
 
   #endregion

@@ -1098,6 +1098,35 @@ check "blanking a recorded change is detected" \
   "$(docker compose exec -T cli wp eval "global \$wpdb;\$t=\$wpdb->prefix.\"gmcp_audit\";\$wpdb->query(\"UPDATE \$t SET changes=NULL WHERE id=$C_ROW\");\$v=GMCP_Audit::verify();echo \$v['ok']?'MISSED':'detected at '.\$v['broken_at'];" 2>/dev/null | tr -d '\r\n')" \
   "detected at $C_ROW"
 
+# A variable-length field list can be spliced: move the recorded changes onto the end of
+# the detail column behind a separator, blank the column, and an untagged recomputation
+# rebuilds the same string. The chain would then call the row intact while the changes it
+# covered had been erased. Detected now, but "detected" is only worth something with the
+# control below, which shows the same splice passing under the scheme without the tag.
+call c_splice1 '{"jsonrpc":"2.0","id":233,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"blogdescription","value":"spliceable"}}}'
+check "there is a row carrying changes to splice" \
+  "$(audit_q 'SELECT COUNT(*) > 0 FROM {$wpdb->prefix}gmcp_audit WHERE changes IS NOT NULL')" "1"
+check "control: the splice defeats the scheme without the tag" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$t=$wpdb->prefix."gmcp_audit";$r=$wpdb->get_row("SELECT * FROM $t WHERE changes IS NOT NULL ORDER BY id LIMIT 1",ARRAY_A);$p=(string)$r["prev_hash"];$e=["ts","actor","actor_name","client","auth_method","tool","target","outcome","ms","args","detail"];$j=function($x,$f) use ($p){$o=[];foreach($f as $k){$o[]=(string)($x[$k] ?? "");}return hash("sha256",$p."\x1f".implode("\x1f",$o));};$s=$r;$s["detail"]=(string)$r["detail"]."\x1f".(string)$r["changes"];$s["changes"]=null;echo $j($s,$e)===$j($r,array_merge($e,["changes"]))?"accepted":"rejected";' 2>/dev/null | tr -d '\r\n')" "accepted"
+check "but the chain as shipped catches it" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$t=$wpdb->prefix."gmcp_audit";$r=$wpdb->get_row("SELECT id,detail,changes FROM $t WHERE changes IS NOT NULL ORDER BY id LIMIT 1",ARRAY_A);$wpdb->update($t,["detail"=>(string)$r["detail"]."\x1f".(string)$r["changes"],"changes"=>null],["id"=>$r["id"]]);$v=GMCP_Audit::verify();echo $v["ok"]?"MISSED":"detected at ".$v["broken_at"].($v["broken_at"]==$r["id"]?"":" WRONGROW");' 2>/dev/null | tr -d '\r\n')" \
+  "detected at $(audit_q 'SELECT id FROM {$wpdb->prefix}gmcp_audit WHERE changes IS NOT NULL ORDER BY id LIMIT 1')"
+
+# An option record's field is always called "value", so the name that says whether the
+# value is a secret is the option's own. mailchimp_key is writable through the option
+# tools: option_guard does not refuse it, and it plainly holds a key.
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+docker compose exec -T cli wp option update mailchimp_key "OLDKEY_MUSTNOTAPPEAR" >/dev/null 2>&1
+call c_named '{"jsonrpc":"2.0","id":234,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"mailchimp_key","value":"NEWKEY_MUSTNOTAPPEAR"}}}'
+check "the write really happened" \
+  "$(docker compose exec -T cli wp option get mailchimp_key 2>/dev/null | tr -d '\r\n')" "NEWKEY_MUSTNOTAPPEAR"
+check "an option named like a credential has both sides redacted" \
+  "$(changes_of wp_update_option | grep -c '"value":{"from":"\[redacted\]","to":"\[redacted\]"}')" "1"
+check "neither value is in the column" \
+  "$(test "$(leaked_changes OLDKEY_MUSTNOTAPPEAR)$(leaked_changes NEWKEY_MUSTNOTAPPEAR)" = "00" && echo absent || echo PRESENT)" "absent"
+check "but its name is, so the entry still says what was touched" "$(leaked_changes mailchimp_key)" "1"
+docker compose exec -T cli wp option delete mailchimp_key >/dev/null 2>&1
+
 echo "-- the audit table repairs itself on upgrade --"
 # WordPress does not run the activation hook when a plugin is updated in place, so the
 # old table meets the new code. While it is broken nothing may be lost quietly, and it

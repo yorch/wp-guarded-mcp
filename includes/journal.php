@@ -86,19 +86,17 @@ class GMCP_Journal {
   /**
   * Options whose previous value is either meaningless, enormous, or dangerous to put
   * back. Restoring active_plugins directly would activate plugins without running their
-  * activation hooks, which is how you get a half-installed plugin; the plugin tools
-  * exist for that. rewrite_rules is a derived cache measured in tens of kilobytes.
+  * activation hooks, which is how you get a half-installed plugin; the plugin tools exist
+  * for that. rewrite_rules is a derived cache measured in tens of kilobytes. Both of those
+  * are on the shared list now, since they are no more readable as changes than they are
+  * revertible.
   */
   private function skip_option( string $key ): bool {
-    if ( strpos( $key, '_transient' ) === 0 || strpos( $key, '_site_transient' ) === 0 ) {
-      return true;
-    }
-    if ( strpos( $key, 'gmcp_' ) === 0 || strpos( $key, '_wp_' ) === 0 ) {
-      return true;
-    }
-    $never = [ 'cron', 'rewrite_rules', 'active_plugins', 'recently_activated', 'auto_updater.lock',
-      'db_upgraded', 'can_compress_scripts', 'user_count', 'admin_email_lifespan' ];
-    if ( in_array( $key, $never, true ) ) {
+    // The rows that are noise rather than change are listed once, where the listening
+    // happens. What is added here is what undo in particular cannot sensibly put back:
+    // restoring a protected row would copy a credential into a second place, and the
+    // capture layer keeps those but records no value for them.
+    if ( GMCP_Changes::is_noise( $key ) ) {
       return true;
     }
     return GMCP_Core::option_guard( $key ) !== true;
