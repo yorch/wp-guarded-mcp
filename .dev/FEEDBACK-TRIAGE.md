@@ -13,6 +13,25 @@ Verdict key: **confirmed** reproduced here; **partly** true of some of what it d
 
 ---
 
+## What has been done since
+
+Five of the twelve are fixed on this branch, each with tests proven to fail without the
+fix and both readmes brought along. A sixth defect was found in the test harness while
+clearing the suites and fixed too.
+
+| Item | State |
+|---|---|
+| 1, result shape | fixed, `1f4c1a7` |
+| 2, credential guard | fixed, `219b86d`, by blanking the leaves rather than either option proposed below |
+| 3, meta corruption | fixed, `ced2dff` |
+| 11, field selection | fixed, `e9ccfdf`, by declaring `_fields` rather than building anything |
+| 12, server-side half | fixed, `a076de1`; the client notification is still open |
+| the WooCommerce mutation probe | fixed, `97d7e9b`; it silently never installed, so two assertions reported a bug that was not there |
+
+Everything else below is untouched and still describes what is true today.
+
+---
+
 ## 1. Single-item REST tools return a schema-invalid result — confirmed, and wider
 
 Reported as `create_pages` / `create_posts`. It is eight tools, and the cause is a name
