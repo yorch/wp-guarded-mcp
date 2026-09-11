@@ -18,7 +18,40 @@ set -u
 #   GMCP_URL=http://localhost:8081 ./smoke-elementor.sh
 BASE="${GMCP_URL:-http://localhost:8080}"
 URL="$BASE/wp-json/mcp/v1/http"
-TOK='testtoken1234567890'
+# The suite mints itself a key. There is no shared token any more, and a key is shown
+# once, so there is nothing to read back out of the database and hardcode here.
+#
+# Recreated under the same label each run rather than reused, and the shape is asserted:
+# without the guard, a failure to create one leaves TOK empty, every request 401s, and a
+# suite that reports a hundred failures is describing one missing credential.
+gmcp_make_key() { # gmcp_make_key <label>
+  docker compose exec -T cli wp eval '
+    $label = "'"$1"'";
+    foreach ( GMCP_Tokens::all() as $k ) {
+      if ( ( $k["label"] ?? "" ) === $label ) { GMCP_Tokens::revoke( $k["id"] ); }
+    }
+    $admins = get_users( [ "role" => "administrator", "number" => 1, "orderby" => "ID", "order" => "ASC" ] );
+    $a = GMCP_Tokens::create( $label, "admin", 0, [], $admins ? $admins[0]->ID : 0 );
+    echo $a["secret"];' 2>/dev/null | tr -d '\r\n'
+}
+# Every key except the suite's own. Blocks that test key behaviour used to wipe the whole
+# option, which was harmless while the suite authenticated with a shared token kept
+# elsewhere. The suite's credential is now a key too, so a blanket wipe revokes it
+# mid-run, every later request 401s, and the checks report the features as broken rather
+# than the credential as gone.
+gmcp_clear_other_keys() { # gmcp_clear_other_keys <keep-label>
+  docker compose exec -T cli wp eval '
+    $keep = "'"$1"'";
+    foreach ( GMCP_Tokens::all() as $k ) {
+      if ( ( $k["label"] ?? "" ) !== $keep ) { GMCP_Tokens::revoke( $k["id"] ); }
+    }' >/dev/null 2>&1
+}
+
+TOK=$(gmcp_make_key "smoke suite")
+case "$TOK" in
+  gmcp_*) ;;
+  *) echo "Could not create an API key for the suite. Is the plugin active?" >&2; exit 1 ;;
+esac
 OUT=$(mktemp -d)
 pass=0; fail=0
 

@@ -15,8 +15,40 @@ set -u
 #   GMCP_URL=http://localhost:8081 ./smoke-admin.sh
 BASE="${GMCP_URL:-http://localhost:8080}"
 URL="$BASE/wp-json/mcp/v1/http"
-URL_TOKEN="$BASE/wp-json/mcp/v1/testtoken1234567890"
-TOK='testtoken1234567890'
+# The suite mints itself a key. There is no shared token any more, and a key is shown
+# once, so there is nothing to read back out of the database and hardcode here.
+#
+# Recreated under the same label each run rather than reused, and the shape is asserted:
+# without the guard, a failure to create one leaves TOK empty, every request 401s, and a
+# suite that reports a hundred failures is describing one missing credential.
+gmcp_make_key() { # gmcp_make_key <label>
+  docker compose exec -T cli wp eval '
+    $label = "'"$1"'";
+    foreach ( GMCP_Tokens::all() as $k ) {
+      if ( ( $k["label"] ?? "" ) === $label ) { GMCP_Tokens::revoke( $k["id"] ); }
+    }
+    $admins = get_users( [ "role" => "administrator", "number" => 1, "orderby" => "ID", "order" => "ASC" ] );
+    $a = GMCP_Tokens::create( $label, "admin", 0, [], $admins ? $admins[0]->ID : 0 );
+    echo $a["secret"];' 2>/dev/null | tr -d '\r\n'
+}
+# Every key except the suite's own. Blocks that test key behaviour used to wipe the whole
+# option, which was harmless while the suite authenticated with a shared token kept
+# elsewhere. The suite's credential is now a key too, so a blanket wipe revokes it
+# mid-run, every later request 401s, and the checks report the features as broken rather
+# than the credential as gone.
+gmcp_clear_other_keys() { # gmcp_clear_other_keys <keep-label>
+  docker compose exec -T cli wp eval '
+    $keep = "'"$1"'";
+    foreach ( GMCP_Tokens::all() as $k ) {
+      if ( ( $k["label"] ?? "" ) !== $keep ) { GMCP_Tokens::revoke( $k["id"] ); }
+    }' >/dev/null 2>&1
+}
+
+TOK=$(gmcp_make_key "smoke suite")
+case "$TOK" in
+  gmcp_*) ;;
+  *) echo "Could not create an API key for the suite. Is the plugin active?" >&2; exit 1 ;;
+esac
 OUT=$(mktemp -d)
 pass=0; fail=0
 
@@ -33,13 +65,6 @@ call() { # call <file> <json>
 call_plain() { # call <file> <json>, without pretty permalinks
   curl -sS -X POST "$BASE/index.php?rest_route=/mcp/v1/http" \
     -H "Authorization: Bearer $TOK" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    -d "$2" -o "$OUT/$1"
-}
-
-call_url_token() { # same, but authenticating through the token-in-path route
-  curl -sS -X POST "$URL_TOKEN" \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
     -d "$2" -o "$OUT/$1"
@@ -119,7 +144,7 @@ reset_state() {
   docker compose exec -T cli wp option delete adminhash >/dev/null 2>&1
   docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
   docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
-  docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
+  gmcp_clear_other_keys "smoke suite"
   # A role that is dangerous WITHOUT holding edit_posts: the case the first guard missed.
   docker compose exec -T cli wp eval 'remove_role("api_admin"); add_role("api_admin","API Admin",["read"=>true,"manage_options"=>true]);' >/dev/null 2>&1
   # The backup sections drive both adapters in sequence and expect to begin with
@@ -172,14 +197,6 @@ check "cannot delete itself" "$(verdict self_del)" "error"
 echo "-- install source restriction --"
 call url_inst '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"url":"https://example.invalid/x.zip"}}}'
 check "arbitrary ZIP URL refused" "$(verdict url_inst)" "error"
-
-echo "-- URL-token endpoint ceiling --"
-call_url_token ut_read '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"posts_per_page":1}}}'
-check "URL token may still read" "$(verdict ut_read)" "ok"
-call_url_token ut_inst '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"hello-dolly"}}}'
-check "URL token may not install" "$(verdict ut_inst)" "error"
-call_url_token ut_theme '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"wp_activate_theme","arguments":{"stylesheet":"twentytwentyfour"}}}'
-check "URL token may not switch theme" "$(verdict ut_theme)" "error"
 
 echo "-- two-step confirmation (needs the network: installs from wordpress.org) --"
 call inst '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"classic-editor","activate":true}}}'
@@ -326,12 +343,6 @@ check "site health runs its direct tests" \
   "$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(sum(t["summary"].values())>10)' h)" "True"
 check "site health reports the environment" \
   "$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(all(k in t["environment"] for k in ("wordpress","php","active_theme")))' h)" "True"
-
-echo "-- URL-token ceiling covers reconfiguration too --"
-call_url_token ut_set '{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"blogdescription":"via url token"}}}}'
-check "URL token may not change settings" "$(verdict ut_set)" "error"
-call_url_token ut_perm '{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"wp_set_permalink_structure","arguments":{"structure":""}}}'
-check "URL token may not change permalinks" "$(verdict ut_perm)" "error"
 
 echo "-- menus --"
 call m_new '{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"wp_create_menu","arguments":{"name":"Smoke Menu"}}}'
@@ -601,8 +612,18 @@ check "a made-up key is refused" \
 # A key readable back out of the database is a key that leaks with the database.
 check "keys are stored hashed, never in the clear" \
   "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("gmcp_tokens",[])),"'"$K_SCOPED"'")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
+# Revokes everything except the suite's own key and counts what is left, rather than
+# revoking the lot and expecting zero. The old form was correct while the suite
+# authenticated with a shared token kept somewhere else; now its credential is a key, and
+# "revoke everything, expect none" revoked the suite mid-run. What followed was 167
+# failures describing features as broken, when one credential had been deleted.
 check "revoking a key locks it out immediately" \
-  "$(docker compose exec -T cli wp eval '$r=GMCP_Tokens::all();foreach($r as $k=>$v){GMCP_Tokens::revoke($k);}echo count(GMCP_Tokens::all());' 2>/dev/null | tr -d '\r\n')" "0"
+  "$(docker compose exec -T cli wp eval '
+      foreach ( GMCP_Tokens::all() as $k ) {
+        if ( ( $k["label"] ?? "" ) !== "smoke suite" ) { GMCP_Tokens::revoke( $k["id"] ); }
+      }
+      $left = array_filter( GMCP_Tokens::all(), fn( $k ) => ( $k["label"] ?? "" ) !== "smoke suite" );
+      echo count( $left );' 2>/dev/null | tr -d '\r\n')" "0"
 check "the revoked key no longer authenticates" \
   "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H "Authorization: Bearer $K_SCOPED" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" "401"
 
@@ -621,7 +642,7 @@ check "nor the site briefing" "$(py 'import json,sys;print("error" in json.load(
 kcall r_tpl "$K_RES" '{"jsonrpc":"2.0","id":133,"method":"resources/templates/list"}'
 check "nor is it offered the post template" \
   "$(py 'import json,sys;print(len(json.load(sys.stdin)["result"]["resourceTemplates"]))' r_tpl)" "0"
-docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
+gmcp_clear_other_keys "smoke suite"
 
 echo "-- undo is not a way round the access levels --"
 # wp_undo_change sits at the write level; wp_update_option sits at admin. Undo replays the
@@ -651,7 +672,7 @@ check "the refusal names the tool that made the change" "$(refusal u_revert | gr
 call u_admin "{\"jsonrpc\":\"2.0\",\"id\":144,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$U_ID\"}}}"
 check "an admin connection can still undo its own change" \
   "$(docker compose exec -T cli wp option get users_can_register 2>/dev/null | tr -d '\r\n')" "1"
-docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
+gmcp_clear_other_keys "smoke suite"
 
 echo "-- a credential in an innocuous option is not journalled --"
 # option_guard matches on the option NAME. Most secrets do not live in the name:
@@ -717,14 +738,14 @@ kcall m_post "$K_MIX" "{\"jsonrpc\":\"2.0\",\"id\":155,\"method\":\"tools/call\"
 check "a write-level key can still revert a post change" "$(verdict m_post)" "ok"
 docker compose exec -T wp sh -c 'rm -f /var/www/html/wp-content/mu-plugins/hookprobe.php' >/dev/null 2>&1
 docker compose exec -T cli wp post delete "$M_POST" --force >/dev/null 2>&1
-docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
+gmcp_clear_other_keys "smoke suite"
 docker compose exec -T cli wp option update default_role subscriber >/dev/null 2>&1
 
 # touch() is a read-modify-write of the row holding every key. Writing back a copy
 # fetched before the throttle check resurrected a key revoked in between.
 check "a revoked key is not resurrected by a later touch" \
   "$(docker compose exec -T cli wp eval '$a=GMCP_Tokens::create("Doomed","readonly",0,[]);$r=GMCP_Tokens::all();$r[$a["id"]]["last_used"]=0;update_option("gmcp_tokens",$r,false);$stale=GMCP_Tokens::all();GMCP_Tokens::revoke($a["id"]);GMCP_Tokens::touch($a["id"]);echo isset(GMCP_Tokens::all()[$a["id"]])?1:0;' 2>/dev/null | tr -d '\r\n')" "0"
-docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
+gmcp_clear_other_keys "smoke suite"
 
 # The guard matches field names inside a value. Options hold settings as arrays, as
 # stdClass and as JSON strings, and checking only arrays left two of those three
@@ -766,7 +787,7 @@ check "the refusal names the tool it cannot reach" \
   "$(py 'import json,sys;print("wp_get_site_health" in json.load(sys.stdin)["error"]["message"])' pr_hidden)" "True"
 kcall pr_ok "$K_PR" '{"jsonrpc":"2.0","id":172,"method":"prompts/get","params":{"name":"stale_drafts"}}'
 check "an offered prompt still renders for it" "$(py 'import json,sys;print("result" in json.load(sys.stdin))' pr_ok)" "True"
-docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
+gmcp_clear_other_keys "smoke suite"
 
 echo "-- this plugin's own rows are not readable through its own tools --"
 # The guard used to name rows one at a time and was wrong twice: the change journal was
@@ -794,66 +815,6 @@ check "the match is not anchored to the start of the name" \
 call g_ok '{"jsonrpc":"2.0","id":182,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"blogname"}}}'
 check "an ordinary option still reads" "$(verdict g_ok)" "ok"
 docker compose exec -T cli wp eval 'delete_transient("gmcp_new_key_1");' >/dev/null 2>&1
-
-echo "-- the URL-token route cannot change anything an admin cares about --"
-# That endpoint puts the secret in the request path, where every proxy log, access log and
-# browser history keeps it. The blocklist used to name eleven tools covering plugins,
-# themes, settings and permalinks, and had never included menus or widgets. Both are admin
-# level, and a widget is arbitrary markup on every page, which is a wider blast radius
-# than most of what the list did cover. It is a rule now: every admin-level tool.
-docker compose exec -T cli wp eval 'foreach(wp_get_nav_menus() as $m){wp_delete_nav_menu($m->term_id);}' >/dev/null 2>&1
-for tool_call in \
-  'wp_create_menu:{"name":"URL token menu"}' \
-  'wp_add_widget:{"sidebar":"sidebar-1","id_base":"text","settings":{"title":"x","text":"y"}}' \
-  'wp_delete_plugin:{"plugin":"akismet/akismet.php"}' \
-  'wp_update_option:{"key":"blogname","value":"pwned"}' \
-  'wp_get_users:{}' \
-  'wp_get_site_health:{}' \
-  'wp_upload_request:{"filename":"x.png"}' ; do
-  tool="${tool_call%%:*}"; args="${tool_call#*:}"
-  call_url_token ut_one "{\"jsonrpc\":\"2.0\",\"id\":190,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}"
-  check "$tool is refused over the URL-token route" "$(verdict ut_one)" "error"
-done
-# Assert the effect, not the refusal text: a refusal that still wrote would look identical.
-check "and no menu was created" \
-  "$(docker compose exec -T cli wp menu list --format=count 2>/dev/null | tr -d '\r\n')" "0"
-check "and the site name is untouched" \
-  "$(docker compose exec -T cli wp option get blogname 2>/dev/null | tr -d '\r\n')" "MCP Test"
-# The route exists for hosts that strip the Authorization header, so reads must still work
-# or it is not a fallback at all.
-call_url_token ut_read '{"jsonrpc":"2.0","id":191,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"limit":1}}}'
-check "read-level tools still work there" "$(verdict ut_read)" "ok"
-call_url_token ut_ping '{"jsonrpc":"2.0","id":192,"method":"tools/call","params":{"name":"mcp_ping","arguments":{}}}'
-check "and so does the health check" "$(verdict ut_ping)" "ok"
-call_url_token ut_brief '{"jsonrpc":"2.0","id":193,"method":"tools/call","params":{"name":"wp_site_briefing","arguments":{}}}'
-check "and orientation, which changes nothing" "$(verdict ut_brief)" "ok"
-call_url_token ut_brief2 '{"jsonrpc":"2.0","id":194,"method":"tools/call","params":{"name":"wp_site_briefing","arguments":{}}}'
-call_url_token ut_write '{"jsonrpc":"2.0","id":195,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Written over the URL token route","post_status":"publish","post_content":"body"}}}'
-check "the route is not read-only, and the docs say so" "$(verdict ut_write)" "ok"
-check "a post written there really lands" \
-  "$(docker compose exec -T cli wp post list --post_status=publish --title='Written over the URL token route' --format=count 2>/dev/null | tr -d '\r\n')" "1"
-docker compose exec -T cli wp eval '$p=get_page_by_title("Written over the URL token route","OBJECT","post"); if($p){wp_delete_post($p->ID,true);}' >/dev/null 2>&1
-# wp_upload_request is write level and writes nothing: it mints a URL on a route whose
-# permission callback returns true unconditionally, so the caller walks away holding an
-# unauthenticated upload endpoint. A level rule cannot see that, hence the exception list.
-#
-# Its own call and its own file. This read $OUT/ut_one, which the loop above overwrites on
-# every iteration, so it was asserting against whatever happened to run last and passed
-# for that reason rather than this one. Reordering the loop would have broken it silently.
-call_url_token ut_upload '{"jsonrpc":"2.0","id":196,"method":"tools/call","params":{"name":"wp_upload_request","arguments":{"filename":"x.png"}}}'
-check "no upload URL was handed out" "$(grep -c upload_url "$OUT/ut_upload" || true)" "0"
-# The settings tool returns the administration email, which is a person's address rather
-# than a fact about the site, and changing it already costs a confirmation token.
-call_url_token ut_settings '{"jsonrpc":"2.0","id":197,"method":"tools/call","params":{"name":"wp_get_settings","arguments":{}}}'
-check "the settings tool is refused there" "$(verdict ut_settings)" "error"
-check "and the administration email did not come out" \
-  "$(grep -c 'a@b.test' "$OUT/ut_settings" || true)" "0"
-# Deliberately still reachable: all of this is in wp_site_briefing, which is read level and
-# allowed there, so blocking them one at a time would be a line drawn where nothing changes.
-for readable in wp_list_menus wp_list_sidebars wp_list_themes wp_get_permalink_structure; do
-  call_url_token ut_read_one "{\"jsonrpc\":\"2.0\",\"id\":198,\"method\":\"tools/call\",\"params\":{\"name\":\"$readable\",\"arguments\":{}}}"
-  check "$readable still reads there, as documented" "$(verdict ut_read_one)" "ok"
-done
 
 echo "-- what two-step confirmation does and does not cover --"
 # The readmes led with "deleting takes two calls" for a long time. It is true of plugins,
@@ -1403,9 +1364,6 @@ check "each undated entry says why it has no time" \
 check "and no filesystem path appears in the reply" "$(grep -c 'wp-content/plugins' "$OUT/lb_bad")" "0"
 docker compose exec -T cli bash -c 'rm -f /var/www/html/wp-content/backuply/backups_info-*/wp__2026-09-10_00-00-00.php /var/www/html/wp-content/backuply/backups-*/wp__2026-09-10_00-00-00.tar.gz /var/www/html/wp-content/backuply/backups_info-*/wp__2026-09-05_00-00-00.php /var/www/html/wp-content/backuply/backups-*/wp__2026-09-05_00-00-00.tar.gz' >/dev/null 2>&1
 
-# Reading is harmless, so this stays at read level and travels the URL-token route.
-call_url_token lb_ut '{"jsonrpc":"2.0","id":259,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{}}}'
-check "listing is allowed over the URL-token route" "$(verdict lb_ut)" "ok"
 
 # With nothing it can enumerate, an empty list would be a lie. There must be no list.
 docker compose exec -T cli wp plugin deactivate backuply >/dev/null 2>&1
@@ -1431,10 +1389,6 @@ call bk_nostart '{"jsonrpc":"2.0","id":234,"method":"tools/call","params":{"name
 check "and starting refuses rather than reporting success" "$(verdict bk_nostart)" "error"
 docker compose exec -T cli wp plugin activate updraftplus backuply >/dev/null 2>&1
 
-# Access levels: reading is harmless, starting is a write, and neither may travel over a
-# secret that sits in an access log.
-call_url_token bk_ut '{"jsonrpc":"2.0","id":235,"method":"tools/call","params":{"name":"wp_start_backup","arguments":{}}}'
-check "starting a backup is refused over the URL-token route" "$(verdict bk_ut)" "error"
 call bk_tools '{"jsonrpc":"2.0","id":236,"method":"tools/call","params":{"name":"tools/list"}}'
 call bk_list '{"jsonrpc":"2.0","id":237,"method":"tools/list"}'
 # Restore is absent on purpose: it discards everything since the backup, which is a larger

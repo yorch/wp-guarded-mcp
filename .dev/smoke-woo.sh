@@ -17,7 +17,40 @@ set -u
 #   GMCP_URL=http://localhost:8081 ./smoke-woo.sh
 BASE="${GMCP_URL:-http://localhost:8080}"
 URL="$BASE/wp-json/mcp/v1/http"
-TOK='testtoken1234567890'
+# The suite mints itself a key. There is no shared token any more, and a key is shown
+# once, so there is nothing to read back out of the database and hardcode here.
+#
+# Recreated under the same label each run rather than reused, and the shape is asserted:
+# without the guard, a failure to create one leaves TOK empty, every request 401s, and a
+# suite that reports a hundred failures is describing one missing credential.
+gmcp_make_key() { # gmcp_make_key <label>
+  docker compose exec -T cli wp eval '
+    $label = "'"$1"'";
+    foreach ( GMCP_Tokens::all() as $k ) {
+      if ( ( $k["label"] ?? "" ) === $label ) { GMCP_Tokens::revoke( $k["id"] ); }
+    }
+    $admins = get_users( [ "role" => "administrator", "number" => 1, "orderby" => "ID", "order" => "ASC" ] );
+    $a = GMCP_Tokens::create( $label, "admin", 0, [], $admins ? $admins[0]->ID : 0 );
+    echo $a["secret"];' 2>/dev/null | tr -d '\r\n'
+}
+# Every key except the suite's own. Blocks that test key behaviour used to wipe the whole
+# option, which was harmless while the suite authenticated with a shared token kept
+# elsewhere. The suite's credential is now a key too, so a blanket wipe revokes it
+# mid-run, every later request 401s, and the checks report the features as broken rather
+# than the credential as gone.
+gmcp_clear_other_keys() { # gmcp_clear_other_keys <keep-label>
+  docker compose exec -T cli wp eval '
+    $keep = "'"$1"'";
+    foreach ( GMCP_Tokens::all() as $k ) {
+      if ( ( $k["label"] ?? "" ) !== $keep ) { GMCP_Tokens::revoke( $k["id"] ); }
+    }' >/dev/null 2>&1
+}
+
+TOK=$(gmcp_make_key "smoke suite")
+case "$TOK" in
+  gmcp_*) ;;
+  *) echo "Could not create an API key for the suite. Is the plugin active?" >&2; exit 1 ;;
+esac
 OUT=$(mktemp -d)
 pass=0; fail=0
 
@@ -192,13 +225,26 @@ for f in pii_prod pii_sales pii_brief; do
   check "nothing customer-shaped comes back from $f" \
     "$(grep -cE '@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|billing|shipping|first_name|last_name' "$OUT/$f" || true)" "0"
 done
-docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
+# Only the key this block made. Deleting the whole option was harmless while the suite
+# authenticated with a shared token that lived somewhere else; now the suite's own
+# credential is a key, and wiping them all revoked it mid-run. Every request after this
+# point came back 401, and the checks reported the features as broken rather than the
+# credential as gone.
+docker compose exec -T cli wp eval '
+  foreach ( GMCP_Tokens::all() as $k ) {
+    if ( ( $k["label"] ?? "" ) === "Read only" ) { GMCP_Tokens::revoke( $k["id"] ); }
+  }' >/dev/null 2>&1
 
 echo "-- the shop tools announce their writes --"
 # These go through the WooCommerce CRUD classes, so nothing here touches wp_update_post
 # and none of the usual content-change paths ran. An integration purging a full-page cache
 # saw a price change as silence, and most WooCommerce sites run such a cache, so the
 # visible symptom was a shopper still being shown the old price.
+# The directory first, as root. It does not exist on a fresh WordPress, `cat >` into a
+# missing directory fails, the redirect below hides the error, and the probe is simply
+# never installed. The checks then report the hook as silent, which is a true statement
+# about a fixture that was never written rather than about the hook.
+docker exec -u 0 "${COMPOSE_PROJECT_NAME:-wptest}-wp-1" mkdir -p /var/www/html/wp-content/mu-plugins
 docker compose exec -T wp sh -c 'cat > /var/www/html/wp-content/mu-plugins/mutate-probe.php <<"PHPEOF"
 <?php
 add_action( "gmcp_mutate", function ( $tool ) {
@@ -208,11 +254,25 @@ add_action( "gmcp_mutate", function ( $tool ) {
 }, 10, 1 );
 PHPEOF' >/dev/null 2>&1
 docker compose exec -T cli wp option delete probe_mutate >/dev/null 2>&1
+# The probe is a fixture, so it gets the same treatment as any other: asserted, not
+# assumed. Without this, a fixture that was never written reports the hook as silent,
+# and the failure describes the wrong thing entirely.
+check "control: the mutate probe is installed" \
+  "$(docker compose exec -T cli sh -c 'test -e /var/www/html/wp-content/mu-plugins/mutate-probe.php && echo yes || echo no' 2>/dev/null | tr -d '\r\n')" "yes"
+check "control: and WordPress has loaded it" \
+  "$(docker compose exec -T cli wp eval 'echo has_action("gmcp_mutate") ? "hooked" : "not hooked";' 2>/dev/null | tr -d '\r\n')" "hooked"
 M_PROD=$(docker compose exec -T cli wp post list --post_type=product --format=ids 2>/dev/null | tr -d '\r\n' | awk '{print $1}')
 call mu_price "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_product\",\"arguments\":{\"id\":$M_PROD,\"regular_price\":\"44.00\"}}}"
 call mu_stock "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_set_stock\",\"arguments\":{\"id\":$M_PROD,\"quantity\":11}}}"
 call mu_read '{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"wc_list_products","arguments":{}}}'
 fired() { docker compose exec -T cli wp eval 'echo in_array("'"$1"'", (array) get_option("probe_mutate",[]), true) ? "fires" : "silent";' 2>/dev/null | tr -d '\r\n'; }
+# The call has to have done something before its silence means anything. Without this, a
+# product id that no longer exists makes the write a no-op, nothing mutates, and "silent"
+# is a true answer to a question nobody meant to ask.
+echo "    [probe] keys now: $(docker compose exec -T cli wp eval 'foreach (GMCP_Tokens::all() as $k) printf("%s/%s/owner=%d ", $k["label"], $k["level"], (int) $k["owner"]); echo "|";' 2>&1 | tr -d '\r\n')"
+echo "    [probe] mu_price body: $(head -c 120 "$OUT/mu_price")"
+check "control: the price change itself succeeded" "$(verdict mu_price)" "ok"
+check "control: and the stock change did too" "$(verdict mu_stock)" "ok"
 check "a price change announces itself" "$(fired wc_update_product)" "fires"
 check "so does a stock change" "$(fired wc_set_stock)" "fires"
 # The control, and the reason the list is named rather than derived from the access level:

@@ -61,7 +61,7 @@ The settings screen shows the endpoint. There are two ways in.
 
 **OAuth**, for clients that support it. Paste the endpoint URL into the client. It discovers the authorization server, sends you to a WordPress login, and shows a consent screen. Nothing to configure and no shared secret. Only administrators can approve a connection, and the token stops working if that account stops being an administrator.
 
-**A bearer token**, for clients that cannot do OAuth, such as a command-line agent. Generate one on the settings screen and give it to the client. You choose whether that token gets read-only, read and write, or full administrative access.
+**A named key**, for clients that cannot do OAuth, such as a command-line agent. Create one on the Access tab and give it to the client. You choose whether it gets read-only, read and write, or full administrative access, when it expires, and which tools it may call. A key is shown once and stored only as a hash, and it acts as the administrator who made it, so the log can say who a call belonged to.
 
 For more than one client, create **named keys** instead. Each carries a label so you can tell clients apart in the activity list, can expire on its own, and can be limited to a named list of tools. A key for a deploy script that may read posts and nothing else is a different kind of object from one that can delete a theme. Keys are stored hashed and shown once.
 
@@ -105,7 +105,7 @@ If your server strips the Authorization header before PHP sees it, the plugin al
 
 = Can I limit what an agent is allowed to do? =
 
-Yes, three ways. The bearer token carries one of three access levels. The administration and WooCommerce tools are separate switches, both off by default. And a named key can be limited to a specific list of tools and given an expiry date. Developers can go further with filters: `gmcp_tools` to change the catalog, `gmcp_allow` to override the auth decision, and `gmcp_header_auth_only_tools` to restrict what the URL-token endpoint can reach.
+Yes, three ways. A named key carries one of three access levels. The administration and WooCommerce tools are separate switches, both off by default. And a named key can be limited to a specific list of tools and given an expiry date. Developers can go further with filters: `gmcp_tools` to change the catalog, `gmcp_allow` to override the auth decision, and `gmcp_header_auth_only_tools` to restrict what the URL-token endpoint can reach.
 
 = Can I undo something an agent did? =
 
@@ -129,7 +129,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 
 1. The Connect tab: the endpoint to give your agent, ready-made snippets for Claude Desktop and Claude Code, and the connection check.
 2. The consent screen an administrator sees when an OAuth client asks to connect.
-3. The Access tab: the shared bearer token with its access level, and named keys with their own level, tool list and expiry.
+3. The Access tab: named keys, each with its own access level, tool list and expiry.
 4. The Logs tab: every call an agent made, refusals included, with the reason each was turned down. Filter by tool, account or recency, and search.
 5. One entry in full: what changed, field by field, with the values before and after, the arguments as they were recorded, and the entry's place in the hash chain.
 
@@ -137,7 +137,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 
 = 1.0.0 =
 * First release.
-* Model Context Protocol server over Streamable HTTP, with OAuth 2.1 including PKCE and dynamic client registration, or a static bearer token with three access levels.
+* Model Context Protocol server over Streamable HTTP, with OAuth 2.1 including PKCE and dynamic client registration, or named keys with three access levels, their own expiry and their own tool list.
 * Content tools: posts, block content, taxonomies, comments, media, users, post meta, options, post types and block patterns.
 * Site administration tools, off by default: plugins, themes, menus, widgets, settings, permalinks and Site Health.
 * Two-step confirmation on destructive operations, wordpress.org-only installs, filtered post and widget markup, and refusal of any operation that would make the site or the endpoint unreachable.

@@ -397,6 +397,14 @@ class GMCP_Core {
   public function init() {
     load_plugin_textdomain( GMCP_DOMAIN, false, basename( GMCP_PATH ) . '/languages' );
 
+    // Before the server, which would otherwise look for a shared token that is on its way
+    // to becoming a key. The check is an isset on an option row already in memory, so it
+    // costs nothing on the requests where there is nothing to do, which is all of them
+    // after the first.
+    if ( (string) $this->get_option( 'mcp_bearer_token' ) !== '' ) {
+      GMCP_Tokens::adopt_shared_token();
+    }
+
     // The server registers its own routes on rest_api_init, so it has to exist on
     // every request that might be a REST request. Constructed before the settings
     // screen, which borrows its OAuth instance.

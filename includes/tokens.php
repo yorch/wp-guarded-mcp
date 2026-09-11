@@ -42,8 +42,13 @@ class GMCP_Tokens {
   * @param array $tools Tool names this key may call. Empty means every tool its level allows.
   * @return array{id:string,secret:string}
   */
-  public static function create( string $label, string $level, int $expires_days, array $tools ): array {
+  /**
+  * @param int $owner The administrator this key acts as. Defaults to whoever is creating it.
+  */
+  public static function create( string $label, string $level, int $expires_days, array $tools,
+    int $owner = 0 ): array {
     $rows = self::all();
+    $owner = $owner > 0 ? $owner : get_current_user_id();
 
     $id = bin2hex( random_bytes( 4 ) );
     // Long enough that guessing is not a strategy, and hex so it survives being pasted
@@ -57,6 +62,13 @@ class GMCP_Tokens {
       'hash' => hash( 'sha256', $token ),
       'level' => in_array( $level, self::LEVELS, true ) ? $level : 'readonly',
       'tools' => array_values( array_filter( array_map( 'sanitize_key', $tools ) ) ),
+      // The account this key acts as, recorded once at creation.
+      //
+      // Before this, every static credential borrowed the lowest-numbered administrator,
+      // so the audit log named the same account whoever was holding the key and could not
+      // answer "who did this". A key that carries its owner makes the log say something
+      // true, and makes revoking one person's access revoke their agent with it.
+      'owner' => $owner,
       'created' => time(),
       'expires' => $expires_days > 0 ? time() + ( $expires_days * DAY_IN_SECONDS ) : 0,
       'last_used' => 0,
@@ -87,6 +99,30 @@ class GMCP_Tokens {
   * @return array|null The key row, or null if unknown, malformed or expired.
   */
   public static function match( string $token ): ?array {
+    $row = self::by_id( $token ) ?? self::legacy_match( $token );
+    if ( !is_array( $row ) ) {
+      return null;
+    }
+    if ( !empty( $row['expires'] ) && $row['expires'] < time() ) {
+      return null;
+    }
+    // Checked on every request rather than at creation, because the answer changes
+    // without anything touching this key: demoting the owner, or deleting the account,
+    // has to take their agent's access with it. This is how OAuth already behaves, and a
+    // static credential that outlived its owner's own access would be the hole the OAuth
+    // path was careful not to leave.
+    //
+    // A key with no owner is one migrated from the retired shared token, which had no
+    // identity to carry over. Those are checked against the fallback administrator
+    // instead, and the screen asks you to replace them.
+    if ( !self::owner_still_allowed( $row ) ) {
+      return null;
+    }
+    return $row;
+  }
+
+  /** A key found by the id it carries, which is how every key this plugin issues works. */
+  private static function by_id( string $token ): ?array {
     if ( strpos( $token, 'gmcp_' ) !== 0 ) {
       return null;
     }
@@ -94,18 +130,95 @@ class GMCP_Tokens {
     if ( count( $parts ) !== 3 ) {
       return null;
     }
-    $rows = self::all();
-    $row = $rows[ $parts[1] ] ?? null;
+    $row = self::all()[ $parts[1] ] ?? null;
     if ( !is_array( $row ) || empty( $row['hash'] ) ) {
       return null;
     }
-    if ( !hash_equals( (string) $row['hash'], hash( 'sha256', $token ) ) ) {
+    return hash_equals( (string) $row['hash'], hash( 'sha256', $token ) ) ? $row : null;
+  }
+
+  /**
+  * A secret carried over from the retired shared token, which has no id in it.
+  *
+  * The shared token was whatever string the site put in the box, so there is no id to
+  * look up and the only way to recognise it is to hash what was presented and compare.
+  * That is a scan, which is why it is confined to rows that say they came from the old
+  * token: there is at most one, and an ordinary key never reaches this.
+  */
+  private static function legacy_match( string $token ): ?array {
+    if ( $token === '' ) {
       return null;
     }
-    if ( !empty( $row['expires'] ) && $row['expires'] < time() ) {
-      return null;
+    $presented = hash( 'sha256', $token );
+    foreach ( self::all() as $row ) {
+      if ( empty( $row['legacy'] ) || empty( $row['hash'] ) ) {
+        continue;
+      }
+      if ( hash_equals( (string) $row['hash'], $presented ) ) {
+        return $row;
+      }
     }
-    return $row;
+    return null;
+  }
+
+  /**
+  * Turn a shared bearer token into a key, once.
+  *
+  * The shared token is gone, and an upgrade that simply dropped it would disconnect every
+  * client on the site with no message anywhere explaining why. So the secret keeps
+  * working, as a key: same string, now stored only as a hash, with the access level the
+  * token had.
+  *
+  * The owner is left at 0 deliberately. The shared token never had an identity to carry
+  * over, and inventing one would put a real person's name against calls they did not
+  * make. A key with no owner falls back to the site's administrator and is flagged on the
+  * screen as worth replacing.
+  *
+  * Runs on load rather than only on activation, because WordPress does not fire the
+  * activation hook when a plugin is updated in place, and an upgrade is exactly when this
+  * has to happen. @see GMCP_Audit::__construct() for the same reasoning.
+  */
+  public static function adopt_shared_token(): void {
+    $core = $GLOBALS['gmcp_core'] ?? null;
+    if ( !$core ) {
+      return;
+    }
+    $token = (string) $core->get_option( 'mcp_bearer_token' );
+    if ( $token === '' ) {
+      return;
+    }
+
+    $rows = self::all();
+    $id = bin2hex( random_bytes( 4 ) );
+    $rows[ $id ] = [
+      'id' => $id,
+      'label' => __( 'Shared token (carried over)', 'guarded-mcp' ),
+      'hash' => hash( 'sha256', $token ),
+      'level' => in_array( $core->get_option( 'mcp_role', 'admin' ), self::LEVELS, true )
+        ? $core->get_option( 'mcp_role', 'admin' ) : 'admin',
+      'tools' => [],
+      'owner' => 0,
+      'legacy' => true,
+      'created' => time(),
+      'expires' => 0,
+      'last_used' => 0,
+    ];
+    update_option( self::OPTION, $rows, false );
+
+    // Only now, and this order matters: if the write above fails the secret is still in
+    // the options row and the site still works. Cleared rather than kept, because leaving
+    // it would mean the plaintext of a working credential stayed in the database, which
+    // is the whole reason the shared token was retired.
+    $core->update_option( 'mcp_bearer_token', '' );
+  }
+
+  /** Whether the account a key acts as may still authorise anything at all. */
+  public static function owner_still_allowed( array $row ): bool {
+    $owner = (int) ( $row['owner'] ?? 0 );
+    if ( $owner <= 0 ) {
+      return true;
+    }
+    return get_userdata( $owner ) && user_can( $owner, 'manage_options' );
   }
 
   /**

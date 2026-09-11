@@ -46,7 +46,6 @@ class GMCP_Server {
   private $session_id = null;
   private $logging = false;
   private $last_action_time = 0;
-  private $bearer_token = null;
   private $mcp_role = 'admin';
   /**
   * Tool names the presented key is limited to, or null when it is not limited.
@@ -97,11 +96,8 @@ class GMCP_Server {
   }
 
   public function rest_api_init() {
-    // Load bearer token if not already loaded
-    if ( $this->bearer_token === null ) {
-      $this->bearer_token = $this->core->get_option( 'mcp_bearer_token' );
-    }
-    $this->mcp_role = $this->core->get_option( 'mcp_role', 'admin' );
+    // No shared token to load any more. A key carries its own level, so mcp_role has
+    // nothing left to say and the default stands until a key replaces it.
 
     // So the change journal can ask whether this caller could make the write it is
     // about to replay. Registered here rather than in the constructor because it is
@@ -146,41 +142,18 @@ class GMCP_Server {
       'show_in_index' => false,
     ] );
 
-    // Alternative endpoint with the bearer token embedded in the URL path, for hosts
-    // that strip the Authorization header before PHP sees it. Registered only when a
-    // bearer token is configured. The token is high-entropy (wp_generate_password),
-    // compared with hash_equals, the route is hidden (show_in_index=false), and every
-    // admin-level tool is refused on it. @see tool_requires_header_auth().
+    // There is no token-in-URL route any more. It existed for hosts that strip the
+    // Authorization header, and it put the credential in the request path, where it was
+    // written to the access log of every proxy and web server in front of the site: one
+    // copy per request, kept for as long as logs are kept, and read by people who are not
+    // thinking about credentials. Measured on a development site, 27 copies of a working
+    // administrator credential sat in the access log while the plugin's own debug trace
+    // held none.
     //
-    // TODO: Re-evaluate after 2026-12-27, flagged by the wordpress.org automated
-    // security review in June 2026. Two things had already changed by September 2026 and
-    // are recorded here so the decision starts from evidence rather than from memory.
-    //
-    // The client half of the original reason has gone. Claude Code takes
-    // `--header "Authorization: Bearer ..."` directly, and the claude.ai connectors
-    // accept a static credential under a standard header name. The open bug reports are
-    // about the OAuth path not sending a token, which this route does not help with.
-    //
-    // The host half is smaller than it was, because authorization_header() now recovers
-    // the header from REDIRECT_HTTP_AUTHORIZATION and apache_request_headers(). On
-    // Apache the header usually arrives and is merely missing from $_SERVER, which was
-    // the common case. What is left is proxies that genuinely drop it.
-    //
-    // So the open question is no longer "do clients need this" but "how many hosts
-    // still do", and the cost is paid by every site with a bearer token whether it needs
-    // the route or not. Hence the filter below: a site can decline it today, and the
-    // default can be flipped once there is a reason to.
-    $offer_url_token = apply_filters( 'gmcp_url_token_route', true );
-    if ( !empty( $this->bearer_token ) && $offer_url_token ) {
-      register_rest_route( $this->namespace, '/' . $this->bearer_token, [
-        'methods' => [ 'GET', 'POST', 'DELETE' ],
-        'callback' => [ $this, 'handle_streamable_http' ],
-        'permission_callback' => function ( $request ) {
-          return $this->handle_noauth_access_streamable( $request );
-        },
-        'show_in_index' => false,
-      ] );
-    }
+    // What made it removable rather than merely unwise is that authorization_header()
+    // recovers the header from REDIRECT_HTTP_AUTHORIZATION and apache_request_headers().
+    // On Apache the header usually arrives and is only missing from $_SERVER, which was
+    // the common case this route was carrying.
 
     // File upload endpoint for wp_upload_request
     // Uses a one-time token in the URL for authentication (no bearer header needed from curl)
@@ -254,12 +227,13 @@ class GMCP_Server {
 
     $hdr = $this->authorization_header( $request );
 
-    // If no authorization header but bearer token is configured, deny access
-    if ( !$hdr && !empty( $this->bearer_token ) ) {
+    // No header, nothing to check. Saying so in the log matters because a stripped
+    // header is now the failure, rather than something the URL route quietly papered over.
+    if ( !$hdr ) {
       if ( $this->logging ) {
         error_log( '[Guarded MCP] ❌ No authorization header provided. Server may be stripping headers.' );
       }
-      return false;
+      return $allow;
     }
 
     // Check for Bearer token in header
@@ -291,26 +265,22 @@ class GMCP_Server {
         }
       }
 
-      // Fall back to static bearer token if configured
-      if ( !empty( $this->bearer_token ) && hash_equals( $this->bearer_token, $token ) ) {
-        if ( $admin = $this->core->get_admin_user() ) {
-          wp_set_current_user( $admin->ID, $admin->user_login );
-        }
-        $auth_result = 'static';
-        $this->auth_method = 'bearer';
-        $this->auth_client_id = 'bearer';
-        $this->auth_client_name = null;
-        if ( $this->logging ) {
-          error_log( '[Guarded MCP] 🔐 Bearer token auth OK' );
-        }
-        return true;
-      }
-
-      // Named keys, each with its own access level, expiry and tool list. Checked
-      // after the shared token so an existing setup keeps behaving exactly as it did.
+      // Named keys are the only static credential. The shared bearer token that used to
+      // be checked here is gone: it was stored in the clear because the screen showed it
+      // back, carried no identity, could not expire and could not be scoped to anything.
+      // A key is hashed, shown once, labelled, expirable and limited to named tools.
       $key = class_exists( 'GMCP_Tokens' ) ? GMCP_Tokens::match( $token ) : null;
       if ( $key ) {
-        if ( $admin = $this->core->get_admin_user() ) {
+        // The key's own owner, not the lowest-numbered administrator. match() has already
+        // refused the key if that account no longer holds manage_options, so by here the
+        // owner is someone who may still authorise this.
+        $owner = (int) ( $key['owner'] ?? 0 );
+        if ( $owner > 0 && ( $user = get_userdata( $owner ) ) ) {
+          wp_set_current_user( $user->ID, $user->user_login );
+        }
+        elseif ( $admin = $this->core->get_admin_user() ) {
+          // Only a key migrated from the retired shared token reaches this, because that
+          // token had no identity to carry over. The screen asks you to replace it.
           wp_set_current_user( $admin->ID, $admin->user_login );
         }
         $this->mcp_role = $key['level'];
@@ -333,127 +303,7 @@ class GMCP_Server {
       return false;
     }
 
-    // ?token=xyz fallback (optional) - only for static bearer token.
-    // Same exposure as the URL-path route: a query string is logged everywhere a path
-    // is, so this is marked bearer_url too and gets the same reduced ceiling.
-    if ( !empty( $this->bearer_token ) ) {
-      $q = sanitize_text_field( $request->get_param( 'token' ) );
-      if ( $q && hash_equals( $this->bearer_token, $q ) ) {
-        if ( $admin = $this->core->get_admin_user() ) {
-          wp_set_current_user( $admin->ID, $admin->user_login );
-        }
-        $this->auth_method = 'bearer_url';
-        $this->auth_client_id = 'bearer_url';
-        return true;
-      }
-    }
-
-    // If bearer token is configured but no valid auth provided, deny access
-    if ( !empty( $this->bearer_token ) ) {
-      return false;
-    }
-
     return $allow;
-  }
-
-  public function handle_noauth_access_streamable( $request ) {
-    // For Streamable HTTP with token in URL path (no trailing slash)
-    $route = $request->get_route();
-    $expected = '/' . $this->namespace . '/' . $this->bearer_token;
-    if ( $route !== $expected ) {
-      if ( $this->logging ) {
-        error_log( '[Guarded MCP] ❌ Invalid Streamable HTTP no-auth URL access attempt.' );
-      }
-      return false;
-    }
-
-    // Set the current user to admin since token is valid
-    if ( $admin = $this->core->get_admin_user() ) {
-      wp_set_current_user( $admin->ID, $admin->user_login );
-    }
-    // Deliberately NOT 'bearer'. This path carries the secret in the request path, so it
-    // is written to the access log of every proxy, CDN and web server in front of the
-    // site, and leaks through Referer on any redirect. Naming it separately lets the
-    // dispatcher hold it to a lower ceiling than a header-authenticated call.
-    $this->auth_method = 'bearer_url';
-    $this->auth_client_id = 'bearer_url';
-    return true;
-  }
-
-  /**
-  * Tools refused to a caller whose token travelled in the URL.
-  *
-  * These install code, delete files, or change which theme renders the site. A secret
-  * sitting in server logs is a secret with a much wider blast radius than one in a
-  * header, so the URL route keeps the read and content tools and gives up the ones that
-  * can take the site over. Callers that need them should send the Authorization header
-  * or use OAuth.
-  */
-  /**
-  * Tools that may not be reached with a secret sitting in the request path.
-  *
-  * A rule plus a short list of exceptions, and both parts are needed.
-  *
-  * The rule is that every admin-level tool is blocked, because admin level is already
-  * this plugin's own answer to "what would you not want done on a misread instruction",
-  * and a token in the URL is a token in every proxy log, access log and browser history
-  * in front of the site. It replaced a list of eleven names that was wrong by omission:
-  * menus and widgets were never on it, and a widget is arbitrary markup on every page.
-  *
-  * The exceptions exist because a declared access level describes what a tool changes,
-  * and two tools reach further than their level says:
-  *
-  * wp_get_site_health is read level, and it runs WordPress's own direct tests. Those
-  * include a loopback request to this site's REST API and a call to wordpress.org, so a
-  * read-level tool makes outbound requests, and the report it returns is a full account
-  * of versions, paths and configuration.
-  *
-  * wp_upload_request is write level, and it does not write anything. It mints a URL on a
-  * route whose permission callback returns true unconditionally, so the caller walks away
-  * holding an unauthenticated upload endpoint, and the file write then happens somewhere
-  * neither the role filter nor a key's tool list can see. Single use and MIME-checked, but
-  * a capability handed out over a logged secret is the shape this whole route is about.
-  *
-  * wp_start_backup is write level and writes nothing to the site. What it does is cause a
-  * complete copy of the database, every user and every email address in it, to be written
-  * to disk and, depending on the site's own settings, shipped to remote storage. It is
-  * also repeatable, so it is a way to spend a host's CPU and a site owner's storage bill.
-  * None of that is visible in the level, which describes what a tool changes.
-  *
-  * wp_get_settings is read level and returns the administration email address, which is a
-  * real person's address rather than a fact about the site. Changing it already costs a
-  * confirmation token and a cooldown, so reading it out of an access log should not be
-  * free. The rest of the administration group stays reachable here on purpose: menus,
-  * widget areas, themes and the permalink structure are all in wp_site_briefing, which is
-  * read level and deliberately allowed, so blocking them one at a time would be a line
-  * drawn where nothing changes.
-  *
-  * The filter adds to and removes from the exception list. It cannot unblock an
-  * admin-level tool: that decision is the rule, and a site whose host strips the
-  * Authorization header should fix the header rather than widen this. That is a
-  * deliberate change from the previous behaviour, where the filter received the whole
-  * blocked set and could empty it.
-  */
-  private function tool_requires_header_auth( string $tool ): bool {
-    if ( empty( $this->tool_access_levels ) ) {
-      $this->get_tools_list();
-    }
-    // An unregistered tool has no level. Refusing it here costs nothing, because it is
-    // about to be refused anyway, and it means a new tool is covered before anyone
-    // remembers to think about this.
-    $level = $this->tool_access_levels[ $tool ] ?? 'admin';
-
-    $exceptions = apply_filters( 'gmcp_header_auth_only_tools', [
-      'wp_get_site_health',
-      'wp_upload_request',
-      'wp_get_settings',
-      'wp_start_backup',
-    ], $level );
-
-    if ( in_array( $tool, (array) $exceptions, true ) ) {
-      return true;
-    }
-    return $level === 'admin';
   }
 
   #endregion
@@ -1082,9 +932,6 @@ class GMCP_Server {
     if ( !$this->token_allows_tool( $tool ) ) {
       return false;
     }
-    if ( $this->auth_method === 'bearer_url' && $this->tool_requires_header_auth( $tool ) ) {
-      return false;
-    }
     if ( $this->role_filter_applies() && !$this->role_has_access( $this->tool_access_levels[ $tool ] ) ) {
       return false;
     }
@@ -1470,11 +1317,6 @@ class GMCP_Server {
       // Unconditional, unlike the role filter below it: role_filter_applies() returns
       // false for OAuth callers and for an admin-role bearer token, so anything placed
       // behind it would not gate the callers this is meant to gate.
-      if ( $this->auth_method === 'bearer_url' && $this->tool_requires_header_auth( $tool ) ) {
-        $error_msg = "'{$tool}' is not available over the URL-token endpoint, because that endpoint puts the token in the request path where servers and proxies log it. Send the token in an Authorization header, or connect with OAuth.";
-        $response = $this->rpc_error( $id, -32600, $error_msg );
-        return $response;
-      }
 
       // Enforce the tool's own inputSchema "required" list before dispatching.
       // Handlers read their arguments directly ($a['key']), so a call missing one
