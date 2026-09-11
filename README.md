@@ -202,10 +202,21 @@ and a database archive holds every user row and password hash on the site. So a 
 identified by when it finished, which answers every question an agent has a reason to ask
 and cannot be turned into a URL.
 
+That rule is enforced rather than asserted. `gmcp_backup_providers` is a public filter, so
+a sentence promising no filenames would only describe the two shipped adapters; every entry
+is reduced to the fields above whoever produced it, unknown keys are dropped, and the two
+free-text fields are withheld if they contain a path separator or an archive extension.
+This matters beyond the reply itself, because the audit log stores it.
+
 The same "cannot tell" rule applies. A provider this plugin cannot enumerate gets said so,
 and the `backups` key is absent rather than empty, because an empty list reads as "there
-are none". A capped listing says it was capped and reports the limit it used, so a caller
-can tell the newest hundred of four hundred from all hundred that exist.
+are none". `total` is how many exist and `count` how many came back, so a capped listing
+can say which it is rather than guessing from the size of its own result.
+
+Existing is not the same as usable. UpdraftPlus prunes archives to its retention limit but
+keeps the history entry, so a set can be listed with most or all of its contents gone. Each
+entry therefore reports what it actually still holds, and the reply counts separately how
+many contain a database, because a backup without one cannot put the site back.
 
 There is no restore tool at any access level. Restoring discards everything since the
 backup, which is a larger irreversible act than anything else here, and no confirmation

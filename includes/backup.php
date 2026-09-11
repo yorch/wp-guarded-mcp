@@ -55,8 +55,13 @@ class GMCP_Backup {
   * rather than a guess, and the difference between null and false is load-bearing
   * throughout this file.
   *
+  * A list slot takes no arguments and returns every backup it knows about, newest first.
+  * Capping is listing()'s job, so that "there may be older ones" is decided against how
+  * many exist rather than how many an adapter chose to hand over.
+  *
   * A list entry describes a backup without naming it on disk. See list_entry() for why
-  * the filename is the one field deliberately missing.
+  * the filename is the one field deliberately missing, and sanitise_entry() for why an
+  * adapter registered through this filter is not taken at its word about that.
   */
   public static function providers(): array {
     return apply_filters( 'gmcp_backup_providers', [
@@ -97,7 +102,9 @@ class GMCP_Backup {
             'last_errors' => $errors,
           ];
         },
-        'list' => function ( int $limit ) {
+        // Everything, newest first. The slicing happens in listing(), so that truncated
+        // can be decided against how many exist rather than against how many came back.
+        'list' => function () {
           // Keyed by the completion time, which is the identifier this returns. The
           // entries themselves hold the zip names, and those are exactly what must not
           // come back out: see list_entry().
@@ -106,9 +113,6 @@ class GMCP_Backup {
 
           $out = [];
           foreach ( $history as $when => $set ) {
-            if ( count( $out ) >= $limit ) {
-              break;
-            }
             $set = (array) $set;
 
             // A component is present when its own key is, and its size lives in a
@@ -117,15 +121,26 @@ class GMCP_Backup {
             // deleted locally.
             $contains = [];
             $bytes = 0;
-            foreach ( [ 'db' => 'database', 'plugins' => 'plugins', 'themes' => 'themes', 'uploads' => 'uploads', 'others' => 'others' ] as $key => $label ) {
+            foreach ( self::updraft_entities() as $key ) {
               if ( empty( $set[ $key ] ) ) {
                 continue;
               }
-              $contains[] = $label;
+              $contains[] = $key === 'db' ? 'database' : $key;
               $bytes += (int) ( $set[ $key . '-size' ] ?? 0 );
             }
 
-            $out[] = self::list_entry( (int) $when, $contains, $bytes, self::updraft_destination( $set ) );
+            $entry = self::list_entry( (int) $when, $contains, $bytes, self::updraft_destination( $set ) );
+
+            // UpdraftPlus prunes archives to its retention limit but keeps the history
+            // entry, sizes and nonce behind. Counting one of those as a backup is the
+            // false yes this whole file is arranged against: an agent asking whether it
+            // has something to fall back on would be told yes by a record of a backup
+            // that no longer exists anywhere.
+            if ( !$contains ) {
+              $entry['note'] = 'UpdraftPlus still lists this set but every archive in it is gone, almost certainly removed by its retention limit. There is nothing here to restore from.';
+            }
+
+            $out[] = $entry;
           }
           return $out;
         },
@@ -147,7 +162,7 @@ class GMCP_Backup {
         },
         'start' => function ( array $args ) { return self::backuply_start(); },
         'state' => function () { return self::backuply_state(); },
-        'list' => function ( int $limit ) { return self::backuply_list( $limit ); },
+        'list' => function () { return self::backuply_list(); },
       ],
 
       // Known, detectable, and not drivable from here. Named rather than ignored so the
@@ -262,32 +277,137 @@ class GMCP_Backup {
       return $out;
     }
 
-    $backups = (array) call_user_func( $provider['list'], $limit );
-    $out['count'] = count( $backups );
+    // The adapter returns everything it knows and the slicing happens here, so truncated
+    // can be decided against how many exist. Deciding it from how many came back cannot
+    // tell "there are exactly this many" from "the adapter stopped at your limit", and it
+    // got both cases wrong: it claimed older backups might exist whenever a site held
+    // exactly as many as were asked for, and it claimed none did whenever an adapter
+    // registered through gmcp_backup_providers capped its own output.
+    $all = (array) call_user_func( $provider['list'] );
+    $total = count( $all );
+    $backups = array_slice( array_values( $all ), 0, $limit );
+
+    $entries = array_values( array_filter( array_map( [ self::class, 'sanitise_entry' ], $backups ) ) );
+
+    $out['total'] = $total;
+    $out['count'] = count( $entries );
     $out['limit'] = $limit;
-    // Said plainly, because a caller that quietly received 20 of 200 would draw
-    // conclusions about the oldest backup it can see that are simply wrong.
-    $out['truncated'] = count( $backups ) >= $limit;
-    $out['backups'] = array_values( $backups );
+    $out['truncated'] = $total > $limit;
+    // Dropped entries are counted rather than quietly absent. count and total disagreeing
+    // with no explanation is the sort of gap a reader fills in with an assumption.
+    if ( count( $entries ) < count( $backups ) ) {
+      $out['unreadable'] = count( $backups ) - count( $entries );
+    }
+    $out['backups'] = $entries;
+
+    // A backup without a database cannot put the site back, and on UpdraftPlus a set can
+    // be reduced to one stray component by retention while still being listed. Counting
+    // those separately is the difference between "you have four backups" and the thing
+    // the caller actually wants to know.
+    $out['with_database'] = count( array_filter( $out['backups'], function ( $b ) {
+      return in_array( 'database', (array) ( $b['contains'] ?? [] ), true );
+    } ) );
+
     $out['summary'] = self::describe_listing( $provider['name'], $out );
     return $out;
   }
 
+  /**
+  * Reduce one entry to the fields this tool promises, whoever produced it.
+  *
+  * The no-filename rule was a sentence in a summary and a sentence in a tool description,
+  * which is a claim rather than a control. providers() is a public filter: a plugin can
+  * register an adapter returning whatever it likes, and this passed it through untouched
+  * and then appended a paragraph asserting the opposite. The audit log stores the reply,
+  * so anything leaked that way is written to the database and readable afterwards.
+  *
+  * So the shape is imposed here instead of asked for. Unknown keys are dropped rather
+  * than sanitised, because a key nobody designed has no safe rendering, and the two free
+  * text fields are checked for anything shaped like a path or an archive: a destination
+  * is meant to name a place, not to give directions to a file.
+  */
+  private static function sanitise_entry( $entry ): ?array {
+    if ( !is_array( $entry ) ) {
+      // Not a record at all. Dropping it loses a backup from the list, so the count above
+      // is taken before this runs and will not match, which is the honest outcome: this
+      // says "something is here that I will not show you", not "there is nothing here".
+      return null;
+    }
+
+    $when = isset( $entry['completed'] ) ? (int) $entry['completed'] : 0;
+    $contains = [];
+    foreach ( (array) ( $entry['contains'] ?? [] ) as $part ) {
+      if ( is_scalar( $part ) ) {
+        $contains[] = self::scrub( (string) $part );
+      }
+    }
+
+    $out = self::list_entry( $when, $contains, isset( $entry['size_bytes'] ) ? (int) $entry['size_bytes'] : 0, self::scrub( (string) ( $entry['destination'] ?? '' ) ) );
+
+    if ( !empty( $entry['note'] ) && is_scalar( $entry['note'] ) ) {
+      $out['note'] = self::scrub( (string) $entry['note'] );
+    }
+    return $out;
+  }
+
+  /**
+  * Strip a free text field of anything that could be followed to a file.
+  *
+  * Deliberately blunt. A destination is a label like "local only" or the name the site
+  * gave an S3 bucket, and none of those need a slash, a backslash or an archive
+  * extension. Replacing rather than deleting means a reader can see that something was
+  * removed instead of silently receiving a shortened name.
+  */
+  private static function scrub( string $value ): string {
+    $value = trim( wp_strip_all_tags( $value ) );
+    if ( $value === '' ) {
+      return '';
+    }
+    // Four backslashes so the pattern reaches PCRE as [/\\]. Written with two, PHP hands
+    // over [/\], where the backslash escapes the closing bracket, the class never ends,
+    // and preg_match returns false on the bad pattern instead of matching. That failure
+    // is silent and reads exactly like "nothing to scrub", which is why the suite asserts
+    // that a planted path is withheld rather than only that a real one is absent.
+    if ( preg_match( '~[/\\\\]|\.(?:zip|gz|tar|sql|bz2|7z|php)\b~i', $value ) ) {
+      return '[withheld: looked like a path or an archive name]';
+    }
+    return mb_substr( $value, 0, 200 );
+  }
+
   /** One sentence about the listing, including what it is not showing. */
   private static function describe_listing( string $name, array $out ): string {
-    if ( $out['count'] === 0 ) {
+    if ( $out['total'] === 0 ) {
       return sprintf( '%s is active and has no backups recorded. It can enumerate them, so this is a real zero rather than a gap in what can be seen.', $name );
     }
+
     $line = sprintf(
-      '%s reports %d backup%s, newest first, identified by when each finished.',
+      '%s has %d backup%s, newest first, each identified by when it finished.',
       $name,
-      $out['count'],
-      $out['count'] === 1 ? '' : 's'
+      $out['total'],
+      $out['total'] === 1 ? '' : 's'
     );
     if ( $out['truncated'] ) {
-      $line .= sprintf( ' This is the newest %d and there may be older ones; raise limit to see further back.', $out['limit'] );
+      $line .= sprintf( ' The newest %d are shown; raise limit to see further back.', $out['count'] );
     }
-    return $line . ' Archive filenames are deliberately not included, because on both supported plugins the filename or its directory is the only thing keeping the archive from being downloaded by anyone who can guess it.';
+    if ( !empty( $out['unreadable'] ) ) {
+      $n = (int) $out['unreadable'];
+      $line .= sprintf(
+        $n === 1 ? ' One more came back in a shape this tool will not pass on, and is not listed.' : ' %d more came back in a shape this tool will not pass on, and are not listed.',
+        $n
+      );
+    }
+
+    // The number that matters before anything irreversible. A set can be listed and hold
+    // nothing restorable, which is worth one clause rather than leaving the reader to
+    // notice an empty contains array.
+    if ( $out['with_database'] === 0 ) {
+      $line .= ' None of the ones shown contain a database, so none of them can put this site back.';
+    }
+    elseif ( $out['with_database'] < $out['count'] ) {
+      $line .= sprintf( ' %d of the %d shown contain a database; the rest cannot put the site back on their own.', $out['with_database'], $out['count'] );
+    }
+
+    return $line . ' No archive filename or path is included in any entry, and entries from an adapter registered through gmcp_backup_providers are reduced to the same fields, because on both supported plugins the filename or its directory is the only thing keeping the archive from being downloaded by anyone who can guess it.';
   }
 
   /**
@@ -305,15 +425,46 @@ class GMCP_Backup {
   * has a reason to ask: is there a recent one, what is in it, and where did it go.
   */
   private static function list_entry( int $when, array $contains, int $bytes, string $destination ): array {
+    // A missing time stays missing. Running the date and the age arithmetic over a zero
+    // produced "1970-01-01 00:00 GMT" and an age of half a million hours, sitting beside
+    // a note saying the time was not recorded. A model reading the number rather than the
+    // note concludes the backup is fifty years old, and nulls cannot be misread that way.
+    $dated = $when > 0;
     return [
-      'completed' => $when,
-      'completed_gmt' => gmdate( 'Y-m-d H:i', $when ) . ' GMT',
-      'age_hours' => (int) round( ( time() - $when ) / HOUR_IN_SECONDS ),
+      'completed' => $dated ? $when : null,
+      'completed_gmt' => $dated ? gmdate( 'Y-m-d H:i', $when ) . ' GMT' : null,
+      'age_hours' => $dated ? (int) round( ( time() - $when ) / HOUR_IN_SECONDS ) : null,
       'contains' => $contains,
       'size_bytes' => $bytes,
       'size' => $bytes > 0 ? size_format( $bytes ) : null,
       'destination' => $destination,
     ];
+  }
+
+  /**
+  * The components an UpdraftPlus backup can hold, asked of UpdraftPlus rather than listed
+  * here.
+  *
+  * A hardcoded list gets this wrong twice. It omitted mu-plugins, which every real history
+  * entry on a site carries, so the listing stated that must-use plugins were not in a
+  * backup that contained them and left their bytes out of the size. And the set is open:
+  * add-ons extend it through updraftplus_backupable_file_entities, and anything added that
+  * way would be dropped the same silent way.
+  *
+  * The global is set by the plugin's main file outside any is_admin() guard, so it is
+  * there on a REST request. The fallback is what the method returned when this was
+  * written, used only if a future version moves it.
+  */
+  private static function updraft_entities(): array {
+    global $updraftplus;
+    if ( is_object( $updraftplus ) && method_exists( $updraftplus, 'get_backupable_file_entities' ) ) {
+      $files = array_keys( (array) $updraftplus->get_backupable_file_entities( true ) );
+    }
+    else {
+      $files = [ 'plugins', 'themes', 'uploads', 'mu-plugins', 'others' ];
+    }
+    // The database is not a file entity and is never in that list, so it is added here.
+    return array_merge( [ 'db' ], array_values( array_filter( array_map( 'strval', $files ) ) ) );
   }
 
   /**
@@ -495,21 +646,29 @@ class GMCP_Backup {
   * is not returned: it is the archive's own filename, and Backuply keeps archives in a
   * directory whose random suffix is all that protects them.
   */
-  private static function backuply_list( int $limit ): array {
+  private static function backuply_list(): array {
     $out = [];
     foreach ( (array) backuply_get_backups_info() as $info ) {
-      if ( count( $out ) >= $limit ) {
-        break;
-      }
-      $when = (int) ( $info->btime ?? 0 );
-      if ( $when <= 0 ) {
-        // Undated, so it cannot be identified the way every other entry is. Skipping it
-        // would undercount, so it is reported with what is known and no invented time.
-        $out[] = self::list_entry( 0, self::backuply_contains( $info ), (int) ( $info->size ?? 0 ), self::backuply_destination( $info ) )
-          + [ 'note' => 'Backuply recorded no completion time for this one.' ];
+      // Backuply pushes json_decode()'s return without checking it, so an info file that
+      // was truncated mid-write while its archive survived puts a null in this list. An
+      // object type hint further down turned that into an uncaught TypeError, and one bad
+      // file took out the listing for every other backup on the site while handing back
+      // the plugin's absolute path in the error. The archive is real, so it is reported
+      // as a backup nothing can be read about rather than skipped.
+      if ( !is_object( $info ) ) {
+        $out[] = self::list_entry( 0, [], 0, '' )
+          + [ 'note' => 'Backuply has an archive here whose record is unreadable, so nothing about it can be reported. Its own screen is the place to look.' ];
         continue;
       }
-      $out[] = self::list_entry( $when, self::backuply_contains( $info ), (int) ( $info->size ?? 0 ), self::backuply_destination( $info ) );
+
+      $when = (int) ( $info->btime ?? 0 );
+      $entry = self::list_entry( $when, self::backuply_contains( $info ), (int) ( $info->size ?? 0 ), self::backuply_destination( $info ) );
+      if ( $when <= 0 ) {
+        // Undated. Skipping it would undercount, and list_entry leaves the time fields
+        // null rather than rendering a zero as 1970.
+        $entry['note'] = 'Backuply recorded no completion time for this one, so it cannot be placed in the order above.';
+      }
+      $out[] = $entry;
     }
     return $out;
   }

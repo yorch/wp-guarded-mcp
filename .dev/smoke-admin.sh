@@ -1084,11 +1084,12 @@ check "with both active the older provider still wins" "$(bky "d['provider']" bk
 echo "-- listing backups without handing out the keys to them --"
 # The listing exists so an agent can see whether a recent backup is worth relying on. What
 # it must never hand over is anything a caller could turn into a URL. On UpdraftPlus the
-# archive name carries the job nonce and that nonce is the whole protection: its
-# wp-content/updraft/.htaccess says "deny from all", which nginx never reads. Backuply
-# inverts it, with a guessable filename inside a directory whose random suffix is the
-# secret. Either way the name is a capability, and the db archive holds every password
-# hash on the site.
+# archive name carries a 12-hex-character job nonce, and that nonce is the whole
+# protection: the .htaccess it sits behind says "deny from all", which nginx never reads.
+# Backuply inverts it, with a filename derivable from the timestamp inside a directory
+# whose 6-character wp_generate_password suffix is the secret, shared by every backup on
+# the site. Neither secret is derivable from a completion time, which is why the time is
+# what identifies a backup here.
 #
 # Both providers get a backup made here rather than inherited from the sections above.
 # Reaching this point with one already present is likely but not guaranteed, and a
@@ -1109,59 +1110,159 @@ docker compose exec -T cli wp eval '
 
 call lb_up '{"jsonrpc":"2.0","id":250,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{}}}'
 lb() { py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print($1)" "$2"; }
-check "UpdraftPlus backups are listed" "$(lb "str(d['can_list']) + ',' + str(d['count'] >= 1)" lb_up)" "True,True"
-check "each entry is identified by when it finished" \
-  "$(lb "str(all(isinstance(b.get('completed'), int) and b['completed'] > 0 for b in d['backups']))" lb_up)" "True"
-check "and says what is in it and where it went" \
-  "$(lb "str(all(b.get('contains') and b.get('destination') for b in d['backups']))" lb_up)" "True"
+check "UpdraftPlus backups are listed" "$(lb "str(d['can_list']) + ',' + str(d['total'] >= 1)" lb_up)" "True,True"
+check "each dated entry is identified by when it finished" \
+  "$(lb "str(all(isinstance(b['completed'], int) and b['completed'] > 0 for b in d['backups'] if b['completed'] is not None))" lb_up)" "True"
+# Every entry says where it went, and every entry either lists contents or says why it has
+# none. The earlier form of this demanded contents unconditionally, which failed the moment
+# UpdraftPlus retention emptied a set the suite itself had pushed out of the window.
+check "and each says where it went, or why it holds nothing" \
+  "$(lb "str(all(b['destination'] and (b['contains'] or b.get('note')) for b in d['backups']))" lb_up)" "True"
+
+# UpdraftPlus backs up mu-plugins as a first-class component, and the component list is
+# open to add-ons through updraftplus_backupable_file_entities. A hardcoded five-entry map
+# dropped mu-plugins from both the contents and the size on every real backup.
+check "control: the stored history really does carry mu-plugins" \
+  "$(docker compose exec -T cli wp eval '$h = (array) UpdraftPlus_Backup_History::get_history(); $n = 0; foreach ( $h as $s ) { $s = (array) $s; if ( !empty( $s["mu-plugins"] ) ) { $n++; } } echo $n > 0 ? 1 : 0;' 2>/dev/null | tr -d '\r\n')" "1"
+check "and a set holding mu-plugins says so" \
+  "$(lb "str(any('mu-plugins' in b['contains'] for b in d['backups']))" lb_up)" "True"
+# A set whose archives retention has removed is still in the history. Counting it as a
+# backup is the false yes this whole file is arranged against, so the reply separates the
+# ones that could actually put the site back.
+check "and the reply counts how many hold a database" \
+  "$(lb "str(d['with_database'] <= d['count'])" lb_up)" "True"
+check "and says so in the summary when some do not" \
+  "$(lb "'yes' if (d['with_database'] == d['count']) or ('cannot put the site back' in d['summary']) else 'no'" lb_up)" "yes"
 
 # A scan for something that must be absent is worth nothing without a control proving the
 # thing exists and is findable. Both halves are asserted, in that order.
-UP_NONCE=$(docker compose exec -T cli wp eval '$h = UpdraftPlus_Backup_History::get_history(); $h = (array) $h; $e = $h ? reset( $h ) : []; echo (string) ( $e["nonce"] ?? "" );' 2>/dev/null | tr -d '\r\n')
-check "control: UpdraftPlus really does have a nonce to leak" "$( [ ${#UP_NONCE} -ge 8 ] && echo yes || echo no )" "yes"
+UP_NONCE=$(docker compose exec -T cli wp eval '$h = (array) UpdraftPlus_Backup_History::get_history(); $e = $h ? (array) reset( $h ) : []; echo (string) ( $e["nonce"] ?? "" );' 2>/dev/null | tr -d '\r\n')
+check "control: UpdraftPlus really does have a nonce to leak" "$(printf '%s' "$UP_NONCE" | grep -cE '^[0-9a-f]{8,}$')" "1"
 check "and it is nowhere in the listing" "$(grep -c "$UP_NONCE" "$OUT/lb_up")" "0"
 # Filename shapes only. "updraft" is not in this pattern: the provider's own name is in
 # every reply by design, and a pattern that matched it would fail on the name rather than
 # on a leak, which is a check that cannot tell the two apart.
 check "nor is any archive filename" "$(grep -ciE 'backup_[0-9]{4}-|\.zip|\.gz|\.tar' "$OUT/lb_up")" "0"
-# The same claim made positively: the raw history the adapter reads does contain the name,
-# so the absence above is the adapter withholding it rather than there being nothing there.
 check "control: the stored history does contain that filename" \
-  "$(docker compose exec -T cli wp eval '$h = (array) UpdraftPlus_Backup_History::get_history(); $e = $h ? reset( $h ) : []; echo empty( $e["db"] ) ? 0 : 1;' 2>/dev/null | tr -d '\r\n')" "1"
+  "$(docker compose exec -T cli wp eval '$h = (array) UpdraftPlus_Backup_History::get_history(); $e = $h ? (array) reset( $h ) : []; echo empty( $e["db"] ) && empty( $e["mu-plugins"] ) ? 0 : 1;' 2>/dev/null | tr -d '\r\n')" "1"
 
 # Backuply, whose archives differ in what is secret and must be withheld all the same.
 docker compose exec -T cli wp plugin deactivate updraftplus >/dev/null 2>&1
 call lb_bky '{"jsonrpc":"2.0","id":251,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{}}}'
 check "Backuply backups are listed too" "$(lb "str(d['provider']) + ',' + str(d['can_list'])" lb_bky)" "Backuply,True"
 BKY_DIR=$(docker compose exec -T cli wp eval 'echo basename( (string) backuply_glob( "backups" ) );' 2>/dev/null | tr -d '\r\n')
+BKY_NAME=$(docker compose exec -T cli wp eval '$i = backuply_get_backups_info(); echo $i ? (string) $i[0]->name : "";' 2>/dev/null | tr -d '\r\n')
 check "control: Backuply's archive directory has a random suffix" \
   "$(printf '%s' "$BKY_DIR" | grep -cE '^backups-.+$')" "1"
 check "and that directory is nowhere in the listing" "$(grep -c "$BKY_DIR" "$OUT/lb_bky")" "0"
-check "nor is a tar.gz name" "$(grep -c 'tar.gz' "$OUT/lb_bky")" "0"
+# Backuply's own filename shape, which the earlier pattern missed entirely: it looks for
+# "tar.gz" and the directory, and Backuply's basename contains neither, so an adapter
+# handing back the name passed this section untouched.
+check "control: Backuply really does record a wp__<date> archive name" \
+  "$(printf '%s' "$BKY_NAME" | grep -cE '^wp__[0-9]{4}-[0-9]{2}-[0-9]{2}_')" "1"
+check "and that name is nowhere in the listing" "$(grep -c "$BKY_NAME" "$OUT/lb_bky")" "0"
+check "nor is any wp__<date> or tar.gz shape at all" "$(grep -ciE 'wp__[0-9]{4}-|tar\.gz' "$OUT/lb_bky")" "0"
 
-# Newest first, and honest about not showing everything. A caller silently handed the
-# newest few would draw conclusions about the oldest backup it can see that are wrong.
+# Newest first, and exact about how many exist. truncated used to be derived from how many
+# came back, which cannot tell "that is all of them" from "the adapter stopped there".
 call lb_two '{"jsonrpc":"2.0","id":252,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{"limit":100}}}'
-check "there are at least two Backuply backups to order" "$(lb "str(d['count'] >= 2)" lb_two)" "True"
+check "there are at least two Backuply backups to order" "$(lb "str(d['total'] >= 2)" lb_two)" "True"
 check "and they come back newest first" \
-  "$(lb "str(d['backups'] == sorted(d['backups'], key=lambda b: b['completed'], reverse=True))" lb_two)" "True"
+  "$(lb "str([b['completed'] for b in d['backups'] if b['completed']] == sorted([b['completed'] for b in d['backups'] if b['completed']], reverse=True))" lb_two)" "True"
+TOTAL=$(py "import json,sys;print(json.loads(json.load(sys.stdin)['result']['content'][0]['text'])['total'])" lb_two)
 call lb_one '{"jsonrpc":"2.0","id":253,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{"limit":1}}}'
-check "a capped listing says it was capped" "$(lb "str(d['count']) + ',' + str(d['truncated'])" lb_one)" "1,True"
-check "and the summary says so in words" "$(lb "'yes' if 'older ones' in d['summary'] else 'no'" lb_one)" "yes"
-# An out-of-range limit is clamped rather than refused, and the reply reports the limit it
-# actually used, so a caller can tell 100 of 400 from all 100 that exist.
+check "a capped listing says it was capped and how many exist" "$(lb "str(d['count']) + ',' + str(d['truncated']) + ',' + str(d['total'])" lb_one)" "1,True,$TOTAL"
+# The case the old contract got wrong in the reassuring direction: asking for exactly as
+# many as exist must not claim there may be older ones.
+call lb_exact "{\"jsonrpc\":\"2.0\",\"id\":258,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_list_backups\",\"arguments\":{\"limit\":$TOTAL}}}"
+check "asking for exactly as many as exist is not called truncated" "$(lb "str(d['truncated'])" lb_exact)" "False"
+check "and the summary does not offer to look further back" "$(lb "'yes' if 'raise limit' not in d['summary'] else 'no'" lb_exact)" "yes"
 call lb_big '{"jsonrpc":"2.0","id":254,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{"limit":9999}}}'
 check "an absurd limit is clamped and the real one reported" "$(lb "d['limit']" lb_big)" "100"
 call lb_zero '{"jsonrpc":"2.0","id":255,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{"limit":-5}}}'
 check "and so is a negative one" "$(lb "d['limit']" lb_zero)" "1"
 
+echo "-- a listing is reduced to shape, not asked to behave --"
+# gmcp_backup_providers is a public filter, so the no-filenames rule cannot be a sentence
+# in a summary: an adapter registered by any plugin would have been passed through
+# untouched and then had that sentence appended to it. The audit log stores the reply, so
+# a leak there is written to the database and readable afterwards. This plants an adapter
+# that returns everything the rule forbids and asserts none of it survives.
+docker compose exec -T cli bash -c 'mkdir -p /var/www/html/wp-content/mu-plugins && cat > /var/www/html/wp-content/mu-plugins/gmcp-probe-provider.php <<"PROBE"
+<?php
+add_filter( "gmcp_backup_providers", function ( $p ) {
+  return [ "probe" => [
+    "name" => "Probe",
+    "installed" => function () { return true; },
+    "start" => null,
+    "state" => null,
+    "list" => function () {
+      return [
+        "wp-content/updraft/backup_2026-01-01-0000_Site_deadbeefcafe-db.gz",
+        [ "completed" => time(), "contains" => [ "database" ], "size_bytes" => 10,
+          "destination" => "wp-content/backuply/backups-SECRET/wp__2026-01-01_00-00-00.tar.gz",
+          "path" => "/var/www/html/wp-content/updraft/backup_deadbeefcafe-db.gz",
+          "filename" => "backup_2026-01-01-0000_Site_deadbeefcafe-db.gz",
+          "note" => "fetch it from /wp-content/updraft/backup_deadbeefcafe-db.gz" ],
+      ];
+    },
+  ] ];
+}, 99 );
+PROBE
+echo ok' >/dev/null 2>&1
+call lb_probe '{"jsonrpc":"2.0","id":256,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{}}}'
+check "control: the planted adapter really is the one answering" "$(lb "d['provider']" lb_probe)" "Probe"
+check "its path-shaped destination is withheld" \
+  "$(lb "str(all('withheld' in b['destination'] for b in d['backups']))" lb_probe)" "True"
+check "so is its path-shaped note" \
+  "$(lb "str(all('withheld' in (b.get('note') or 'withheld') for b in d['backups']))" lb_probe)" "True"
+check "keys nobody designed are dropped rather than rendered" \
+  "$(lb "str(any('path' in b or 'filename' in b for b in d['backups']))" lb_probe)" "False"
+check "and an entry that is not a record at all is dropped and counted" \
+  "$(lb "str(d.get('unreadable'))" lb_probe)" "1"
+# The whole point, asserted against the raw bytes rather than against parsed fields.
+check "no planted secret survives anywhere in the reply" \
+  "$(grep -ciE 'deadbeefcafe|backups-SECRET|wp-content/|\.gz|tar\.gz' "$OUT/lb_probe")" "0"
+# And the audit log, which stores the reply, therefore has none of it either.
+check "and none of it reaches the audit log" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb; $a = implode( "", (array) $wpdb->get_col( "SELECT COALESCE(detail,\"\") FROM {$wpdb->prefix}gmcp_audit" ) ); echo strpos( $a, "deadbeefcafe" ) === false ? 0 : 1;' 2>/dev/null | tr -d '\r\n')" "0"
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-probe-provider.php >/dev/null 2>&1
+
+echo "-- a listing survives records it cannot read --"
+# Backuply pushes json_decode()'s return without checking it, so an info file truncated
+# mid-write whose archive survived puts a null in the list. That used to reach an object
+# type hint and take out the listing for every other backup on the site, with the plugin's
+# absolute path in the error message. An undated record used to render as 1970 and an age
+# of half a million hours beside a note saying no time was recorded.
+# Counted before planting, because how many backups earlier sections left behind is not
+# something this one should assume. An absolute number here failed the moment the section
+# above it reset Backuply.
+call lb_pre '{"jsonrpc":"2.0","id":261,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{"limit":100}}}'
+LB_PRE=$(lb "d['total']" lb_pre)
+docker compose exec -T cli bash -c 'D=$(ls -d /var/www/html/wp-content/backuply/backups_info-*); A=$(ls -d /var/www/html/wp-content/backuply/backups-*);
+printf "<?php exit();?>\n{\n  \"name\": \"wp__2026-09-10_00-00-00\",\n  \"backup_di" > "$D/wp__2026-09-10_00-00-00.php"
+printf "partial" > "$A/wp__2026-09-10_00-00-00.tar.gz"
+printf "<?php exit();?>\n{\"name\":\"wp__2026-09-05_00-00-00\",\"backup_dir\":\"1\",\"backup_db\":\"1\",\"ext\":\"tar.gz\",\"size\":12345}" > "$D/wp__2026-09-05_00-00-00.php"
+printf "partial" > "$A/wp__2026-09-05_00-00-00.tar.gz"' >/dev/null 2>&1
+call lb_bad '{"jsonrpc":"2.0","id":257,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{"limit":100}}}'
+check "one unreadable record does not take out the listing" "$(verdict lb_bad)" "ok"
+check "control: both planted records really are in the listing" "$(lb "d['total']" lb_bad)" "$((LB_PRE + 2))"
+check "an undated entry reports no time rather than 1970" \
+  "$(lb "str(all(b['completed_gmt'] is None and b['age_hours'] is None for b in d['backups'] if b['completed'] is None))" lb_bad)" "True"
+check "and there really is such an entry, so that means something" \
+  "$(lb "str(any(b['completed'] is None for b in d['backups']))" lb_bad)" "True"
+check "each undated entry says why it has no time" \
+  "$(lb "str(all(b.get('note') for b in d['backups'] if b['completed'] is None))" lb_bad)" "True"
+check "and no filesystem path appears in the reply" "$(grep -c 'wp-content/plugins' "$OUT/lb_bad")" "0"
+docker compose exec -T cli bash -c 'rm -f /var/www/html/wp-content/backuply/backups_info-*/wp__2026-09-10_00-00-00.php /var/www/html/wp-content/backuply/backups-*/wp__2026-09-10_00-00-00.tar.gz /var/www/html/wp-content/backuply/backups_info-*/wp__2026-09-05_00-00-00.php /var/www/html/wp-content/backuply/backups-*/wp__2026-09-05_00-00-00.tar.gz' >/dev/null 2>&1
+
 # Reading is harmless, so this stays at read level and travels the URL-token route.
-call_url_token lb_ut '{"jsonrpc":"2.0","id":256,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{}}}'
+call_url_token lb_ut '{"jsonrpc":"2.0","id":259,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{}}}'
 check "listing is allowed over the URL-token route" "$(verdict lb_ut)" "ok"
 
 # With nothing it can enumerate, an empty list would be a lie. There must be no list.
 docker compose exec -T cli wp plugin deactivate backuply >/dev/null 2>&1
-call lb_none '{"jsonrpc":"2.0","id":257,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{}}}'
+call lb_none '{"jsonrpc":"2.0","id":260,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{}}}'
 check "with no provider it says it cannot list" "$(lb "str(d['can_list'])" lb_none)" "False"
 check "and returns no backups key at all, rather than an empty one" \
   "$(lb "str('backups' in d)" lb_none)" "False"
