@@ -113,6 +113,14 @@ diagnosis.
 If you find a stack in that state, do not reclaim it. Another session may be mid-run. Bring
 up your own project on a free port, verify there, and say what happened.
 
+The way this actually bites is not forgetting the variables on the first command. It is
+setting them up in a helper, working happily for an hour, and then typing one bare
+`docker compose exec -T cli wp ...` later in the same session. That one command silently
+addresses `wptest`, and it is usually a repair: restoring a fixture on the wrong site,
+leaving the real one broken, and turning the next suite run into a mystery. When a result
+does not make sense, `wp option get siteurl` says which site you are actually holding, and
+it costs nothing.
+
 ## Documentation
 
 Docs are part of the change, not a follow-up. The recurring failure here is narrower than
