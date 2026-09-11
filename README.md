@@ -146,15 +146,31 @@ description of the difference so a reader can see what moved. Two copies of the 
 would drift, and the day somebody added a field to one list the other would quietly stop
 mentioning it.
 
-Undo records modifications and not creations or deletions, and that is a real limit rather
-than a nicety. The capture layer reports both and the journal declines them: putting back
-a creation means deleting something, and putting back a deletion means recreating it, and
-neither is the same write in reverse. Users, comments, terms, plugins, themes and media
-are reported too and journalled none of them, for the same reason. Post meta is watched by
-nothing, because every post save writes `_edit_lock` and the noise would bury the signal.
-The audit log has all of it, which is the difference between the record and undo. Deleting
-a post without `force` puts it in the trash, where WordPress can restore it, which covers
+Undo records modifications and not creations or deletions of posts, and that is a real
+limit rather than a nicety. The capture layer reports both and the journal declines them:
+putting back a creation means deleting something, and putting back a deletion means
+recreating it, and neither is the same write in reverse. Users, comments, terms, plugins,
+themes and media are reported too and journalled none of them, for the same reason. The
+audit log has all of it, which is the difference between the record and undo. Deleting a
+post without `force` puts it in the trash, where WordPress can restore it, which covers
 the most common case by accident rather than by design.
+
+Post meta is journalled, and adding or removing a field is journalled with it, unlike a
+post. Those two really are the same write in reverse: the opposite of adding a key is
+removing it. It is journalled because on a page-builder site the meta *is* the work, and
+an undo log that covered everything except `_elementor_data` missed the changes that
+mattered most on exactly the sites this gets used to build. The noise that used to be the
+argument against it is handled by a short filterable list, `gmcp_meta_noise_keys`, holding
+the keys that say who is editing rather than what the post holds and the ones Elementor
+derives from the document and regenerates on demand.
+
+Previous meta values live in a table of their own rather than in the journal's option row,
+because `_elementor_data` runs past 100KB and the option's per-value ceiling is 64KB, so
+sharing the budget would have recorded every Elementor edit as too large to keep. The
+table is pruned by age and by total size on the same daily event the audit log uses, and a
+snapshot that has expired makes its entry report the copy as gone rather than silently
+putting back something stale. A value past a megabyte, or one whose key name or contents
+look like a credential, is recorded as changed with no copy kept and says which.
 
 Reverting is gated twice: on the tool that made the change, and on the operation the revert will perform, derived from the entry's own kind. Both are needed, because the recorded tool is whatever was in flight rather than what wrote the row. A plugin hooked on `save_post` that writes an option produces an option entry attributed to `wp_update_post`, and gating on that name alone let a write-level caller replay an admin-level option write.
 

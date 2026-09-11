@@ -105,6 +105,16 @@ class GMCP_Changes {
     add_action( 'post_updated', [ $this, 'post_changed' ], 10, 3 );
     add_action( 'wp_insert_post', [ $this, 'post_inserted' ], 10, 3 );
     add_action( 'deleted_post', [ $this, 'post_deleted' ], 10, 2 );
+
+    // Post meta, in pre/post pairs. The previous value only exists before the write, and
+    // whether the write happened at all is only known after: update_metadata() returns
+    // false and fires nothing when the new value equals the old, so recording at the
+    // pre-hook alone would journal edits that never occurred.
+    add_action( 'update_post_meta', [ $this, 'meta_before' ], 10, 4 );
+    add_action( 'updated_post_meta', [ $this, 'meta_updated' ], 10, 4 );
+    add_action( 'added_post_meta', [ $this, 'meta_added' ], 10, 4 );
+    add_action( 'delete_post_meta', [ $this, 'meta_delete_before' ], 10, 4 );
+    add_action( 'deleted_post_meta', [ $this, 'meta_deleted' ], 10, 4 );
     // An attachment is a post and fires neither of the two hooks above: wp_insert_post
     // branches for attachments and fires these instead. Listening to post_updated alone
     // meant an upload and a rename through the media tools both recorded nothing, which
@@ -133,9 +143,26 @@ class GMCP_Changes {
 
   #region The in-flight signal
 
+  /**
+  * An id for the call now starting, stamped on every record it produces.
+  *
+  * One tool call routinely changes several things: writing a page can move an option that
+  * some other plugin keeps in step with it, and a page-builder save writes a handful of
+  * meta keys. Those arrive as separate records, which is right, and then read as a list of
+  * unrelated events, which is wrong. The id is what lets the log say "these happened
+  * because of that one call" and what lets undo put a whole call back rather than asking
+  * somebody to spot its pieces among their neighbours.
+  */
+  private static $call = '';
+
+  public static function call_id(): string {
+    return self::$call;
+  }
+
   public function start( $tool ): void {
     self::$recording = true;
     self::$tool = (string) $tool;
+    self::$call = bin2hex( random_bytes( 5 ) );
     self::$seen = [];
     self::$overflow = 0;
     self::$before = [];
@@ -179,6 +206,7 @@ class GMCP_Changes {
   */
   private function record( array $record ): void {
     $record['tool'] = self::$tool;
+    $record['call'] = self::$call;
     // Counted past the cap, so a truncated summary can say how many were left out rather
     // than implying the call changed forty things exactly.
     if ( count( self::$seen ) < self::MAX_RECORDS ) {
@@ -373,6 +401,112 @@ class GMCP_Changes {
         'post_status' => [ 'from' => null, 'to' => $post->post_status ],
         'post_title' => [ 'from' => null, 'to' => $post->post_title ],
       ],
+    ] );
+  }
+
+  /**
+  * Meta keys that are bookkeeping rather than content.
+  *
+  * The same reasoning as is_noise() for options, and the list is short on purpose. Two
+  * kinds qualify: keys that say who is editing rather than what the post holds, and keys
+  * Elementor derives from _elementor_data and regenerates on demand. Journalling the
+  * derived ones would record a second, worse description of a change already recorded
+  * properly, and restoring one without the document it was derived from would put back a
+  * stylesheet that no longer matches the page.
+  *
+  * Filterable as a whole rather than as an addendum, so a site can remove an entry as
+  * well as add one. A key not listed here is journalled, which is the safe default: the
+  * cost of a needless entry is noise, and the cost of a missing one is an edit nobody can
+  * put back.
+  */
+  public static function meta_noise_keys(): array {
+    return (array) apply_filters( 'gmcp_meta_noise_keys', [
+      '_edit_lock', '_edit_last',
+      '_pingme', '_encloseme',
+      '_elementor_css', '_elementor_page_assets', '_elementor_controls_usage',
+      '_elementor_inspector_data', '_elementor_element_cache',
+    ] );
+  }
+
+  /** Whether a meta write is worth recording at all. */
+  private function skip_meta( $object_id, $meta_key ): bool {
+    if ( !self::$recording || !is_string( $meta_key ) || $meta_key === '' ) {
+      return true;
+    }
+    if ( in_array( $meta_key, self::meta_noise_keys(), true ) ) {
+      return true;
+    }
+    $post = get_post( (int) $object_id );
+    return !$post || $this->skip_post( $post );
+  }
+
+  /** Where a pre-hook leaves the previous value for its matching post-hook. */
+  private function meta_stash_key( $object_id, $meta_key ): string {
+    return 'meta:' . (int) $object_id . ':' . $meta_key;
+  }
+
+  public function meta_before( $meta_id, $object_id, $meta_key, $meta_value ): void {
+    if ( $this->skip_meta( $object_id, $meta_key ) ) {
+      return;
+    }
+    // Read before the write, because afterwards it is gone. single = true matches how
+    // update_post_meta() without a prior value behaves and how undo will write it back.
+    self::$before[ $this->meta_stash_key( $object_id, $meta_key ) ] = [
+      'value' => get_post_meta( (int) $object_id, $meta_key, true ),
+      'existed' => metadata_exists( 'post', (int) $object_id, $meta_key ),
+    ];
+  }
+
+  public function meta_updated( $meta_id, $object_id, $meta_key, $meta_value ): void {
+    if ( $this->skip_meta( $object_id, $meta_key ) ) {
+      return;
+    }
+    $stash = self::$before[ $this->meta_stash_key( $object_id, $meta_key ) ] ?? null;
+    unset( self::$before[ $this->meta_stash_key( $object_id, $meta_key ) ] );
+    $this->record_meta( (int) $object_id, $meta_key, 'updated', $stash['value'] ?? null, !empty( $stash['existed'] ) );
+  }
+
+  public function meta_added( $meta_id, $object_id, $meta_key, $meta_value ): void {
+    if ( $this->skip_meta( $object_id, $meta_key ) ) {
+      return;
+    }
+    // Nothing was there. Recorded as a distinct state rather than as "was empty", or undo
+    // leaves a row behind that the post never had.
+    $this->record_meta( (int) $object_id, $meta_key, 'created', null, false );
+  }
+
+  public function meta_delete_before( $meta_ids, $object_id, $meta_key, $meta_value ): void {
+    if ( $this->skip_meta( $object_id, $meta_key ) ) {
+      return;
+    }
+    self::$before[ $this->meta_stash_key( $object_id, $meta_key ) ] = [
+      'value' => get_post_meta( (int) $object_id, $meta_key, true ),
+      'existed' => metadata_exists( 'post', (int) $object_id, $meta_key ),
+    ];
+  }
+
+  public function meta_deleted( $meta_ids, $object_id, $meta_key, $meta_value ): void {
+    if ( $this->skip_meta( $object_id, $meta_key ) ) {
+      return;
+    }
+    $stash = self::$before[ $this->meta_stash_key( $object_id, $meta_key ) ] ?? null;
+    unset( self::$before[ $this->meta_stash_key( $object_id, $meta_key ) ] );
+    $this->record_meta( (int) $object_id, $meta_key, 'deleted', $stash['value'] ?? null, !empty( $stash['existed'] ) );
+  }
+
+  private function record_meta( int $post_id, string $meta_key, string $op, $previous, bool $existed ): void {
+    $post = get_post( $post_id );
+    $this->record( [
+      'kind' => 'meta',
+      'op' => $op,
+      'id' => $post_id,
+      'subject' => $post ? $this->post_subject( $post ) : 'post',
+      'label' => $post ? $this->post_label( $post ) : (string) $post_id,
+      'meta_key' => $meta_key,
+      'existed' => $existed,
+      // Carried whole rather than diffed. A meta value has no fields to compare and the
+      // journal needs the previous value itself to put it back.
+      'previous' => $previous,
     ] );
   }
 

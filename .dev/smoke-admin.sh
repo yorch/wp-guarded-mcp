@@ -2018,5 +2018,119 @@ check "the token completes it" "$(verdict cr_drop2)" "ok"
 check "and the event is gone" \
   "$(docker compose exec -T cli wp cron event list --fields=hook --format=csv 2>/dev/null | grep -c '^smoke_test_event$' | tr -d '\r\n')" "0"
 
+echo "-- the journal watches post meta --"
+# On a page-builder site the meta IS the work, so an undo log covering everything except
+# _elementor_data missed the changes that mattered most on the sites this gets used to
+# build. Previous values live in a table of their own: the journal's option row caps a
+# single value at 64KB and an Elementor document runs past 100KB, so sharing the budget
+# would have recorded every one of them as too large to keep.
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+JM_ID=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Journal meta probe","post_type"=>"page","post_status"=>"publish"]);' 2>/dev/null | tr -d '\r\n')
+# Seeded with wp_slash, the way the plugin's own writer does it. Without that
+# update_post_meta unslashes the fixture and the test measures a corrupt seed.
+docker compose exec -T cli wp eval "
+  update_post_meta($JM_ID, 'jm_plain', 'ORIGINAL');
+  update_post_meta($JM_ID, 'jm_slash', wp_slash([ 'sl' => 'C:' . chr(92) . 'path' ]));
+  update_post_meta($JM_ID, 'api_key', 'JM-LIVE-SECRET');
+  update_post_meta($JM_ID, 'jm_big', str_repeat('B', 1200000));
+  update_post_meta($JM_ID, '_edit_lock', '123:1');" >/dev/null 2>&1
+
+jm_call() { # jm_call <file> <id> <arguments json>
+  call "$1" "{\"jsonrpc\":\"2.0\",\"id\":$2,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post_meta\",\"arguments\":$3}}"
+}
+jm_call jm_w1 300 "{\"ID\":$JM_ID,\"key\":\"jm_plain\",\"value\":\"CHANGED\"}"
+jm_call jm_w2 301 "{\"ID\":$JM_ID,\"key\":\"jm_new\",\"value\":\"FRESH\"}"
+jm_call jm_w3 302 "{\"ID\":$JM_ID,\"key\":\"api_key\",\"value\":\"ROTATED\"}"
+jm_call jm_w4 303 "{\"ID\":$JM_ID,\"key\":\"_edit_lock\",\"value\":\"456:2\"}"
+# Through the API, not wp eval: the journal records writes a tool call made, so a fixture
+# written straight to the database is not journalled and the undo below would have nothing
+# to find. The first version of this block did that and reported the restore as mangled
+# when in truth it had never run.
+jm_call jm_wslash 313 "{\"ID\":$JM_ID,\"key\":\"jm_slash\",\"value\":{\"sl\":\"OVERWRITTEN\"}}"
+call jm_list '{"jsonrpc":"2.0","id":304,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":40}}}'
+jm_field() { py "import json,sys,re
+rows = json.loads(json.load(sys.stdin)['result']['content'][0]['text'])
+hit = [r for r in rows if 'custom field \"$1\"' in r['what']]
+print(hit[0][$2] if hit else 'MISSING')" jm_list; }
+
+check "an edited field is journalled" "$(jm_field jm_plain "'reversible'")" "True"
+check "and adding a field is journalled as added" \
+  "$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(any('\"jm_new\" added' in r['what'] for r in rows))" jm_list)" "True"
+# The control for the two absence checks below: the probe finds a key that IS journalled,
+# so a key it cannot find is one that was skipped rather than one it cannot see.
+check "CONTROL: the probe can find a journalled field" "$(jm_field jm_plain "'what'")" \
+  "Page \"Journal meta probe\" custom field \"jm_plain\" changed"
+# Keys that say who is editing rather than what the post holds. Journalling these buries
+# the signal: every post save writes one.
+check "a noise key is not journalled at all" "$(jm_field _edit_lock "'what'")" "MISSING"
+check "a credential-shaped key is recorded but its value is not kept" \
+  "$(jm_field api_key "'not_reversible_because'")" \
+  "The previous value looked like it held a credential, so it was never stored."
+# The bound that makes a table safe to keep at all. Written through the API for the same
+# reason as above, with the body built in Python because a megabyte does not belong on a
+# command line.
+python3 - "$OUT" "$JM_ID" <<'PYBIG'
+import json, sys
+out, pid = sys.argv[1], int(sys.argv[2])
+open(out + '/jm_big.json', 'w').write(json.dumps(
+    {"jsonrpc": "2.0", "id": 305, "method": "tools/call",
+     "params": {"name": "wp_update_post_meta",
+                "arguments": {"ID": pid, "key": "jm_big", "value": "C" * 1200000}}}))
+PYBIG
+curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' -d @"$OUT/jm_big.json" -o "$OUT/jm_big"
+call jm_list2 '{"jsonrpc":"2.0","id":306,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":40}}}'
+check "an oversized value is recorded without a copy" \
+  "$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);hit=[r for r in rows if 'jm_big' in r['what']];print('past the limit' in hit[0].get('not_reversible_because','') if hit else 'MISSING')" jm_list2)" "True"
+check "and neither the secret nor the oversized value reached the snapshot table" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb; $t = GMCP_Journal::snapshot_table();
+      $all = implode( "", (array) $wpdb->get_col( "SELECT CONCAT(meta_key, COALESCE(meta_value,\"\")) FROM $t" ) );
+      $hit = 0;
+      if ( strpos( $all, "JM-LIVE-SECRET" ) !== false ) { $hit++; }
+      if ( strpos( $all, str_repeat( "B", 1000 ) ) !== false ) { $hit++; }
+      echo $hit;' 2>/dev/null | tr -d '\r\n')" "0"
+# A scan over an empty table reports everything safe, so prove the table has content.
+check "CONTROL: the snapshot table did record the other fields" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb; echo (int) $wpdb->get_var( "SELECT COUNT(*) FROM " . GMCP_Journal::snapshot_table() ) > 0 ? 1 : 0;' 2>/dev/null | tr -d '\r\n')" "1"
+
+JM_UNDO=$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next(r['id'] for r in rows if 'jm_plain' in r['what']))" jm_list)
+call jm_rev "{\"jsonrpc\":\"2.0\",\"id\":306,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$JM_UNDO\"}}}"
+check "undo puts a field back" \
+  "$(docker compose exec -T cli wp eval "echo get_post_meta($JM_ID,'jm_plain',true);" 2>/dev/null | tr -d '\r\n')" "ORIGINAL"
+JM_ADDED=$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next(r['id'] for r in rows if 'jm_new' in r['what']))" jm_list)
+call jm_rev2 "{\"jsonrpc\":\"2.0\",\"id\":307,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$JM_ADDED\"}}}"
+# Absent is its own state. Restoring an empty string would leave a row the post never had.
+check "and undoing an added field removes the row rather than emptying it" \
+  "$(docker compose exec -T cli wp eval "echo metadata_exists('post',$JM_ID,'jm_new') ? 'present' : 'gone';" 2>/dev/null | tr -d '\r\n')" "gone"
+JM_SLASH=$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next(r['id'] for r in rows if 'jm_slash' in r['what']))" jm_list)
+call jm_rev3 "{\"jsonrpc\":\"2.0\",\"id\":308,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$JM_SLASH\"}}}"
+# update_post_meta unslashes what it is handed, so a restore without wp_slash puts back a
+# corrupted copy of a value that was recorded correctly.
+check "and a restored value keeps its backslashes" \
+  "$(docker compose exec -T cli wp eval "
+      \$v = get_post_meta($JM_ID, 'jm_slash', true);
+      echo is_array( \$v ) && \$v['sl'] === 'C:' . chr(92) . 'path' ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
+
+echo "-- one call, one unit of undo --"
+# A single call routinely changes several things and they read as unrelated events without
+# a shared id.
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+docker compose exec -T cli wp eval "
+  update_post_meta($JM_ID,'g_a','A1'); update_post_meta($JM_ID,'g_b','B1'); update_post_meta($JM_ID,'g_c','C1');" >/dev/null 2>&1
+jm_call jm_grp 309 "{\"ID\":$JM_ID,\"meta\":{\"g_a\":\"A2\",\"g_b\":\"B2\",\"g_c\":\"C2\"}}"
+call jm_glist '{"jsonrpc":"2.0","id":310,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":40}}}'
+check "three writes in one call share one call id" \
+  "$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);g=[r for r in rows if r['what'].count('custom field') and r['what'].split('custom field ')[1][1] == 'g'];print(len({r['call'] for r in g}))" jm_glist)" "1"
+JM_CALL=$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(rows[0]['call'])" jm_glist)
+call jm_grev "{\"jsonrpc\":\"2.0\",\"id\":311,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"call\":\"$JM_CALL\"}}}"
+check "and undoing the call puts all three back" \
+  "$(docker compose exec -T cli wp eval "echo get_post_meta($JM_ID,'g_a',true) . get_post_meta($JM_ID,'g_b',true) . get_post_meta($JM_ID,'g_c',true);" 2>/dev/null | tr -d '\r\n')" "A1B1C1"
+# The two mean different amounts of undo, and guessing which was meant is the wrong way to
+# be helpful about a write.
+call jm_both '{"jsonrpc":"2.0","id":312,"method":"tools/call","params":{"name":"wp_undo_change","arguments":{"id":"x","call":"y"}}}'
+check "passing both id and call is refused" \
+  "$(py "import json,sys;print('not both' in json.load(sys.stdin)['result']['content'][0]['text'])" jm_both)" "True"
+docker compose exec -T cli wp post delete "$JM_ID" --force >/dev/null 2>&1
+
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

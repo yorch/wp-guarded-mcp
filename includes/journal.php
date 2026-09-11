@@ -61,8 +61,107 @@ class GMCP_Journal {
   /** And the whole row stays under this, however few entries that turns out to be. */
   const MAX_TOTAL = 512000;
 
+  /**
+  * Post meta gets a table of its own rather than a place in the option row above.
+  *
+  * The limits above exist because the journal is a single option, and they are the right
+  * limits for one. They are the wrong limits for meta: _elementor_data runs past 100KB
+  * routinely, which is larger than MAX_VALUE, so every Elementor edit would have been
+  * recorded as "too large to keep" and the undo that motivated journalling meta at all
+  * would never have worked once. Raising MAX_VALUE instead would let two or three page
+  * edits evict every option and post entry from a shared budget.
+  *
+  * So the entry stays in the option, small, and points at a row here. The two are kept
+  * consistent by reversible(), which treats a missing snapshot as a pruned one and says
+  * so, rather than by assuming a pointer always resolves.
+  */
+  const SNAP_DB_VERSION = '1';
+  const SNAP_VERSION_OPTION = 'gmcp_journal_db_version';
+  /** A single value larger than this is recorded as changed and not copied. */
+  const SNAP_MAX_VALUE = 1048576;
+  /** The whole snapshot table stays under this. */
+  const SNAP_MAX_BYTES = 16777216;
+  const SNAP_RETENTION_DAYS = 14;
+
   public function __construct() {
     add_action( 'gmcp_change', [ $this, 'observe' ], 10, 1 );
+    if ( get_option( self::SNAP_VERSION_OPTION ) !== self::SNAP_DB_VERSION ) {
+      self::install();
+    }
+    // Hung on the audit log's daily event rather than scheduling a second one. That event
+    // is scheduled on activation whether or not the audit log is switched on, so this
+    // prunes even on a site that keeps no activity log, and a site with both gets one
+    // wake-up instead of two.
+    add_action( GMCP_Audit::CRON_HOOK, [ __CLASS__, 'prune_snapshots' ] );
+  }
+
+  public static function snapshot_table(): string {
+    global $wpdb;
+    return $wpdb->prefix . 'gmcp_meta_snapshots';
+  }
+
+  /**
+  * Create or update the snapshot table.
+  *
+  * dbDelta is fussy in the ways GMCP_Audit::install() records: two spaces after PRIMARY
+  * KEY, KEY rather than INDEX, lowercase types.
+  *
+  * meta_key is indexed at a prefix length. WordPress allows 255 characters there and
+  * utf8mb4 makes that 1020 bytes, past InnoDB's 767-byte limit on older row formats, so
+  * an unbounded key silently fails to create on exactly the installs least able to
+  * diagnose it.
+  */
+  public static function install(): void {
+    global $wpdb;
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    $table = self::snapshot_table();
+    $collate = $wpdb->get_charset_collate();
+    dbDelta( "CREATE TABLE {$table} (
+      id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+      entry_id varchar(32) NOT NULL DEFAULT '',
+      ts datetime NOT NULL,
+      post_id bigint(20) unsigned NOT NULL DEFAULT 0,
+      meta_key varchar(255) NOT NULL DEFAULT '',
+      meta_value longtext NULL,
+      was_absent tinyint(1) NOT NULL DEFAULT 0,
+      bytes int(10) unsigned NOT NULL DEFAULT 0,
+      PRIMARY KEY  (id),
+      KEY entry_id (entry_id),
+      KEY ts (ts),
+      KEY post_meta (post_id,meta_key(191))
+    ) {$collate};" );
+    update_option( self::SNAP_VERSION_OPTION, self::SNAP_DB_VERSION, false );
+  }
+
+  /**
+  * Keep the snapshot table inside its bounds: age first, then total bytes.
+  *
+  * Age first because it is the cheap bound and usually the only one that does anything.
+  * Bytes last because it is the one that removes something recent, and dropping by age
+  * may already have solved it.
+  *
+  * A pruned snapshot does not remove its journal entry. The entry is the record that the
+  * change happened, which stays true; only the ability to put it back expires, and
+  * reversible() says so in those words rather than reporting a change that never was.
+  */
+  public static function prune_snapshots(): array {
+    global $wpdb;
+    $table = self::snapshot_table();
+    $removed = [ 'age' => 0, 'bytes' => 0 ];
+
+    $cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::SNAP_RETENTION_DAYS * DAY_IN_SECONDS ) );
+    $removed['age'] = (int) $wpdb->query( $wpdb->prepare( "DELETE FROM {$table} WHERE ts < %s", $cutoff ) );
+
+    $guard = 0;
+    while ( (int) $wpdb->get_var( "SELECT COALESCE(SUM(bytes),0) FROM {$table}" ) > self::SNAP_MAX_BYTES && $guard < 200 ) {
+      $dropped = (int) $wpdb->query( "DELETE FROM {$table} ORDER BY id ASC LIMIT 20" );
+      if ( $dropped === 0 ) {
+        break;
+      }
+      $removed['bytes'] += $dropped;
+      $guard++;
+    }
+    return $removed;
   }
 
   /**
@@ -74,6 +173,9 @@ class GMCP_Journal {
   public function observe( $change ): void {
     if ( !is_array( $change ) ) {
       return;
+    }
+    if ( ( $change['kind'] ?? '' ) === 'meta' ) {
+      $this->observe_meta( $change );
     }
     if ( ( $change['kind'] ?? '' ) === 'option' ) {
       $this->observe_option( $change );
@@ -141,6 +243,7 @@ class GMCP_Journal {
       'key' => $key,
       'what' => "Option \"{$key}\" changed",
       'tool' => (string) ( $change['tool'] ?? '' ),
+      'call' => (string) ( $change['call'] ?? '' ),
     ];
     if ( GMCP_Core::holds_credential( $old ) ) {
       // Keep the shape with the secret-looking leaves blanked, rather than dropping the
@@ -168,6 +271,106 @@ class GMCP_Journal {
   }
 
   /**
+  * One post meta write.
+  *
+  * Unlike a post edit, all three operations are recorded here. Creating a meta row and
+  * deleting one are both reversible in a way that creating or deleting a post is not:
+  * the opposite of adding a key is removing it, and the opposite of removing one is
+  * writing the value back. "Previously absent" is kept as its own state so undo removes
+  * the row rather than leaving an empty one the post never had.
+  *
+  * The value goes in the snapshot table and the entry keeps only a pointer, for the
+  * reason SNAP_MAX_VALUE gives. Nothing credential-shaped goes in either: the same test
+  * the option side uses is asked here, so the two subsystems cannot disagree about what
+  * counts as a secret.
+  */
+  private function observe_meta( array $change ): void {
+    $post_id = (int) ( $change['id'] ?? 0 );
+    $meta_key = (string) ( $change['meta_key'] ?? '' );
+    $op = (string) ( $change['op'] ?? '' );
+    if ( $post_id <= 0 || $meta_key === '' ) {
+      return;
+    }
+
+    $verb = [ 'created' => 'added', 'updated' => 'changed', 'deleted' => 'removed' ][ $op ] ?? null;
+    if ( $verb === null ) {
+      return;
+    }
+
+    $entry = [
+      'kind' => 'meta',
+      'ID' => $post_id,
+      'key' => $meta_key,
+      'what' => ucfirst( (string) ( $change['subject'] ?? 'post' ) ) . ' "'
+        . mb_substr( (string) ( $change['label'] ?? '' ), 0, 60 ) . '" custom field "'
+        . $meta_key . '" ' . $verb,
+      'absent' => empty( $change['existed'] ),
+      'tool' => (string) ( $change['tool'] ?? '' ),
+      'call' => (string) ( $change['call'] ?? '' ),
+    ];
+
+    // A key whose NAME looks like a credential, or a value that holds one, is recorded as
+    // changed and its previous value is not kept. Same answer as the option side, asked of
+    // the same functions, so the journal cannot protect a secret in an option and copy the
+    // same secret out of a meta row.
+    $previous = $change['previous'] ?? null;
+    if ( GMCP_Core::field_looks_secret( $meta_key ) || GMCP_Core::holds_credential( $previous ) ) {
+      $entry['redacted'] = true;
+      $this->record( $entry );
+      return;
+    }
+
+    // Nothing to keep for a key that was not there. The absent flag is the whole record.
+    if ( !empty( $entry['absent'] ) ) {
+      $entry['snapshot'] = 0;
+      $this->record( $entry );
+      return;
+    }
+
+    $serialized = maybe_serialize( $previous );
+    $bytes = strlen( (string) $serialized );
+    if ( $bytes > self::SNAP_MAX_VALUE ) {
+      $entry['too_large'] = $bytes;
+      $this->record( $entry );
+      return;
+    }
+
+    // The id is minted before the row is written so the snapshot can carry it, which is
+    // what lets a pruned snapshot be told apart from an entry that never had one.
+    $entry['id'] = bin2hex( random_bytes( 5 ) );
+    global $wpdb;
+    $wpdb->insert( self::snapshot_table(), [
+      'entry_id' => $entry['id'],
+      'ts' => gmdate( 'Y-m-d H:i:s' ),
+      'post_id' => $post_id,
+      'meta_key' => $meta_key,
+      'meta_value' => $serialized,
+      'was_absent' => 0,
+      'bytes' => $bytes,
+    ] );
+    $entry['snapshot'] = (int) $wpdb->insert_id;
+    $this->record( $entry );
+  }
+
+  /** The stored previous value for an entry, or null when there is no usable snapshot. */
+  private static function snapshot_for( string $entry_id ) {
+    global $wpdb;
+    $row = $wpdb->get_row( $wpdb->prepare(
+      "SELECT meta_value FROM " . self::snapshot_table() . " WHERE entry_id = %s ORDER BY id DESC LIMIT 1",
+      $entry_id
+    ) );
+    return $row ? maybe_unserialize( $row->meta_value ) : null;
+  }
+
+  private static function snapshot_exists( string $entry_id ): bool {
+    global $wpdb;
+    return (int) $wpdb->get_var( $wpdb->prepare(
+      "SELECT COUNT(*) FROM " . self::snapshot_table() . " WHERE entry_id = %s",
+      $entry_id
+    ) ) > 0;
+  }
+
+  /**
   * An edited post. Creations and deletions go past: this restores fields, and neither of
   * those is a field to restore.
   */
@@ -188,6 +391,7 @@ class GMCP_Journal {
       'fields' => $changed,
       'previous' => [],
       'tool' => (string) ( $change['tool'] ?? '' ),
+      'call' => (string) ( $change['call'] ?? '' ),
     ];
     foreach ( $change['fields'] as $field => $pair ) {
       $entry['previous'][ $field ] = $this->storable( $pair['from'] ?? null );
@@ -264,7 +468,13 @@ class GMCP_Journal {
   private function record( array $entry ): void {
     $entry['t'] = time();
     $entry['tool'] = (string) ( $entry['tool'] ?? '' );
-    $entry['id'] = bin2hex( random_bytes( 5 ) );
+    $entry['call'] = (string) ( $entry['call'] ?? GMCP_Changes::call_id() );
+    // Minted here unless the caller already has one. A meta entry writes its snapshot row
+    // before the entry exists and has to carry the id it used, or the row and the entry
+    // reference different ids and every meta undo reports its snapshot pruned.
+    if ( empty( $entry['id'] ) ) {
+      $entry['id'] = bin2hex( random_bytes( 5 ) );
+    }
 
     $log = get_option( self::OPTION, [] );
     $log = is_array( $log ) ? $log : [];
@@ -296,6 +506,9 @@ class GMCP_Journal {
         'id' => $entry['id'] ?? '',
         'when' => gmdate( 'Y-m-d H:i', (int) ( $entry['t'] ?? 0 ) ) . ' GMT',
         'tool' => $entry['tool'] ?? '',
+        // Entries sharing a call came from one tool call. A page build writes several
+        // things and they read as unrelated events without this.
+        'call' => $entry['call'] ?? '',
         'what' => $entry['what'] ?? '',
         'reversible' => self::reversible( $entry ) === true,
       ];
@@ -338,6 +551,25 @@ class GMCP_Journal {
         ? true
         : 'That option is protected.';
     }
+    if ( ( $entry['kind'] ?? '' ) === 'meta' ) {
+      if ( !get_post( (int) $entry['ID'] ) ) {
+        return 'The post no longer exists.';
+      }
+      if ( !empty( $entry['redacted'] ) ) {
+        return 'The previous value looked like it held a credential, so it was never stored.';
+      }
+      if ( !empty( $entry['too_large'] ) ) {
+        return 'The previous value was ' . (int) $entry['too_large'] . ' bytes, past the limit for keeping a copy.';
+      }
+      // Absent needs no snapshot: undo removes the row. Anything else does, and a snapshot
+      // that has been pruned is a real state rather than an error, so it is named as one.
+      if ( !empty( $entry['absent'] ) ) {
+        return true;
+      }
+      return self::snapshot_exists( (string) ( $entry['id'] ?? '' ) )
+        ? true
+        : 'The stored copy of the previous value has passed its retention window and been removed.';
+    }
     if ( ( $entry['kind'] ?? '' ) === 'post' ) {
       if ( !get_post( (int) $entry['ID'] ) ) {
         return 'The post no longer exists.';
@@ -374,6 +606,10 @@ class GMCP_Journal {
     $byKind = [
       'option' => 'wp_update_option',
       'post' => 'wp_update_post',
+      // Named for the operation the revert performs, not for the tool that happened to be
+      // in flight. Putting a meta row back is a meta write, and a caller who cannot make
+      // one has no business making it backwards.
+      'meta' => 'wp_update_post_meta',
     ];
     $tools = [];
     $kind = (string) ( $entry['kind'] ?? '' );
@@ -396,6 +632,67 @@ class GMCP_Journal {
   *
   * @return array{ok:bool,message:string}
   */
+  /**
+  * Put back everything one tool call changed, newest first.
+  *
+  * One call routinely changes several things, and reverting them one at a time means
+  * spotting its pieces among their neighbours and getting the order right. Newest first
+  * matters: two entries can touch the same row, and replaying them oldest first leaves the
+  * value the call set rather than the value it found.
+  *
+  * Partial success is reported rather than hidden. An entry can be individually
+  * irreversible, a credential-shaped value or an expired snapshot among the reasons, and
+  * saying "reverted" over a call that was only partly put back is the kind of claim this
+  * plugin exists not to make.
+  *
+  * @return array{ok:bool,message:string}
+  */
+  public static function revert_call( string $call ): array {
+    if ( $call === '' ) {
+      return [ 'ok' => false, 'message' => 'A call id is required.' ];
+    }
+    $log = get_option( self::OPTION, [] );
+    $log = is_array( $log ) ? $log : [];
+
+    $ids = [];
+    foreach ( $log as $entry ) {
+      if ( (string) ( $entry['call'] ?? '' ) === $call && empty( $entry['undone'] ) ) {
+        $ids[] = (string) $entry['id'];
+      }
+    }
+    if ( !$ids ) {
+      return [
+        'ok' => false,
+        'message' => "No changes are on record for call \"{$call}\" that have not already been reverted. Call wp_list_changes to see what is there.",
+      ];
+    }
+
+    $done = [];
+    $failed = [];
+    foreach ( array_reverse( $ids ) as $one ) {
+      $result = self::revert( $one );
+      if ( !empty( $result['ok'] ) ) {
+        $done[] = $result['message'];
+      }
+      else {
+        $failed[] = $one . ': ' . $result['message'];
+      }
+    }
+
+    $lines = [ count( $done ) . ' of ' . count( $ids ) . ' change(s) from that call were put back.' ];
+    foreach ( $done as $line ) {
+      $lines[] = '- ' . $line;
+    }
+    if ( $failed ) {
+      $lines[] = '';
+      $lines[] = 'Not put back:';
+      foreach ( $failed as $line ) {
+        $lines[] = '- ' . $line;
+      }
+    }
+    return [ 'ok' => !empty( $done ), 'message' => implode( "\n", $lines ) ];
+  }
+
   public static function revert( string $id ): array {
     $log = get_option( self::OPTION, [] );
     $log = is_array( $log ) ? $log : [];
@@ -435,7 +732,26 @@ class GMCP_Journal {
       $was = GMCP_Changes::pause();
 
       $done = '';
-      if ( $entry['kind'] === 'option' ) {
+      if ( $entry['kind'] === 'meta' ) {
+        $meta_post = (int) $entry['ID'];
+        $meta_key = (string) $entry['key'];
+        if ( !empty( $entry['absent'] ) ) {
+          // It was not there before, so putting it back means removing it. Every row for
+          // the key goes, which is what "absent" described.
+          delete_post_meta( $meta_post, $meta_key );
+          $done = 'Custom field "' . $meta_key . '" removed from post ' . $meta_post . ', which is what it was before.';
+        }
+        else {
+          // wp_slash for the reason prepare_meta_value() gives: update_post_meta()
+          // unslashes what it is handed, so restoring a JSON or regex value without this
+          // puts back a corrupted copy of what was recorded correctly.
+          $meta_value = self::snapshot_for( (string) $entry['id'] );
+          update_post_meta( $meta_post, $meta_key, wp_slash( $meta_value ) );
+          $done = 'Custom field "' . $meta_key . '" on post ' . $meta_post . ' restored to its previous value.';
+        }
+        clean_post_cache( $meta_post );
+      }
+      elseif ( $entry['kind'] === 'option' ) {
         // An undo is still a write, and the same policy applies to it. Being able to
         // call wp_update_option is not the same as being allowed to make this write:
         // a site whose default_role was already an editing role would otherwise have
