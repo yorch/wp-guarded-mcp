@@ -160,6 +160,25 @@ class GMCP_Audit {
     foreach ( self::IDENTIFIER_ARGS as $field ) {
       if ( isset( $args[ $field ] ) && is_scalar( $args[ $field ] ) ) {
         $redacted[ $field ] = $args[ $field ];
+
+        // A call that names a thing and supplies its content: if the NAME is
+        // credential-shaped then the content is a credential, however innocent the
+        // argument holding it looks. wp_update_option passes the option name as "key"
+        // and the secret as "value", and "value" matches no pattern, so a password
+        // written to smtp_pwd was recorded in the clear for the full retention window.
+        //
+        // The write itself is allowed because option_guard's list, which gates reads and
+        // writes, is deliberately narrower than the field-name list, which only decides
+        // what gets written down. That asymmetry is right, and it is exactly why the
+        // recording side has to look at the name rather than only at the field it arrives
+        // under.
+        if ( GMCP_Core::field_looks_secret( (string) $args[ $field ] ) ) {
+          foreach ( [ 'value', 'meta_value', 'option_value' ] as $companion ) {
+            if ( array_key_exists( $companion, $redacted ) ) {
+              $redacted[ $companion ] = '[redacted]';
+            }
+          }
+        }
       }
     }
     $json = wp_json_encode( $redacted, JSON_UNESCAPED_SLASHES );

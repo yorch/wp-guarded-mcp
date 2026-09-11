@@ -801,6 +801,23 @@ check "but harmless arguments are, so the scan works" "$(leaked_audit au@example
 # The credential patterns suit field names inside a value, where "key" is a good signal.
 # At the top level it is the option's NAME, and redacting it leaves an entry saying an
 # option changed without saying which.
+# A call that names a thing and supplies its content: if the NAME is credential-shaped
+# then the content is a credential, whatever the argument holding it is called.
+# wp_update_option passes the name as "key" and the secret as "value", and "value" matches
+# no pattern, so a password written to smtp_pwd was kept in the clear for ninety days. The
+# write is allowed because option_guard's list is deliberately narrower than the field-name
+# list, which is right, and is exactly why the recording side must look at the name.
+call c_named '{"jsonrpc":"2.0","id":166,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"smtp_pwd","value":"PWDMUSTNOTAPPEAR"}}}'
+call c_plainopt '{"jsonrpc":"2.0","id":167,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"blogdescription","value":"an ordinary setting"}}}'
+check "a value under a credential-shaped option name is not recorded" "$(leaked PWDMUSTNOTAPPEAR)" "0"
+# Two controls. The option name must survive, or the entry says nothing useful; and an
+# ordinary value must survive, or the check above would pass by redacting everything.
+check "but the option name still is" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)(bool)$wpdb->get_var("SELECT id FROM {$wpdb->prefix}gmcp_audit WHERE args LIKE \"%smtp_pwd%\"");' 2>/dev/null | tr -d '\r\n')" "1"
+check "and an ordinary value is not over-redacted" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)(bool)$wpdb->get_var("SELECT id FROM {$wpdb->prefix}gmcp_audit WHERE args LIKE \"%an ordinary setting%\"");' 2>/dev/null | tr -d '\r\n')" "1"
+docker compose exec -T cli wp option delete smtp_pwd >/dev/null 2>&1
+
 check "the option name stays readable" \
   "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)(bool)$wpdb->get_var("SELECT id FROM {$wpdb->prefix}gmcp_audit WHERE args LIKE \"%acme_gw%\"");' 2>/dev/null | tr -d '\r\n')" "1"
 
