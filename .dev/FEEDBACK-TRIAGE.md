@@ -19,14 +19,19 @@ Five of the twelve are fixed on this branch, each with tests proven to fail with
 fix and both readmes brought along. A sixth defect was found in the test harness while
 clearing the suites and fixed too.
 
+Commits are named by their subject rather than by a hash. This branch has been rebased
+twice and every hash recorded here died with the first one, still resolving locally while
+pointing at commits no longer in the history they claim to describe. A subject survives a
+rewrite; a short hash does not.
+
 | Item | State |
 |---|---|
-| 1, result shape | fixed, `1f4c1a7` |
-| 2, credential guard | fixed, `219b86d`, by blanking the leaves rather than either option proposed below |
-| 3, meta corruption | fixed, `ced2dff` |
-| 11, field selection | fixed, `e9ccfdf`, by declaring `_fields` rather than building anything |
-| 12, server-side half | fixed, `a076de1`; the client notification is still open |
-| the WooCommerce mutation probe | fixed, `97d7e9b`; it silently never installed, so two assertions reported a bug that was not there |
+| 1, result shape | fixed, `fix(server): recognise an MCP envelope by shape, not by a key name` |
+| 2, credential guard | fixed, `fix(journal): blank the credential-shaped leaves instead of dropping the value`, by blanking the leaves rather than either option proposed below |
+| 3, meta corruption | fixed, `fix(tools): stop wp_update_post_meta silently stripping backslashes` |
+| 11, field selection | fixed, `feat(tools): declare _fields on the generated REST tools`, by declaring `_fields` rather than building anything |
+| 12, server-side half | fixed, `fix(core): throw the generated tool cache away when the version changes`; the client notification is still open |
+| the WooCommerce mutation probe | fixed, `test(woo): install the mutation probe instead of assuming a directory`; it silently never installed, so two assertions reported a bug that was not there. Note that main fixed the same directory bug independently, so what this commit still contributes is the control check proving the probe is present |
 
 Everything else below is untouched and still describes what is true today.
 
