@@ -67,7 +67,9 @@ test then reports a code fault that is a seeding fault.
 
 The suites live in `.dev/`. `smoke.sh` covers transport, auth, content tools, prompts and
 resources. `smoke-admin.sh` covers the administration tools and every guard, and is
-destructive. `smoke-woo.sh` covers the shop tools. Run all three before committing.
+destructive. `smoke-woo.sh` covers the shop tools, and `smoke-elementor.sh` covers the Elementor tools.
+Run all four before committing. The last two need their plugin installed and say so and
+exit rather than reporting failures against a site that simply does not have it.
 
 **A test for a guard must not depend on that guard.** Read the value, make the hostile
 call, read it back, **put it back**, and only then compare. The first version of the
