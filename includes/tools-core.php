@@ -28,6 +28,37 @@ class GMCP_Tools_Core {
     }
     $r['result']['content'][] = [ 'type' => 'text', 'text' => $text ];
   }
+
+  /**
+  * A tool failure the model is supposed to read and act on.
+  *
+  * These used to be JSON-RPC errors. A protocol error carries no result at all, so a
+  * client reading result.content found nothing there, called the response malformed and
+  * discarded it whole, including on calls that had already done their work: that is how
+  * a created post came back with no readable ID. An isError result is handed to the
+  * model as the tool's answer instead, which is what a refusal is for.
+  *
+  * -32601 is "method not found", a genuine protocol-level condition, so that one stays a
+  * real JSON-RPC error. Everything else is an outcome. tools-admin.php and server.php's
+  * catch block draw the line in the same place.
+  *
+  * The code is kept in the text because the result shape has nowhere else to put it, and
+  * it is what separates a bad argument from a failed write. Several callers pass a
+  * WP_Error code, which says more than either.
+  */
+  private function error( array $r, string $message, int|string $code = -32603 ): array {
+    if ( $code === -32601 ) {
+      unset( $r['result'] );
+      $r['error'] = [ 'code' => $code, 'message' => $message ];
+      return $r;
+    }
+    $r['result'] = [
+      'content' => [ [ 'type' => 'text', 'text' => $message . ' [error ' . $code . ']' ] ],
+      'isError' => true,
+    ];
+    unset( $r['error'] );
+    return $r;
+  }
   private function clean_html( string $v ): string {
     return wp_kses_post( wp_unslash( $v ) );
   }
@@ -1197,7 +1228,7 @@ class GMCP_Tools_Core {
       case 'wp_delete_comment':
         return $this->preview_delete_comment( $a, $r );
     }
-    $r['error'] = [ 'code' => -32603, 'message' => "No preview is implemented for {$tool}." ];
+    $r = $this->error( $r, "No preview is implemented for {$tool}.", -32603 );
     return $r;
   }
 
@@ -1210,7 +1241,7 @@ class GMCP_Tools_Core {
   private function preview_delete_post( array $a, array $r ): array {
     $post = get_post( (int) ( $a['ID'] ?? 0 ) );
     if ( !$post ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'No post with ID ' . (int) ( $a['ID'] ?? 0 ) . '.' ];
+      $r = $this->error( $r, 'No post with ID ' . (int) ( $a['ID'] ?? 0 ) . '.', -32602 );
       return $r;
     }
     $force = !empty( $a['force'] );
@@ -1262,7 +1293,7 @@ class GMCP_Tools_Core {
   private function preview_update_post( array $a, array $r ): array {
     $post = get_post( (int) ( $a['ID'] ?? 0 ) );
     if ( !$post ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'No post with ID ' . (int) ( $a['ID'] ?? 0 ) . '.' ];
+      $r = $this->error( $r, 'No post with ID ' . (int) ( $a['ID'] ?? 0 ) . '.', -32602 );
       return $r;
     }
 
@@ -1304,12 +1335,12 @@ class GMCP_Tools_Core {
   private function preview_alter_post( array $a, array $r ): array {
     $post = get_post( (int) ( $a['ID'] ?? 0 ) );
     if ( !$post ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'No post with ID ' . (int) ( $a['ID'] ?? 0 ) . '.' ];
+      $r = $this->error( $r, 'No post with ID ' . (int) ( $a['ID'] ?? 0 ) . '.', -32602 );
       return $r;
     }
     $field = sanitize_key( $a['field'] ?? '' );
     if ( !in_array( $field, [ 'post_content', 'post_excerpt', 'post_title' ], true ) ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'field must be post_content, post_excerpt or post_title.' ];
+      $r = $this->error( $r, 'field must be post_content, post_excerpt or post_title.', -32602 );
       return $r;
     }
     $subject = (string) $post->$field;
@@ -1326,7 +1357,7 @@ class GMCP_Tools_Core {
       // the write then does not make, or miss ones it does.
       list( $pattern, $error ) = $this->compile_alter_regex( $search, isset( $a['flags'] ) && is_string( $a['flags'] ) ? $a['flags'] : '' );
       if ( $error !== null ) {
-        $r['error'] = [ 'code' => -32602, 'message' => $error ];
+        $r = $this->error( $r, $error, -32602 );
         return $r;
       }
       // Count without materialising anything. Asking for every match with
@@ -1338,7 +1369,7 @@ class GMCP_Tools_Core {
       $count = @preg_match_all( $pattern, $subject );
       if ( $count === false ) {
         $msg = function_exists( 'preg_last_error_msg' ) ? preg_last_error_msg() : 'PCRE error code ' . preg_last_error();
-        $r['error'] = [ 'code' => -32602, 'message' => 'That pattern failed against this content: ' . $msg ];
+        $r = $this->error( $r, 'That pattern failed against this content: ' . $msg, -32602 );
         return $r;
       }
       // Then walk out only the handful actually shown.
@@ -1359,7 +1390,7 @@ class GMCP_Tools_Core {
     }
     else {
       if ( $search === '' ) {
-        $r['error'] = [ 'code' => -32602, 'message' => 'search cannot be empty.' ];
+        $r = $this->error( $r, 'search cannot be empty.', -32602 );
         return $r;
       }
       $count = substr_count( $subject, $search );
@@ -1396,7 +1427,7 @@ class GMCP_Tools_Core {
     $taxonomy = sanitize_key( $a['taxonomy'] ?? '' );
     $term = get_term( (int) ( $a['term_id'] ?? 0 ), $taxonomy ?: '' );
     if ( !$term || is_wp_error( $term ) ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'No such term.' ];
+      $r = $this->error( $r, 'No such term.', -32602 );
       return $r;
     }
     $children = get_terms( [ 'taxonomy' => $term->taxonomy, 'parent' => $term->term_id, 'hide_empty' => false ] );
@@ -1419,7 +1450,7 @@ class GMCP_Tools_Core {
     $id = (int) ( $a['ID'] ?? 0 );
     $post = get_post( $id );
     if ( !$post || $post->post_type !== 'attachment' ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'No attachment with ID ' . $id . '.' ];
+      $r = $this->error( $r, 'No attachment with ID ' . $id . '.', -32602 );
       return $r;
     }
     $file = get_attached_file( $id );
@@ -1462,7 +1493,7 @@ class GMCP_Tools_Core {
     $id = (int) ( $a['comment_ID'] ?? 0 );
     $comment = get_comment( $id );
     if ( !$comment ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'No comment with ID ' . $id . '.' ];
+      $r = $this->error( $r, 'No comment with ID ' . $id . '.', -32602 );
       return $r;
     }
     $replies = get_comments( [ 'parent' => $id, 'count' => true ] );
@@ -1608,13 +1639,13 @@ class GMCP_Tools_Core {
         // correctly denying per-site Administrators) and refuse to assign a role
         // the caller cannot grant (e.g. administrator).
         if ( !current_user_can( 'create_users' ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'You are not allowed to create users.' ];
+          $r = $this->error( $r, 'You are not allowed to create users.', -32603 );
           break;
         }
         $role = sanitize_key( $a['role'] ?? get_option( 'default_role', 'subscriber' ) );
         require_once ABSPATH . 'wp-admin/includes/user.php'; // get_editable_roles()
         if ( $role !== '' && !array_key_exists( $role, get_editable_roles() ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'You are not allowed to assign this role.' ];
+          $r = $this->error( $r, 'You are not allowed to assign this role.', -32603 );
           break;
         }
         $data = [
@@ -1626,7 +1657,7 @@ class GMCP_Tools_Core {
         ];
         $uid = wp_insert_user( $data );
         if ( is_wp_error( $uid ) ) {
-          $r['error'] = [ 'code' => $uid->get_error_code(), 'message' => $uid->get_error_message() ];
+          $r = $this->error( $r, $uid->get_error_message(), $uid->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'User created ID ' . $uid );
@@ -1635,7 +1666,7 @@ class GMCP_Tools_Core {
 
       case 'wp_update_user':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $target_id = intval( $a['ID'] );
@@ -1647,7 +1678,7 @@ class GMCP_Tools_Core {
         // to edit_user enforces the same boundary core does, for every auth path.
         // Reported by Charles Vosburgh via responsible disclosure.
         if ( !current_user_can( 'edit_user', $target_id ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'You are not allowed to edit this user.' ];
+          $r = $this->error( $r, 'You are not allowed to edit this user.', -32603 );
           break;
         }
         $upd = [ 'ID' => $target_id ];
@@ -1662,13 +1693,13 @@ class GMCP_Tools_Core {
         if ( isset( $upd['role'] ) && $upd['role'] !== '' ) {
           require_once ABSPATH . 'wp-admin/includes/user.php'; // get_editable_roles()
           if ( !current_user_can( 'promote_user', $target_id ) || !array_key_exists( $upd['role'], get_editable_roles() ) ) {
-            $r['error'] = [ 'code' => -32603, 'message' => 'You are not allowed to assign this role.' ];
+            $r = $this->error( $r, 'You are not allowed to assign this role.', -32603 );
             break;
           }
         }
         $u = wp_update_user( $upd );
         if ( is_wp_error( $u ) ) {
-          $r['error'] = [ 'code' => $u->get_error_code(), 'message' => $u->get_error_message() ];
+          $r = $this->error( $r, $u->get_error_message(), $u->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'User #' . $u . ' updated' );
@@ -1723,7 +1754,7 @@ class GMCP_Tools_Core {
 
       case 'wp_create_comment':
         if ( empty( $a['post_id'] ) || empty( $a['comment_content'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'post_id & comment_content required' ];
+          $r = $this->error( $r, 'post_id & comment_content required', -32602 );
           break;
         }
         $ins = [
@@ -1737,7 +1768,7 @@ class GMCP_Tools_Core {
         $cid = wp_insert_comment( $ins );
         if ( is_wp_error( $cid ) ) {
           /** @var WP_Error $cid */
-          $r['error'] = [ 'code' => $cid->get_error_code(), 'message' => $cid->get_error_message() ];
+          $r = $this->error( $r, $cid->get_error_message(), $cid->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'Comment created ID ' . $cid );
@@ -1746,7 +1777,7 @@ class GMCP_Tools_Core {
 
       case 'wp_update_comment':
         if ( empty( $a['comment_ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'comment_ID required' ];
+          $r = $this->error( $r, 'comment_ID required', -32602 );
           break;
         }
         $c = [ 'comment_ID' => intval( $a['comment_ID'] ) ];
@@ -1757,7 +1788,7 @@ class GMCP_Tools_Core {
         }
         $cid = wp_update_comment( $c, true );
         if ( is_wp_error( $cid ) ) {
-          $r['error'] = [ 'code' => $cid->get_error_code(), 'message' => $cid->get_error_message() ];
+          $r = $this->error( $r, $cid->get_error_message(), $cid->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'Comment #' . $cid . ' updated' );
@@ -1766,7 +1797,7 @@ class GMCP_Tools_Core {
 
       case 'wp_delete_comment':
         if ( empty( $a['comment_ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'comment_ID required' ];
+          $r = $this->error( $r, 'comment_ID required', -32602 );
           break;
         }
         $done = wp_delete_comment( intval( $a['comment_ID'] ), !empty( $a['force'] ) );
@@ -1774,14 +1805,14 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, 'Comment #' . $a['comment_ID'] . ' deleted' );
         }
         else {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Deletion failed' ];
+          $r = $this->error( $r, 'Deletion failed', -32603 );
         }
         break;
 
         /* ===== Change journal ===== */
       case 'wp_list_changes':
         if ( !class_exists( 'GMCP_Journal' ) || !$this->core->get_option( 'mcp_change_journal' ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'The change journal is switched off for this site, so nothing is being recorded and nothing can be reverted. Turn it on under the MCP Server screen in the admin menu.' ];
+          $r = $this->error( $r, 'The change journal is switched off for this site, so nothing is being recorded and nothing can be reverted. Turn it on under the MCP Server screen in the admin menu.', -32603 );
           break;
         }
         $limit = isset( $a['limit'] ) ? max( 1, min( 40, (int) $a['limit'] ) ) : 20;
@@ -1790,12 +1821,12 @@ class GMCP_Tools_Core {
 
       case 'wp_undo_change':
         if ( !class_exists( 'GMCP_Journal' ) || !$this->core->get_option( 'mcp_change_journal' ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'The change journal is switched off for this site, so there is nothing on record to revert.' ];
+          $r = $this->error( $r, 'The change journal is switched off for this site, so there is nothing on record to revert.', -32603 );
           break;
         }
         $undo = GMCP_Journal::revert( (string) ( $a['id'] ?? '' ) );
         if ( !$undo['ok'] ) {
-          $r['error'] = [ 'code' => -32602, 'message' => $undo['message'] ];
+          $r = $this->error( $r, $undo['message'], -32602 );
           break;
         }
         $this->add_result_text( $r, $undo['message'] );
@@ -1806,7 +1837,7 @@ class GMCP_Tools_Core {
         $opt_key = $this->clean_option_key( $a['key'] );
         $permitted = $this->option_allowed( $opt_key );
         if ( $permitted !== true ) {
-          $r['error'] = [ 'code' => -32600, 'message' => $permitted ];
+          $r = $this->error( $r, $permitted, -32600 );
           break;
         }
         if ( !empty( $a['raw'] ) ) {
@@ -1842,7 +1873,7 @@ class GMCP_Tools_Core {
         $key = $this->clean_option_key( $a['key'] );
         $permitted = $this->option_allowed( $key );
         if ( $permitted !== true ) {
-          $r['error'] = [ 'code' => -32600, 'message' => $permitted ];
+          $r = $this->error( $r, $permitted, -32600 );
           break;
         }
         // The write policy, which option_allowed() does not cover and must not: that
@@ -1872,7 +1903,7 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, 'Option "' . $key . '" already had that value' );
         }
         else {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Update failed' ];
+          $r = $this->error( $r, 'Update failed', -32603 );
         }
         break;
 
@@ -1887,7 +1918,7 @@ class GMCP_Tools_Core {
         $tax = sanitize_key( $a['taxonomy'] );
         $total = wp_count_terms( $tax, [ 'hide_empty' => false ] );
         if ( is_wp_error( $total ) ) {
-          $r['error'] = [ 'code' => $total->get_error_code(), 'message' => $total->get_error_message() ];
+          $r = $this->error( $r, $total->get_error_message(), $total->get_error_code() );
         }
         else {
           $this->add_result_text( $r, (string) $total );
@@ -1992,12 +2023,12 @@ class GMCP_Tools_Core {
         /* ===== Posts: single ===== */
       case 'wp_get_post':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post ID required (pass "ID", e.g. {"ID": 123}; "post_id" is also accepted).' ];
+          $r = $this->error( $r, 'Post ID required (pass "ID", e.g. {"ID": 123}; "post_id" is also accepted).', -32602 );
           break;
         }
         $p = get_post( intval( $a['ID'] ) );
         if ( !$p ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post not found' ];
+          $r = $this->error( $r, 'Post not found', -32602 );
           break;
         }
         $out = [
@@ -2018,7 +2049,7 @@ class GMCP_Tools_Core {
         /* ===== Posts: snapshot ===== */
       case 'wp_get_post_snapshot':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post ID required (pass "ID", e.g. {"ID": 123}; "post_id" is also accepted).' ];
+          $r = $this->error( $r, 'Post ID required (pass "ID", e.g. {"ID": 123}; "post_id" is also accepted).', -32602 );
           break;
         }
 
@@ -2026,7 +2057,7 @@ class GMCP_Tools_Core {
         $p = get_post( $post_id );
 
         if ( !$p ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post not found' ];
+          $r = $this->error( $r, 'Post not found', -32602 );
           break;
         }
 
@@ -2124,7 +2155,7 @@ class GMCP_Tools_Core {
         /* ===== Posts: create ===== */
       case 'wp_create_post':
         if ( empty( $a['post_title'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'post_title required' ];
+          $r = $this->error( $r, 'post_title required', -32602 );
           break;
         }
         $ins = [
@@ -2153,7 +2184,7 @@ class GMCP_Tools_Core {
 
         $new = wp_insert_post( wp_slash( $ins ), true );
         if ( is_wp_error( $new ) ) {
-          $r['error'] = [ 'code' => $new->get_error_code(), 'message' => $new->get_error_message() ];
+          $r = $this->error( $r, $new->get_error_message(), $new->get_error_code() );
         }
         else {
           if ( empty( $ins['meta_input'] ) && !empty( $meta_input ) && is_array( $meta_input ) ) {
@@ -2172,13 +2203,13 @@ class GMCP_Tools_Core {
         /* ===== Posts: write blocks ===== */
       case 'wp_write_blocks':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post ID required (pass "ID"; create the post first with wp_create_post).' ];
+          $r = $this->error( $r, 'Post ID required (pass "ID"; create the post first with wp_create_post).', -32602 );
           break;
         }
         $wb_id = intval( $a['ID'] );
         $wb_post = get_post( $wb_id );
         if ( !$wb_post ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post ' . $wb_id . ' not found.' ];
+          $r = $this->error( $r, 'Post ' . $wb_id . ' not found.', -32602 );
           break;
         }
         // Some MCP clients send arrays as JSON strings.
@@ -2188,7 +2219,7 @@ class GMCP_Tools_Core {
         }
         list( $wb_markup, $wb_err ) = $this->blocks_to_markup( $wb_blocks );
         if ( $wb_err !== null ) {
-          $r['error'] = [ 'code' => -32602, 'message' => $wb_err ];
+          $r = $this->error( $r, $wb_err, -32602 );
           break;
         }
         $wb_mode = in_array( $a['mode'] ?? 'replace', [ 'replace', 'append', 'prepend' ], true ) ? ( $a['mode'] ?? 'replace' ) : 'replace';
@@ -2203,7 +2234,7 @@ class GMCP_Tools_Core {
         }
         $wb_res = wp_update_post( wp_slash( [ 'ID' => $wb_id, 'post_content' => $wb_content ] ), true );
         if ( is_wp_error( $wb_res ) ) {
-          $r['error'] = [ 'code' => $wb_res->get_error_code(), 'message' => $wb_res->get_error_message() ];
+          $r = $this->error( $r, $wb_res->get_error_message(), $wb_res->get_error_code() );
           break;
         }
         $this->bust_post_cache( $wb_id, [ 'tool' => 'wp_write_blocks' ] );
@@ -2213,7 +2244,7 @@ class GMCP_Tools_Core {
         /* ===== Block patterns: list ===== */
       case 'wp_list_block_patterns':
         if ( !class_exists( 'WP_Block_Patterns_Registry' ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Block patterns are not available on this site.' ];
+          $r = $this->error( $r, 'Block patterns are not available on this site.', -32603 );
           break;
         }
         $bp_all = WP_Block_Patterns_Registry::get_instance()->get_all_registered();
@@ -2253,29 +2284,29 @@ class GMCP_Tools_Core {
         /* ===== Block patterns: insert ===== */
       case 'wp_insert_block_pattern':
         if ( empty( $a['ID'] ) || empty( $a['pattern'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Both "ID" and "pattern" (a name from wp_list_block_patterns) are required.' ];
+          $r = $this->error( $r, 'Both "ID" and "pattern" (a name from wp_list_block_patterns) are required.', -32602 );
           break;
         }
         if ( !class_exists( 'WP_Block_Patterns_Registry' ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Block patterns are not available on this site.' ];
+          $r = $this->error( $r, 'Block patterns are not available on this site.', -32603 );
           break;
         }
         $bp_name = sanitize_text_field( $a['pattern'] );
         $bp_reg = WP_Block_Patterns_Registry::get_instance();
         if ( !$bp_reg->is_registered( $bp_name ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Pattern "' . $bp_name . '" is not registered. Use wp_list_block_patterns to see available names.' ];
+          $r = $this->error( $r, 'Pattern "' . $bp_name . '" is not registered. Use wp_list_block_patterns to see available names.', -32602 );
           break;
         }
         $bp_pat = $bp_reg->get_registered( $bp_name );
         $bp_markup = (string) ( $bp_pat['content'] ?? '' );
         if ( $bp_markup === '' ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Pattern "' . $bp_name . '" has no content.' ];
+          $r = $this->error( $r, 'Pattern "' . $bp_name . '" has no content.', -32603 );
           break;
         }
         $bp_id = intval( $a['ID'] );
         $bp_post = get_post( $bp_id );
         if ( !$bp_post ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post ' . $bp_id . ' not found.' ];
+          $r = $this->error( $r, 'Post ' . $bp_id . ' not found.', -32602 );
           break;
         }
         $bp_mode = in_array( $a['mode'] ?? 'append', [ 'replace', 'append', 'prepend' ], true ) ? ( $a['mode'] ?? 'append' ) : 'append';
@@ -2290,7 +2321,7 @@ class GMCP_Tools_Core {
         }
         $bp_res = wp_update_post( wp_slash( [ 'ID' => $bp_id, 'post_content' => $bp_new ] ), true );
         if ( is_wp_error( $bp_res ) ) {
-          $r['error'] = [ 'code' => $bp_res->get_error_code(), 'message' => $bp_res->get_error_message() ];
+          $r = $this->error( $r, $bp_res->get_error_message(), $bp_res->get_error_code() );
           break;
         }
         $this->bust_post_cache( $bp_id, [ 'tool' => 'wp_insert_block_pattern' ] );
@@ -2300,7 +2331,7 @@ class GMCP_Tools_Core {
         /* ===== Posts: update ===== */
       case 'wp_update_post':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post ID required (pass "ID", e.g. {"ID": 123}; "post_id" is also accepted).' ];
+          $r = $this->error( $r, 'Post ID required (pass "ID", e.g. {"ID": 123}; "post_id" is also accepted).', -32602 );
           break;
         }
         $post_id = intval( $a['ID'] );
@@ -2313,7 +2344,7 @@ class GMCP_Tools_Core {
           $fields = json_decode( $fields, true );
           // Detect truncated/malformed JSON
           if ( $fields === null && strlen( $fields_raw ) > 0 ) {
-            $r['error'] = [ 'code' => -32602, 'message' => 'Fields parameter is invalid JSON (possibly truncated). Content may be too large for the transport. Raw length: ' . strlen( $fields_raw ) . ' bytes' ];
+            $r = $this->error( $r, 'Fields parameter is invalid JSON (possibly truncated). Content may be too large for the transport. Raw length: ' . strlen( $fields_raw ) . ' bytes', -32602 );
             break;
           }
         }
@@ -2361,7 +2392,7 @@ class GMCP_Tools_Core {
         if ( is_string( $meta_input ) ) {
           $meta_input = json_decode( $meta_input, true );
           if ( $meta_input === null && strlen( $meta_raw ) > 0 ) {
-            $r['error'] = [ 'code' => -32602, 'message' => 'meta_input parameter is invalid JSON (possibly truncated).' ];
+            $r = $this->error( $r, 'meta_input parameter is invalid JSON (possibly truncated).', -32602 );
             break;
           }
         }
@@ -2375,7 +2406,7 @@ class GMCP_Tools_Core {
           if ( isset( $a['fields'] ) || isset( $a['meta_input'] ) ) {
             $hint = ' (parameters were provided but parsed as empty - check for malformed JSON)';
           }
-          $r['error'] = [ 'code' => -32602, 'message' => 'No fields or meta_input provided to update. Pass post fields inside a "fields" object (or at the top level), e.g. {"ID": 123, "fields": {"post_title": "..."}}, and/or "meta_input" for custom fields.' . $hint ];
+          $r = $this->error( $r, 'No fields or meta_input provided to update. Pass post fields inside a "fields" object (or at the top level), e.g. {"ID": 123, "fields": {"post_title": "..."}}, and/or "meta_input" for custom fields.' . $hint, -32602 );
           break;
         }
 
@@ -2392,7 +2423,7 @@ class GMCP_Tools_Core {
           if ( $target_status === 'trash' && $current_status !== 'trash' ) {
             $trashed = wp_trash_post( $post_id );
             if ( !$trashed ) {
-              $r['error'] = [ 'code' => -32603, 'message' => 'wp_trash_post failed' ];
+              $r = $this->error( $r, 'wp_trash_post failed', -32603 );
               break;
             }
             unset( $c['post_status'] );
@@ -2401,7 +2432,7 @@ class GMCP_Tools_Core {
           elseif ( $current_status === 'trash' && $target_status !== 'trash' ) {
             $untrashed = wp_untrash_post( $post_id );
             if ( !$untrashed ) {
-              $r['error'] = [ 'code' => -32603, 'message' => 'wp_untrash_post failed' ];
+              $r = $this->error( $r, 'wp_untrash_post failed', -32603 );
               break;
             }
             // Leave post_status in $c: wp_untrash_post restores to a previous status, and
@@ -2413,7 +2444,7 @@ class GMCP_Tools_Core {
         if ( $has_fields ) {
           $u = wp_update_post( wp_slash( $c ), true );
           if ( is_wp_error( $u ) ) {
-            $r['error'] = [ 'code' => $u->get_error_code(), 'message' => $u->get_error_message() ];
+            $r = $this->error( $r, $u->get_error_message(), $u->get_error_code() );
             break;
           }
         }
@@ -2456,7 +2487,7 @@ class GMCP_Tools_Core {
         /* ===== Posts: delete ===== */
       case 'wp_delete_post':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $delete_id = intval( $a['ID'] );
@@ -2466,14 +2497,14 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, 'Post #' . $a['ID'] . ' deleted' );
         }
         else {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Deletion failed' ];
+          $r = $this->error( $r, 'Deletion failed', -32603 );
         }
         break;
 
         /* ===== Posts: alter (search/replace) ===== */
       case 'wp_alter_post':
         if ( empty( $a['ID'] ) || empty( $a['field'] ) || !isset( $a['search'] ) || !isset( $a['replace'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID, field, search, and replace required' ];
+          $r = $this->error( $r, 'ID, field, search, and replace required', -32602 );
           break;
         }
         $post_id = intval( $a['ID'] );
@@ -2486,13 +2517,13 @@ class GMCP_Tools_Core {
         // Validate field
         $allowed_fields = [ 'post_content', 'post_excerpt', 'post_title' ];
         if ( !in_array( $field, $allowed_fields, true ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Field must be: post_content, post_excerpt, or post_title' ];
+          $r = $this->error( $r, 'Field must be: post_content, post_excerpt, or post_title', -32602 );
           break;
         }
 
         $post = get_post( $post_id );
         if ( !$post ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post not found' ];
+          $r = $this->error( $r, 'Post not found', -32602 );
           break;
         }
 
@@ -2502,13 +2533,13 @@ class GMCP_Tools_Core {
         if ( $is_regex ) {
           list( $compiled, $regex_err ) = $this->compile_alter_regex( $search, $flags );
           if ( $regex_err !== null ) {
-            $r['error'] = [ 'code' => -32602, 'message' => $regex_err ];
+            $r = $this->error( $r, $regex_err, -32602 );
             break;
           }
           $new_content = preg_replace( $compiled, $replace, $content, -1, $count );
           if ( $new_content === null ) {
             $msg = function_exists( 'preg_last_error_msg' ) ? preg_last_error_msg() : 'PCRE error code ' . preg_last_error();
-            $r['error'] = [ 'code' => -32603, 'message' => 'Regex replacement failed: ' . $msg ];
+            $r = $this->error( $r, 'Regex replacement failed: ' . $msg, -32603 );
             break;
           }
         }
@@ -2526,7 +2557,7 @@ class GMCP_Tools_Core {
         // FAQ, etc.) and silently corrupt the post. Pre-slash to compensate.
         $update = wp_update_post( wp_slash( [ 'ID' => $post_id, $field => $new_content ] ), true );
         if ( is_wp_error( $update ) ) {
-          $r['error'] = [ 'code' => $update->get_error_code(), 'message' => $update->get_error_message() ];
+          $r = $this->error( $r, $update->get_error_message(), $update->get_error_code() );
           break;
         }
 
@@ -2537,7 +2568,7 @@ class GMCP_Tools_Core {
         /* ===== Post-meta ===== */
       case 'wp_get_post_meta':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $pid = intval( $a['ID'] );
@@ -2547,7 +2578,7 @@ class GMCP_Tools_Core {
 
       case 'wp_update_post_meta':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $pid = intval( $a['ID'] );
@@ -2569,7 +2600,7 @@ class GMCP_Tools_Core {
           update_post_meta( $pid, sanitize_key( $a['key'] ), $a['value'] );
         }
         else {
-          $r['error'] = [ 'code' => -32602, 'message' => 'meta array or key/value required' ];
+          $r = $this->error( $r, 'meta array or key/value required', -32602 );
           break;
         }
         $this->add_result_text( $r, 'Meta updated for post #' . $pid );
@@ -2577,7 +2608,7 @@ class GMCP_Tools_Core {
 
       case 'wp_delete_post_meta':
         if ( empty( $a['ID'] ) || empty( $a['key'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID & key required' ];
+          $r = $this->error( $r, 'ID & key required', -32602 );
           break;
         }
         $pid = intval( $a['ID'] );
@@ -2588,14 +2619,14 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, 'Meta deleted on post #' . $pid );
         }
         else {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Deletion failed' ];
+          $r = $this->error( $r, 'Deletion failed', -32603 );
         }
         break;
 
         /* ===== Featured image ===== */
       case 'wp_set_featured_image':
         if ( empty( $a['post_id'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'post_id required' ];
+          $r = $this->error( $r, 'post_id required', -32602 );
           break;
         }
         $post_id = intval( $a['post_id'] );
@@ -2606,7 +2637,7 @@ class GMCP_Tools_Core {
             $this->add_result_text( $r, 'Featured image set on post #' . $post_id );
           }
           else {
-            $r['error'] = [ 'code' => -32603, 'message' => 'Failed to set thumbnail' ];
+            $r = $this->error( $r, 'Failed to set thumbnail', -32603 );
           }
         }
         else {
@@ -2645,7 +2676,7 @@ class GMCP_Tools_Core {
 
       case 'wp_create_term':
         if ( empty( $a['term_name'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'term_name required' ];
+          $r = $this->error( $r, 'term_name required', -32602 );
           break;
         }
         $tax = sanitize_key( $a['taxonomy'] );
@@ -2661,7 +2692,7 @@ class GMCP_Tools_Core {
         }
         $term = wp_insert_term( sanitize_text_field( $a['term_name'] ), $tax, $args );
         if ( is_wp_error( $term ) ) {
-          $r['error'] = [ 'code' => $term->get_error_code(), 'message' => $term->get_error_message() ];
+          $r = $this->error( $r, $term->get_error_message(), $term->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'Term ' . $term['term_id'] . ' created' );
@@ -2671,7 +2702,7 @@ class GMCP_Tools_Core {
       case 'wp_update_term':
         $tid = intval( $a['term_id'] ?? 0 );
         if ( !$tid ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'term_id required' ];
+          $r = $this->error( $r, 'term_id required', -32602 );
           break;
         }
         $tax = sanitize_key( $a['taxonomy'] );
@@ -2683,7 +2714,7 @@ class GMCP_Tools_Core {
         }
         $t = wp_update_term( $tid, $tax, $uargs );
         if ( is_wp_error( $t ) ) {
-          $r['error'] = [ 'code' => $t->get_error_code(), 'message' => $t->get_error_message() ];
+          $r = $this->error( $r, $t->get_error_message(), $t->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'Term ' . $tid . ' updated' );
@@ -2693,7 +2724,7 @@ class GMCP_Tools_Core {
       case 'wp_delete_term':
         $tid = intval( $a['term_id'] ?? 0 );
         if ( !$tid ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'term_id required' ];
+          $r = $this->error( $r, 'term_id required', -32602 );
           break;
         }
         $tax = sanitize_key( $a['taxonomy'] );
@@ -2702,13 +2733,13 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, 'Term ' . $tid . ' deleted' );
         }
         else {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Deletion failed' ];
+          $r = $this->error( $r, 'Deletion failed', -32603 );
         }
         break;
 
       case 'wp_get_post_terms':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $tax = sanitize_key( $a['taxonomy'] ?? 'category' );
@@ -2721,7 +2752,7 @@ class GMCP_Tools_Core {
 
       case 'wp_add_post_terms':
         if ( empty( $a['ID'] ) || empty( $a['terms'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID & terms required' ];
+          $r = $this->error( $r, 'ID & terms required', -32602 );
           break;
         }
         $terms = $a['terms'];
@@ -2733,7 +2764,7 @@ class GMCP_Tools_Core {
         $append = !isset( $a['append'] ) || $a['append'];
         $set = wp_set_post_terms( intval( $a['ID'] ), $terms, $tax, $append );
         if ( is_wp_error( $set ) ) {
-          $r['error'] = [ 'code' => $set->get_error_code(), 'message' => $set->get_error_message() ];
+          $r = $this->error( $r, $set->get_error_message(), $set->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'Terms set for post #' . $a['ID'] );
@@ -2776,7 +2807,7 @@ class GMCP_Tools_Core {
         $has_url = !empty( $a['url'] );
         $has_base64 = !empty( $a['base64'] ) && !empty( $a['filename'] );
         if ( !$has_url && !$has_base64 ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Provide either url, or base64 + filename.' ];
+          $r = $this->error( $r, 'Provide either url, or base64 + filename.', -32602 );
           break;
         }
         try {
@@ -2833,14 +2864,14 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, wp_get_attachment_url( $id ) );
         }
         catch ( \Throwable $e ) {
-          $r['error'] = [ 'code' => $e->getCode() ?: -32603, 'message' => $e->getMessage() ];
+          $r = $this->error( $r, $e->getMessage(), $e->getCode() ?: -32603 );
         }
         break;
 
         /* ===== Media: upload alternative (two-step) ===== */
       case 'wp_upload_request':
         if ( empty( $a['filename'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'filename required' ];
+          $r = $this->error( $r, 'filename required', -32602 );
           break;
         }
         try {
@@ -2861,14 +2892,14 @@ class GMCP_Tools_Core {
           ], JSON_PRETTY_PRINT ) );
         }
         catch ( \Throwable $e ) {
-          $r['error'] = [ 'code' => $e->getCode() ?: -32603, 'message' => $e->getMessage() ];
+          $r = $this->error( $r, $e->getMessage(), $e->getCode() ?: -32603 );
         }
         break;
 
         /* ===== Media: update ===== */
       case 'wp_update_media':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $upd = [ 'ID' => intval( $a['ID'] ) ];
@@ -2883,7 +2914,7 @@ class GMCP_Tools_Core {
         }
         $u = wp_update_post( wp_slash( $upd ), true );
         if ( is_wp_error( $u ) ) {
-          $r['error'] = [ 'code' => $u->get_error_code(), 'message' => $u->get_error_message() ];
+          $r = $this->error( $r, $u->get_error_message(), $u->get_error_code() );
         }
         else {
           if ( $a['alt'] ?? '' ) {
@@ -2896,7 +2927,7 @@ class GMCP_Tools_Core {
         /* ===== Media: delete ===== */
       case 'wp_delete_media':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $d = wp_delete_post( intval( $a['ID'] ), !empty( $a['force'] ) );
@@ -2904,12 +2935,12 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, 'Media #' . $a['ID'] . ' deleted' );
         }
         else {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Deletion failed' ];
+          $r = $this->error( $r, 'Deletion failed', -32603 );
         }
         break;
 
 
-      default: $r['error'] = [ 'code' => -32601, 'message' => 'Unknown tool' ];
+      default: $r = $this->error( $r, 'Unknown tool', -32601 );
     }
 
     // Generic post-write hook: fires after any successful content-mutating tool
@@ -2918,7 +2949,11 @@ class GMCP_Tools_Core {
     // search, write an audit log, etc. The options/object cache is already updated
     // by WordPress, but full-page caches (Varnish, WP Rocket, Cloudflare) are not,
     // so a cache layer should listen here. Reads never trigger it.
-    if ( empty( $r['error'] ) && $this->is_mutating_tool( $tool ) ) {
+    //
+    // A failure is an isError result now, not an error field, so both have to be tested
+    // or every refused write would announce itself as a change and purge caches for
+    // nothing.
+    if ( empty( $r['error'] ) && empty( $r['result']['isError'] ) && $this->is_mutating_tool( $tool ) ) {
       do_action( 'gmcp_mutate', $tool, $a, $r );
     }
     return $r;

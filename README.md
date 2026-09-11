@@ -380,6 +380,13 @@ add_filter( 'gmcp_callback', function ( $result, $tool, $args, $id ) {
 }, 10, 4 );
 ```
 
+A tool that fails returns a result rather than a JSON-RPC error: `content` as usual, with
+`isError` set. A protocol error carries no result at all, so a client reading
+`result.content` finds nothing where an array should be, and may discard the whole
+response, including on a call that had already done its work. That is how a created post
+came back with no readable ID. Only a genuinely protocol-level condition, an unknown
+method, is a real error. Follow the same rule in your own tools.
+
 Other hooks:
 
 | Hook | Purpose |

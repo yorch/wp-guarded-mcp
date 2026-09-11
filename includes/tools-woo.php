@@ -240,8 +240,7 @@ class GMCP_Tools_Woo {
       case 'wc_sales_summary': $r = $this->sales_summary( $args, $r ); break;
       case 'wc_store_briefing': $r = $this->store_briefing( $args, $r ); break;
       default:
-        $r['error'] = [ 'code' => -32601, 'message' => 'Unknown tool' ];
-        return $r;
+        return $this->error( $r, 'Unknown tool', -32601 );
     }
 
     // The same post-write hook the other tool groups fire, and it was missing here.
@@ -252,7 +251,11 @@ class GMCP_Tools_Woo {
     // cache saw a price change and a stock change as silence. Most WooCommerce sites run
     // such a cache, so the visible symptom is a shopper still being shown the old price,
     // which is a worse failure than the stale page it would be anywhere else.
-    if ( empty( $r['error'] ) && in_array( $tool, self::MUTATING, true ) ) {
+    //
+    // A failure is an isError result now, not an error field, so both have to be tested
+    // or every refused write would announce itself as a change and purge caches for
+    // nothing.
+    if ( empty( $r['error'] ) && empty( $r['result']['isError'] ) && in_array( $tool, self::MUTATING, true ) ) {
       do_action( 'gmcp_mutate', $tool, $args, $r );
     }
     return $r;
@@ -272,8 +275,33 @@ class GMCP_Tools_Woo {
 
   #region Helpers
 
-  private function error( array $r, string $message, int $code = -32602 ): array {
-    $r['error'] = [ 'code' => $code, 'message' => $message ];
+  /**
+  * A tool failure the model is supposed to read and act on.
+  *
+  * These used to be JSON-RPC errors. A protocol error carries no result at all, so a
+  * client reading result.content found nothing there, called the response malformed and
+  * discarded it whole, including on calls that had already done their work. An isError
+  * result is handed to the model as the tool's answer instead, which is what a refusal
+  * about a price or a stock level needs to be.
+  *
+  * -32601 is "method not found", a genuine protocol-level condition, so that one stays a
+  * real JSON-RPC error. Everything else is an outcome. tools-core.php, tools-admin.php
+  * and server.php's catch block draw the line in the same place.
+  *
+  * The code is kept in the text because the result shape has nowhere else to put it, and
+  * it is what separates a bad argument from a failed write.
+  */
+  private function error( array $r, string $message, int|string $code = -32602 ): array {
+    if ( $code === -32601 ) {
+      unset( $r['result'] );
+      $r['error'] = [ 'code' => $code, 'message' => $message ];
+      return $r;
+    }
+    $r['result'] = [
+      'content' => [ [ 'type' => 'text', 'text' => $message . ' [error ' . $code . ']' ] ],
+      'isError' => true,
+    ];
+    unset( $r['error'] );
     return $r;
   }
 

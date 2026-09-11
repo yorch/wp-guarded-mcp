@@ -273,14 +273,7 @@ class GMCP_Tools_Rest {
 
     if ( in_array( $action, [ 'get', 'update', 'delete' ], true ) ) {
       if ( empty( $args['id'] ) ) {
-        return [
-          'jsonrpc' => '2.0',
-          'id' => $id,
-          'error' => [
-            'code' => -32602,
-            'message' => 'Missing parameter: id',
-          ],
-        ];
+        return $this->error( $id, 'Missing parameter: id', -32602 );
       }
       $path .= '/' . intval( $args['id'] );
     }
@@ -314,22 +307,48 @@ class GMCP_Tools_Rest {
     if ( is_wp_error( $response ) || $response->get_status() >= 400 ) {
       $error_obj = is_wp_error( $response ) ? $response : $response->as_error();
 
-      // Return error in old format for backward compatibility
-      // The execute_tool method will detect this and not re-wrap it
-      return [
-        'jsonrpc' => '2.0',
-        'id' => $id,
-        'error' => [
-          'code' => (int) ( $error_obj->get_error_code() ?: $response->get_status() ),
-          'message' => $error_obj->get_error_message(),
-          'data' => $error_obj->get_error_data() ?: null,
-        ],
-      ];
+      // A fully-formed response, which execute_tool() detects and does not re-wrap.
+      return $this->error(
+        $id,
+        $error_obj->get_error_message(),
+        $error_obj->get_error_code() ?: $response->get_status(),
+        $error_obj->get_error_data()
+      );
     }
 
     $data = $response->get_data();
 
     // Return just the data - execute_tool will wrap it properly
     return $data;
+  }
+
+  /**
+  * A tool failure the model is supposed to read and act on.
+  *
+  * These used to be JSON-RPC errors. A protocol error carries no result at all, so a
+  * client reading result.content found nothing there, called the response malformed and
+  * discarded it whole. An isError result is handed to the model as the tool's answer
+  * instead. tools-core.php, tools-woo.php, tools-admin.php and server.php's catch block
+  * draw the line in the same place, at -32601 for "method not found". Nothing in this
+  * file reports that: an unrecognised tool is passed on untouched for another provider
+  * or the server to answer, so there is no case here that stays a protocol error.
+  *
+  * The code, and whatever WordPress attached to the error, go into the text because the
+  * result shape has nowhere else to put them. The code is no longer cast to int on the
+  * way through, which used to turn every WP_Error name into a 0.
+  */
+  private function error( $id, string $message, $code, $data = null ): array {
+    $text = $message . ' [error ' . $code . ']';
+    if ( !empty( $data ) ) {
+      $text .= ' ' . wp_json_encode( $data );
+    }
+    return [
+      'jsonrpc' => '2.0',
+      'id' => $id,
+      'result' => [
+        'content' => [ [ 'type' => 'text', 'text' => $text ] ],
+        'isError' => true,
+      ],
+    ];
   }
 }

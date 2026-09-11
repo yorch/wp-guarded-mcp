@@ -144,6 +144,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * Preview mode on the six riskiest tools, which describes what would happen and changes nothing.
 * MCP prompts for common upkeep jobs, and MCP resources for attaching site content to a conversation.
 * A one-call site briefing, so an agent orients in one request rather than six.
+* Tool failures arrive as results the model can read, with isError set, rather than as JSON-RPC errors a client may discard along with the rest of the response.
 
 == Upgrade Notice ==
 
