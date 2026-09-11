@@ -877,18 +877,15 @@ class GMCP_Settings {
           ],
         ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) );
       ?></textarea>
-      <?php if ( $token === '' ) : ?>
-        <p class="description">
-          <strong><?php esc_html_e( 'No bearer token is set yet.', 'guarded-mcp' ); ?></strong>
-          <?php
-          printf(
-            /* translators: %s: link to the Access page. */
-            esc_html__( 'Generate one on the %s page and this snippet will fill itself in. OAuth clients do not need one.', 'guarded-mcp' ),
-            '<a href="' . esc_url( self::page_url( 'access' ) ) . '">' . esc_html__( 'Access', 'guarded-mcp' ) . '</a>'
-          );
-          ?>
-        </p>
-      <?php endif; ?>
+      <p class="description">
+        <?php
+        printf(
+          /* translators: %s: link to the Access page. */
+          esc_html__( 'Uses a key from the %s page in place of YOUR_KEY. OAuth clients do not need one.', 'guarded-mcp' ),
+          '<a href="' . esc_url( self::page_url( 'access' ) ) . '">' . esc_html__( 'Access', 'guarded-mcp' ) . '</a>'
+        );
+        ?>
+      </p>
     </div>
 
     <h2 class="title"><?php esc_html_e( 'Is this site ready', 'guarded-mcp' ); ?></h2>
@@ -986,7 +983,7 @@ class GMCP_Settings {
     $keys = GMCP_Tokens::all();
     ?>
     <p class="description gmcp-intro">
-      <?php esc_html_e( 'The bearer token above is one secret with one access level, shared by every client. A key is narrower: it carries a label so you can tell clients apart in the activity list, it can expire on its own, and it can be limited to a named list of tools. Keys are stored hashed, so a key is shown once and never again.', 'guarded-mcp' ); ?>
+      <?php esc_html_e( 'A key carries a label so you can tell clients apart in the activity list, it can expire on its own, and it can be limited to a named list of tools. Keys are stored hashed, so a key is shown once and never again.', 'guarded-mcp' ); ?>
     </p>
 
     <?php if ( $keys ) : ?>
@@ -1414,7 +1411,7 @@ class GMCP_Settings {
                 __( 'ran as %s', 'guarded-mcp' ), $e['actor_name'] ) ); ?></span>
               <?php // Said in full here rather than as a tooltip. The list has to be
               // terse; this page is where somebody came to find out what it means. ?>
-              <p class="description"><?php esc_html_e( 'The WordPress account the call ran as. A shared bearer token borrows one administrator account, so this names the account, not the person.', 'guarded-mcp' ); ?></p>
+              <p class="description"><?php esc_html_e( 'The WordPress account the call ran as. The call borrows one administrator account, so this names the account, not the person.', 'guarded-mcp' ); ?></p>
             <?php endif; ?>
           </td>
         </tr>

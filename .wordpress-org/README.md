@@ -27,7 +27,7 @@ zip, which is the convention the common GitHub-to-SVN deploy actions expect.
 | `banner-772x250.png`, `banner-1544x500.png` | Standard and retina banners. Must be PNG or JPG; SVG is not accepted here. |
 | `screenshot-1.png` | The Connect page. |
 | `screenshot-2.png` | The OAuth consent screen an administrator sees. |
-| `screenshot-3.png` | The Access page: the bearer token and the named keys. |
+| `screenshot-3.png` | The Access page: named keys, each with its own access level, tool list and expiry. |
 | `screenshot-4.png` | The Audit Log page: the audit log, with its filters and its refusals. |
 | `screenshot-5.png` | One audit entry in full, with the before and after of each field. |
 
