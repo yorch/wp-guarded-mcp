@@ -539,6 +539,37 @@ class GMCP_Tools_Core {
     'admin_email' => 'It is where recovery mail, password resets and fatal-error notices go. Without it nobody is told when the site is in trouble.',
   ];
 
+  /**
+  * A meta value as it should be STORED, from a value that arrived as a tool argument.
+  *
+  * Two corrections, and they live here rather than in a caller for the reason
+  * option_write_policy() gives about options: three tools write post meta, and until this
+  * existed they disagreed about both. wp_write_post_meta_chunk was right, and the tool
+  * every caller actually reaches for was wrong.
+  *
+  * JSON for an array is decoded, the same rule wp_update_option and the chunk writer
+  * already follow: a caller that sends an Elementor payload as JSON must not leave a JSON
+  * string in a row that every reader expects to hold an array. Anything else is stored
+  * verbatim, a string that merely contains a backslash included.
+  *
+  * The result is then slashed, because update_post_meta() unslashes whatever it is given.
+  * Without that a regex, a Windows path or a JSON payload is stored with its backslashes
+  * stripped: "{"re":"\\d+"}" becomes "{"re":"\d+"}", which is no longer parseable JSON,
+  * and the tool answers "Meta updated" over it. A success message across a mangled write
+  * is worse than a refusal, because nothing downstream has any reason to look again.
+  */
+  private function prepare_meta_value( $value ) {
+    if ( is_string( $value ) && isset( $value[0] ) && ( $value[0] === '[' || $value[0] === '{' ) ) {
+      $decoded = json_decode( $value, true );
+      if ( json_last_error() === JSON_ERROR_NONE && is_array( $decoded ) ) {
+        $value = $decoded;
+      }
+    }
+    // Deep by way of map_deep(), so a nested array is slashed at every leaf, and a
+    // non-string leaf is returned untouched rather than cast.
+    return wp_slash( $value );
+  }
+
   private function bust_post_cache( int $post_id, array $context = [] ): void {
     if ( $post_id <= 0 ) {
       return;
@@ -1240,14 +1271,14 @@ class GMCP_Tools_Core {
       ],
       'wp_update_post_meta' => [
         'name' => 'wp_update_post_meta',
-        'description' => 'Update post meta efficiently. Use "meta" object to update MULTIPLE fields at once (e.g., {_price: "19.99", _stock: "50", _sku: "WIDGET"}), or use "key"+"value" for a single field. Essential for WooCommerce products and custom post types. Keys are written EXACTLY as given, case included, so "myPlugin_Data" creates that key and not the "myplugin_data" earlier versions silently wrote instead. One thing is not decided here: the database matches an existing row case-insensitively, so writing "myPlugin_Data" where "myplugin_data" is already on the post updates that row and leaves its spelling alone, and reads are exact and would then miss it. That is reported in the answer when it happens, naming the row the value is really in. An empty key, the key "0" (WordPress cannot address either), or one longer than 255 characters (the width of wp_postmeta.meta_key) is refused and nothing at all is written.',
+        'description' => 'Update post meta efficiently. Use "meta" object to update MULTIPLE fields at once (e.g., {_price: "19.99", _stock: "50", _sku: "WIDGET"}), or use "key"+"value" for a single field. Essential for WooCommerce products and custom post types. A value may be an array or object, and a string that is valid JSON for one is decoded before storing, the same way wp_update_option and wp_write_post_meta_chunk do, so a small Elementor payload no longer needs the chunk API. Backslashes are preserved, so a regex, a Windows path or a JSON payload is stored as it was sent. Keys are written EXACTLY as given, case included, so "myPlugin_Data" creates that key and not the "myplugin_data" earlier versions silently wrote instead. One thing is not decided here: the database matches an existing row case-insensitively, so writing "myPlugin_Data" where "myplugin_data" is already on the post updates that row and leaves its spelling alone, and reads are exact and would then miss it. That is reported in the answer when it happens, naming the row the value is really in. An empty key, the key "0" (WordPress cannot address either), or one longer than 255 characters (the width of wp_postmeta.meta_key) is refused and nothing at all is written. Use wp_write_post_meta_chunk instead when the value is too large to pass in one tool argument. Post meta is not journalled, so this CANNOT be undone with wp_undo_change.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
             'ID' => [ 'type' => 'integer' ],
             'meta' => [ 'type' => 'object', 'description' => 'Key/value pairs to set. Alternative: provide "key" + "value".' ],
             'key' => [ 'type' => 'string' ],
-            'value' => [ 'type' => [ 'string', 'number', 'boolean' ] ],
+            'value' => [ 'type' => [ 'string', 'number', 'boolean', 'array', 'object' ] ],
           ],
           'required' => [ 'ID' ],
         ],
@@ -3287,8 +3318,10 @@ class GMCP_Tools_Core {
           $meta = json_decode( $meta, true );
         }
 
-        // Pass values as-is: update_post_meta() serializes arrays itself, so
-        // maybe_serialize() here double-serialized nested arrays into a string.
+        // Never maybe_serialize() here: update_post_meta() serializes arrays itself, and
+        // doing it twice stored a nested array as its own serialization. prepare_meta_value()
+        // is the single answer to what a value should look like on the way in, so the map
+        // form and the key/value form can no longer treat the same bytes differently.
         if ( !empty( $meta ) && is_array( $meta ) ) {
           $pairs = [];
           foreach ( $meta as $k => $v ) {
@@ -3320,11 +3353,14 @@ class GMCP_Tools_Core {
         }
         $meta_lines = [ 'Meta updated for post #' . $pid ];
         foreach ( $pairs as $k => $v ) {
-          // wp_slash on the KEY only: update_metadata() unslashes it, so a key holding a
-          // backslash would otherwise be stored without it, under a name no reader asks
-          // for. @see meta_key_allowed(). The value is left exactly as it arrives, which
-          // is the behaviour every existing caller already writes against.
-          update_post_meta( $pid, wp_slash( $k ), $v );
+          // Key and value are slashed for the same reason and by different routes.
+          // update_metadata() unslashes both, so a key holding a backslash would be stored
+          // without it under a name no reader asks for (@see meta_key_allowed()), and a
+          // value holding one would lose it silently, which is what prepare_meta_value()
+          // exists to stop. That helper also decodes a JSON string into the array a reader
+          // expects, and it is shared with the chunk writer so the two cannot disagree
+          // about the same bytes.
+          update_post_meta( $pid, wp_slash( $k ), $this->prepare_meta_value( $v ) );
           $elsewhere = $this->meta_key_stored_as( $pid, $k );
           if ( $elsewhere !== '' ) {
             $meta_lines[] = 'Note: "' . $k . '" went into the row already spelled "' . $elsewhere
@@ -3472,24 +3508,16 @@ class GMCP_Tools_Core {
           break;
         }
 
-        $chunk_value = $staged['data'];
-        $chunk_stored_as = 'string';
-        // Same decode wp_update_option does, for the same reason: a caller that sends an
-        // Elementor payload as JSON must not end up with a JSON string in a meta row that
-        // every reader expects to hold an array.
-        if ( isset( $chunk_value[0] ) && ( $chunk_value[0] === '[' || $chunk_value[0] === '{' ) ) {
-          $chunk_decoded = json_decode( $chunk_value, true );
-          if ( json_last_error() === JSON_ERROR_NONE && is_array( $chunk_decoded ) ) {
-            $chunk_value = $chunk_decoded;
-            $chunk_stored_as = 'array';
-          }
-        }
-        // wp_slash for the reason copy_post_meta() gives: update_post_meta() unslashes,
-        // and an unslashed JSON payload loses the backslashes that make it valid JSON.
-        // The key needs it for the same reason and is easier to miss, because a key with
-        // a backslash in it would be stored without one and the reader would never find
-        // it. @see meta_key_allowed().
-        update_post_meta( $chunk_pid, wp_slash( $chunk_key ), wp_slash( $chunk_value ) );
+        // The decode-and-slash this writer used to carry itself now lives in
+        // prepare_meta_value(), which wp_update_post_meta asks too. Keeping two copies is
+        // how the two tools came to disagree about the same bytes in the first place.
+        $chunk_value = $this->prepare_meta_value( $staged['data'] );
+        $chunk_stored_as = is_array( $chunk_value ) ? 'array' : 'string';
+        // The key is slashed separately: update_metadata() unslashes it too, and a key with
+        // a backslash would be stored without one under a name no reader asks for. It is
+        // the easier of the two to miss, because nothing about the stored value looks
+        // wrong. @see meta_key_allowed().
+        update_post_meta( $chunk_pid, wp_slash( $chunk_key ), $chunk_value );
         // written_to names the row the bytes are in, not the row that was asked for, so a
         // caller can hand it straight to wp_read_post_meta_chunk. @see meta_key_stored_as().
         $chunk_elsewhere = $this->meta_key_stored_as( $chunk_pid, $chunk_key );

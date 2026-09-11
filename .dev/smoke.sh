@@ -450,5 +450,76 @@ call ch_b "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{
 # reusing an id would interleave their bytes into one value and neither would know.
 check "a session started on one target is refused on another" "$(verdict ch_b)" "error"
 
+echo "-- the everyday meta tool keeps backslashes --"
+# update_post_meta() unslashes what it is given, so a value carrying backslashes arrives
+# stripped: a JSON payload stops parsing, a regex stops matching and a Windows path loses
+# its separators. The chunk tool has always compensated with wp_slash(); the everyday tool
+# did not, and answered "Meta updated" over the mangled write.
+#
+# Asserted against the STORED value, never the reply. The reply was already truthful-
+# looking while the row was wrong, which is the whole defect.
+SL_ID=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Slashes","post_type"=>"page","post_status"=>"draft"]);' 2>/dev/null | tr -d '\r\n')
+python3 - "$OUT" "$SL_ID" <<'PYSLASH'
+import json, sys
+out, pid = sys.argv[1], int(sys.argv[2])
+# A regex, a Windows path and an escaped solidus: the three shapes that lose meaning when
+# a backslash is dropped. Written as a JSON *string*, which is how a client sends one.
+value = r'{"re":"\\d+","win":"C:\\path","url":"https:\/\/e.test"}'
+open(out + '/slash_kv.json', 'w').write(json.dumps(
+    {"jsonrpc": "2.0", "id": 81, "method": "tools/call",
+     "params": {"name": "wp_update_post_meta",
+                "arguments": {"ID": pid, "key": "_slashed", "value": value}}}))
+open(out + '/slash_map.json', 'w').write(json.dumps(
+    {"jsonrpc": "2.0", "id": 82, "method": "tools/call",
+     "params": {"name": "wp_update_post_meta",
+                "arguments": {"ID": pid, "meta": {"_slashed_map": value}}}}))
+# The control for the pair above: the same bytes through the tool that was already
+# correct. If this one ever fails too, the probe is broken rather than the everyday tool.
+open(out + '/slash_chunk.json', 'w').write(json.dumps(
+    {"jsonrpc": "2.0", "id": 83, "method": "tools/call",
+     "params": {"name": "wp_write_post_meta_chunk",
+                "arguments": {"session": "slash1", "ID": pid, "key": "_slashed_chunk",
+                              "data": value, "final": True}}}))
+PYSLASH
+for f in slash_kv slash_map slash_chunk; do
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d @"$OUT/$f.json" -o "$OUT/$f"
+done
+# get_post_meta() returns the array WordPress stored. Comparing against the literal the
+# payload means keeps the assertion readable and independent of how it was serialized.
+slashed() { # slashed <meta key>
+  docker compose exec -T cli wp eval "
+    \$v = get_post_meta($SL_ID, '$1', true);
+    echo (is_array(\$v) && \$v['re'] === '\\\\d+' && \$v['win'] === 'C:\\\\path'
+          && \$v['url'] === 'https://e.test') ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n'
+}
+check "key/value form keeps its backslashes" "$(slashed _slashed)" "intact"
+check "and the meta map form keeps them too" "$(slashed _slashed_map)" "intact"
+check "CONTROL: the chunk tool, already correct, agrees" "$(slashed _slashed_chunk)" "intact"
+# Decoding matches wp_write_post_meta_chunk and wp_update_option: a caller that sends an
+# array as JSON must not find a JSON string where every reader expects an array.
+check "JSON for an array is stored as an array" \
+  "$(docker compose exec -T cli wp eval "echo gettype(get_post_meta($SL_ID,'_slashed',true));" 2>/dev/null | tr -d '\r\n')" "array"
+# The other half of that rule: text that merely contains a backslash is not JSON and must
+# survive verbatim, not be coerced into anything.
+# Built in Python, not in the shell. Written inline, the escaping needed four levels of
+# quoting and landed on a doubled backslash, which the unslashing then reduced to the
+# single one the assertion wanted: the test passed on broken code by cancelling the bug
+# against itself.
+python3 - "$OUT" "$SL_ID" <<'PYPLAIN'
+import json, sys
+out, pid = sys.argv[1], int(sys.argv[2])
+open(out + '/slash_plain.json', 'w').write(json.dumps(
+    {"jsonrpc": "2.0", "id": 84, "method": "tools/call",
+     "params": {"name": "wp_update_post_meta",
+                "arguments": {"ID": pid, "key": "_plain", "value": r"C:\Users\me"}}}))
+PYPLAIN
+curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' -d @"$OUT/slash_plain.json" -o "$OUT/slash_plain"
+check "a plain string with backslashes is stored verbatim" \
+  "$(docker compose exec -T cli wp eval "
+    echo get_post_meta($SL_ID, '_plain', true) === 'C:' . chr(92) . 'Users' . chr(92) . 'me'
+      ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
+
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

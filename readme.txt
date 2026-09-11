@@ -152,7 +152,8 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * A one-call site briefing, so an agent orients in one request rather than six.
 * Tool failures arrive as results the model can read, with isError set, rather than as JSON-RPC errors a client may discard along with the rest of the response.
 * Scheduled events can be listed, run and removed, so a cron event Site Health keeps flagging can be diagnosed and cleared. Only events the site already scheduled can be run, and removing one takes a confirmation step.
-* Copy post meta between posts, duplicate a post, and write or read an oversized value across several calls, so a large or heavily escaped design never has to pass through a tool argument. A duplicate is a draft unless you ask otherwise.
+* Copy post meta between posts, duplicate a post, and write or read an oversized value across several calls, so a large design never has to pass through a tool argument. A duplicate is a draft unless you ask otherwise.
+* Post meta keeps its backslashes. WordPress unslashes every meta value it stores, which used to turn a regex, a Windows path or a JSON payload into something that no longer meant what was sent, while the tool still reported success. Every meta writer now goes through one function that slashes the value and decodes a JSON string for an array, so an ordinary update no longer needs the chunked writer to survive.
 * Delete an option, not only set one, so a stale cache that only clears by removing the row can be cleared. Nine options are refused, each with what breaks if it goes. The reply carries the removed value, because undo cannot put it back.
 * Flush the object cache, expired transients or one post, and say plainly which CDN or reverse proxy it could not reach and you still have to purge yourself.
 * Meta keys are matched exactly rather than lowercased, and a write that lands under a different spelling than you asked for says so.
