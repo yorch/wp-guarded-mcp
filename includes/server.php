@@ -342,6 +342,31 @@ class GMCP_Server {
   }
 
   /** Format tool result for MCP protocol */
+  /**
+  * Whether a value is an MCP content block list: a non-empty list whose every entry is an
+  * array carrying a string "type".
+  *
+  * Deliberately strict about all three. A map rather than a list is the post-object case
+  * this exists to catch. An empty list is treated as not-an-envelope so it is wrapped
+  * rather than delivered as a reply with nothing in it; no handler here produces one,
+  * because every builder appends at least one block before returning.
+  *
+  * "type" is the only field checked. The protocol allows blocks other than text, images
+  * and resource links among them, and requiring "text" would reject a valid reply the
+  * moment this plugin or a filter on it grows one.
+  */
+  private static function is_content_block_list( $content ): bool {
+    if ( !is_array( $content ) || $content === [] || !array_is_list( $content ) ) {
+      return false;
+    }
+    foreach ( $content as $block ) {
+      if ( !is_array( $block ) || !isset( $block['type'] ) || !is_string( $block['type'] ) ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   private function format_tool_result( $result ): array {
     // If result is a string, wrap it in the MCP content format
     if ( is_string( $result ) ) {
@@ -355,8 +380,19 @@ class GMCP_Server {
       ];
     }
 
-    // If result has 'content' key, assume it's already properly formatted
-    if ( is_array( $result ) && isset( $result['content'] ) ) {
+    // Already an MCP envelope, judged by the SHAPE of content rather than by the presence
+    // of a key with that name. The difference is the whole bug: a WordPress post carries a
+    // content field of its own, holding {raw, rendered, protected, block_version}, so every
+    // single-item posts or pages tool in the dynamic REST group was read as a finished
+    // envelope and handed back whole. The client then found result.content was an object
+    // where the protocol requires an array, called the reply malformed and discarded it,
+    // and a caller that had just created a page could not read back its id without listing
+    // the site again to find it.
+    //
+    // Testing the shape closes the class rather than the instance. The next handler to
+    // return a domain object with a content field, a comment or a WooCommerce order note
+    // among them, is otherwise exactly this bug again.
+    if ( is_array( $result ) && isset( $result['content'] ) && self::is_content_block_list( $result['content'] ) ) {
       return $result;
     }
 

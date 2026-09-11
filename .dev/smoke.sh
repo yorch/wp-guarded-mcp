@@ -553,6 +553,41 @@ import json
 a=json.load(open('$OUT/rf_all'),strict=False)['result']['content'][0]['text']
 b=json.load(open('$OUT/rf_slim'),strict=False)['result']['content'][0]['text']
 print(len(b) * 4 < len(a))")" "True"
+
+# Every reply must carry content as a LIST OF BLOCKS. format_tool_result() used to decide
+# a handler had already built an envelope by testing for a key called "content", and a
+# WordPress post has a content field of its own holding {raw, rendered, protected}. So a
+# created page was mistaken for a finished envelope and passed through whole: the client
+# found an object where the protocol requires an array, called the reply malformed and
+# discarded it, and the caller could not read back the id of the page it had just made.
+shape() { # shape <response file>
+  python3 -c "
+import json, sys
+d = json.load(open('$OUT/' + sys.argv[1]), strict=False)
+c = d.get('result', {}).get('content')
+print('blocks' if isinstance(c, list) and c and all(
+    isinstance(b, dict) and 'type' in b and 'text' in b for b in c) else 'malformed')
+" "$1"; }
+SH_PAGE=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Shape probe","post_type"=>"page","post_status"=>"draft"]);' 2>/dev/null | tr -d '\r\n')
+SH_MEDIA=$(docker compose exec -T cli wp eval 'echo wp_insert_attachment(["post_title"=>"Shape media","post_mime_type"=>"image/gif","post_status"=>"inherit"], false, 0);' 2>/dev/null | tr -d '\r\n')
+call sh_create '{"jsonrpc":"2.0","id":93,"method":"tools/call","params":{"name":"create_pages","arguments":{"title":"Shape created","status":"draft"}}}'
+call sh_get    "{\"jsonrpc\":\"2.0\",\"id\":94,\"method\":\"tools/call\",\"params\":{\"name\":\"get_pages\",\"arguments\":{\"id\":$SH_PAGE}}}"
+call sh_update "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\",\"params\":{\"name\":\"update_pages\",\"arguments\":{\"id\":$SH_PAGE,\"title\":\"Shape renamed\"}}}"
+call sh_delete "{\"jsonrpc\":\"2.0\",\"id\":96,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_pages\",\"arguments\":{\"id\":$SH_PAGE}}}"
+call sh_media  "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\",\"params\":{\"name\":\"get_media\",\"arguments\":{\"id\":$SH_MEDIA}}}"
+for t in create get update delete; do
+  check "${t}_pages answers with a block list" "$(shape sh_$t)" "blocks"
+done
+# Media never had the defect, because an attachment has no content field for the key test
+# to trip over. Kept as a control: it is the shape the others should always have had, and
+# if it ever reports malformed the probe is wrong rather than the tools.
+check "CONTROL: get_media, which never had the defect, is unchanged" "$(shape sh_media)" "blocks"
+# The point of the fix rather than a restatement of it. A create whose reply the client
+# discards is a write the caller cannot follow up, and re-listing to find the new id was
+# the workaround this removes.
+check "and a create reports the id of what it made" \
+  "$(py 'import json,sys;t=json.load(sys.stdin,strict=False)["result"]["content"][0]["text"];print("id" in json.loads(t))' sh_create)" "True"
+docker compose exec -T cli wp post delete "$SH_MEDIA" --force >/dev/null 2>&1
 docker compose exec -T cli wp post delete "$RF_ID" --force >/dev/null 2>&1
 # Quoted, and it was not: the shell substitutes REST_WAS bare, so (1==='1') compares an
 # int against a string under PHP's strict operator and is always false. The restore then

@@ -550,6 +550,16 @@ response, including on a call that had already done its work. That is how a crea
 came back with no readable ID. Only a genuinely protocol-level condition, an unknown
 method, is a real error. Follow the same rule in your own tools.
 
+A filter may also return plain data instead of a full response, and the server wraps it:
+the JSON becomes the reply text and the value is attached as `data`. It decides a value is
+already an envelope by looking at the shape of `content`, a non-empty list of blocks each
+carrying a `type`, not merely by finding a key of that name. The distinction matters if
+your tool returns a record of its own that happens to have a `content` field. WordPress
+posts do, holding `{raw, rendered, protected}`, and for a while that was enough to have a
+created page handed back as though it were a finished MCP reply, which no client could
+parse. Return a full response when you want to control the envelope, and plain data when
+you do not.
+
 Other hooks:
 
 | Hook | Purpose |
