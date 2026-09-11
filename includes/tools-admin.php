@@ -508,6 +508,17 @@ class GMCP_Tools_Admin {
         'inputSchema' => [ 'type' => 'object', 'properties' => [] ],
         'accessLevel' => 'read',
       ],
+      'wp_list_backups' => [
+        'name' => 'wp_list_backups',
+        'description' => 'List the backups that exist, newest first, each identified by when it finished and described by what it contains, how big it is and where it went. Archive filenames and paths are deliberately never returned: on both supported backup plugins the filename or its directory is the only thing stopping anyone who can guess it from downloading a database archive holding every user and password hash. As with wp_backup_status, "cannot tell" is a real answer: a plugin this one cannot enumerate gets said so, never an empty list.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'limit' => [ 'type' => 'integer', 'description' => 'How many to return, newest first. Default 20, maximum 100. The reply says whether it was truncated.' ],
+          ],
+        ],
+        'accessLevel' => 'read',
+      ],
       'wp_start_backup' => [
         'name' => 'wp_start_backup',
         'description' => 'Ask the site\'s backup plugin to start a full backup. It starts one; it does not wait for one. A backup takes minutes to hours and this call returns in seconds, so a successful reply means the job was started and NOT that a backup exists. Poll wp_backup_status until it reports a newly completed backup before doing anything you would want the backup for. There is deliberately no tool to restore.',
@@ -780,6 +791,9 @@ class GMCP_Tools_Admin {
       case 'wp_backup_status':
         return $this->json( $r, GMCP_Backup::status() );
 
+      case 'wp_list_backups':
+        return $this->json( $r, GMCP_Backup::listing( isset( $a['limit'] ) ? (int) $a['limit'] : 20 ) );
+
       case 'wp_start_backup':
         $started = GMCP_Backup::start();
         if ( !$started['ok'] ) {
@@ -844,7 +858,7 @@ class GMCP_Tools_Admin {
   private const READ_ONLY_TOOLS = [
     'wp_list_themes', 'wp_get_settings', 'wp_get_permalink_structure', 'wp_get_site_health',
     'wp_list_menus', 'wp_get_menu_items', 'wp_list_sidebars', 'wp_site_briefing',
-    'wp_get_audit_log', 'wp_backup_status', 'wp_list_cron_events',
+    'wp_get_audit_log', 'wp_backup_status', 'wp_list_backups', 'wp_list_cron_events',
   ];
 
   private function is_mutating_tool( string $tool ): bool {

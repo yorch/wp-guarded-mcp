@@ -50,9 +50,13 @@ class GMCP_Backup {
   /**
   * The adapters, newest-first in preference order.
   *
-  * Each declares: whether it is installed, how to start a backup, and how to read the
-  * state. An adapter that cannot answer a question returns null rather than a guess, and
-  * the difference between null and false is load-bearing throughout this file.
+  * Each declares: whether it is installed, how to start a backup, how to read the state,
+  * and how to list what exists. An adapter that cannot answer a question returns null
+  * rather than a guess, and the difference between null and false is load-bearing
+  * throughout this file.
+  *
+  * A list entry describes a backup without naming it on disk. See list_entry() for why
+  * the filename is the one field deliberately missing.
   */
   public static function providers(): array {
     return apply_filters( 'gmcp_backup_providers', [
@@ -93,6 +97,38 @@ class GMCP_Backup {
             'last_errors' => $errors,
           ];
         },
+        'list' => function ( int $limit ) {
+          // Keyed by the completion time, which is the identifier this returns. The
+          // entries themselves hold the zip names, and those are exactly what must not
+          // come back out: see list_entry().
+          $history = (array) UpdraftPlus_Backup_History::get_history();
+          krsort( $history, SORT_NUMERIC );
+
+          $out = [];
+          foreach ( $history as $when => $set ) {
+            if ( count( $out ) >= $limit ) {
+              break;
+            }
+            $set = (array) $set;
+
+            // A component is present when its own key is, and its size lives in a
+            // sibling "<component>-size". Summing those rather than stat-ing the
+            // directory keeps this working for a backup that has been sent away and
+            // deleted locally.
+            $contains = [];
+            $bytes = 0;
+            foreach ( [ 'db' => 'database', 'plugins' => 'plugins', 'themes' => 'themes', 'uploads' => 'uploads', 'others' => 'others' ] as $key => $label ) {
+              if ( empty( $set[ $key ] ) ) {
+                continue;
+              }
+              $contains[] = $label;
+              $bytes += (int) ( $set[ $key . '-size' ] ?? 0 );
+            }
+
+            $out[] = self::list_entry( (int) $when, $contains, $bytes, self::updraft_destination( $set ) );
+          }
+          return $out;
+        },
       ],
 
       // Backuply, free or Pro: the Pro plugin loads this same code base, so both answer
@@ -111,6 +147,7 @@ class GMCP_Backup {
         },
         'start' => function ( array $args ) { return self::backuply_start(); },
         'state' => function () { return self::backuply_state(); },
+        'list' => function ( int $limit ) { return self::backuply_list( $limit ); },
       ],
 
       // Known, detectable, and not drivable from here. Named rather than ignored so the
@@ -188,6 +225,108 @@ class GMCP_Backup {
     $out['age_hours'] = $state['last_completed'] ? (int) round( ( time() - $state['last_completed'] ) / HOUR_IN_SECONDS ) : null;
     $out['summary'] = self::describe( $provider['name'], $state );
     return $out;
+  }
+
+  /**
+  * The backups this site has, newest first.
+  *
+  * Separate from status() because the two answer different questions and one of them is
+  * expensive. status() is called on every destructive confirmation; this is called when
+  * somebody asks what is actually there.
+  *
+  * can_list is its own answer, distinct from can_tell, because an adapter may know when a
+  * backup last finished without being able to enumerate them. Where it cannot list, the
+  * backups key is absent rather than empty: an empty array reads as "there are none",
+  * which is the one thing this file may never say when it does not know.
+  */
+  public static function listing( int $limit = 20 ): array {
+    $limit = max( 1, min( 100, $limit ) );
+
+    $provider = self::detect();
+    if ( !$provider ) {
+      return [
+        'provider' => null,
+        'can_list' => false,
+        'summary' => 'No backup plugin this one recognises is active, so it cannot list anything. That is not the same as there being no backups: a host-level or external backup would be invisible here.',
+      ];
+    }
+
+    $out = [
+      'provider' => $provider['name'],
+      'can_list' => is_callable( $provider['list'] ?? null ),
+    ];
+
+    if ( !$out['can_list'] ) {
+      $out['summary'] = $provider['name'] . ' is active and this plugin cannot enumerate its backups, so it cannot say whether any exist. '
+        . ( $provider['why_not'] ?? '' );
+      return $out;
+    }
+
+    $backups = (array) call_user_func( $provider['list'], $limit );
+    $out['count'] = count( $backups );
+    $out['limit'] = $limit;
+    // Said plainly, because a caller that quietly received 20 of 200 would draw
+    // conclusions about the oldest backup it can see that are simply wrong.
+    $out['truncated'] = count( $backups ) >= $limit;
+    $out['backups'] = array_values( $backups );
+    $out['summary'] = self::describe_listing( $provider['name'], $out );
+    return $out;
+  }
+
+  /** One sentence about the listing, including what it is not showing. */
+  private static function describe_listing( string $name, array $out ): string {
+    if ( $out['count'] === 0 ) {
+      return sprintf( '%s is active and has no backups recorded. It can enumerate them, so this is a real zero rather than a gap in what can be seen.', $name );
+    }
+    $line = sprintf(
+      '%s reports %d backup%s, newest first, identified by when each finished.',
+      $name,
+      $out['count'],
+      $out['count'] === 1 ? '' : 's'
+    );
+    if ( $out['truncated'] ) {
+      $line .= sprintf( ' This is the newest %d and there may be older ones; raise limit to see further back.', $out['limit'] );
+    }
+    return $line . ' Archive filenames are deliberately not included, because on both supported plugins the filename or its directory is the only thing keeping the archive from being downloaded by anyone who can guess it.';
+  }
+
+  /**
+  * One backup, described without naming it on disk.
+  *
+  * The missing field is the point. UpdraftPlus writes
+  * backup_<date>_<site>_<nonce>-db.gz into wp-content/updraft, where that nonce is what
+  * makes the URL unguessable; its .htaccess there says "deny from all", which nginx does
+  * not read at all. Backuply inverts it, with a predictable filename inside a directory
+  * whose random suffix is the secret. Either way the on-disk name is a capability, and a
+  * database archive holds every user row and password hash on the site.
+  *
+  * So this returns nothing a caller could turn into a URL. A backup is identified by when
+  * it finished, which is unguessable by nobody and sufficient for every question an agent
+  * has a reason to ask: is there a recent one, what is in it, and where did it go.
+  */
+  private static function list_entry( int $when, array $contains, int $bytes, string $destination ): array {
+    return [
+      'completed' => $when,
+      'completed_gmt' => gmdate( 'Y-m-d H:i', $when ) . ' GMT',
+      'age_hours' => (int) round( ( time() - $when ) / HOUR_IN_SECONDS ),
+      'contains' => $contains,
+      'size_bytes' => $bytes,
+      'size' => $bytes > 0 ? size_format( $bytes ) : null,
+      'destination' => $destination,
+    ];
+  }
+
+  /**
+  * Where an UpdraftPlus backup went.
+  *
+  * An empty service list means it was only ever written next to the site, which is worth
+  * saying rather than leaving blank: a backup on the same disk as the site does not
+  * survive the failure people take backups for.
+  */
+  private static function updraft_destination( array $set ): string {
+    $services = array_filter( array_map( 'strval', (array) ( $set['service'] ?? [] ) ) );
+    $services = array_filter( $services, function ( $s ) { return $s !== '' && $s !== 'none'; } );
+    return $services ? implode( ', ', array_unique( $services ) ) : 'local only';
   }
 
   /** One sentence a person or a model can act on, with no cheerful rounding. */
@@ -343,6 +482,65 @@ class GMCP_Backup {
       'last_succeeded' => $log['succeeded'],
       'last_errors' => $log['errors'],
     ];
+  }
+
+  /**
+  * Backuply's backups, newest first.
+  *
+  * backuply_get_backups_info() already sorts by the timestamp in the info filename and
+  * drops records whose archive has gone, so this is a filter and a reshape rather than a
+  * scan. It returns objects, not arrays, which is the one thing to be careful of.
+  *
+  * btime is the completion time and doubles as the identifier. The name field beside it
+  * is not returned: it is the archive's own filename, and Backuply keeps archives in a
+  * directory whose random suffix is all that protects them.
+  */
+  private static function backuply_list( int $limit ): array {
+    $out = [];
+    foreach ( (array) backuply_get_backups_info() as $info ) {
+      if ( count( $out ) >= $limit ) {
+        break;
+      }
+      $when = (int) ( $info->btime ?? 0 );
+      if ( $when <= 0 ) {
+        // Undated, so it cannot be identified the way every other entry is. Skipping it
+        // would undercount, so it is reported with what is known and no invented time.
+        $out[] = self::list_entry( 0, self::backuply_contains( $info ), (int) ( $info->size ?? 0 ), self::backuply_destination( $info ) )
+          + [ 'note' => 'Backuply recorded no completion time for this one.' ];
+        continue;
+      }
+      $out[] = self::list_entry( $when, self::backuply_contains( $info ), (int) ( $info->size ?? 0 ), self::backuply_destination( $info ) );
+    }
+    return $out;
+  }
+
+  /** Which halves of the site a Backuply archive holds, from the flags it was made with. */
+  private static function backuply_contains( object $info ): array {
+    $contains = [];
+    if ( !empty( $info->backup_db ) ) {
+      $contains[] = 'database';
+    }
+    if ( !empty( $info->backup_dir ) ) {
+      $contains[] = 'files';
+    }
+    return $contains;
+  }
+
+  /**
+  * Where a Backuply archive went.
+  *
+  * backup_location is an id into the site's own list of configured remote locations, and
+  * an absent or empty one means Backuply's local folder. The id is resolved to the name
+  * the site gave it, because "3" tells a reader nothing.
+  */
+  private static function backuply_destination( object $info ): string {
+    $id = $info->backup_location ?? '';
+    if ( $id === '' || $id === null ) {
+      return 'local only';
+    }
+    $locations = (array) get_option( 'backuply_remote_backup_locs', [] );
+    $name = $locations[ $id ]['name'] ?? '';
+    return $name !== '' ? (string) $name : 'a remote location Backuply no longer has configured';
   }
 
   /**

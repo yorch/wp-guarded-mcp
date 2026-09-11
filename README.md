@@ -148,8 +148,9 @@ Reverting is gated twice: on the tool that made the change, and on the operation
 
 Two limits worth knowing. Values that look credential-shaped are not stored, judged by the field names inside them through `gmcp_credential_field_patterns` as well as by the option's own name, so those changes are recorded but cannot be reverted. That check is structural, so a secret held as a bare string under an innocuous option name is still stored. And it is not retroactive: adding an option to `gmcp_protected_options` refuses future reverts but does not scrub what is already recorded, so clear the journal after protecting something that was previously being written.
 
-**Backups.** `wp_backup_status` reports what is known; `wp_start_backup` asks the site's
-backup plugin to start one. Three things shape this more than the integration does.
+**Backups.** `wp_backup_status` reports what is known, `wp_list_backups` says which backups
+exist, and `wp_start_backup` asks the site's backup plugin to start one. Three things shape
+this more than the integration does.
 
 There is no common interface. Sixteen backup plugins with no dominant one, and the largest
 work in unrelated ways: UpdraftPlus fires a WordPress action, Backuply writes a job record
@@ -189,6 +190,22 @@ So "cannot tell" is a first-class answer, returned rather than flattened into a 
 the two-step confirmation *reports* the backup situation instead of gating on it. A gate
 would have to pass whenever it could not read a provider, and a control that silently
 passes is worse than an absent one because it gets counted.
+
+A listing must not hand out the keys. `wp_list_backups` returns when each backup finished,
+what it contains, how big it is and where it went. It never returns the archive's filename
+or path, and that omission is the design rather than an oversight. UpdraftPlus writes
+`backup_<date>_<site>_<nonce>-db.gz` into `wp-content/updraft`, where the nonce is the only
+thing making the URL unguessable: the `.htaccess` there says `deny from all`, which nginx
+never reads. Backuply inverts the arrangement, with a predictable filename inside a
+directory whose random suffix is the secret. Either way the on-disk name is a capability,
+and a database archive holds every user row and password hash on the site. So a backup is
+identified by when it finished, which answers every question an agent has a reason to ask
+and cannot be turned into a URL.
+
+The same "cannot tell" rule applies. A provider this plugin cannot enumerate gets said so,
+and the `backups` key is absent rather than empty, because an empty list reads as "there
+are none". A capped listing says it was capped and reports the limit it used, so a caller
+can tell the newest hundred of four hundred from all hundred that exist.
 
 There is no restore tool at any access level. Restoring discards everything since the
 backup, which is a larger irreversible act than anything else here, and no confirmation
