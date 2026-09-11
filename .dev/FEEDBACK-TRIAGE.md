@@ -31,6 +31,10 @@ rewrite; a short hash does not.
 | 3, meta corruption | fixed, `fix(tools): stop wp_update_post_meta silently stripping backslashes` |
 | 11, field selection | fixed, `feat(tools): declare _fields on the generated REST tools`, by declaring `_fields` rather than building anything |
 | 12, server-side half | fixed, `fix(core): throw the generated tool cache away when the version changes`; the client notification is still open |
+| 5, per-URL purging | fixed, `feat(tools): purge one page rather than the whole cache` |
+| 8, menu tooling | fixed, `feat(tools): edit a menu item, name a menu's slug, and report what is broken` |
+| 9, template references | fixed, `feat(elementor): answer what still points at a template` |
+| 12, client notification | fixed, `feat(server): tell a connected client when the tool list changes`; both halves are now done |
 | the WooCommerce mutation probe | fixed, `test(woo): install the mutation probe instead of assuming a directory`; it silently never installed, so two assertions reported a bug that was not there. Note that main fixed the same directory bug independently, so what this commit still contributes is the control check proving the probe is present |
 
 Everything else below is untouched and still describes what is true today.
@@ -324,8 +328,10 @@ should have caught it), 12's server-cache half (bust on version change).
 either option offered, but "what does undo do with a redacted leaf" has to be answered
 first, and the answer has to be written down in both readmes.
 
-**Good features, bounded.** 8 (menu update, menu slug, nav-menu audit), 9 (template
-references), 5 (`wp_purge_url`), 12's notification half.
+**Good features, bounded.** All four are now done: 8 (menu update, menu slug, and the
+report, shipped as `wp_menu_health` rather than `wp_audit_menus`, because "audit" means the
+audit log here and a safety check greps for it), 9 (template references), 5
+(`wp_purge_url`), 12's notification half.
 
 **Larger, needs design.** 6 (meta journalling and side-effect grouping), 7 (batch, after 6),
 4 (backup scope; the listing half is done and the download-URL half should be declined),

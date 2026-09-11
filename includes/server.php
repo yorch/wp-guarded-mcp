@@ -42,6 +42,15 @@ class GMCP_Server {
   private $protocol_version = '2025-06-18';
   private $supported_protocol_versions = [ '2024-11-05', '2025-06-18' ];
   private $queue_key = 'gmcp_msg';
+  // Bumped whenever something changes which tools this site offers, and read by an open
+  // SSE stream to decide whether to announce it. An integer in an option rather than a
+  // hash of the inputs, so a new source of tools needs one more add_action here and not a
+  // second list of what counts.
+  const TOOLS_REVISION_OPTION = 'gmcp_tools_revision';
+  // Per session, the revision that session was last told about. Prefixed away from
+  // queue_key: the message queue is swept with a LIKE over its own prefix, and this must
+  // not be caught by it.
+  const SEEN_REVISION_PREFIX = 'gmcp_seen_rev_';
   private $session_id = null;
   private $logging = false;
   private $last_action_time = 0;
@@ -80,6 +89,35 @@ class GMCP_Server {
     $this->oauth = new GMCP_OAuth( $core, $this );
 
     add_action( 'rest_api_init', [ $this, 'rest_api_init' ] );
+
+    // Everything that changes which tools this site offers. Registered in the constructor
+    // rather than on rest_api_init, because none of these happen on a REST request: a
+    // settings save is wp-admin, an upgrade is the first request of any kind after it,
+    // and a plugin toggle is either admin or wp-cli.
+    //
+    // The settings row is watched whole rather than by the five mcp_tools_* keys that
+    // actually gate the groups. Comparing those keys would be exact and would rot: the
+    // sixth group is added and this list is not. Watching the row over-fires when an
+    // unrelated setting changes, and an over-fire costs the client one tools/list, since
+    // the notification carries no payload. Under-firing costs a client that is wrong
+    // about what the server offers, which is the thing being fixed.
+    add_action( 'update_option_' . GMCP_Core::OPTION_NAME, [ $this, 'bump_tools_revision' ] );
+    // The generated REST tools are rebuilt on the first request after the version changes,
+    // so this is the upgrade case, and the one the report was actually about.
+    //
+    // Asked after the fact rather than listened for. GMCP_Core::init() fires gmcp_upgraded
+    // a dozen lines before it constructs this object, so an add_action here is registered
+    // too late to ever run and the upgrade would pass unannounced. Measured, not assumed:
+    // with the listener the revision stayed absent across a version change while the
+    // settings hook beside it bumped correctly. did_action() asks the same question at a
+    // point this code can reach.
+    if ( did_action( 'gmcp_upgraded' ) ) {
+      $this->bump_tools_revision();
+    }
+    // The shop and Elementor tools appear and disappear with their plugin, and an agent
+    // holding an admin key can activate one itself.
+    add_action( 'activated_plugin', [ $this, 'bump_tools_revision' ] );
+    add_action( 'deactivated_plugin', [ $this, 'bump_tools_revision' ] );
   }
 
   /**
@@ -509,8 +547,20 @@ class GMCP_Server {
                 'name' => 'WordPress - ' . get_bloginfo( 'name' ),
                 'version' => $this->server_version,
               ],
+              // listChanged is the key that gates notifications/tools/list_changed: the
+              // specification says a server "MUST declare the tools capability" as
+              // {"tools":{"listChanged":true}}, and that only servers "that declared the
+              // listChanged capability SHOULD send a notification" when the list moves.
+              // So the two halves have to ship together. Advertising without sending
+              // leaves a client waiting on a promise; sending without advertising
+              // produces a message the client is entitled to discard.
+              // https://modelcontextprotocol.io/specification/2025-06-18/server/tools
+              //
+              // Claimed only for tools. get_prompts_list() and get_resources_list() both
+              // return an empty array and nothing moves them, so there is no list there
+              // to announce a change to.
               'capabilities' => (object) [
-                'tools' => new stdClass(),
+                'tools' => (object) [ 'listChanged' => true ],
                 'prompts' => new stdClass(),
                 'resources' => new stdClass(),
               ],
@@ -820,6 +870,34 @@ class GMCP_Server {
     echo 'data: {"session":"' . esc_js( $session_id ) . "\"}\n\n";
     flush();
 
+    // The tool-list revision this session was last told about, so a change that lands
+    // while the client has no stream open is announced on the next one it opens. That gap
+    // is not hypothetical: this stream closes itself after a few idle minutes and the
+    // client reconnects, but an MCP session survives that, and so does the stale tool list
+    // the client is holding. Without the stored value a change landing in the gap would be
+    // silently swallowed, because a fresh stream would take the new revision as its
+    // baseline and see nothing move.
+    //
+    // Only when the client identified itself. A GET with no Mcp-Session-Id gets a session
+    // id invented for it above, which the client will never send back, so there is nothing
+    // to correlate the next stream with and the baseline can only live as long as this one.
+    $seen_key = !empty( $session_header ) ? self::SEEN_REVISION_PREFIX . $session_id : '';
+    $seen_revision = $seen_key ? get_transient( $seen_key ) : false;
+    if ( $seen_revision === false ) {
+      // First stream on this session. It has just listed tools or is about to, so what it
+      // holds is current by definition and there is nothing to announce.
+      $seen_revision = $this->tools_revision();
+    }
+    if ( $seen_key ) {
+      // Written on every open, not only when it was missing, so an active session keeps
+      // pushing the expiry out ahead of itself.
+      set_transient( $seen_key, $seen_revision, DAY_IN_SECONDS );
+    }
+    // Zero so the first pass of the loop checks immediately. That is what delivers the
+    // "changed while this session had no stream" case, through the same code as the
+    // ordinary one rather than a branch of its own.
+    $next_revision_check = 0;
+
     $max_time = $this->logging ? 30 : 60 * 3;
     /**
     * How long an idle SSE stream may hold a PHP worker, in seconds.
@@ -863,6 +941,35 @@ class GMCP_Server {
         $this->last_action_time = time();
       }
 
+      // Tell the client its tool list has moved. The notification carries no params and
+      // no id; it is the whole message, and the client answers it by calling tools/list
+      // again.
+      // https://modelcontextprotocol.io/specification/2025-06-18/server/tools
+      //
+      // Checked every couple of seconds rather than on every pass. The loop spins five
+      // times a second and this is one more query each time it does, while a tool list
+      // that has changed is not urgent to the second.
+      if ( time() >= $next_revision_check ) {
+        $next_revision_check = time() + 2;
+        $revision = $this->tools_revision();
+        if ( $revision !== $seen_revision ) {
+          $seen_revision = $revision;
+          if ( $seen_key ) {
+            set_transient( $seen_key, $revision, DAY_IN_SECONDS );
+          }
+          echo "event: message\n";
+          echo 'data: ' . wp_json_encode( [
+            'jsonrpc' => '2.0',
+            'method' => 'notifications/tools/list_changed',
+          ], JSON_UNESCAPED_UNICODE ) . "\n\n";
+          flush();
+          // Deliberately does not touch last_action_time, unlike the queued messages
+          // above. Those are the server answering something; this one the client never
+          // asked for, and letting it restart the idle clock would mean an unsolicited
+          // notification could extend how long a stream holds a PHP worker.
+        }
+      }
+
       // Heartbeat every 10 seconds
       $time_since_last = time() - $this->last_action_time;
       if ( $time_since_last >= 10 && $time_since_last % 10 === 0 ) {
@@ -900,6 +1007,9 @@ class GMCP_Server {
       'jsonrpc' => '2.0',
       'method' => 'gmcp/kill'
     ] );
+
+    // The session is over, so the revision it was last told about is of no use to anyone.
+    delete_transient( self::SEEN_REVISION_PREFIX . $session_id );
 
     // Clean up any remaining transients for this session
     global $wpdb;
@@ -1604,6 +1714,52 @@ class GMCP_Server {
       $this->log( 'flush ' . count( $msgs ) . ' msg(s)' );
     }
     return $msgs;
+  }
+  #endregion
+
+  #region Tool list revision
+  /**
+  * Record that the site's tool list has moved.
+  *
+  * Hooked to everything that can move it; see the constructor for which, and why the
+  * settings row is watched whole rather than key by key.
+  *
+  * A counter rather than a timestamp because two changes inside one second are then still
+  * two values. Two writers racing can both read N and both write N+1, losing one
+  * increment, and that is harmless: every reader still sees the value move away from N,
+  * and the notification carries no payload, so one announcement for two changes says
+  * exactly as much as two would.
+  *
+  * Not autoloaded. Only an open stream reads it, and it reads it straight from the table.
+  */
+  public function bump_tools_revision() {
+    $current = (int) get_option( self::TOOLS_REVISION_OPTION, 0 );
+    update_option( self::TOOLS_REVISION_OPTION, $current + 1, false );
+  }
+
+  /**
+  * The site's current tool-list revision, read from the table rather than through
+  * get_option().
+  *
+  * An SSE stream is a single request that lives for minutes, and WordPress answers
+  * get_option() for the whole of a request out of a cache filled on the first call. So
+  * get_option() here would return the value as it stood when the stream opened and never
+  * change again, which is the one thing this must not do. fetch_messages() queries
+  * directly for the same reason.
+  *
+  * Returned as a string so the comparison against the stored value is like for like: a
+  * transient comes back as whatever was written to it, and a strict compare against an int
+  * would then report a change on every tick.
+  */
+  private function tools_revision(): string {
+    global $wpdb;
+    $value = $wpdb->get_var(
+      $wpdb->prepare(
+        "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s",
+        self::TOOLS_REVISION_OPTION
+      )
+    );
+    return (string) ( $value ?? '0' );
   }
   #endregion
 

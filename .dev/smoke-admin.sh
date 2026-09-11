@@ -1917,6 +1917,68 @@ check "and ordinary text is untouched" "$(csv_cell "'wp_create_post'")" "wp_crea
 docker compose exec -T cli wp eval '
   global $wpdb; $wpdb->query( "DELETE FROM {$wpdb->prefix}gmcp_audit WHERE tool = \"smoke_scope\"" );' >/dev/null 2>&1
 
+echo "-- editing a menu item --"
+# wp_update_nav_menu_item() blanks every field you do not name, and treats position 0 as
+# "append", while the first item of any menu is genuinely stored at 0. So a naive rename
+# clears the URL and moves the top item to the bottom, with nothing erroring. Both are
+# asserted on the STORED row: wp_get_nav_menu_items() renumbers menu_order on the objects
+# it returns, so a comparison built on it compares two renumbered views and sees nothing.
+MENU_ID=$(docker compose exec -T cli wp eval '
+  $m = wp_create_nav_menu( "Smoke Menu " . wp_rand( 1000, 9999 ) );
+  $a = wp_update_nav_menu_item( $m, 0, [ "menu-item-title" => "First", "menu-item-url" => "https://example.test/one",
+    "menu-item-type" => "custom", "menu-item-status" => "publish" ] );
+  $b = wp_update_nav_menu_item( $m, 0, [ "menu-item-title" => "Second", "menu-item-url" => "https://example.test/two",
+    "menu-item-type" => "custom", "menu-item-status" => "publish" ] );
+  echo $m . "|" . $a . "|" . $b;' 2>/dev/null | tr -d '\r\n')
+M_ID=$(echo "$MENU_ID" | cut -d'|' -f1); ITEM_A=$(echo "$MENU_ID" | cut -d'|' -f2); ITEM_B=$(echo "$MENU_ID" | cut -d'|' -f3)
+ORDER_BEFORE=$(docker compose exec -T cli wp post get "$ITEM_A" --field=menu_order 2>/dev/null | tr -d '\r\n')
+call mi_rename "{\"jsonrpc\":\"2.0\",\"id\":240,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_menu_item\",\"arguments\":{\"item_id\":$ITEM_A,\"title\":\"First Renamed\"}}}"
+check "a menu item can be renamed" "$(verdict mi_rename)" "ok"
+check "and the rename leaves its URL alone" \
+  "$(docker compose exec -T cli wp eval "echo get_post_meta($ITEM_A,'_menu_item_url',true);" 2>/dev/null | tr -d '\r\n')" "https://example.test/one"
+# The one that catches the position-0 append. Renaming the FIRST item is the case that
+# breaks, because its stored menu_order is 0 and core reads that as "not specified".
+check "and does not move it to the end of the menu" \
+  "$(docker compose exec -T cli wp post get "$ITEM_A" --field=menu_order 2>/dev/null | tr -d '\r\n')" "$ORDER_BEFORE"
+# A repair after the write would leave the audit log describing a change that did not
+# happen, because menu_order is one of the post fields the change layer watches.
+check "and the log does not record a move that never happened" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$c=(string)$wpdb->get_var("SELECT changes FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_update_menu_item\" ORDER BY id DESC LIMIT 1");echo strpos($c,"menu_order")===false?"clean":"RECORDED A MOVE";' 2>/dev/null | tr -d '\r\n')" "clean"
+call mi_self "{\"jsonrpc\":\"2.0\",\"id\":241,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_menu_item\",\"arguments\":{\"item_id\":$ITEM_A,\"parent_id\":$ITEM_A}}}"
+check "an item cannot be its own parent" "$(verdict mi_self)" "error"
+
+echo "-- menu slugs and the audit --"
+# WordPress appends a numbered suffix when a derived slug is taken, and the slug is what an
+# Elementor Nav Menu widget stores. Creating "main-menu-2" silently leaves that widget
+# pointing at the other menu, rendering an empty nav with no error anywhere.
+docker compose exec -T cli wp eval 'if ( ! get_term_by( "slug", "smoke-taken", "nav_menu" ) ) { wp_insert_term( "Smoke Taken", "nav_menu", [ "slug" => "smoke-taken" ] ); }' >/dev/null 2>&1
+call ms_dup '{"jsonrpc":"2.0","id":242,"method":"tools/call","params":{"name":"wp_create_menu","arguments":{"name":"Another","slug":"smoke-taken"}}}'
+check "a taken menu slug is refused rather than suffixed" "$(verdict ms_dup)" "error"
+check "and no second menu was created under a suffix" \
+  "$(docker compose exec -T cli wp eval 'echo get_term_by("slug","smoke-taken-2","nav_menu") ? "SUFFIXED" : "none";' 2>/dev/null | tr -d '\r\n')" "none"
+call mh_report '{"jsonrpc":"2.0","id":243,"method":"tools/call","params":{"name":"wp_menu_health","arguments":{}}}'
+check "the menu health report runs" "$(verdict mh_report)" "ok"
+# It reads Elementor data, and Elementor may not be installed. That must be a sentence,
+# never an error: the report is worth most on a site where something is already wrong.
+check "and it reports rather than failing when Elementor is absent" \
+  "$(py 'import json,sys;print("ok" if not json.load(sys.stdin)["result"].get("isError") else "err")' mh_report)" "ok"
+
+echo "-- purging one URL --"
+call pu_foreign '{"jsonrpc":"2.0","id":244,"method":"tools/call","params":{"name":"wp_purge_url","arguments":{"urls":["https://evil.example/x"]}}}'
+check "a URL on another site is refused" "$(verdict pu_foreign)" "error"
+# A host that merely STARTS with this site's host is the case a prefix comparison passes.
+call pu_prefix '{"jsonrpc":"2.0","id":245,"method":"tools/call","params":{"name":"wp_purge_url","arguments":{"urls":["http://localhost:8101.evil.example/x"]}}}'
+check "and so is a host that merely starts with ours" "$(verdict pu_prefix)" "error"
+# Every per-URL purge below turns the URL into a filesystem path and globs it.
+call pu_trav '{"jsonrpc":"2.0","id":246,"method":"tools/call","params":{"name":"wp_purge_url","arguments":{"urls":["/../../etc/passwd"]}}}'
+check "and a path stepping outside the site is refused" "$(verdict pu_trav)" "error"
+call pu_ok '{"jsonrpc":"2.0","id":247,"method":"tools/call","params":{"name":"wp_purge_url","arguments":{"urls":["/hello-world/"]}}}'
+check "a URL on this site is accepted" "$(verdict pu_ok)" "ok"
+# With no page cache installed the honest answer is that nothing was purged. Reporting
+# success here is how a caller comes to believe a stale page is fresh.
+check "and says plainly that nothing was purged" \
+  "$(refusal pu_ok | grep -ci 'nothing was purged')" "1"
+
 echo "-- scheduled events --"
 # Site Health flags a cron event that keeps failing and there was no way to look at it,
 # run it or stop it. The guards matter more than the happy path here: the run tool fires
