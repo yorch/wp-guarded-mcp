@@ -97,6 +97,55 @@ Bringing a stack up from a worktree without `COMPOSE_PROJECT_NAME` is worse: the
 name defaults to `wptest`, Compose sees a changed bind mount on the running containers and
 recreates them pointed at your worktree, silently taking over the main checkout's site.
 
+Two things follow from that takeover, and both have happened.
+
+The named volumes are project-scoped, so the recreate can take the database with it. The
+site then asks to be installed again, with no clue as to which command did it. Volume
+creation time dates the loss precisely, which is the quickest way to pin it on a command
+somebody ran:
+
+```
+docker volume inspect wptest_wpdb --format '{{.CreatedAt}}'
+```
+
+And Compose reconciles services independently, so the takeover can be partial. The result
+is a stack whose `wp` container serves one worktree while its `cli` container still mounts
+another. Nothing errors. A suite driving the site over HTTP while asserting through
+`docker compose exec` is then testing two branches at once, and reports the difference
+between them as a regression in whichever one you are working on. It looks exactly like a
+merge having dropped your changes.
+
+`docker inspect` settles it. The compose file describes what a *new* container would
+mount; only a running one knows what it does mount:
+
+```
+for c in $(docker ps --format '{{.Names}}' | grep '^wptest-'); do
+  echo "== $c"
+  docker inspect "$c" --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
+done
+```
+
+Two different sources under one project name is the whole diagnosis. A content hash
+confirms it, where a timestamp will not:
+
+```
+md5 -q includes/tools-core.php
+docker compose exec -T cli md5sum /var/www/html/wp-content/plugins/guarded-mcp/includes/tools-core.php
+docker compose exec -T wp  md5sum /var/www/html/wp-content/plugins/guarded-mcp/includes/tools-core.php
+```
+
+Before trusting any result from a shared stack, check that the *web* container serves the
+tree you mean, using a marker only your branch has:
+
+```
+docker exec wptest-wp-1 grep -c some_symbol_only_on_your_branch \
+  /var/www/html/wp-content/plugins/guarded-mcp/includes/tools-core.php
+```
+
+A zero means you are testing somebody else's branch, whatever the suite says.
+`docker compose up -d --force-recreate` puts a split stack back together, but it pulls the
+stack away from whoever else is using it, so check before you run it.
+
 ## Building an installable zip
 
 ```
