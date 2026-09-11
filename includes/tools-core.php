@@ -2168,11 +2168,24 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $permitted, -32600 );
           break;
         }
-        if ( isset( self::OPTIONS_NEVER_DELETED[ strtolower( $key ) ] ) ) {
+        // Anything the shared write policy will not let you change, this will not let you
+        // remove. Deleting a row is the harsher edit of the two, so a key too dangerous to
+        // set cannot be safe to drop, and composing the two lists here means a key added to
+        // the shared one is covered the day it is added rather than the day someone
+        // notices. The entries this file names itself win, because they answer the question
+        // that was actually asked: "set new_admin_email instead" is the right answer to a
+        // write and not to a deletion.
+        $undeletable = self::OPTIONS_NEVER_DELETED;
+        foreach ( GMCP_Core::unwritable_options() as $name => $why ) {
+          if ( !isset( $undeletable[ $name ] ) ) {
+            $undeletable[ $name ] = $why;
+          }
+        }
+        if ( isset( $undeletable[ strtolower( $key ) ] ) ) {
           $r = $this->error(
             $r,
             'The option "' . $key . '" cannot be deleted through this API: '
-              . self::OPTIONS_NEVER_DELETED[ strtolower( $key ) ]
+              . $undeletable[ strtolower( $key ) ]
               . ' Change it with wp_update_option if you need a different value.',
             -32600
           );
