@@ -68,12 +68,18 @@ COMPOSE_PROJECT_NAME=wptest2 docker compose exec -T cli wp core install \
   --url=http://localhost:8081 --title="MCP Test" \
   --admin_user=admin --admin_password=admin --admin_email=a@b.test --skip-email
 
-GMCP_URL=http://localhost:8081 ./smoke.sh
+COMPOSE_PROJECT_NAME=wptest2 GMCP_URL=http://localhost:8081 ./smoke.sh
 ```
 
-Every `docker compose` command in that stack needs the same `COMPOSE_PROJECT_NAME`, and
-every suite run needs the matching `GMCP_URL`. Forgetting either points you back at the
-first stack, which is the failure mode this exists to avoid.
+Both variables, every time, including on the suite runs. `GMCP_URL` steers only the HTTP
+calls; every database assertion inside a suite goes through `docker compose exec`, which
+reads `COMPOSE_PROJECT_NAME`. Set one without the other and the suite talks to the second
+site over HTTP while checking the first site's database, which does not fail, it just
+answers the wrong question.
+
+Bringing a stack up from a worktree without `COMPOSE_PROJECT_NAME` is worse: the project
+name defaults to `wptest`, Compose sees a changed bind mount on the running containers and
+recreates them pointed at your worktree, silently taking over the main checkout's site.
 
 ## Building an installable zip
 

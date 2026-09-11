@@ -110,7 +110,20 @@ Two things make that preview trustworthy rather than decorative. It compiles the
 
 It also counts matches without collecting them. A pattern of `.` against a 400 KB post is 380,000 matches, and building an entry for each in order to display ten exhausted the memory limit, which made the cautious call more dangerous than the write it was protecting.
 
-**Undo.** `wp_list_changes` and `wp_undo_change` put back a setting or post an agent changed. The journal listens to WordPress rather than to the tools, so it also covers widgets, which live in options, and menu items, which are posts. Only writes made during a tool call are recorded, never a person's own edits.
+**Undo.** `wp_list_changes` and `wp_undo_change` put back a setting or post an agent
+*modified*. The journal listens to WordPress rather than to the tools, so it also covers
+widgets, which live in options, and menu items, which are posts. Only writes made during
+a tool call are recorded, never a person's own edits.
+
+It records modifications and not creations or deletions, and that is a real limit rather
+than a nicety. It listens on `post_updated` and `updated_option`, and WordPress does not
+fire `post_updated` when a post is inserted, so a post the agent created is not in the
+journal and neither is one it deleted. The same is true of users, comments, terms and post
+meta, none of which the journal listens for at all. The audit log sees every one of those
+calls, because it hooks the tool layer rather than the storage layer; it is undo, not the
+record, that is narrower than it looks. Deleting a post without `force` puts it in the
+trash, where WordPress can restore it, which covers the most common case by accident
+rather than by design.
 
 Reverting is gated twice: on the tool that made the change, and on the operation the revert will perform, derived from the entry's own kind. Both are needed, because the recorded tool is whatever was in flight rather than what wrote the row. A plugin hooked on `save_post` that writes an option produces an option entry attributed to `wp_update_post`, and gating on that name alone let a write-level caller replay an admin-level option write.
 

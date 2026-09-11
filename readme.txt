@@ -29,7 +29,7 @@ The other difference is the guardrails, which exist because of a specific risk. 
 * **It refuses to break itself**: no deactivating or deleting the plugin mid-call, no deleting the active theme, no activating a theme this server cannot run.
 * **The plugin's own credentials are not readable through its own tools.**
 * **The riskiest tools can say what they would do first.** A search and replace, a delete or a rewrite can be run with `preview`, which describes every match and everything attached, and changes nothing.
-* **Changes can be put back.** It remembers what a setting or a post said before an agent changed it, and one call reverts it. Only writes made through this API are recorded, never your own. Reverting needs the same access the original change needed, so undo is not a way around the access levels. Settings that look like they hold a credential are recorded as changed but their previous value is not kept, so those cannot be reverted.
+* **Edits can be put back.** It remembers what a setting or a post said before an agent modified it, and one call reverts it. Only writes made through this API are recorded, never your own. Reverting needs the same access the original change needed, so undo is not a way around the access levels. Settings that look like they hold a credential are recorded as changed but their previous value is not kept, so those cannot be reverted. Creating and deleting are not covered; see the FAQ.
 
 You can also see what actually happened. The settings screen keeps a full audit log: every tool call, including the refused ones, with the arguments it was given, what it was aimed at and why it was turned down. Anything that looks like a password or a key is replaced before the entry is written. Each entry hashes the one before it, so a row edited or deleted later shows up as a break rather than vanishing quietly. Entries are kept for 90 days by default and pruned automatically, and you can prune or clear them yourself at any time.
 
@@ -103,7 +103,13 @@ Yes, three ways. The bearer token carries one of three access levels. The admini
 
 = Can I undo something an agent did? =
 
-Usually. The plugin records what a setting, post or page said before an agent changed it, and `wp_undo_change` puts one back. It covers widgets and menus too, because widgets are stored in settings and menu items are posts. It does not cover deleting a plugin's files or anything that leaves WordPress, such as an email that has already been sent.
+If the agent modified something, usually. If it created or deleted something, no.
+
+The plugin records what a setting, post or page said before an agent modified it, and `wp_undo_change` puts one back. It covers widgets and menus too, because widgets are stored in settings and menu items are posts.
+
+It does not record creations or deletions. It watches WordPress rather than the tools, and WordPress does not announce a post insert the same way it announces an edit, so a post the agent created is not in the journal and neither is one it deleted. Users, comments, terms and post meta are not watched at all. Deleting a post without forcing it sends it to the trash, where WordPress can restore it, so the commonest case is usually recoverable anyway.
+
+The audit log is the complete record: it lists every call the agent made, including the creations and deletions the journal cannot reverse. It also does not cover deleting a plugin's files, or anything that has already left WordPress, such as an email that has been sent.
 
 = Can I see what a tool would do before it does it? =
 
@@ -131,7 +137,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * Connection test on the settings screen and in Site Health, which distinguishes an unreachable endpoint from credentials that never arrived.
 * WooCommerce tools on their own switch: products, stock, orders, order notes, customers and sales figures. No refunds.
 * Named keys with their own access level, expiry date and tool list, stored hashed.
-* A change journal, so a setting or post an agent changed can be put back.
+* A change journal, so a setting or post an agent modified can be put back.
 * Preview mode on the six riskiest tools, which describes what would happen and changes nothing.
 * MCP prompts for common upkeep jobs, and MCP resources for attaching site content to a conversation.
 * A one-call site briefing, so an agent orients in one request rather than six.

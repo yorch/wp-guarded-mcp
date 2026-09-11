@@ -840,6 +840,31 @@ check "the reply carries the tamper verdict" \
 docker compose exec -T cli wp user delete audituser --yes >/dev/null 2>&1
 docker compose exec -T cli wp option delete acme_gw >/dev/null 2>&1
 
+echo "-- what the journal does and does not see --"
+# The journal listens on post_updated and updated_option. WordPress does not fire
+# post_updated on an insert, so a post the agent created is not in the journal, and
+# neither is one it deleted. Users, comments and terms are not listened for at all. The
+# readmes claimed "changes can be put back" without saying which changes, which read as a
+# promise about deletions. Pinning the real boundary so the documentation cannot drift
+# back, and so the day somebody widens the listeners this fails loudly and gets updated.
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+call jb_new '{"jsonrpc":"2.0","id":220,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Journal boundary probe","post_status":"publish"}}}'
+JB_ID=$(py "import json,sys,re;print(re.search(r'\d+',json.load(sys.stdin)['result']['content'][0]['text']).group())" jb_new)
+call jb_edit "{\"jsonrpc\":\"2.0\",\"id\":221,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$JB_ID,\"post_title\":\"Renamed\"}}}"
+call jb_list '{"jsonrpc":"2.0","id":222,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+# The control. Without it, "creation absent" would pass on an empty journal for any reason.
+check "an edit is journalled" \
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_update_post'))" jb_list)" "1"
+check "a creation is not, which the readmes now say" \
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_create_post'))" jb_list)" "0"
+call jb_del "{\"jsonrpc\":\"2.0\",\"id\":223,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$JB_ID,\"force\":true}}}"
+call jb_list2 '{"jsonrpc":"2.0","id":224,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+check "nor is a deletion" \
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_delete_post'))" jb_list2)" "0"
+# The audit log is the complete record, which is the reason the readmes can point at it.
+check "but the audit log has all three" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(DISTINCT tool) FROM {$wpdb->prefix}gmcp_audit WHERE tool IN (\"wp_create_post\",\"wp_update_post\",\"wp_delete_post\")");' 2>/dev/null | tr -d '\r\n')" "3"
+
 echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
 # The hard flush is what writes .htaccess, and it only runs if save_mod_rewrite_rules()
 # exists. That lives in wp-admin/includes/misc.php and calls get_home_path() from
