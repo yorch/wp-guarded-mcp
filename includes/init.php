@@ -22,6 +22,7 @@ spl_autoload_register( function ( $class ) {
     'GMCP_Tools_Admin' => '/includes/tools-admin.php',
     'GMCP_Audit' => '/includes/audit.php',
     'GMCP_Backup' => '/includes/backup.php',
+    'GMCP_Changes' => '/includes/changes.php',
     'GMCP_Journal' => '/includes/journal.php',
     'GMCP_Tokens' => '/includes/tokens.php',
     'GMCP_SelfTest' => '/includes/selftest.php',

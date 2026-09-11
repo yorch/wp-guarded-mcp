@@ -18,6 +18,7 @@ delete_option( 'gmcp_oauth_db_version' );
 // know to remove it. The key table holds credential hashes, which have the same problem.
 delete_option( 'gmcp_activity' );
 delete_option( 'gmcp_audit_db_version' );
+delete_option( 'gmcp_audit_hash_boundary' );
 delete_option( 'gmcp_journal' );
 delete_option( 'gmcp_tokens' );
 

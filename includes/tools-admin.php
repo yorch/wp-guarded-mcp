@@ -487,7 +487,7 @@ class GMCP_Tools_Admin {
 
       'wp_get_audit_log' => [
         'name' => 'wp_get_audit_log',
-        'description' => 'Read this API\'s own audit log: every tool call made through it, including the refused ones, with the arguments each was given and why it was turned down. Useful for answering "what did I change last week" or "what has been refused and why". Read only; nothing here can prune or clear the log.',
+        'description' => 'Read this API\'s own audit log: every tool call made through it, including the refused ones, with the arguments each was given, what each one actually changed, and why it was turned down. Entries carry field-level before and after values, so it answers "what did I change last week" down to the field. Read only; nothing here can prune or clear the log.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -497,7 +497,7 @@ class GMCP_Tools_Admin {
             'outcome' => [ 'type' => 'string', 'description' => 'ok or refused.' ],
             'since' => [ 'type' => 'string', 'description' => 'GMT datetime, e.g. 2026-09-01 00:00:00.' ],
             'until' => [ 'type' => 'string' ],
-            'search' => [ 'type' => 'string', 'description' => 'Matches the target, the arguments and the refusal message.' ],
+            'search' => [ 'type' => 'string', 'description' => 'Matches the target, the arguments, the recorded changes and the refusal message. An object id here finds calls that changed it even when it was not the call\'s own target.' ],
           ],
         ],
         'accessLevel' => 'admin',
@@ -1953,9 +1953,10 @@ class GMCP_Tools_Admin {
         'target' => $row['target'],
         'outcome' => $row['outcome'],
         'ms' => (int) $row['ms'],
-        'client' => $row['client'] ?: $row['auth_method'],
-        'actor' => $row['actor_name'],
+        'called_by' => $row['client'] ?: $row['auth_method'],
+        'acted_as' => $row['actor_name'],
         'arguments' => $row['args'] ? json_decode( $row['args'], true ) : null,
+        'changed' => !empty( $row['changes'] ) ? json_decode( $row['changes'], true ) : null,
         'detail' => $row['detail'],
       ];
     }
@@ -1974,7 +1975,8 @@ class GMCP_Tools_Admin {
               . $chain['total'] . '. Older entries were not checked here; a full check is available on the settings screen.' )
         : 'The hash chain breaks at entry ' . $chain['broken_at'] . ': ' . $chain['reason']
           . ' Treat everything from that point on as unverified.',
-      'note' => 'Arguments are recorded with credential-shaped fields replaced, so a value reading "[redacted]" means a secret was passed rather than that the field was empty.',
+      'note' => 'Arguments are recorded with credential-shaped fields replaced, so a value reading "[redacted]" means a secret was passed rather than that the field was empty. The same applies to the before and after values under "changed", and a value reading like "[1.4 KB of text]" means the field changed but was too long to keep.',
+      'about_identity' => 'called_by is the OAuth application, the named key, or the authentication method a shared token used: it is the closest this site has to who was driving. acted_as is the WordPress account the call ran as, which for a shared bearer token is always the same administrator whoever sent the request, so it does not identify a person.',
     ] );
   }
 

@@ -287,6 +287,10 @@ call w_block '{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"w
 check "block widget added" "$(verdict w_block)" "ok"
 call w_classic '{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"wp_add_widget","arguments":{"sidebar":"sidebar-1","id_base":"text","settings":{"title":"Smoke","text":"smoke-classic-widget"}}}}'
 check "classic widget added" "$(verdict w_classic)" "ok"
+# A widget lives in an option and a widget area in another one, so the audit log would
+# otherwise record adding a widget as two anonymous setting writes. It names them.
+check "a widget write is recorded as a widget, not as a setting" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$c=(string)$wpdb->get_var("SELECT changes FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_add_widget\" ORDER BY id DESC LIMIT 1");echo strpos($c,"\"what\":\"widget ")!==false && strpos($c,"\"what\":\"widget area ")!==false ? "labelled" : "NOT: ".mb_substr($c,0,60);' 2>/dev/null | tr -d '\r\n')" "labelled"
 call w_bad '{"jsonrpc":"2.0","id":62,"method":"tools/call","params":{"name":"wp_add_widget","arguments":{"sidebar":"not-a-sidebar","content":"x"}}}'
 check "unknown widget area refused" "$(verdict w_bad)" "error"
 # Losing _multiwidget makes core read the row as pre-2.8 format and mangle it.
@@ -969,6 +973,216 @@ call bk_list '{"jsonrpc":"2.0","id":237,"method":"tools/list"}'
 # irreversible act than anything else here, and no confirmation token makes that safe.
 check "there is no restore tool at any level" \
   "$(py "import json,sys;t=[x['name'] for x in json.load(sys.stdin)['result']['tools']];print(len([n for n in t if 'restore' in n]))" bk_list)" "0"
+echo "-- the audit log says what changed, not only what was called --"
+# An entry recording that wp_update_post ran on post 12 does not say the post went from
+# private to publish, which is usually what somebody is looking for. Every check here
+# reads the stored row rather than the reply, and asserts the real state first: a
+# summary describing a change that did not happen is worse than no summary at all.
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+changes_of() { audit_q "SELECT changes FROM {\$wpdb->prefix}gmcp_audit WHERE tool=\\\"$1\\\" ORDER BY id DESC LIMIT 1"; }
+# A scan for something that must be absent needs a control that finds something present,
+# or an empty column reports every secret safe.
+leaked_changes() { docker compose exec -T cli wp eval 'global $wpdb;$a=implode("",$wpdb->get_col("SELECT COALESCE(changes,\"\") FROM {$wpdb->prefix}gmcp_audit"));echo strpos($a,"'"$1"'")===false?0:1;' 2>/dev/null | tr -d '\r\n'; }
+have_changes_column() { docker compose exec -T cli wp eval 'global $wpdb;echo $wpdb->get_var("SHOW COLUMNS FROM {$wpdb->prefix}gmcp_audit LIKE \"changes\"") ? "yes" : "no";' 2>/dev/null | tr -d '\r\n'; }
+
+C_POST=$(docker compose exec -T cli wp post create --post_title='Diff subject' --post_status=private --post_content='<p>Body that stays put.</p>' --porcelain 2>/dev/null | tr -d '\r\n')
+check "the seed landed, and landed private" \
+  "$(docker compose exec -T cli wp post get "$C_POST" --field=post_status 2>/dev/null | tr -d '\r\n')" "private"
+call c_pub "{\"jsonrpc\":\"2.0\",\"id\":220,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$C_POST,\"post_status\":\"publish\",\"post_title\":\"Diff subject renamed\"}}}"
+check "the write really happened" \
+  "$(docker compose exec -T cli wp post get "$C_POST" --field=post_status 2>/dev/null | tr -d '\r\n')" "publish"
+C_CH=$(changes_of wp_update_post)
+check "the status change is recorded with both sides" \
+  "$(echo "$C_CH" | grep -c '"post_status":{"from":"private","to":"publish"}')" "1"
+check "so is the title change" \
+  "$(echo "$C_CH" | grep -c '"post_title":{"from":"Diff subject","to":"Diff subject renamed"}')" "1"
+# The two checks above are the control for this one: the same scan over the same string
+# finds the fields that did change, so a zero here is absence rather than a blind scan.
+check "the body, which did not change, is not mentioned" "$(echo "$C_CH" | grep -c 'post_content')" "0"
+
+# Field-level detail is only affordable because long values are described, not copied.
+C_BIG=$(python3 -c "print('y'*5000)")
+call c_grow "{\"jsonrpc\":\"2.0\",\"id\":221,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$C_POST,\"post_content\":\"$C_BIG\"}}}"
+check "the long body really was written" \
+  "$(docker compose exec -T cli wp eval "echo strlen( get_post( $C_POST )->post_content );" 2>/dev/null | tr -d '\r\n')" "5000"
+C_CH2=$(changes_of wp_update_post)
+check "a long value is recorded as its size, not copied" "$(echo "$C_CH2" | grep -c 'of text\]')" "1"
+check "and those 5000 characters are not in the row" "$(echo "$C_CH2" | grep -c 'yyyyyyyyyy')" "0"
+docker compose exec -T cli wp post delete "$C_POST" --force >/dev/null 2>&1
+
+# wp_update_user takes a password. That it changed is worth recording; the value never is.
+call c_user '{"jsonrpc":"2.0","id":222,"method":"tools/call","params":{"name":"wp_create_user","arguments":{"user_login":"diffuser","user_email":"diff@example.test","user_pass":"CREATEPASS_MUSTNOTAPPEAR","role":"subscriber"}}}'
+C_UID=$(docker compose exec -T cli wp user get diffuser --field=ID 2>/dev/null | tr -d '\r\n')
+check "the user was really created" "$(test -n "$C_UID" && echo yes || echo no)" "yes"
+call c_pass "{\"jsonrpc\":\"2.0\",\"id\":223,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_user\",\"arguments\":{\"ID\":$C_UID,\"fields\":{\"user_pass\":\"NEWPASS_MUSTNOTAPPEAR\",\"display_name\":\"Diff Person\"}}}}"
+check "the display name really changed" \
+  "$(docker compose exec -T cli wp user get "$C_UID" --field=display_name 2>/dev/null | tr -d '\r\n')" "Diff Person"
+C_CH3=$(changes_of wp_update_user)
+check "the password change is recorded as having happened" \
+  "$(echo "$C_CH3" | grep -c '"user_pass":{"from":"\[redacted\]","to":"\[redacted\]"}')" "1"
+check "and the harmless field beside it is recorded in full" "$(echo "$C_CH3" | grep -c 'Diff Person')" "1"
+check "no password reaches the changes column" "$(leaked_changes NEWPASS_MUSTNOTAPPEAR)" "0"
+check "nor the one the account was created with" "$(leaked_changes CREATEPASS_MUSTNOTAPPEAR)" "0"
+check "but an ordinary changed value does, so the scan works" "$(leaked_changes 'Diff Person')" "1"
+# A role change is the user write that matters most, and it arrives on its own hook.
+call c_role "{\"jsonrpc\":\"2.0\",\"id\":224,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_user\",\"arguments\":{\"ID\":$C_UID,\"fields\":{\"role\":\"editor\"}}}}"
+check "the promotion really happened" \
+  "$(docker compose exec -T cli wp user get "$C_UID" --field=roles 2>/dev/null | tr -d '\r\n')" "editor"
+check "and is recorded from and to" \
+  "$(changes_of wp_update_user | grep -c '"roles":{"from":"subscriber","to":"editor"}')" "1"
+docker compose exec -T cli wp user delete "$C_UID" --yes >/dev/null 2>&1
+
+# A credential inside an option value is refused by the names inside it, both sides.
+docker compose exec -T cli wp option update diff_gw --format=json '{"mode":"live","secret_key":"OPTSEED_MUSTNOTAPPEAR"}' >/dev/null 2>&1
+call c_gw '{"jsonrpc":"2.0","id":225,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"diff_gw","value":{"mode":"test","secret_key":"OPTNEW_MUSTNOTAPPEAR"}}}}'
+check "the option write really happened" \
+  "$(docker compose exec -T cli wp eval 'echo get_option("diff_gw")["mode"];' 2>/dev/null | tr -d '\r\n')" "test"
+check "neither side of a credential-shaped value is recorded" \
+  "$(changes_of wp_update_option | grep -c '"value":{"from":"\[redacted\]","to":"\[redacted\]"}')" "1"
+check "the previous secret is not in the column" "$(leaked_changes OPTSEED_MUSTNOTAPPEAR)" "0"
+check "nor the new one" "$(leaked_changes OPTNEW_MUSTNOTAPPEAR)" "0"
+docker compose exec -T cli wp option delete diff_gw >/dev/null 2>&1
+
+# Where, and not in storage terms. A menu is a term and a menu item is a post, and an
+# entry that says so makes the reader do the translating.
+call c_menu '{"jsonrpc":"2.0","id":226,"method":"tools/call","params":{"name":"wp_create_menu","arguments":{"name":"Diff menu"}}}'
+check "the menu really exists" \
+  "$(docker compose exec -T cli wp eval 'echo wp_get_nav_menu_object("Diff menu") ? "yes" : "no";' 2>/dev/null | tr -d '\r\n')" "yes"
+check "a menu is recorded as a menu, not as a nav_menu term" \
+  "$(changes_of wp_create_menu | grep -c '"what":"menu ')" "1"
+call c_item '{"jsonrpc":"2.0","id":227,"method":"tools/call","params":{"name":"wp_add_menu_item","arguments":{"menu":"Diff menu","title":"Diff item","type":"custom","url":"https://example.test"}}}'
+check "the item really exists" \
+  "$(docker compose exec -T cli wp eval 'echo count( wp_get_nav_menu_items( "Diff menu" ) );' 2>/dev/null | tr -d '\r\n')" "1"
+check "a menu item is recorded as a menu item, not as a post" \
+  "$(changes_of wp_add_menu_item | grep -c '"what":"menu item ')" "1"
+
+# An attachment is a post that fires neither post_updated nor wp_insert_post, so a
+# listener on those alone recorded nothing for any media write at all.
+call c_media '{"jsonrpc":"2.0","id":231,"method":"tools/call","params":{"name":"wp_upload_media","arguments":{"filename":"diff.gif","base64":"R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7","title":"Diff image"}}}'
+C_ATT=$(docker compose exec -T cli wp eval 'echo (int) ( get_posts( [ "post_type" => "attachment", "numberposts" => 1, "fields" => "ids" ] )[0] ?? 0 );' 2>/dev/null | tr -d '\r\n')
+check "the upload really landed" \
+  "$(docker compose exec -T cli wp eval "echo get_post( $C_ATT )->post_title;" 2>/dev/null | tr -d '\r\n')" "Diff image"
+check "a media write is recorded at all" "$(changes_of wp_upload_media | grep -c '"what":"media ')" "1"
+call c_rename "{\"jsonrpc\":\"2.0\",\"id\":232,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_media\",\"arguments\":{\"ID\":$C_ATT,\"title\":\"Diff image renamed\"}}}"
+check "the rename really happened" \
+  "$(docker compose exec -T cli wp eval "echo get_post( $C_ATT )->post_title;" 2>/dev/null | tr -d '\r\n')" "Diff image renamed"
+check "and the rename is recorded from and to" \
+  "$(changes_of wp_update_media | grep -c '"post_title":{"from":"Diff image","to":"Diff image renamed"}')" "1"
+docker compose exec -T cli wp post delete "$C_ATT" --force >/dev/null 2>&1
+
+# The reader side: the tool has to hand the detail on, and has to be honest about what
+# the account name means. A bearer caller borrows one administrator, so it is not a who.
+call c_read '{"jsonrpc":"2.0","id":228,"method":"tools/call","params":{"name":"wp_get_audit_log","arguments":{"limit":25}}}'
+check "the audit tool returns the recorded changes" \
+  "$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(any(e.get('changed') for e in d['entries']))" c_read)" "True"
+check "and names the caller and the account separately" \
+  "$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);e=d['entries'][0];print('called_by' in e and 'acted_as' in e and 'actor' not in e)" c_read)" "True"
+check "and says what the account name does not mean" \
+  "$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print('does not identify a person' in d.get('about_identity',''))" c_read)" "True"
+# A shared token names no client, and an empty column is less use than the method.
+check "a shared-token call is attributed to something" \
+  "$(audit_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE client = \"\"')" "0"
+
+# The chain has to cover the new column while still covering rows written before it
+# existed. Both cases, explicitly, because the argument is easier to get right on paper
+# than in code.
+check "rows with and without recorded changes chain together" \
+  "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify();echo $v["ok"]?"intact":"BROKEN at ".$v["broken_at"];' 2>/dev/null | tr -d '\r\n')" "intact"
+check "and both kinds are really present, so that verdict means something" \
+  "$(audit_q 'SELECT CONCAT(SUM(changes IS NULL) > 0, \"-\", SUM(changes IS NOT NULL) > 0) FROM {$wpdb->prefix}gmcp_audit')" "1-1"
+# Blanking the column is the way out a per-row hash could leave open: the recomputation
+# has to notice that what was hashed is no longer there.
+C_ROW=$(audit_q 'SELECT id FROM {$wpdb->prefix}gmcp_audit WHERE changes IS NOT NULL ORDER BY id LIMIT 1')
+check "there is a recorded change to tamper with" "$(test -n "$C_ROW" && echo yes || echo no)" "yes"
+check "blanking a recorded change is detected" \
+  "$(docker compose exec -T cli wp eval "global \$wpdb;\$t=\$wpdb->prefix.\"gmcp_audit\";\$wpdb->query(\"UPDATE \$t SET changes=NULL WHERE id=$C_ROW\");\$v=GMCP_Audit::verify();echo \$v['ok']?'MISSED':'detected at '.\$v['broken_at'];" 2>/dev/null | tr -d '\r\n')" \
+  "detected at $C_ROW"
+
+# A hash that commits only to the contents of a row and not to its shape can be spliced:
+# move the recorded changes onto the end of the detail column behind a separator, blank
+# the column, and a recomputation over one field fewer rebuilds the same string. The chain
+# would call the row intact while the changes it covered had been erased. Caught now, and
+# the control below is what makes "caught" mean something: it computes the same splice
+# under the older construction and shows it accepted there.
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+call c_splice1 '{"jsonrpc":"2.0","id":233,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"blogdescription","value":"spliceable"}}}'
+call c_splice2 '{"jsonrpc":"2.0","id":234,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"limit":1}}}'
+C_ROW=$(audit_q 'SELECT id FROM {$wpdb->prefix}gmcp_audit WHERE changes IS NOT NULL ORDER BY id LIMIT 1')
+check "there is a row carrying changes to splice" "$(test -n "$C_ROW" && echo yes || echo no)" "yes"
+check "control: the splice is accepted by a hash over contents alone" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$t=$wpdb->prefix."gmcp_audit";$r=$wpdb->get_row("SELECT * FROM $t WHERE changes IS NOT NULL ORDER BY id LIMIT 1",ARRAY_A);$p=(string)$r["prev_hash"];$e=["ts","actor","actor_name","client","auth_method","tool","target","outcome","ms","args","detail"];$j=function($x,$f) use ($p){$o=[];foreach($f as $k){$o[]=(string)($x[$k] ?? "");}return hash("sha256",$p."\x1f".implode("\x1f",$o));};$s=$r;$s["detail"]=(string)$r["detail"]."\x1f".(string)$r["changes"];$s["changes"]=null;echo $j($s,$e)===$j($r,array_merge($e,["changes"]))?"accepted":"rejected";' 2>/dev/null | tr -d '\r\n')" "accepted"
+check "but the chain as shipped refuses it" \
+  "$(docker compose exec -T cli wp eval "global \$wpdb;\$t=\$wpdb->prefix.\"gmcp_audit\";\$r=\$wpdb->get_row(\"SELECT id,detail,changes FROM \$t WHERE id=$C_ROW\",ARRAY_A);\$wpdb->update(\$t,['detail'=>(string)\$r['detail'].\"\x1f\".(string)\$r['changes'],'changes'=>null],['id'=>$C_ROW]);\$v=GMCP_Audit::verify();echo \$v['ok']?'MISSED':'detected at '.\$v['broken_at'];" 2>/dev/null | tr -d '\r\n')" \
+  "detected at $C_ROW"
+# The refusal has to be about the splice rather than about the blanking on its own, so
+# assert the row really is holding the separator and the changes it swallowed.
+check "and the splice really was written" \
+  "$(audit_q "SELECT changes IS NULL AND INSTR(detail, CHAR(31)) > 0 FROM {\$wpdb->prefix}gmcp_audit WHERE id=$C_ROW")" "1"
+
+# Rows written before the canonical encoding have to keep verifying under the construction
+# that signed them, or every upgraded site is told on day one that its log was tampered
+# with. Built here rather than assumed: rows hashed the old way, the boundary set to the
+# last of them, then a real call on top.
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();
+  global $wpdb; $t=$wpdb->prefix."gmcp_audit"; $prev="";
+  foreach ( [ "wp_get_posts", "wp_update_option", "wp_get_users" ] as $i => $tool ) {
+    $row = [ "ts"=>gmdate("Y-m-d H:i:s"), "actor"=>1, "actor_name"=>"admin", "client"=>"bearer",
+      "auth_method"=>"bearer", "tool"=>$tool, "target"=>"t".$i, "outcome"=>"ok", "ms"=>1,
+      "args"=>"{}", "detail"=>"", "changes"=>null ];
+    $parts = [];
+    foreach ( ["ts","actor","actor_name","client","auth_method","tool","target","outcome","ms","args","detail"] as $f ) { $parts[] = (string) $row[$f]; }
+    $row["prev_hash"] = $prev;
+    $row["hash"] = $prev = hash("sha256", $prev."\x1f".implode("\x1f",$parts));
+    $wpdb->insert($t,$row);
+  }
+  update_option("gmcp_audit_hash_boundary",(int)$wpdb->get_var("SELECT MAX(id) FROM $t"),false);' >/dev/null 2>&1
+check "the older rows were really written the old way" \
+  "$(audit_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit')" "3"
+check "and they verify" \
+  "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify();echo $v["ok"]?"intact ".$v["checked"]:"BROKEN at ".$v["broken_at"];' 2>/dev/null | tr -d '\r\n')" "intact 3"
+call c_after '{"jsonrpc":"2.0","id":235,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"blogdescription","value":"after the boundary"}}}'
+check "a new row lands above the boundary" \
+  "$(audit_q 'SELECT COUNT(*) > 3 FROM {$wpdb->prefix}gmcp_audit')" "1"
+check "and old and new constructions verify in one chain" \
+  "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify();echo $v["ok"]?"intact":"BROKEN at ".$v["broken_at"];' 2>/dev/null | tr -d '\r\n')" "intact"
+# The same chain under a full walk, since the windowed default and the whole-table scope
+# start in different places and only the second one begins below the boundary mark.
+check "and under a full walk, which reports its own coverage" \
+  "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify("all");echo $v["ok"] && $v["complete"] ? "intact and complete" : "BROKEN";' 2>/dev/null | tr -d '\r\n')" "intact and complete"
+check "and the walk really crossed the mark, so that verdict covers both constructions" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$b=(int)get_option("gmcp_audit_hash_boundary");$t=$wpdb->prefix."gmcp_audit";echo ((int)$wpdb->get_var("SELECT COUNT(*) FROM $t WHERE id <= $b") > 0 && (int)$wpdb->get_var("SELECT COUNT(*) FROM $t WHERE id > $b") > 0) ? "both sides" : "ONE SIDE ONLY";' 2>/dev/null | tr -d '\r\n')" "both sides"
+# Clearing resets the boundary, or the ids TRUNCATE hands back would be checked the old
+# way and every new row would read as tampered with.
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+check "clearing resets the boundary" \
+  "$(docker compose exec -T cli wp eval 'echo (int) get_option("gmcp_audit_hash_boundary");' 2>/dev/null | tr -d '\r\n')" "0"
+call c_fresh '{"jsonrpc":"2.0","id":236,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"blogdescription","value":"after the clear"}}}'
+check "and rows written after a clear still verify" \
+  "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify();echo $v["ok"]?"intact":"BROKEN at ".$v["broken_at"];' 2>/dev/null | tr -d '\r\n')" "intact"
+
+echo "-- the audit table repairs itself on upgrade --"
+# WordPress does not run the activation hook when a plugin is updated in place, so the
+# old table meets the new code. While it is broken nothing may be lost quietly, and it
+# has to repair itself on the next load.
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();global $wpdb;$wpdb->query("ALTER TABLE {$wpdb->prefix}gmcp_audit DROP COLUMN changes");update_option("gmcp_audit_db_version","2");' >/dev/null 2>&1
+check "the column really is gone" "$(have_changes_column)" "no"
+C_ROWS=$(audit_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit')
+call c_stale '{"jsonrpc":"2.0","id":229,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"limit":1}}}'
+check "the call still succeeds for the caller" "$(verdict c_stale)" "ok"
+check "but the entry is not written against the wrong schema" \
+  "$(audit_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit')" "$C_ROWS"
+check "and the failure is announced rather than swallowed" \
+  "$(docker compose logs wp --since 120s 2>&1 | grep -q 'audit entry NOT recorded' && echo said || echo silent)" "said"
+check "control: the log scan does not match just anything" \
+  "$(docker compose logs wp --since 120s 2>&1 | grep -q 'audit entry NOT recorded for a tool that does not exist' && echo said || echo silent)" "silent"
+# Now the repair: a version marker older than the code is what an upgrade really leaves.
+docker compose exec -T cli wp option update gmcp_audit_db_version 1 >/dev/null 2>&1
+call c_fixed '{"jsonrpc":"2.0","id":230,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"limit":1}}}'
+check "the table repairs itself on the next load" "$(have_changes_column)" "yes"
+check "the version marker is brought up to date" \
+  "$(docker compose exec -T cli wp option get gmcp_audit_db_version 2>/dev/null | tr -d '\r\n')" "2"
+check "and entries are recorded again" \
+  "$(audit_q "SELECT COUNT(*) > $C_ROWS FROM {\$wpdb->prefix}gmcp_audit")" "1"
 
 echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
 # The hard flush is what writes .htaccess, and it only runs if save_mod_rewrite_rules()

@@ -736,6 +736,51 @@ class GMCP_Settings {
     return wp_date( 'M j, H:i', $timestamp );
   }
 
+  /**
+  * What an entry changed, as one line per object.
+  *
+  * The stored summary is JSON because the column has to be searchable and machine
+  * readable for the tool. This is the reading of it, and it stays one line per object:
+  * the screen is a list of calls, and a call that touched eight things should not push
+  * the next call off the page.
+  *
+  * @return string[]
+  */
+  private function changed_lines( $json ): array {
+    $records = $json ? json_decode( (string) $json, true ) : null;
+    if ( !is_array( $records ) ) {
+      return [];
+    }
+    $lines = [];
+    foreach ( $records as $record ) {
+      if ( isset( $record['__gmcp_more'] ) ) {
+        $lines[] = sprintf(
+          /* translators: %d: number of further changes not recorded in detail. */
+          __( 'and %d more changes, too many to record in one entry', 'guarded-mcp' ),
+          (int) $record['__gmcp_more']
+        );
+        continue;
+      }
+      $what = trim( (string) ( $record['what'] ?? '' ) );
+      $label = (string) ( $record['label'] ?? '' );
+      if ( $label !== '' ) {
+        $what .= ' "' . mb_substr( $label, 0, 40 ) . '"';
+      }
+      $fields = [];
+      foreach ( (array) ( $record['fields'] ?? [] ) as $field => $pair ) {
+        $from = $pair['from'] ?? null;
+        $to = $pair['to'] ?? null;
+        $fields[] = $from === null
+          ? sprintf( '%s set to %s', $field, mb_substr( (string) $to, 0, 40 ) )
+          : sprintf( '%s %s → %s', $field, mb_substr( (string) $from, 0, 40 ), mb_substr( (string) $to, 0, 40 ) );
+      }
+      $lines[] = $fields
+        ? sprintf( '%s %s: %s', (string) ( $record['op'] ?? '' ), $what, implode( ', ', $fields ) )
+        : sprintf( '%s %s', (string) ( $record['op'] ?? '' ), $what );
+    }
+    return $lines;
+  }
+
   private function render_activity(): void {
     if ( empty( $this->core->get_option( 'mcp_activity_log' ) ) ) {
       echo '<p>' . esc_html__( 'The audit log is switched off, so nothing is being recorded.', 'guarded-mcp' ) . '</p>';
@@ -775,7 +820,10 @@ class GMCP_Settings {
             <th><?php esc_html_e( 'When', 'guarded-mcp' ); ?></th>
             <th><?php esc_html_e( 'Tool', 'guarded-mcp' ); ?></th>
             <th><?php esc_html_e( 'Target', 'guarded-mcp' ); ?></th>
-            <th><?php esc_html_e( 'Who', 'guarded-mcp' ); ?></th>
+            <?php // Not "Who". A shared token borrows one administrator account, so the
+            // account below is the same whoever sent the request, and a column headed
+            // "Who" invites a reader to believe something this site cannot know. ?>
+            <th><?php esc_html_e( 'Called by', 'guarded-mcp' ); ?></th>
             <th><?php esc_html_e( 'Result', 'guarded-mcp' ); ?></th>
           </tr>
         </thead>
@@ -788,7 +836,8 @@ class GMCP_Settings {
               <td>
                 <?php echo esc_html( $e['client'] ?: $e['auth_method'] ); ?>
                 <?php if ( $e['actor_name'] !== '' ) : ?>
-                  <span style="color:#787c82"><?php echo esc_html( 'as ' . $e['actor_name'] ); ?></span>
+                  <span style="color:#787c82" title="<?php esc_attr_e( 'The WordPress account the call ran as. A shared bearer token borrows one administrator, so this does not identify a person.', 'guarded-mcp' ); ?>">
+                    <?php echo esc_html( sprintf( __( 'ran as %s', 'guarded-mcp' ), $e['actor_name'] ) ); ?></span>
                 <?php endif; ?>
               </td>
               <td>
@@ -801,6 +850,9 @@ class GMCP_Settings {
                 <?php if ( $e['detail'] !== '' && $e['detail'] !== null ) : ?>
                   <div style="color:#787c82;font-size:12px"><?php echo esc_html( mb_substr( $e['detail'], 0, 160 ) ); ?></div>
                 <?php endif; ?>
+                <?php foreach ( $this->changed_lines( $e['changes'] ?? null ) as $line ) : ?>
+                  <div style="color:#1d2327;font-size:12px"><?php echo esc_html( $line ); ?></div>
+                <?php endforeach; ?>
                 <?php if ( !empty( $e['args'] ) && $e['args'] !== '[]' && $e['args'] !== '{}' ) : ?>
                   <details style="margin-top:4px">
                     <summary style="cursor:pointer;color:#2271b1;font-size:12px"><?php esc_html_e( 'arguments', 'guarded-mcp' ); ?></summary>

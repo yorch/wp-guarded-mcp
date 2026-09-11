@@ -146,10 +146,72 @@ class GMCP_Core {
   }
 
   /**
+  * Whether a value carries something credential-shaped, judged by the names inside it.
+  *
+  * The all-or-nothing counterpart to redact(): this refuses a whole value if any part of
+  * it looks secret, which is what a caller wants when it is deciding whether to keep the
+  * value at all rather than how to print it.
+  *
+  * Deliberately about structure rather than content: guessing whether a bare string is a
+  * secret means guessing, and guessing wrong in the permissive direction stores the
+  * secret. Settings hold these under named fields, and the names say so.
+  *
+  * It has to walk more than arrays. An option holding a stdClass and an option holding a
+  * JSON string are two of the three commonest ways plugins store settings, and checking
+  * only arrays left both unguarded. Serialized strings are unpacked for the same reason.
+  *
+  * Running past the depth limit redacts rather than permits. Returning false there meant
+  * a credential nested deeply enough was stored, which is a limit that fails open.
+  *
+  * It lives here rather than in the change journal, where it was written, because the
+  * journal is no longer the only caller: the audit log decides the same thing about the
+  * same values when it summarises what changed. Two copies would drift, and the direction
+  * they drift in is a secret recorded by whichever one was not updated.
+  */
+  public static function holds_credential( $value, int $depth = 0 ): bool {
+    if ( $depth > 6 ) {
+      return true;
+    }
+
+    if ( is_string( $value ) ) {
+      $trimmed = trim( $value );
+      if ( $trimmed === '' ) {
+        return false;
+      }
+      if ( function_exists( 'is_serialized' ) && is_serialized( $trimmed ) ) {
+        $unpacked = @unserialize( $trimmed, [ 'allowed_classes' => false ] );
+        return $unpacked === false ? false : self::holds_credential( $unpacked, $depth + 1 );
+      }
+      if ( $trimmed[0] === '{' || $trimmed[0] === '[' ) {
+        $decoded = json_decode( $trimmed, true );
+        return is_array( $decoded ) ? self::holds_credential( $decoded, $depth + 1 ) : false;
+      }
+      return false;
+    }
+
+    if ( is_object( $value ) ) {
+      $value = get_object_vars( $value );
+    }
+    if ( !is_array( $value ) ) {
+      return false;
+    }
+
+    foreach ( $value as $key => $inner ) {
+      if ( is_string( $key ) && self::field_looks_secret( $key ) ) {
+        return true;
+      }
+      if ( self::holds_credential( $inner, $depth + 1 ) ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
   * A copy of a value with anything credential-shaped replaced.
   *
-  * Unlike the journal's holds_credential(), which refuses the whole value if any part of
-  * it looks secret, this keeps the shape and blanks the leaves. An audit entry is worth
+  * Unlike holds_credential() above, which refuses the whole value if any part of it
+  * looks secret, this keeps the shape and blanks the leaves. An audit entry is worth
   * far more with the harmless arguments intact, and the redaction marker is itself
   * information: it records that a secret was passed without recording the secret.
   *
@@ -186,6 +248,14 @@ class GMCP_Core {
     // screen, which borrows its OAuth instance.
     $this->server = new GMCP_Server( $this );
 
+    // What changed, worked out once for both of the things that want to know. Listens to
+    // WordPress rather than to the tools, so it has to be constructed on every request a
+    // tool call might arrive on, and before its two consumers so its listeners are in
+    // place first.
+    if ( $this->get_option( 'mcp_activity_log' ) || $this->get_option( 'mcp_change_journal' ) ) {
+      new GMCP_Changes();
+    }
+
     if ( $this->get_option( 'mcp_activity_log' ) ) {
       // Constructed on every request a tool call might arrive on, and it registers the
       // prune cron handler as well as the recorder, so a scheduled prune fires even on a
@@ -193,8 +263,7 @@ class GMCP_Core {
       new GMCP_Audit();
     }
 
-    // What changed and how to put it back. Listens to WordPress rather than to the
-    // tools, so it has to be constructed on every request a tool call might arrive on.
+    // How to put back what changed.
     if ( $this->get_option( 'mcp_change_journal' ) ) {
       new GMCP_Journal();
     }

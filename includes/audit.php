@@ -15,7 +15,7 @@ if ( !defined( 'ABSPATH' ) ) {
 * A table fixes both. An INSERT cannot lose a concurrent entry, rows are indexed by time,
 * tool and actor, and pruning is one DELETE rather than rewriting a serialized blob.
 *
-* Three things are worth explaining, because each is a decision rather than a default.
+* Four things are worth explaining, because each is a decision rather than a default.
 *
 * ARGUMENTS ARE RECORDED, REDACTED. An audit entry that does not say what was asked for
 * is half an entry. But wp_create_user and wp_update_user take a password, and
@@ -34,14 +34,40 @@ if ( !defined( 'ABSPATH' ) ) {
 * A row cap alone lets one enormous entry do it. A byte cap alone throws away last week
 * because of something that happened last year. So all three, and whichever is hit first
 * wins.
+*
+* WHAT WAS CALLED IS NOT WHAT CHANGED. An entry saying wp_update_post ran on post 12 with
+* certain arguments does not say that the post went from private to publish, and that is
+* usually the thing somebody is looking for. GMCP_Changes watches WordPress during the
+* call and reports what actually moved; the changes column holds a summary of it. A
+* summary rather than the values, because field-level copies of post bodies would eat the
+* pruning bounds, and because some of those values are passwords. @see
+* GMCP_Changes::summarise().
 */
 class GMCP_Audit {
 
-  const DB_VERSION = '1';
+  /**
+  * 2 added the changes column, and with it the canonical hash encoding.
+  *
+  * The column is nullable, and rows written before the upgrade keep verifying under the
+  * construction that signed them, so an existing log verifies unchanged rather than
+  * announcing on day one that every row has been tampered with. @see hash().
+  */
+  const DB_VERSION = '2';
   const CRON_HOOK = 'gmcp_audit_prune';
+
+  /** The last row written under the old hash construction. @see hash_boundary(). */
+  const BOUNDARY_OPTION = 'gmcp_audit_hash_boundary';
 
   /** Per-entry cap on the recorded arguments, before the row is written. */
   const MAX_ARGS = 64000;
+
+  /**
+  * And on the recorded changes, which share the entry with them.
+  *
+  * Smaller than the argument cap on purpose. A summary is meant to be read, and forty
+  * field diffs nobody reads still cost ninety days of disk under the retention bounds.
+  */
+  const MAX_CHANGES = 16000;
 
   /** Defaults, overridable from the settings screen. */
   const DEFAULT_DAYS = 90;
@@ -52,6 +78,15 @@ class GMCP_Audit {
   const NEVER_RECORD = [ 'user_pass', 'password', 'pass' ];
 
   public function __construct() {
+    // WordPress does not run the activation hook when a plugin is updated in place, so a
+    // site that upgrades without deactivating first would carry yesterday's table and
+    // every insert naming the new column would fail. Failing inserts in an audit log are
+    // the one loss this whole file exists to prevent, so the schema is checked here as
+    // well. The check is a comparison against an autoloaded option that is already in
+    // memory, not a query: cheap enough to do on every request that loads the plugin.
+    if ( get_option( 'gmcp_audit_db_version' ) !== self::DB_VERSION ) {
+      self::install();
+    }
     add_action( 'gmcp_tool_called', [ $this, 'record' ], 5 );
     add_action( self::CRON_HOOK, [ __CLASS__, 'prune' ] );
   }
@@ -76,6 +111,7 @@ class GMCP_Audit {
     $table = self::table();
     $collate = $wpdb->get_charset_collate();
 
+
     dbDelta( "CREATE TABLE {$table} (
       id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
       ts datetime NOT NULL,
@@ -88,6 +124,7 @@ class GMCP_Audit {
       outcome varchar(16) NOT NULL DEFAULT '',
       ms int(11) NOT NULL DEFAULT 0,
       args longtext NULL,
+      changes longtext NULL,
       detail text NULL,
       prev_hash char(64) NOT NULL DEFAULT '',
       hash char(64) NOT NULL DEFAULT '',
@@ -96,6 +133,15 @@ class GMCP_Audit {
       KEY tool (tool),
       KEY actor (actor)
     ) {$collate};" );
+
+    // Which rows predate the canonical hash encoding, noted after the table exists and
+    // before anything new is written, so verify() can check them the way the version that
+    // wrote them checked them. Recorded once and never overwritten: running this again
+    // once new rows existed would sweep them into the old construction and report the lot
+    // as broken. A fresh install finds an empty table and records 0, which is right.
+    if ( get_option( self::BOUNDARY_OPTION, null ) === null ) {
+      update_option( self::BOUNDARY_OPTION, (int) $wpdb->get_var( "SELECT MAX(id) FROM {$table}" ), false );
+    }
 
     update_option( 'gmcp_audit_db_version', self::DB_VERSION );
   }
@@ -211,13 +257,22 @@ class GMCP_Audit {
       'ts' => gmdate( 'Y-m-d H:i:s' ),
       'actor' => (int) $user,
       'actor_name' => $user ? (string) ( get_userdata( $user )->user_login ?? '' ) : '',
-      'client' => mb_substr( (string) ( $call['client_name'] ?: '' ), 0, 191 ),
+      // The nearest thing to who was driving, and it is not the actor. A static bearer
+      // token borrows the lowest-numbered administrator, so actor says "admin" whoever
+      // sent the request. An OAuth grant names the app, a named key names its label, and
+      // a shared token names only itself; falling back to the client id means the column
+      // says "bearer" or "key:3" instead of nothing at all, which is a smaller claim but
+      // a true one.
+      'client' => mb_substr( (string) ( $call['client_name'] ?: ( $call['client_id'] ?? '' ) ), 0, 191 ),
       'auth_method' => mb_substr( (string) ( $call['auth_method'] ?? '' ), 0, 32 ),
       'tool' => mb_substr( (string) $call['tool'], 0, 64 ),
       'target' => $this->target( $args ),
       'outcome' => $failed ? 'refused' : 'ok',
       'ms' => (int) ( $call['duration_ms'] ?? 0 ),
       'args' => $this->storable_args( $args ),
+      'changes' => class_exists( 'GMCP_Changes' )
+        ? GMCP_Changes::summarise( GMCP_Changes::captured(), self::MAX_CHANGES )
+        : null,
       'detail' => $this->detail( $call, $failed ),
     ];
 
@@ -225,7 +280,26 @@ class GMCP_Audit {
     $row['prev_hash'] = $prev;
     $row['hash'] = self::hash( $row, $prev );
 
-    $wpdb->insert( self::table(), $row );
+    // Errors suppressed across the insert, and deliberately. wpdb prints a failed query
+    // straight to output when WP_DEBUG is on, and this runs inside the tool dispatcher's
+    // finally block, so the error text lands in front of the JSON-RPC body and the client
+    // gets a parse error instead of its result. A site with an out-of-date table would
+    // find every tool call broken rather than one audit entry missing. last_error is
+    // still set while suppressed, so nothing is lost but the printing.
+    $noisy = $wpdb->suppress_errors( true );
+    $written = $wpdb->insert( self::table(), $row );
+    $wpdb->suppress_errors( $noisy );
+
+    if ( $written === false ) {
+      // A lost audit entry is the failure this table exists to prevent, and it is the
+      // one failure that leaves no trace of itself: the next row chains to the one
+      // before, so nothing downstream ever notices. The likeliest cause is a schema
+      // older than the code, which the constructor tries to rule out. Say so loudly
+      // rather than returning quietly, because the alternative is a log that is wrong
+      // and looks intact.
+      error_log( '[Guarded MCP] audit entry NOT recorded for ' . $row['tool'] . ': '
+        . ( $wpdb->last_error ?: 'the database reported no error' ) );
+    }
   }
 
   /**
@@ -245,16 +319,61 @@ class GMCP_Audit {
   /**
   * One row's link in the chain.
   *
-  * Fixed field order, because a hash over an associative array would depend on insertion
-  * order and a later refactor would silently break every existing row.
+  * Two constructions, and which one a row uses is decided by its id rather than by its
+  * contents. Everything at or below the boundary recorded at upgrade time was written by
+  * the version that hashed eleven columns joined by a separator, and is verified exactly
+  * as that version verified it. Everything above it uses the canonical encoding below.
+  *
+  * The old construction is not re-signed and not reinterpreted, because a chain the
+  * plugin rewrites on demand proves nothing, and an upgraded site being told on day one
+  * that its whole audit log has been tampered with is no better.
+  *
+  * THE CANONICAL ENCODING. Each field contributes its name, the byte length of its
+  * value, and the value; the whole is prefixed with a version tag and the field count.
+  * Length prefixes are the point rather than decoration. A plain separator join says
+  * only "these pieces in this order", so content can be moved from one column into the
+  * next behind a separator, and while a fixed field list survives that, a list whose
+  * length varies does not: an entry written with a changes column could have its changes
+  * appended to the detail column and the column blanked, and the shorter recomputation
+  * would rebuild the same string and call the row intact. That was reachable, since a
+  * refusal message quotes what the caller asked for. Committing to each field's name and
+  * length makes every input unambiguous, so no rearrangement between columns produces the
+  * same digest and a thirteenth column later needs no further thought.
   */
-  private static function hash( array $row, string $prev ): string {
-    $parts = [];
-    foreach ( [ 'ts', 'actor', 'actor_name', 'client', 'auth_method', 'tool',
-      'target', 'outcome', 'ms', 'args', 'detail' ] as $field ) {
-      $parts[] = (string) ( $row[ $field ] ?? '' );
+  const HASH_FIELDS = [ 'ts', 'actor', 'actor_name', 'client', 'auth_method', 'tool',
+    'target', 'outcome', 'ms', 'args', 'changes', 'detail' ];
+
+  /** How the rows written before the canonical encoding were hashed. Unchanged, forever. */
+  const LEGACY_HASH_FIELDS = [ 'ts', 'actor', 'actor_name', 'client', 'auth_method', 'tool',
+    'target', 'outcome', 'ms', 'args', 'detail' ];
+
+  private static function hash( array $row, string $prev, bool $legacy = false ): string {
+    if ( $legacy ) {
+      $parts = [];
+      foreach ( self::LEGACY_HASH_FIELDS as $field ) {
+        $parts[] = (string) ( $row[ $field ] ?? '' );
+      }
+      return hash( 'sha256', $prev . "\x1f" . implode( "\x1f", $parts ) );
     }
-    return hash( 'sha256', $prev . "\x1f" . implode( "\x1f", $parts ) );
+    $parts = [];
+    foreach ( self::HASH_FIELDS as $field ) {
+      $value = (string) ( $row[ $field ] ?? '' );
+      $parts[] = $field . ':' . strlen( $value ) . ':' . $value;
+    }
+    return hash( 'sha256', 'gmcp/2' . "\x1f" . count( self::HASH_FIELDS ) . "\x1f"
+      . $prev . "\x1f" . implode( "\x1f", $parts ) );
+  }
+
+  /**
+  * The last row written before the canonical encoding, or 0 when there is none.
+  *
+  * Recorded once, at the upgrade that added the changes column, because a row cannot say
+  * for itself which construction signed it. It is not a secret and not a second chain:
+  * moving it only makes rows verify under the wrong construction and fail, which is a
+  * false alarm rather than a way past one.
+  */
+  public static function hash_boundary(): int {
+    return (int) get_option( self::BOUNDARY_OPTION, 0 );
   }
 
   #endregion
@@ -289,9 +408,12 @@ class GMCP_Audit {
       $params[] = (string) $filters['until'];
     }
     if ( !empty( $filters['search'] ) ) {
-      $where[] = '(target LIKE %s OR detail LIKE %s OR args LIKE %s)';
+      // Changes are searched too, which is how "what touched post 12" gets an answer: a
+      // bulk call records one target and a dozen changed objects, and the target column
+      // only ever names the first.
+      $where[] = '(target LIKE %s OR detail LIKE %s OR args LIKE %s OR changes LIKE %s)';
       $like = '%' . $wpdb->esc_like( (string) $filters['search'] ) . '%';
-      array_push( $params, $like, $like, $like );
+      array_push( $params, $like, $like, $like, $like );
     }
 
     $limit = max( 1, min( 500, (int) ( $filters['limit'] ?? 50 ) ) );
@@ -309,11 +431,19 @@ class GMCP_Audit {
     return (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . self::table() );
   }
 
-  /** Payload bytes rather than the table's reported size, which lags and rounds. */
+  /**
+  * Payload bytes rather than the table's reported size, which lags and rounds.
+  *
+  * Each column is coalesced separately rather than the sum being coalesced once. Most
+  * rows have no changes recorded, and adding LENGTH(changes) to the old expression would
+  * have made the whole addition NULL for every one of them, so the byte bound would have
+  * quietly measured only the handful of rows that changed something.
+  */
   public static function bytes(): int {
     global $wpdb;
     return (int) $wpdb->get_var(
-      'SELECT COALESCE(SUM(LENGTH(args) + LENGTH(detail)), 0) FROM ' . self::table()
+      'SELECT COALESCE(SUM(COALESCE(LENGTH(args), 0) + COALESCE(LENGTH(changes), 0)'
+      . ' + COALESCE(LENGTH(detail), 0)), 0) FROM ' . self::table()
     );
   }
 
@@ -367,6 +497,9 @@ class GMCP_Audit {
       ) );
     }
 
+    // Rows at or below this were signed by the older construction. @see hash().
+    $boundary = self::hash_boundary();
+
     $prev = '';
     $checked = 0;
     $imported = 0;
@@ -397,7 +530,7 @@ class GMCP_Audit {
           return self::verdict( false, $checked, $imported, $total, $scope, (int) $row['id'],
             'a row is missing before this one, or its link was rewritten' );
         }
-        if ( self::hash( $row, $prev ) !== (string) $row['hash'] ) {
+        if ( self::hash( $row, $prev, (int) $row['id'] <= $boundary ) !== (string) $row['hash'] ) {
           return self::verdict( false, $checked, $imported, $total, $scope, (int) $row['id'],
             'this row does not match its own hash, so its contents changed after it was written' );
         }
@@ -479,6 +612,12 @@ class GMCP_Audit {
   public static function clear(): void {
     global $wpdb;
     $wpdb->query( 'TRUNCATE TABLE ' . self::table() );
+    // TRUNCATE resets the auto-increment, so the next row written takes an id that used
+    // to belong to a row signed by the older construction. Leaving the boundary where it
+    // was would have verify() check brand new rows the old way and report every one of
+    // them as tampered with. Nothing older survives a clear, so nothing needs the old
+    // construction any more.
+    update_option( self::BOUNDARY_OPTION, 0, false );
   }
 
   #endregion

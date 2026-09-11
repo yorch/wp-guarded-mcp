@@ -12,13 +12,23 @@ if ( !defined( 'ABSPATH' ) ) {
 * back". Without it, undoing an agent's afternoon means knowing what the settings used
 * to say, and nobody knows what the settings used to say.
 *
-* It listens to WordPress rather than to the tools. Every write, whichever tool made it,
-* eventually goes through update_option or wp_update_post, so hooking there covers tools
-* that did not exist when this was written. It also covers more than it looks like:
-* widgets live in options, and menu items are posts, so both are journalled for free.
+* It no longer listens to WordPress itself. GMCP_Changes does that, and works out the
+* before and after once for both the subsystems that want it: this one, which needs the
+* previous value so it can put it back, and the audit log, which needs a description of
+* the difference. Two copies of that diff would drift, and the day somebody added a
+* field to one list the other would silently stop mentioning it.
 *
-* Only writes made by a tool call are recorded. A human saving a settings page is not
-* the agent's doing and is not the agent's to undo.
+* What arrives is still every write a tool made, whichever tool made it, because the
+* capture layer hooks WordPress rather than the tools: widgets live in options and menu
+* items are posts, so both are journalled for free. Only writes made during a tool call
+* are recorded. A human saving a settings page is not the agent's doing and is not the
+* agent's to undo.
+*
+* Of the kinds the capture layer reports, this takes options and posts and ignores the
+* rest. Users, terms, comments, plugins and themes are recorded in the audit log because
+* a reader wants to know about them; they are absent here because nothing in this file
+* could put them back, and an undo list full of entries that cannot be undone is worse
+* than one that is honest about its reach.
 *
 * Two things it deliberately will not record:
 *
@@ -51,63 +61,76 @@ class GMCP_Journal {
   /** And the whole row stays under this, however few entries that turns out to be. */
   const MAX_TOTAL = 512000;
 
-  /** True only while a tool call is in flight. */
-  private static $recording = false;
-
-  /** Set once per request so one tool call groups its writes under one entry list. */
-  private static $tool = '';
-
   public function __construct() {
-    add_action( 'gmcp_tool_start', [ $this, 'start' ], 10, 1 );
-    add_action( 'gmcp_tool_called', [ $this, 'stop' ], 99 );
-    // Belt and braces for worker SAPIs. Under mod_php or PHP-FPM a static dies with the
-    // request, so a fatal between start and stop costs nothing. Under FrankenPHP or
-    // RoadRunner the worker survives, and a fatal mid-tool would leave the flag set for
-    // whatever that worker served next, quietly attributing a person's own wp-admin save
-    // to the agent. Tools do die that way; the fatal net exists because of it.
-    add_action( 'shutdown', [ $this, 'stop' ], 0 );
-    add_action( 'updated_option', [ $this, 'option_changed' ], 10, 3 );
-    add_action( 'added_option', [ $this, 'option_added' ], 10, 2 );
-    add_action( 'post_updated', [ $this, 'post_changed' ], 10, 3 );
+    add_action( 'gmcp_change', [ $this, 'observe' ], 10, 1 );
   }
 
-  public function start( $tool ): void {
-    self::$recording = true;
-    self::$tool = (string) $tool;
-  }
-
-  public function stop(): void {
-    self::$recording = false;
+  /**
+  * One observed change, if it is a kind this can put back.
+  *
+  * The in-flight test lives in GMCP_Changes now: nothing reaches this hook unless a tool
+  * call made it.
+  */
+  public function observe( $change ): void {
+    if ( !is_array( $change ) ) {
+      return;
+    }
+    if ( ( $change['kind'] ?? '' ) === 'option' ) {
+      $this->observe_option( $change );
+    }
+    elseif ( ( $change['kind'] ?? '' ) === 'post' ) {
+      $this->observe_post( $change );
+    }
   }
 
   /**
   * Options whose previous value is either meaningless, enormous, or dangerous to put
   * back. Restoring active_plugins directly would activate plugins without running their
-  * activation hooks, which is how you get a half-installed plugin; the plugin tools
-  * exist for that. rewrite_rules is a derived cache measured in tens of kilobytes.
+  * activation hooks, which is how you get a half-installed plugin; the plugin tools exist
+  * for that. rewrite_rules is a derived cache measured in tens of kilobytes. Both of those
+  * are on the shared list now, since they are no more readable as changes than they are
+  * revertible.
   */
   private function skip_option( string $key ): bool {
-    if ( strpos( $key, '_transient' ) === 0 || strpos( $key, '_site_transient' ) === 0 ) {
-      return true;
-    }
-    if ( strpos( $key, 'gmcp_' ) === 0 || strpos( $key, '_wp_' ) === 0 ) {
-      return true;
-    }
-    $never = [ 'cron', 'rewrite_rules', 'active_plugins', 'recently_activated', 'auto_updater.lock',
-      'db_upgraded', 'can_compress_scripts', 'user_count', 'admin_email_lifespan' ];
-    if ( in_array( $key, $never, true ) ) {
+    // The rows that are noise rather than change are listed once, where the listening
+    // happens. What is added here is what undo in particular cannot sensibly put back:
+    // restoring a protected row would copy a credential into a second place, and the
+    // capture layer keeps those but records no value for them.
+    if ( GMCP_Changes::is_noise( $key ) ) {
       return true;
     }
     return GMCP_Core::option_guard( $key ) !== true;
   }
 
-  public function option_changed( $key, $old, $new ): void {
-    if ( !self::$recording || !is_string( $key ) || $this->skip_option( $key ) ) {
+  /**
+  * Created and updated options are recorded; a deleted one is not.
+  *
+  * Putting back a deletion means deciding whether the row was there before, which the
+  * created case already answers for the opposite direction, and no tool deletes an
+  * option today. Recording one would be an undo path nothing had ever exercised.
+  */
+  private function observe_option( array $change ): void {
+    $key = (string) ( $change['id'] ?? '' );
+    if ( $key === '' || $this->skip_option( $key ) ) {
       return;
     }
-    if ( $old === $new ) {
+    if ( ( $change['op'] ?? '' ) === 'created' ) {
+      // "Previously absent" has to be a distinct state from "previously empty", or undo
+      // leaves a row behind that WordPress never had.
+      $this->record( [
+        'kind' => 'option',
+        'key' => $key,
+        'what' => "Option \"{$key}\" created",
+        'previous' => null,
+        'absent' => true,
+        'tool' => (string) ( $change['tool'] ?? '' ),
+      ] );
       return;
     }
+    if ( ( $change['op'] ?? '' ) !== 'updated' ) {
+      return;
+    }
+    $old = $change['fields']['value']['from'] ?? null;
     // The guard matches on the option's NAME, which is not where most secrets live.
     // woocommerce_stripe_settings, wp_mail_smtp and jetpack_options are all innocuous
     // names holding an array with a secret_key or an api_key inside it. Copying that
@@ -117,8 +140,9 @@ class GMCP_Journal {
       'kind' => 'option',
       'key' => $key,
       'what' => "Option \"{$key}\" changed",
+      'tool' => (string) ( $change['tool'] ?? '' ),
     ];
-    if ( self::holds_credential( $old ) ) {
+    if ( GMCP_Core::holds_credential( $old ) ) {
       $entry['previous'] = null;
       $entry['redacted'] = true;
     }
@@ -129,107 +153,29 @@ class GMCP_Journal {
   }
 
   /**
-  * Whether a value carries something credential-shaped, judged by the names inside it.
-  *
-  * Deliberately about structure rather than content: guessing whether a bare string is a
-  * secret means guessing, and guessing wrong in the permissive direction stores the
-  * secret. Settings hold these under named fields, and the names say so.
-  *
-  * It has to walk more than arrays. An option holding a stdClass and an option holding a
-  * JSON string are two of the three commonest ways plugins store settings, and checking
-  * only arrays left both unguarded. Serialized strings are unpacked for the same reason.
-  *
-  * Running past the depth limit redacts rather than permits. Returning false there meant
-  * a credential nested deeply enough was stored, which is a limit that fails open.
+  * An edited post. Creations and deletions go past: this restores fields, and neither of
+  * those is a field to restore.
   */
-  private static function holds_credential( $value, int $depth = 0 ): bool {
-    if ( $depth > 6 ) {
-      return true;
-    }
-
-    if ( is_string( $value ) ) {
-      $trimmed = trim( $value );
-      if ( $trimmed === '' ) {
-        return false;
-      }
-      if ( function_exists( 'is_serialized' ) && is_serialized( $trimmed ) ) {
-        $unpacked = @unserialize( $trimmed, [ 'allowed_classes' => false ] );
-        return $unpacked === false ? false : self::holds_credential( $unpacked, $depth + 1 );
-      }
-      if ( $trimmed[0] === '{' || $trimmed[0] === '[' ) {
-        $decoded = json_decode( $trimmed, true );
-        return is_array( $decoded ) ? self::holds_credential( $decoded, $depth + 1 ) : false;
-      }
-      return false;
-    }
-
-    if ( is_object( $value ) ) {
-      $value = get_object_vars( $value );
-    }
-    if ( !is_array( $value ) ) {
-      return false;
-    }
-
-    foreach ( $value as $key => $inner ) {
-      if ( is_string( $key ) && self::field_looks_secret( $key ) ) {
-        return true;
-      }
-      if ( self::holds_credential( $inner, $depth + 1 ) ) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private static function field_looks_secret( string $field ): bool {
-    // @see GMCP_Core::field_looks_secret(). Shared because the audit log has to make the
-    // same judgement, and two lists would drift in the direction of recording a secret.
-    return GMCP_Core::field_looks_secret( $field );
-  }
-
-  public function option_added( $key, $value ): void {
-    if ( !self::$recording || !is_string( $key ) || $this->skip_option( $key ) ) {
+  private function observe_post( array $change ): void {
+    if ( ( $change['op'] ?? '' ) !== 'updated' ) {
       return;
     }
-    // "Previously absent" has to be a distinct state from "previously empty", or undo
-    // leaves a row behind that WordPress never had.
-    $this->record( [
-      'kind' => 'option',
-      'key' => $key,
-      'what' => "Option \"{$key}\" created",
-      'previous' => null,
-      'absent' => true,
-    ] );
-  }
-
-  public function post_changed( $post_id, $after, $before ): void {
-    if ( !self::$recording || !( $before instanceof WP_Post ) || !( $after instanceof WP_Post ) ) {
-      return;
-    }
-    // Revisions are themselves posts, and saving one fires this hook. So does the
-    // auto-draft WordPress creates before anything real exists.
-    if ( in_array( $after->post_type, [ 'revision' ], true ) || $after->post_status === 'auto-draft' ) {
-      return;
-    }
-    $changed = [];
-    foreach ( [ 'post_title', 'post_content', 'post_excerpt', 'post_status', 'post_name', 'post_parent', 'menu_order' ] as $field ) {
-      if ( $before->$field !== $after->$field ) {
-        $changed[] = $field;
-      }
-    }
+    $changed = array_keys( (array) ( $change['fields'] ?? [] ) );
     if ( !$changed ) {
       return;
     }
 
     $entry = [
       'kind' => 'post',
-      'ID' => (int) $post_id,
-      'what' => ucfirst( $after->post_type ) . ' "' . mb_substr( $after->post_title, 0, 60 ) . '" changed: ' . implode( ', ', $changed ),
+      'ID' => (int) ( $change['id'] ?? 0 ),
+      'what' => ucfirst( (string) ( $change['subject'] ?? 'post' ) ) . ' "'
+        . mb_substr( (string) ( $change['label'] ?? '' ), 0, 60 ) . '" changed: ' . implode( ', ', $changed ),
       'fields' => $changed,
       'previous' => [],
+      'tool' => (string) ( $change['tool'] ?? '' ),
     ];
-    foreach ( $changed as $field ) {
-      $entry['previous'][ $field ] = $this->storable( $before->$field );
+    foreach ( $change['fields'] as $field => $pair ) {
+      $entry['previous'][ $field ] = $this->storable( $pair['from'] ?? null );
     }
     if ( $this->oversized( $entry['previous'] ) ) {
       $entry['note'] = 'Part of the previous version was too large to keep, so reverting will restore only what fits.';
@@ -262,7 +208,7 @@ class GMCP_Journal {
 
   private function record( array $entry ): void {
     $entry['t'] = time();
-    $entry['tool'] = self::$tool;
+    $entry['tool'] = (string) ( $entry['tool'] ?? '' );
     $entry['id'] = bin2hex( random_bytes( 5 ) );
 
     $log = get_option( self::OPTION, [] );
@@ -424,8 +370,7 @@ class GMCP_Journal {
 
       // A revert writes options and posts like anything else, and recording it would
       // put the change back on the list as though the agent had made it.
-      $was = self::$recording;
-      self::$recording = false;
+      $was = GMCP_Changes::pause();
 
       $done = '';
       if ( $entry['kind'] === 'option' ) {
@@ -461,7 +406,7 @@ class GMCP_Journal {
           : 'Nothing was left to restore on post ' . $post_id . '.';
       }
 
-      self::$recording = $was;
+      GMCP_Changes::resume( $was );
 
       // Marked rather than removed, so the history still shows that it happened and
       // that it was put back. A revert cannot be double-applied.
