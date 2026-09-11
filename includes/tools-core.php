@@ -603,6 +603,17 @@ class GMCP_Tools_Core {
   private const META_CHUNK_MAX_BYTES = 4194304;
   private const META_CHUNK_TTL = 900;
 
+  // How much one chunked READ hands back at a time.
+  //
+  // 64KB by default because the answer is read by a model and has to fit in what it can
+  // hold. 262144 is the ceiling because the slice travels base64, four bytes of response
+  // for every three bytes of value, and because a larger one defeats the point of asking
+  // for a value in pieces at all. A longer length is clamped rather than refused:
+  // bytes_returned reports what actually came back, so a caller that adds it to offset
+  // still walks to the end and never skips the bytes it did not get.
+  private const META_READ_CHUNK_BYTES = 65536;
+  private const META_READ_CHUNK_MAX_BYTES = 262144;
+
   /**
   * Where a half-written meta value waits.
   *
@@ -1167,6 +1178,23 @@ class GMCP_Tools_Core {
           'required' => [ 'session', 'ID', 'key', 'data' ],
         ],
         'accessLevel' => 'write',
+      ],
+
+      'wp_read_post_meta_chunk' => [
+        'name' => 'wp_read_post_meta_chunk',
+        'description' => 'Read a post meta value that is too large to return in one response, a piece at a time: the mirror of wp_write_post_meta_chunk. Every call answers with offset, bytes_returned, total_bytes and more; walk the value by calling again with offset set to offset + bytes_returned, until more is false. "data" is ALWAYS base64: decode each piece and concatenate the DECODED bytes. It is base64 because a slice can end in the middle of a multibyte character, and only base64 carries those bytes through a JSON response unchanged. "represents" says what the bytes are, so a caller never has to guess: "raw" for a value stored as a string, or "json" when WordPress stored an array or an object, in which case the bytes are the same JSON that wp_get_post_meta prints for that row and can be handed straight back to wp_write_post_meta_chunk to reproduce it. A key with several rows is addressed with "index", and "rows" says how many there are. "sha256" hashes the WHOLE value rather than the piece, so it is identical on every call of one walk: if it changes, the value was rewritten mid-walk and the pieces already collected belong to a different document, so start again. Refuses a key the post does not have, an index that does not exist and an offset past the end. length defaults to 65536 bytes and is capped at 262144; a longer request is clamped, and bytes_returned says what came back.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'ID' => [ 'type' => 'integer', 'description' => 'Post to read from.' ],
+            'key' => [ 'type' => 'string', 'description' => 'Meta key to read.' ],
+            'index' => [ 'type' => 'integer', 'description' => 'Which row of a multi-valued key, counting from 0 (default 0). "rows" in the answer says how many exist.' ],
+            'offset' => [ 'type' => 'integer', 'description' => 'Byte to start at (default 0). Byte, not character.' ],
+            'length' => [ 'type' => 'integer', 'description' => 'How many bytes to return (default 65536, capped at 262144).' ],
+          ],
+          'required' => [ 'ID', 'key' ],
+        ],
+        'accessLevel' => 'read',
       ],
 
       /* -------- Featured image -------- */
@@ -3259,6 +3287,126 @@ class GMCP_Tools_Core {
           'written_to' => [ 'ID' => $chunk_pid, 'key' => $chunk_key ],
           'stored_as' => $chunk_stored_as,
           'note' => 'Post meta is not journalled; wp_undo_change cannot reverse this write.',
+        ], JSON_PRETTY_PRINT ) );
+        break;
+
+      case 'wp_read_post_meta_chunk':
+        // read level, and that is the whole reach it has. Post meta reads are ungated
+        // today: wp_get_post_meta is itself a read tool and returns any key on any post
+        // in full, with no option_guard() equivalent standing in front of it. Walking the
+        // same value in pieces therefore exposes nothing a read-only token could not
+        // already ask for in one call. If a guard is ever put on post meta reads it has
+        // to be put on both tools, or this one becomes the way around it.
+        $read_pid = intval( $a['ID'] ?? 0 );
+        $read_key = sanitize_key( $a['key'] ?? '' );
+        if ( !$read_pid || !get_post( $read_pid ) ) {
+          $r = $this->error( $r, 'No post with ID ' . $read_pid . '.', -32602 );
+          break;
+        }
+        if ( $read_key === '' ) {
+          $r = $this->error( $r, 'key required', -32602 );
+          break;
+        }
+
+        // get_post_meta() WITHOUT single, so a key with several rows arrives as several
+        // rows and can be addressed one at a time. wp_get_post_meta's single read hands
+        // back row 0 and never mentions the others, which is the thing worth not
+        // repeating in a tool whose job is to return a value completely.
+        $read_rows = get_post_meta( $read_pid, $read_key );
+        if ( !is_array( $read_rows ) || $read_rows === [] ) {
+          $r = $this->error( $r, 'Post #' . $read_pid . ' has no meta key "' . $read_key . '".', -32602 );
+          break;
+        }
+        $read_count = count( $read_rows );
+        $read_index = intval( $a['index'] ?? 0 );
+        if ( $read_index < 0 || !array_key_exists( $read_index, $read_rows ) ) {
+          $r = $this->error(
+            $r,
+            'Post #' . $read_pid . ' meta "' . $read_key . '" has ' . $read_count . ' row'
+              . ( $read_count === 1 ? '' : 's' ) . ', numbered 0 to ' . ( $read_count - 1 )
+              . '; index ' . $read_index . ' is not one of them.',
+            -32602
+          );
+          break;
+        }
+        $read_value = $read_rows[ $read_index ];
+
+        // What the bytes ARE, which the answer has to name or the caller is reassembling
+        // something it cannot identify. A value stored as a string is walked verbatim. An
+        // array or object has no string to walk: WordPress unserialized it on the way out,
+        // and the serialized row underneath is an internal encoding no caller asked for.
+        // So those are walked as the same JSON wp_get_post_meta already prints for that
+        // row, which keeps the two read tools answering with identical bytes for identical
+        // values, and which wp_write_post_meta_chunk decodes back into the array, so the
+        // chunked pair is a round trip rather than two tools that merely both exist.
+        if ( is_string( $read_value ) ) {
+          $read_bytes = $read_value;
+          $read_repr = 'raw';
+        }
+        else {
+          $read_bytes = wp_json_encode( $read_value, JSON_PRETTY_PRINT );
+          $read_repr = 'json';
+          if ( !is_string( $read_bytes ) ) {
+            $r = $this->error(
+              $r,
+              'Post #' . $read_pid . ' meta "' . $read_key . '" row ' . $read_index
+                . ' holds a ' . gettype( $read_value ) . ' that cannot be encoded as JSON, so there is'
+                . ' no sequence of bytes to walk. Read it with wp_get_post_meta instead.',
+              -32603
+            );
+            break;
+          }
+        }
+        $read_total = strlen( $read_bytes );
+
+        $read_offset = intval( $a['offset'] ?? 0 );
+        if ( $read_offset < 0 || $read_offset > $read_total ) {
+          $r = $this->error(
+            $r,
+            'offset ' . $read_offset . ' is outside post #' . $read_pid . ' meta "' . $read_key
+              . '", which is ' . $read_total . ' bytes; offsets run from 0 to ' . $read_total . '.',
+            -32602
+          );
+          break;
+        }
+        $read_length = isset( $a['length'] ) ? intval( $a['length'] ) : self::META_READ_CHUNK_BYTES;
+        if ( $read_length < 1 ) {
+          $r = $this->error( $r, 'length must be at least 1 byte.', -32602 );
+          break;
+        }
+        $read_length = min( $read_length, self::META_READ_CHUNK_MAX_BYTES );
+
+        // substr() and strlen(), never mb_substr() and mb_strlen(). The offset is a byte
+        // offset, so a slice can begin or end inside a multibyte character, and that is
+        // harmless precisely because nothing here tries to repair it: the caller
+        // concatenates the pieces and the character is whole again. What would not be
+        // harmless is returning the slice as text. WordPress serializes the response with
+        // wp_json_encode(), which on invalid UTF-8 falls back to _wp_json_sanity_check()
+        // and runs the string through mb_convert_encoding(), substituting a placeholder
+        // for the partial character and reporting no error, so every chunk boundary that
+        // landed inside a character would come back subtly wrong and the caller would
+        // never know. base64 has no opinion about what the bytes mean, so it carries them.
+        $read_slice = substr( $read_bytes, $read_offset, $read_length );
+        $read_returned = strlen( $read_slice );
+
+        $this->add_result_text( $r, wp_json_encode( [
+          'ID' => $read_pid,
+          'key' => $read_key,
+          'index' => $read_index,
+          'rows' => $read_count,
+          'represents' => $read_repr,
+          'encoding' => 'base64',
+          'offset' => $read_offset,
+          'bytes_returned' => $read_returned,
+          'total_bytes' => $read_total,
+          'more' => ( $read_offset + $read_returned ) < $read_total,
+          // The hash covers the whole value, not this slice. A value can be rewritten
+          // between chunk one and chunk five, and a caller that reassembled two halves of
+          // two documents has no other way to find out. This does not prevent that and is
+          // not meant to: it makes it detectable, which is the part a caller cannot do
+          // for itself. It also lets a caller check its own reassembly at the end.
+          'sha256' => hash( 'sha256', $read_bytes ),
+          'data' => base64_encode( $read_slice ),
         ], JSON_PRETTY_PRINT ) );
         break;
 

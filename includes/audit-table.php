@@ -148,6 +148,11 @@ class GMCP_Audit_Table extends WP_List_Table {
     return !empty( $_GET['gmcp_expand'] );
   }
 
+  /** Whether this page is showing fewer rows than it holds entries. */
+  private function folded_here(): bool {
+    return !$this->expanded() && count( $this->items ) < $this->entries_on_page;
+  }
+
   /**
   * Consecutive entries recording the same call, drawn as one row carrying a count.
   *
@@ -211,8 +216,7 @@ class GMCP_Audit_Table extends WP_List_Table {
   * key alike to a different call and hide inside its count.
   */
   private static function fold_key( array $row ): ?string {
-    $records = json_decode( (string) ( $row['changes'] ?? '' ), true );
-    if ( is_array( $records ) && $records ) {
+    if ( self::change_records( $row ) ) {
       return null;
     }
     $key = '';
@@ -226,6 +230,22 @@ class GMCP_Audit_Table extends WP_List_Table {
   /** How many entries this row stands for. One, for a row that stands for itself. */
   private static function folded( array $item ): int {
     return count( $item['__fold_ids'] ?? [] );
+  }
+
+  /**
+  * What the row records as changed, decoded, and so the one test for whether it changed
+  * anything at all.
+  *
+  * Three places need that answer and they must not drift: the Changed column decides
+  * whether to draw a dash, fold_key() decides whether the row may merge with its
+  * neighbour, and the expander decides whether to exist. A row whose changes column
+  * holds null, an empty string or an empty array changed nothing recorded, and a second
+  * spelling of that test somewhere else is how a row acquires an empty expander the
+  * Changed column has already called a dash.
+  */
+  private static function change_records( array $item ): array {
+    $records = json_decode( (string) ( $item['changes'] ?? '' ), true );
+    return is_array( $records ) ? $records : [];
   }
 
   /** The link to one entry's full record, preserving whatever the reader had filtered to. */
@@ -313,8 +333,8 @@ class GMCP_Audit_Table extends WP_List_Table {
   * being a list. The full record is one click away and has room for all of it.
   */
   public function column_changed( array $item ): string {
-    $records = json_decode( (string) ( $item['changes'] ?? '' ), true );
-    if ( !is_array( $records ) || !$records ) {
+    $records = self::change_records( $item );
+    if ( !$records ) {
       return '<span class="gmcp-muted">&mdash;</span>';
     }
     $more = 0;
@@ -419,15 +439,18 @@ class GMCP_Audit_Table extends WP_List_Table {
   * hardest to read. A full-width line under the row gives the sentence the width of the
   * table. Core does the same thing for the plugin update notices, with the same shape.
   *
-  * ONLY REFUSALS GET ONE. A successful call's detail is the tool's own report, "Post
-  * created ID 16", which the Tool, Target and Changed columns have already said between
-  * them; a second row for every entry to repeat the row above it is how the entries that
-  * matter got pushed off the screen in the first place.
+  * WHAT ELSE GETS A ROW, AND WHAT STILL DOES NOT. A row that changed the site gets one
+  * too, closed, holding the expander (@see expander). A successful call's detail does
+  * not: it is the tool's own report, "Post created ID 16", which the Tool, Target and
+  * Changed columns have already said between them, and a second row under every entry
+  * repeating the row above it is how the entries that matter got pushed off the screen
+  * in the first place. So a read that changed nothing adds nothing, which is most of the
+  * log.
   *
   * Cut at 140 characters, about a line, which holds the identifying first sentence of
-  * every refusal this plugin writes. The rest is in the tooltip and on the entry page. A
-  * refusal quotes what the caller asked for, so this is the likeliest text in the table
-  * to have been written by someone hoping it would not be escaped.
+  * every refusal this plugin writes. The rest of it is one click below rather than in a
+  * tooltip. A refusal quotes what the caller asked for, so this is the likeliest text in
+  * the table to have been written by someone hoping it would not be escaped.
   */
   public function single_row( $item ): void {
     $refused = (string) $item['outcome'] !== 'ok';
@@ -436,24 +459,177 @@ class GMCP_Audit_Table extends WP_List_Table {
     echo '</tr>';
 
     $why = $refused ? trim( (string) ( $item['detail'] ?? '' ) ) : '';
-    if ( $why === '' ) {
+    $records = self::change_records( $item );
+    // A read that changed nothing and was not refused has nothing under it. That is most
+    // of the log, and it is why this row is not simply drawn for every entry.
+    if ( $why === '' && !$records ) {
       return;
     }
+
     // Cut back to a word boundary, because a sentence that stops mid-word reads as
     // damaged text rather than as a message with more of it elsewhere.
     $short = mb_strwidth( $why ) > 140
       ? preg_replace( '/\s+\S*$/u', '', mb_strimwidth( $why, 0, 140 ) ) . '…'
       : $why;
-    printf( '<tr class="gmcp-row-refused"><td colspan="%d" class="gmcp-detail"%s>%s%s</td></tr>',
+
+    printf( '<tr class="%s"><td colspan="%d" class="gmcp-detail">%s%s%s</td></tr>',
+      $refused ? 'gmcp-row-refused' : '',
       count( $this->get_columns() ),
-      $short === $why ? '' : sprintf( ' title="%s"', esc_attr( $why ) ),
       // The row above carries the entry number and the word; a reader who is hearing
       // this rather than seeing it gets neither back, since the cell spans the table.
       sprintf( '<span class="screen-reader-text">%s </span>',
-        esc_html( sprintf(
-          /* translators: %d: an audit log entry number. */
-          __( 'Why entry %d was refused:', 'guarded-mcp' ), (int) $item['id'] ) ) ),
-      esc_html( $short ) );
+        esc_html( $why !== ''
+          ? sprintf(
+              /* translators: %d: an audit log entry number. */
+              __( 'Why entry %d was refused:', 'guarded-mcp' ), (int) $item['id'] )
+          : sprintf(
+              /* translators: %d: an audit log entry number. */
+              __( 'What entry %d changed:', 'guarded-mcp' ), (int) $item['id'] ) ) ),
+      esc_html( $short ),
+      $this->expander( $item, $why, $short, $records ) );
+  }
+
+  /**
+  * What the row is already holding, opened without a page load.
+  *
+  * Comparing three refusals was three page loads and three journeys back, for facts that
+  * came out of the database with the row: detail and changes are selected whether this
+  * opens them or not. `details` and `summary` do the opening, as the fold control does,
+  * so this screen still carries no JavaScript.
+  *
+  * HOW THIS AND THE TRUNCATED REASON COEXIST. The line above stays the truncated one,
+  * because a refusal can run to a thousand characters and a log where one row is a
+  * paragraph is the thing the truncation exists to prevent. What went is the `title`
+  * attribute that used to carry the rest: a tooltip is unreachable on a touch screen, is
+  * not offered to a screen reader by most combinations, and cannot be selected or
+  * copied. So the full sentence moved into the expander, where all three work, and it is
+  * only offered when there is more of it than the line above already shows.
+  *
+  * WHAT IS DELIBERATELY NOT HERE. The recorded arguments and the two chain hashes stay
+  * on the entry page, which this links to. args is capped at 64,000 bytes to a row
+  * against changes' 16,000, so twenty-five of them in one page of markup would trade a
+  * page that is hard to read for a page that is slow to load. The hashes only mean
+  * anything beside the neighbouring entry's, which is that page's subject and not this
+  * row's.
+  *
+  * ON A FOLDED ROW it is the reason, never the changes: anything that changed the site
+  * stands alone (@see fold_key), so a row that stands for several entries has no changes
+  * to show. The reason it does show is true of all of them, because detail is part of
+  * the fold key, and the expander says so rather than leaving the reader to assume it.
+  */
+  private function expander( array $item, string $why, string $short, array $records ): string {
+    $rest = $short !== $why;
+    if ( !$records && !$rest ) {
+      return '';
+    }
+
+    $body = '';
+    if ( $rest ) {
+      $body .= '<p class="gmcp-detail">' . esc_html( $why ) . '</p>';
+    }
+    $body .= self::change_list( $records );
+
+    $count = self::folded( $item );
+    if ( $count > 1 ) {
+      // The arguments are NOT part of the fold key, so the calls this row stands for may
+      // have been given different ones. Offering one entry's full record here would
+      // present one call's arguments as the run's; the Entry column already lists every
+      // id, and each of them has its own.
+      $body .= '<p class="gmcp-detail">' . esc_html( sprintf(
+        /* translators: %d: how many entries this one row stands for. */
+        __( 'The same reason was recorded for all %d entries this row stands for. Their arguments and chain hashes are each their own: open one from the entry numbers in the first column.', 'guarded-mcp' ),
+        $count ) ) . '</p>';
+    } else {
+      $body .= sprintf( '<p class="gmcp-detail"><a href="%s">%s</a> %s</p>',
+        esc_url( self::entry_url( (int) $item['id'] ) ),
+        esc_html__( 'Full record', 'guarded-mcp' ),
+        esc_html__( 'for the arguments the call was given and the chain hashes either side of it.', 'guarded-mcp' ) );
+    }
+
+    if ( $records && $rest ) {
+      $label = __( 'What it changed, and the rest of the reason', 'guarded-mcp' );
+    } elseif ( $records ) {
+      $label = __( 'What it changed', 'guarded-mcp' );
+    } else {
+      $label = __( 'The rest of the reason', 'guarded-mcp' );
+    }
+
+    return sprintf( '<details><summary class="gmcp-summary">%s</summary>%s</details>',
+      esc_html( $label ), $body );
+  }
+
+  /**
+  * Every recorded change, in the words the entry page uses.
+  *
+  * The Changed column has room for the first object and a count of the others; this is
+  * the rest of them, and it is bounded before it gets here: the writer keeps at most
+  * forty records to a row and shortens any value past 120 characters, so the longest
+  * this can be is already decided and already fits.
+  *
+  * Not a table. The entry page draws four columns because it has the width of the screen
+  * for one entry; here the cell is already spanning a seven-column table under a row it
+  * belongs to, and a table inside it reads as a second list rather than as a note on
+  * the first.
+  */
+  private static function change_list( array $records ): string {
+    $out = '';
+    foreach ( $records as $record ) {
+      if ( isset( $record['__gmcp_more'] ) ) {
+        // Said here as it is said on the entry page. A summary that was cut short has to
+        // say so, or a large change and a missing one look the same.
+        $out .= '<p class="gmcp-muted">' . esc_html( sprintf(
+          /* translators: %d: number of further changes not recorded in detail. */
+          __( 'and %d more changes, too many to record in one entry', 'guarded-mcp' ),
+          (int) $record['__gmcp_more'] ) ) . '</p>';
+        continue;
+      }
+      $line = '<strong>' . esc_html( trim(
+        (string) ( $record['op'] ?? '' ) . ' ' . (string) ( $record['what'] ?? '' ) ) ) . '</strong>';
+      $label = (string) ( $record['label'] ?? '' );
+      if ( $label !== '' ) {
+        $line .= ' <span class="gmcp-muted">' . esc_html( $label ) . '</span>';
+      }
+      $fields = (array) ( $record['fields'] ?? [] );
+      if ( !$fields ) {
+        $line .= ' <span class="gmcp-muted">'
+          . esc_html__( 'no field values recorded', 'guarded-mcp' ) . '</span>';
+      }
+      foreach ( $fields as $field => $pair ) {
+        $line .= sprintf( '<br><code>%s</code> %s',
+          esc_html( (string) $field ),
+          sprintf(
+            /* translators: 1: the value before, 2: the value after. Both already marked up. */
+            esc_html__( 'was %1$s, became %2$s', 'guarded-mcp' ),
+            self::value_word( $pair['from'] ?? null,
+              __( 'not set', 'guarded-mcp' ), __( 'empty', 'guarded-mcp' ) ),
+            self::value_word( $pair['to'] ?? null,
+              __( 'removed', 'guarded-mcp' ), __( 'empty', 'guarded-mcp' ) ) ) );
+      }
+      $out .= '<p class="gmcp-change">' . $line . '</p>';
+    }
+    return $out;
+  }
+
+  /**
+  * A recorded value, or the word for what it is instead.
+  *
+  * Absent and empty stay two different words, and the words differ either side, for the
+  * reason they do on the entry page: the plugin strips markup out of a title on the way
+  * in, so a post created with a script tag for a title records a change from null to the
+  * empty string, and one word for both said somebody had deleted a title that had never
+  * existed.
+  */
+  private static function value_word( $value, string $absent, string $empty ): string {
+    if ( $value === null ) {
+      return '<span class="gmcp-muted">' . esc_html( $absent ) . '</span>';
+    }
+    if ( $value === '' ) {
+      return '<span class="gmcp-muted">' . esc_html( $empty ) . '</span>';
+    }
+    if ( (string) $value === '[redacted]' ) {
+      return '<span class="gmcp-muted" title="' . esc_attr__( 'Recorded as changed, but the value looked like a credential and was not kept.', 'guarded-mcp' ) . '">[redacted]</span>';
+    }
+    return '<code>' . esc_html( (string) $value ) . '</code>';
   }
 
   /**
@@ -522,10 +698,10 @@ class GMCP_Audit_Table extends WP_List_Table {
         esc_html__( 'Fold repeated calls', 'guarded-mcp' ) );
       return;
     }
-    $rows = count( $this->items );
-    if ( $rows >= $this->entries_on_page ) {
+    if ( !$this->folded_here() ) {
       return;
     }
+    $rows = count( $this->items );
     printf( '<span class="gmcp-detail" title="%s">%s</span> <a href="%s">%s</a>',
       esc_attr__( 'Consecutive entries recording the same call are drawn as one row. Entries that changed the site are never folded, and folding happens within a page, so a run crossing a page break is folded on each page separately.', 'guarded-mcp' ),
       esc_html( sprintf(
@@ -534,6 +710,68 @@ class GMCP_Audit_Table extends WP_List_Table {
         $this->entries_on_page, $rows ) ),
       esc_url( add_query_arg( 'gmcp_expand', '1' ) ),
       esc_html__( 'Show every row', 'guarded-mcp' ) );
+  }
+
+  /**
+  * What this view holds that is not on this page, when the page is hiding how much that
+  * is.
+  *
+  * Folding is within a page, and that is what keeps the item total honest, but it has a
+  * cost the reader cannot see: a run of thirty identical calls still occupies its whole
+  * page, drawn as one row, and the four refusals that were the reason to open the log
+  * are behind it. The pager says how many entries match. It does not say that four of
+  * them are the kind worth walking to, and a page showing one row looks like a log with
+  * one thing in it.
+  *
+  * ONLY ON A PAGE THAT FOLDED. An ordinary page of twenty-five rows is not
+  * misrepresenting itself: the rows are all there, the pager is beside them, and a
+  * sentence about other pages under every one of them is how a reader learns to stop
+  * reading this line. The same goes for a page the reader has unfolded, having already
+  * decided to look at the run.
+  *
+  * NOTHING WHEN AN OUTCOME FILTER IS IN FORCE. In the Refusals view every matching entry
+  * is a refusal and the pager has already counted them, so this would be a second
+  * sentence about the same number. In the successes view no refusal matches the filters
+  * at all, and a count taken from a wider set than the one on screen would be a true
+  * number about a different question, which is the worse of the two failures.
+  *
+  * NOTHING WHEN THEY ARE ALL HERE EITHER. Refusals on this page are subtracted rather
+  * than estimated, and the subtraction is exact: outcome is part of the fold key, so a
+  * folded row is all refusals or none, and the ids it stands for are the entries. A
+  * reader looking at the refusals is not told to go and find them.
+  *
+  * THE COST is one COUNT(*), on a page that folded, over the WHERE the pager's own count
+  * has already run plus outcome, which is indexed. Nothing walks the table here: asking
+  * the database for a number it can read off an index is the whole point of asking it
+  * rather than counting the rows this screen happens to be holding.
+  */
+  private function signpost(): void {
+    if ( !$this->folded_here() || !empty( $this->filters['outcome'] ) ) {
+      return;
+    }
+    $filters = $this->filters;
+    $filters['outcome'] = 'refused';
+    $elsewhere = GMCP_Audit::count( $filters );
+    foreach ( $this->items as $item ) {
+      if ( (string) $item['outcome'] !== 'ok' ) {
+        $elsewhere -= self::folded( $item );
+      }
+    }
+    if ( $elsewhere < 1 ) {
+      return;
+    }
+    // Built on the current request, so the link carries the filters and the search the
+    // count was taken under; without that it would lead somewhere the number is not
+    // true of. The page number is dropped, because page four of one view is not page
+    // four of a narrower one.
+    printf( ' <span class="gmcp-detail">%s</span> <a href="%s">%s</a>',
+      esc_html( sprintf(
+        /* translators: %d: refusals matching the current filters that are on other pages. */
+        _n( '%d refusal matching this view is on another page.',
+          '%d refusals matching this view are on other pages.', $elsewhere, 'guarded-mcp' ),
+        $elsewhere ) ),
+      esc_url( remove_query_arg( 'paged', add_query_arg( 'gmcp_outcome', 'refused' ) ) ),
+      esc_html__( 'Show the refusals', 'guarded-mcp' ) );
   }
 
   /**
@@ -592,7 +830,7 @@ class GMCP_Audit_Table extends WP_List_Table {
       <?php submit_button( __( 'Filter', 'guarded-mcp' ), '', 'gmcp_filter', false ); ?>
     </div>
 
-    <div class="alignleft actions"><?php $this->fold_control(); ?></div>
+    <div class="alignleft actions"><?php $this->fold_control(); $this->signpost(); ?></div>
     <?php
   }
 }

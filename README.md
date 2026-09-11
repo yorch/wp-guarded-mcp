@@ -79,7 +79,9 @@ reading it back.
 
 **Content and site data**, on by default: posts and pages, block content, taxonomies and terms, comments, media (including upload by URL or by a one-time upload link), users, post meta, site options, post types, block patterns.
 
-Three of those exist because a value can be too large or too escaped to survive a tool argument. `wp_copy_post_meta` and `wp_duplicate_post` copy inside PHP, so a page design of 100KB never leaves the server. Size was never the only reason: `update_metadata()` unslashes whatever it is handed, so a value that went out to the caller and came back loses every escape in it and returns broken, however small it is. `wp_write_post_meta_chunk` is the general answer, staging a value across several calls and writing the meta row only on the last one, so a half-written value is never on the post for something else to read as finished. A duplicate is a draft unless you ask otherwise, because a copy that inherits `publish` goes live on a misread instruction.
+Four of those exist because a value can be too large or too escaped to survive a tool argument. `wp_copy_post_meta` and `wp_duplicate_post` copy inside PHP, so a page design of 100KB never leaves the server. Size was never the only reason: `update_metadata()` unslashes whatever it is handed, so a value that went out to the caller and came back loses every escape in it and returns broken, however small it is. `wp_write_post_meta_chunk` is the general answer, staging a value across several calls and writing the meta row only on the last one, so a half-written value is never on the post for something else to read as finished. `wp_read_post_meta_chunk` is its mirror, so the round trip closes: it walks a value by byte offset, says how large the whole thing is and whether more remains, and returns each piece as base64.
+
+That last detail is not fussiness. A chunk boundary falls wherever the byte count lands, which is routinely inside a multi-byte character, and a half-character is fine only if nothing tries to repair it. Sent as text it does not survive: `wp_json_encode` hands invalid UTF-8 to WordPress's own sanity check, which substitutes a placeholder and reports no error, so a slice ending on the first byte of an emoji comes back the same length with that byte turned into a question mark. Every cheap check passes and the reassembled document differs from the stored one. Base64 carries those bytes through untouched, and each chunk also carries a hash of the whole value, so a caller can tell that the value was rewritten under it mid-walk and that what it reassembled is what was stored. A duplicate is a draft unless you ask otherwise, because a copy that inherits `publish` goes live on a misread instruction.
 
 **Site administration**, off by default: installing, activating, updating and deleting plugins and themes; navigation menus and their items; widgets and widget areas; the General, Reading and Discussion settings; the permalink structure; the site's scheduled events; and a Site Health report. These install code and change how the site renders, so they are opt-in and carry their own guards:
 
@@ -368,8 +370,12 @@ The verdict names an entry, and the screen links to it, so "the chain breaks at 
 *And it says how much it checked.* Recomputing the whole table means reading every
 recorded argument back out of the database, which on a full one is tens of megabytes, so
 the screen checks the most recent thousand rows and offers a button for the rest. The
-count it reports is the count it read: "intact across all 412 entries" when that is the
-whole table, and "intact across the 1,000 most recent entries, of 8,300" when it is not.
+count it reports is the count it read, and a partial check does not merely say so, it looks
+different: a complete pass is a sentence, while a partial one is set apart on the page under
+"only part of the chain was checked" and gives all three numbers, so "1,000 of 8,300 entries
+were checked, the most recent first, and those are intact. The other 7,300 were not looked
+at." Reassurance and partial reassurance reading alike at a glance is the whole failure this
+guards against, since glancing is what a person does with it.
 An earlier version read the oldest rows instead and said only "intact across 1,000
 entries", which was true, read as a verdict on the whole log, and never examined the
 period anyone would most want to check.
@@ -433,6 +439,22 @@ rounds down what it holds is not a log. Anything that recorded a change never fo
 alike two such calls look: five writes of the same option are five different before-and-after
 pairs, and merging them would hide exactly what the log exists to show.
 
+*The page says what is behind it.* Folding is within a page, which is what keeps the item total
+honest, so a long run still occupies its own page and the interesting rows sit further back. A
+folded page therefore also says how many refusals match the current filters but fall on other
+pages, linked. It stays quiet when nothing folded, when the reader has unfolded the page, when
+an outcome filter is already in force, and when every matching refusal is on the page already:
+a line printed on every page is how a reader learns to skip the line that will one day matter.
+
+*A row opens in place.* Comparing three refusals used to be three page loads and three journeys
+back. The row already holds its reason and its changes, so an expander shows both without
+another query. Arguments and the chain hashes stay on the entry page, because arguments are
+capped at 64,000 bytes each and putting twenty-five of those in one page trades one problem for
+a worse one. A row that changed nothing grows no expander, judged by the same test the Changed
+column uses, so the two can never disagree. On a folded row the expander shows the reason and
+never the changes: the reason is part of the fold key so it is true of every entry in the run,
+while anything that changed the site never folds in the first place.
+
 *A refusal says why on the row.* Refusals are the interesting entries, and they used to all
 render as the single word "Refused" with the reason a page load away. The reason now sits
 under the row, cut to a readable length with the whole of it on the entry page. It is a
@@ -445,6 +467,23 @@ substring search across all of it is a full scan of the table. The search box re
 target and the result, both small, and a checkbox puts the arguments and the changes back
 when you need to ask what touched post 12. The `outcome` column is indexed, so the Refusals
 view reads the page it returns rather than scanning to find it.
+
+*A partial check looks partial.* Verifying the chain walks the newest thousand entries, and the
+table may hold fifty thousand, so a reassuring sentence could cover two percent of the log and
+look exactly like one that covered all of it. A complete pass is still a green sentence. A
+partial one is its own box, says how many entries were checked and how many were not, and
+offers a button that walks the whole chain; that walk takes about six tenths of a second on a
+full table of fifty thousand rows, at flat memory, because it verifies in chunks.
+
+The result of a full walk is remembered with the date it ran, since it is the only thing that
+can say anything about the rows the window never reaches. It is never phrased as current state.
+A remembered pass is dropped the moment the quick walk disagrees with it, and that rule is
+load-bearing rather than tidy: the record is invalidated by the row count and the highest id,
+neither of which moves when a row is edited in place, which is exactly the tampering the chain
+exists to catch. Without it the screen printed a break and, directly underneath, that all fifty
+thousand entries were intact and nothing had changed since. A remembered break is kept either
+way, because it covers rows the window cannot reach and the window finding nothing does not
+answer it.
 
 An agent can read the log through `wp_get_audit_log` at `admin` level, filtered by tool,
 outcome, date or free text, and the reply carries the tamper verdict so a caller is told

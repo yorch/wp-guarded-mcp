@@ -170,6 +170,26 @@ class GMCP_Settings {
       .gmcp-change { color: inherit; font-size: 12px; }
       /* Long enough to wrap on a narrow screen rather than widen the table. */
       .gmcp-hash { font-size: 11px; word-break: break-all; }
+      /*
+      Three chain verdicts, and only one of them is a sentence. A complete pass stays in
+      the line of prose under the table, because there is nothing to do about it. A check
+      that covered part of the table and a chain that is broken become blocks, since the
+      whole worth of a tamper-evident log is that a person can glance at it, and two
+      sentences differing only in their words are read as the same reassurance.
+      Amber rather than red for the partial one: it is neither a pass nor a failure, and
+      dressing it as a failure sends the reader hunting for tampering nobody has found.
+      Both are blocks because a bordered partial next to a one-line break would put the
+      heavier mark on the smaller problem.
+      */
+      /* Border and nothing else. Naming a background here would mean naming a light one,
+      which is the mistake .gmcp-change above records: rendered dark it becomes a white
+      panel of near-white text. The shape carries the difference on either page. */
+      .gmcp-verdict { max-width: 800px; margin: 12px 0; padding: 8px 12px;
+        border: 1px solid #dcdcde; border-left-width: 4px; }
+      .gmcp-verdict p { margin: 0 0 6px; }
+      .gmcp-verdict p:last-child { margin-bottom: 0; }
+      .gmcp-verdict-partial { border-left-color: #dba617; }
+      .gmcp-verdict-broken { border-left-color: #d63638; }
       /* A refusal is worth spotting from across the table, not by reading it. */
       tr.gmcp-row-refused td { box-shadow: inset 3px 0 0 #d63638; }
       .gmcp-args { white-space: pre-wrap; font-size: 11px; margin: 4px 0 0; }
@@ -249,11 +269,15 @@ class GMCP_Settings {
       // full table is tens of megabytes, so it is a button rather than something every
       // page load pays for.
       $chain = GMCP_Audit::verify( 'all' );
+      // Kept, because this notice is printed once by the redirect and then gone, and the
+      // window check that runs on every load cannot say anything at all about the rows
+      // below it. The screen renders what is kept with the date it was found on.
+      GMCP_Audit::remember_full_check( $chain );
       $this->notice = $chain['ok']
         ? sprintf(
-            /* translators: 1: entries verified, 2: entries carried over unchained. */
-            __( 'Checked the whole chain: %1$d entries intact, %2$d carried over from before the log was chained.', 'guarded-mcp' ),
-            $chain['checked'], $chain['imported'] )
+            /* translators: 1: entries verified, 2: entries in the log, 3: entries carried over unchained. */
+            __( 'Checked the whole chain: %1$d of %2$d entries intact, %3$d carried over from before the log was chained.', 'guarded-mcp' ),
+            $chain['checked'], $chain['total'], $chain['imported'] )
         : sprintf(
             /* translators: 1: entry id, 2: the reason. */
             __( 'The chain breaks at entry %1$d: %2$s', 'guarded-mcp' ),
@@ -1668,43 +1692,103 @@ class GMCP_Settings {
         esc_html( size_format( GMCP_Audit::bytes() ) ),
         (int) GMCP_Audit::retention_days()
       ); ?>
-      <?php if ( $chain['ok'] ) : ?>
-        <span class="gmcp-ok"><?php echo esc_html( $chain['complete']
-          ? sprintf(
-              /* translators: %d: number of entries verified. */
-              __( 'The chain is intact across all %d entries.', 'guarded-mcp' ), (int) $chain['checked'] )
-          // Saying only "intact" would let a tenth of a log read as a whole one, which is
-          // the mistake this wording exists to stop repeating.
-          : sprintf(
-              /* translators: 1: entries verified, 2: entries in total. */
-              __( 'The chain is intact across the %1$d most recent entries, of %2$d.', 'guarded-mcp' ),
-              (int) $chain['checked'], (int) $chain['total'] )
-        ); ?></span>
-        <?php if ( !empty( $chain['imported'] ) ) : ?>
-          <span class="gmcp-muted"><?php printf(
-            esc_html__( '%d older entries were carried over from before this log was chained and are not covered.', 'guarded-mcp' ),
-            (int) $chain['imported'] ); ?></span>
-        <?php endif; ?>
-        <?php if ( !$chain['complete'] ) : ?>
-          <?php // Through form_head, not by hand: the POST redirects, and a form that
-          // forgets gmcp_tab sends the reader to the first tab to read a verdict about
-          // the log they were just looking at. ?>
-          <form method="post" style="display:inline">
-            <?php $this->form_head( 'verify_audit', 'logs' ); ?>
-            <button type="submit" class="button button-small"><?php esc_html_e( 'Check the whole chain', 'guarded-mcp' ); ?></button>
-          </form>
-        <?php endif; ?>
-      <?php else : ?>
-        <strong class="gmcp-fail"><?php printf(
-          esc_html__( 'The chain breaks at entry %1$d: %2$s', 'guarded-mcp' ),
-          (int) $chain['broken_at'], esc_html( $chain['reason'] )
-        ); ?></strong>
-        <?php // The verdict names an id, so it links to it. Before this the reader was
-        // handed a number and no way to look at the entry it named. ?>
-        <a href="<?php echo esc_url( GMCP_Audit_Table::entry_url( (int) $chain['broken_at'] ) ); ?>"><?php
-          esc_html_e( 'Look at that entry', 'guarded-mcp' ); ?></a>
+      <?php // Only the complete pass is said here. The other two verdicts are blocks
+      // below, because a partial check that reads like a whole one at a glance is the
+      // thing this arrangement exists to stop. ?>
+      <?php if ( $chain['ok'] && $chain['complete'] ) : ?>
+        <span class="gmcp-ok"><?php printf(
+          /* translators: %s: number of entries verified. */
+          esc_html__( 'The chain is intact across all %s entries.', 'guarded-mcp' ),
+          esc_html( number_format_i18n( $chain['checked'] ) ) ); ?></span>
+      <?php endif; ?>
+      <?php // Only alongside a verdict that reached the end of its walk. A break stops
+      // the walk, so the count is whatever had been passed by then rather than a count
+      // of the log. ?>
+      <?php if ( $chain['ok'] && !empty( $chain['imported'] ) ) : ?>
+        <span class="gmcp-muted"><?php printf(
+          esc_html__( '%s older entries were carried over from before this log was chained and are not covered.', 'guarded-mcp' ),
+          esc_html( number_format_i18n( $chain['imported'] ) ) ); ?></span>
       <?php endif; ?>
     </p>
+
+    <?php if ( $chain['ok'] && !$chain['complete'] ) : ?>
+      <div class="gmcp-verdict gmcp-verdict-partial">
+        <?php // The heading carries the state in words, so the mark beside it is
+        // decoration and is hidden rather than read out twice. ?>
+        <p><strong><span class="gmcp-warn" aria-hidden="true">!</span>
+          <?php esc_html_e( 'Only part of the chain was checked.', 'guarded-mcp' ); ?></strong></p>
+        <?php // Counted rather than described. "Intact" over an unstated slice of the
+        // table is the sentence that made a two per cent check read like a whole one.
+        // Unchecked is total minus checked, so the two numbers account for every row:
+        // an entry from before the chain was never checkable, and saying so is the
+        // muted line above, not an adjustment to this arithmetic. ?>
+        <p><?php printf(
+          /* translators: 1: entries checked, 2: entries in the log, 3: entries not checked. */
+          esc_html__( '%1$s of %2$s entries were checked, the most recent first, and those are intact. The other %3$s were not looked at.', 'guarded-mcp' ),
+          esc_html( number_format_i18n( $chain['checked'] ) ),
+          esc_html( number_format_i18n( $chain['total'] ) ),
+          esc_html( number_format_i18n( max( 0, (int) $chain['total'] - (int) $chain['checked'] ) ) )
+        ); ?></p>
+        <?php // Through form_head, not by hand: the POST redirects, and a form that
+        // forgets gmcp_tab sends the reader to the first tab to read a verdict about
+        // the log they were just looking at. ?>
+        <form method="post">
+          <?php $this->form_head( 'verify_audit', 'logs' ); ?>
+          <button type="submit" class="button"><?php esc_html_e( 'Check the whole chain', 'guarded-mcp' ); ?></button>
+        </form>
+      </div>
+    <?php elseif ( !$chain['ok'] ) : ?>
+      <div class="gmcp-verdict gmcp-verdict-broken">
+        <p><strong class="gmcp-fail"><span aria-hidden="true">&#10007;</span>
+          <?php printf(
+            /* translators: 1: entry id, 2: the reason. */
+            esc_html__( 'The chain breaks at entry %1$d: %2$s', 'guarded-mcp' ),
+            (int) $chain['broken_at'], esc_html( $chain['reason'] )
+          ); ?></strong></p>
+        <?php // The verdict names an id, so it links to it. Before this the reader was
+        // handed a number and no way to look at the entry it named. ?>
+        <p><a href="<?php echo esc_url( GMCP_Audit_Table::entry_url( (int) $chain['broken_at'] ) ); ?>"><?php
+          esc_html_e( 'Look at that entry', 'guarded-mcp' ); ?></a></p>
+      </div>
+    <?php endif; ?>
+
+    <?php // What the last full walk found, dated, because the button's own answer died
+    // with the redirect that printed it and the window check can say nothing at all
+    // about the rows underneath it. Never phrased as current state: see
+    // GMCP_Audit::remember_full_check() for what this can and cannot notice. ?>
+    <?php $last = GMCP_Audit::last_full_check(); ?>
+    <?php // A remembered pass is dropped the moment the live walk disagrees with it.
+    // Editing a row in place changes neither the count nor the highest id, so the record
+    // stays "current" through exactly the tampering the chain is built to catch, and it
+    // was measured sitting under a break saying all 50,001 entries were intact and
+    // nothing had changed since. A remembered break is kept either way: it covers rows
+    // the window never reaches, so the window finding nothing does not answer it. ?>
+    <?php if ( $last && ( !$last['ok'] || $chain['ok'] ) ) : ?>
+      <p class="<?php echo $last['ok'] ? 'gmcp-muted' : 'gmcp-fail'; ?>">
+        <?php if ( !$last['ok'] ) : ?>
+          <?php printf(
+            /* translators: 1: when the check ran, 2: entry id, 3: the reason. */
+            esc_html__( 'A check of the whole chain on %1$s found it broken at entry %2$d: %3$s', 'guarded-mcp' ),
+            esc_html( $this->format_date( $last['ran_at'] ) ),
+            (int) $last['broken_at'], esc_html( $last['reason'] ) ); ?>
+          <a href="<?php echo esc_url( GMCP_Audit_Table::entry_url( (int) $last['broken_at'] ) ); ?>"><?php
+            esc_html_e( 'Look at that entry', 'guarded-mcp' ); ?></a>
+        <?php elseif ( $last['current'] ) : ?>
+          <?php printf(
+            /* translators: 1: when the check ran, 2: entries verified. */
+            esc_html__( 'The whole chain was checked on %1$s, and all %2$s entries were intact then. Nothing has been added or removed since, but only another check can say whether an entry was altered in place.', 'guarded-mcp' ),
+            esc_html( $this->format_date( $last['ran_at'] ) ),
+            esc_html( number_format_i18n( $last['checked'] ) ) ); ?>
+        <?php else : ?>
+          <?php printf(
+            /* translators: 1: when the check ran, 2: entries verified, 3: entries in the log at the time. */
+            esc_html__( 'The whole chain was checked on %1$s, when %2$s of %3$s entries were intact. Entries have been added or removed since, so that no longer describes the log as it is now.', 'guarded-mcp' ),
+            esc_html( $this->format_date( $last['ran_at'] ) ),
+            esc_html( number_format_i18n( $last['checked'] ) ),
+            esc_html( number_format_i18n( $last['total'] ) ) ); ?>
+        <?php endif; ?>
+      </p>
+    <?php endif; ?>
 
     <div class="gmcp-actions">
       <form method="post">

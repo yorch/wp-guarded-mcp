@@ -786,6 +786,57 @@ class GMCP_Audit {
     ];
   }
 
+  /** Where the last full walk's verdict is kept. Not autoloaded; read only by the screen. */
+  const LAST_FULL_OPTION = 'gmcp_audit_last_full_verify';
+
+  /**
+  * Keep a full check's verdict, because the answer outlives the page it was asked on.
+  *
+  * The button posts, redirects and prints one notice, so the verdict was gone by the
+  * next load and the screen could only ever show the window check. What is stored is a
+  * statement about a moment: when the walk ran, what it found, and how large the table
+  * was, so a later read can say whether it still describes the table in front of it.
+  *
+  * It does not stand in for the check and must never be rendered as current state. A row
+  * edited in place changes neither the count nor the highest id, so nothing recorded here
+  * can notice that; only walking again can. Hence the timestamp travels with the verdict
+  * everywhere it is shown.
+  */
+  public static function remember_full_check( array $verdict ): void {
+    global $wpdb;
+    update_option( self::LAST_FULL_OPTION, [
+      'ok' => (bool) $verdict['ok'],
+      'checked' => (int) $verdict['checked'],
+      'imported' => (int) $verdict['imported'],
+      'total' => (int) $verdict['total'],
+      'broken_at' => $verdict['broken_at'] === null ? null : (int) $verdict['broken_at'],
+      'reason' => (string) $verdict['reason'],
+      'ran_at' => gmdate( 'Y-m-d H:i:s' ),
+      'high_water' => (int) $wpdb->get_var( 'SELECT MAX(id) FROM ' . self::table() ),
+    ], false );
+  }
+
+  /**
+  * That verdict, with whether the table has moved under it since.
+  *
+  * `current` is the narrow claim that no row has been added and none removed: the count
+  * and the highest id are both where the walk left them. It is not a claim that the log
+  * is still intact, which is why the caller is given the date as well and not this flag
+  * alone.
+  *
+  * @return array{ok:bool,checked:int,imported:int,total:int,broken_at:?int,reason:string,ran_at:string,high_water:int,current:bool}|null
+  */
+  public static function last_full_check(): ?array {
+    global $wpdb;
+    $last = get_option( self::LAST_FULL_OPTION, null );
+    if ( !is_array( $last ) || empty( $last['ran_at'] ) ) {
+      return null;
+    }
+    $last['current'] = (int) $last['total'] === self::count()
+      && (int) $last['high_water'] === (int) $wpdb->get_var( 'SELECT MAX(id) FROM ' . self::table() );
+    return $last;
+  }
+
   #endregion
 
   #region Pruning
@@ -844,6 +895,9 @@ class GMCP_Audit {
     // them as tampered with. Nothing older survives a clear, so nothing needs the old
     // construction any more.
     update_option( self::BOUNDARY_OPTION, 0, false );
+    // The remembered full check describes rows that no longer exist. Kept, it would sit
+    // under an empty log quoting a count from before the clear.
+    delete_option( self::LAST_FULL_OPTION );
   }
 
   #endregion

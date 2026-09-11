@@ -152,9 +152,10 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * A one-call site briefing, so an agent orients in one request rather than six.
 * Tool failures arrive as results the model can read, with isError set, rather than as JSON-RPC errors a client may discard along with the rest of the response.
 * Scheduled events can be listed, run and removed, so a cron event Site Health keeps flagging can be diagnosed and cleared. Only events the site already scheduled can be run, and removing one takes a confirmation step.
-* Copy post meta between posts, duplicate a post, and write an oversized value across several calls, so a large or heavily escaped design never has to pass through a tool argument. A duplicate is a draft unless you ask otherwise.
+* Copy post meta between posts, duplicate a post, and write or read an oversized value across several calls, so a large or heavily escaped design never has to pass through a tool argument. A duplicate is a draft unless you ask otherwise.
 * Delete an option, not only set one, so a stale cache that only clears by removing the row can be cleared. Nine options are refused, each with what breaks if it goes. The reply carries the removed value, because undo cannot put it back.
 * Flush the object cache, expired transients or one post, and say plainly which CDN or reverse proxy it could not reach and you still have to purge yourself.
+* A folded page says how many refusals sit on other pages, a row opens in place to show its reason and what it changed, and a chain check that covered only part of the log says so and offers to walk the rest.
 * The audit log screen folds repeated identical calls into one counted row, says on the row why a call was refused, names the way a caller got in beside the client, searches the small columns by default with a checkbox for the rest, and exports the filtered view as CSV or JSON.
 * Elementor tools on their own switch: theme-builder conditions written to both the template and Elementor's cached registry, regenerate CSS, and apply a library template to a page without the design passing through a tool argument.
 
