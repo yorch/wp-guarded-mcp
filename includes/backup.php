@@ -267,13 +267,17 @@ class GMCP_Backup {
     }
 
     $out = [
-      'provider' => $provider['name'],
+      // Never $provider['name'] alone. providers() is a filter, and an adapter registered
+      // without a name produced provider: null, which is the value that means "nothing
+      // recognised" - two opposite situations reported identically, with a summary that
+      // began on a bare space.
+      'provider' => self::provider_name( $provider ),
       'can_list' => is_callable( $provider['list'] ?? null ),
     ];
 
     if ( !$out['can_list'] ) {
-      $out['summary'] = $provider['name'] . ' is active and this plugin cannot enumerate its backups, so it cannot say whether any exist. '
-        . ( $provider['why_not'] ?? '' );
+      $out['summary'] = trim( $out['provider'] . ' is active and this plugin cannot enumerate its backups, so it cannot say whether any exist. '
+        . ( $provider['why_not'] ?? '' ) );
       return $out;
     }
 
@@ -289,8 +293,11 @@ class GMCP_Backup {
 
     $entries = array_values( array_filter( array_map( [ self::class, 'sanitise_entry' ], $backups ) ) );
 
+    // "shown", not "count". wp_backup_status already publishes a count meaning how many
+    // backups exist, and the same key meaning a page size here had the two tools
+    // disagreeing about the same site at the same moment.
     $out['total'] = $total;
-    $out['count'] = count( $entries );
+    $out['shown'] = count( $entries );
     $out['limit'] = $limit;
     $out['truncated'] = $total > $limit;
     // Dropped entries are counted rather than quietly absent. count and total disagreeing
@@ -304,7 +311,7 @@ class GMCP_Backup {
     // be reduced to one stray component by retention while still being listed. Counting
     // those separately is the difference between "you have four backups" and the thing
     // the caller actually wants to know.
-    $out['with_database'] = count( array_filter( $out['backups'], function ( $b ) {
+    $out['with_database'] = count( array_filter( $entries, function ( $b ) {
       return in_array( 'database', (array) ( $b['contains'] ?? [] ), true );
     } ) );
 
@@ -387,7 +394,7 @@ class GMCP_Backup {
       $out['total'] === 1 ? '' : 's'
     );
     if ( $out['truncated'] ) {
-      $line .= sprintf( ' The newest %d are shown; raise limit to see further back.', $out['count'] );
+      $line .= sprintf( ' The newest %d are shown; raise limit to see further back.', $out['shown'] );
     }
     if ( !empty( $out['unreadable'] ) ) {
       $n = (int) $out['unreadable'];
@@ -403,22 +410,27 @@ class GMCP_Backup {
     if ( $out['with_database'] === 0 ) {
       $line .= ' None of the ones shown contain a database, so none of them can put this site back.';
     }
-    elseif ( $out['with_database'] < $out['count'] ) {
-      $line .= sprintf( ' %d of the %d shown contain a database; the rest cannot put the site back on their own.', $out['with_database'], $out['count'] );
+    elseif ( $out['with_database'] < $out['shown'] ) {
+      $line .= sprintf( ' %d of the %d shown contain a database; the rest cannot put the site back on their own.', $out['with_database'], $out['shown'] );
     }
 
-    return $line . ' No archive filename or path is included in any entry, and entries from an adapter registered through gmcp_backup_providers are reduced to the same fields, because on both supported plugins the filename or its directory is the only thing keeping the archive from being downloaded by anyone who can guess it.';
+    return $line . ' No archive filename or path is included in any entry, and entries from an adapter registered through gmcp_backup_providers are reduced to the same fields. Both plugins do guard their directory with an .htaccess, which Apache honours and nginx never reads, so on an nginx site the unguessable name is the last thing between a caller and a database archive holding every user row and password hash.';
   }
 
   /**
   * One backup, described without naming it on disk.
   *
   * The missing field is the point. UpdraftPlus writes
-  * backup_<date>_<site>_<nonce>-db.gz into wp-content/updraft, where that nonce is what
-  * makes the URL unguessable; its .htaccess there says "deny from all", which nginx does
-  * not read at all. Backuply inverts it, with a predictable filename inside a directory
-  * whose random suffix is the secret. Either way the on-disk name is a capability, and a
-  * database archive holds every user row and password hash on the site.
+  * backup_<date>_<site>_<nonce>-db.gz into wp-content/updraft, where a 48-bit job nonce
+  * makes the URL unguessable. Backuply inverts it, with a filename derivable from the
+  * timestamp inside a directory whose 36-bit suffix is the secret, one suffix covering
+  * every archive on the site.
+  *
+  * Not the only protection, which this comment used to claim. Both ship an .htaccess
+  * saying "deny from all", and Backuply writes archives 0600; Apache honours the first and
+  * nginx never reads it, so on nginx the name is the last line rather than the only one.
+  * Either way the on-disk name is a capability, and a database archive holds every user
+  * row and password hash on the site.
   *
   * So this returns nothing a caller could turn into a URL. A backup is identified by when
   * it finished, which is unguessable by nobody and sufficient for every question an agent
@@ -439,6 +451,16 @@ class GMCP_Backup {
       'size' => $bytes > 0 ? size_format( $bytes ) : null,
       'destination' => $destination,
     ];
+  }
+
+  /** An adapter's name, or something that at least is not the value meaning "none". */
+  private static function provider_name( array $provider ): string {
+    $name = trim( (string) ( $provider['name'] ?? '' ) );
+    if ( $name !== '' ) {
+      return $name;
+    }
+    $slug = trim( (string) ( $provider['slug'] ?? '' ) );
+    return $slug !== '' ? $slug : 'an unnamed backup adapter';
   }
 
   /**
