@@ -19,6 +19,7 @@ spl_autoload_register( function ( $class ) {
     'GMCP_Tools_Core' => '/includes/tools-core.php',
     'GMCP_Tools_Rest' => '/includes/tools-rest.php',
     'GMCP_Tools_Woo' => '/includes/tools-woo.php',
+    'GMCP_Tools_Elementor' => '/includes/tools-elementor.php',
     'GMCP_Tools_Admin' => '/includes/tools-admin.php',
     'GMCP_Audit' => '/includes/audit.php',
     'GMCP_Audit_Table' => '/includes/audit-table.php',

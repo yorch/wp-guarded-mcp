@@ -28,6 +28,37 @@ class GMCP_Tools_Core {
     }
     $r['result']['content'][] = [ 'type' => 'text', 'text' => $text ];
   }
+
+  /**
+  * A tool failure the model is supposed to read and act on.
+  *
+  * These used to be JSON-RPC errors. A protocol error carries no result at all, so a
+  * client reading result.content found nothing there, called the response malformed and
+  * discarded it whole, including on calls that had already done their work: that is how
+  * a created post came back with no readable ID. An isError result is handed to the
+  * model as the tool's answer instead, which is what a refusal is for.
+  *
+  * -32601 is "method not found", a genuine protocol-level condition, so that one stays a
+  * real JSON-RPC error. Everything else is an outcome. tools-admin.php and server.php's
+  * catch block draw the line in the same place.
+  *
+  * The code is kept in the text because the result shape has nowhere else to put it, and
+  * it is what separates a bad argument from a failed write. Several callers pass a
+  * WP_Error code, which says more than either.
+  */
+  private function error( array $r, string $message, int|string $code = -32603 ): array {
+    if ( $code === -32601 ) {
+      unset( $r['result'] );
+      $r['error'] = [ 'code' => $code, 'message' => $message ];
+      return $r;
+    }
+    $r['result'] = [
+      'content' => [ [ 'type' => 'text', 'text' => $message . ' [error ' . $code . ']' ] ],
+      'isError' => true,
+    ];
+    unset( $r['error'] );
+    return $r;
+  }
   private function clean_html( string $v ): string {
     return wp_kses_post( wp_unslash( $v ) );
   }
@@ -395,6 +426,30 @@ class GMCP_Tools_Core {
     return GMCP_Core::option_guard( $key );
   }
 
+  /**
+  * Options that may not be deleted, each with what actually breaks if it goes.
+  *
+  * These are separate from option_guard(), which is about secrecy. These are rows
+  * WordPress either cannot run without or cannot rebuild, so losing one is not a
+  * recoverable mistake. The value is the sentence the refusal says, so the reason and
+  * the rule cannot drift apart.
+  *
+  * rewrite_rules is deliberately NOT here. It is a derived cache, WordPress regenerates
+  * it on the next permalink flush, and deleting it is a normal repair for broken
+  * permalinks rather than damage.
+  */
+  private const OPTIONS_NEVER_DELETED = [
+    'siteurl' => 'WordPress builds every URL from it, so with the row gone the site cannot resolve its own address; wp-admin and this endpoint included, which means there is no way back in through the API that deleted it.',
+    'home' => 'Same as siteurl: the front page and every link on it become unreachable, and so does the route this request arrived on.',
+    'template' => 'It names the active theme. With no theme WordPress has nothing to render the front end with.',
+    'stylesheet' => 'It names the active child or parent theme. Removing it leaves WordPress looking for a theme directory that is not identified anywhere.',
+    'active_plugins' => 'Every plugin deactivates at once, this one among them, so the API that deleted the row is no longer running to restore it.',
+    'db_version' => 'It records which schema the database is on. Missing, WordPress runs its upgrade routine against a schema it can no longer place.',
+    'initial_db_version' => 'It records the schema the site was installed at, which upgrade routines read to decide what to skip.',
+    'cron' => 'The entire schedule is this one row. Deleting it silently drops every scheduled event on the site: publishing, backups, renewals, WooCommerce actions. Nothing errors; things just stop happening.',
+    'admin_email' => 'It is where recovery mail, password resets and fatal-error notices go. Without it nobody is told when the site is in trouble.',
+  ];
+
   private function bust_post_cache( int $post_id, array $context = [] ): void {
     if ( $post_id <= 0 ) {
       return;
@@ -416,6 +471,149 @@ class GMCP_Tools_Core {
     if ( function_exists( 'rocket_clean_post' ) ) {
       rocket_clean_post( $post_id );
     }
+  }
+
+  /**
+  * Purge the whole-site page caches this plugin can name, and say which ones did anything.
+  *
+  * Same stance as bust_post_cache(): purge what we can name and hand the rest to a hook.
+  * Every entry is guarded, so a name that has since changed is a no-op instead of a fatal,
+  * and a plugin that is not installed is simply never reported as purged. What is returned
+  * is what actually ran, because the caller has to be able to tell what is still stale.
+  *
+  * @return string[] Names of the caches that were purged.
+  */
+  private function purge_page_caches(): array {
+    $purged = [];
+
+    // LiteSpeed documents its purge as an action, and has_action() both guards the call
+    // and answers whether anything listened. docs.litespeedtech.com/lscache/lscwp/api/
+    if ( has_action( 'litespeed_purge_all' ) ) {
+      do_action( 'litespeed_purge_all' );
+      $purged[] = 'LiteSpeed Cache (whole site)';
+    }
+    // WP Rocket's documented whole-domain purge, the site-wide sibling of the
+    // rocket_clean_post() that bust_post_cache() already calls.
+    // docs.wp-rocket.me/article/92-rocketcleandomain
+    if ( function_exists( 'rocket_clean_domain' ) ) {
+      rocket_clean_domain();
+      $purged[] = 'WP Rocket (whole domain)';
+    }
+    // W3 Total Cache's public API function, declared in its w3-total-cache-api.php.
+    if ( function_exists( 'w3tc_flush_all' ) ) {
+      w3tc_flush_all();
+      $purged[] = 'W3 Total Cache (all engines)';
+    }
+    // WP Super Cache's own clear, from wp-cache-phase2.php. Despite the name it has
+    // nothing to do with core's wp_cache_flush(): this one empties the static page files.
+    if ( function_exists( 'wp_cache_clear_cache' ) ) {
+      wp_cache_clear_cache();
+      $purged[] = 'WP Super Cache (static page files)';
+    }
+    // SpeedyCache 1.4 keeps its purge on a static class in main/delete.php rather than
+    // behind a function or an action, so this is the only public entry point it offers.
+    if ( is_callable( [ '\SpeedyCache\Delete', 'all_cache' ] ) ) {
+      call_user_func( [ '\SpeedyCache\Delete', 'all_cache' ] );
+      $purged[] = 'SpeedyCache (cached HTML)';
+    }
+    return $purged;
+  }
+
+  /** Meta keys that say who is editing the source post rather than what it contains. */
+  private const META_KEYS_NEVER_COPIED = [ '_edit_lock', '_edit_last' ];
+
+  /**
+  * Copy meta rows from one post to another.
+  *
+  * get_post_meta( $id ) with no key returns every key as a LIST of its rows, and those
+  * rows are the raw database strings: WordPress only unserializes when you name a key.
+  * Both facts are load-bearing. Keeping the list is what makes a key with several rows
+  * arrive as several rows instead of collapsing into one, and the raw strings have to be
+  * put back through maybe_unserialize() before they are written, because maybe_serialize()
+  * on the way in deliberately re-serializes a string that already looks serialized. Handing
+  * it the raw row stored s:48:"a:2:{...}" and an array key read back as a string. Nothing
+  * is serialized here, for the reason the wp_update_post_meta handler gives: WordPress
+  * serializes arrays itself, so doing it here would double-serialize them instead.
+  *
+  * wp_slash() is not decoration. add_post_meta() runs wp_unslash() on the value, which
+  * would strip the backslashes out of an Elementor JSON payload (\/ and <) and
+  * corrupt it silently. Slashing first makes the round trip exact.
+  *
+  * @return array{0: array<string,array{bytes:int,rows:int}>, 1: array<string,string>} what was copied, and key => why it was skipped.
+  */
+  private function copy_post_meta( int $from, int $to, array $only, bool $overwrite ): array {
+    $source = get_post_meta( $from );
+    $copied = [];
+    $skipped = [];
+
+    // Requested keys are matched against the source verbatim rather than sanitize_key()'d.
+    // The only keys ever written are keys that already exist on the source, so there is
+    // nothing to sanitize, and lowercasing the request would just fail to find a
+    // mixed-case key that is really there.
+    $wanted = [];
+    foreach ( $only as $key ) {
+      $key = (string) $key;
+      if ( $key === '' ) {
+        continue;
+      }
+      $wanted[ $key ] = true;
+      if ( !isset( $source[ $key ] ) ) {
+        $skipped[ $key ] = 'not set on post #' . $from;
+      }
+    }
+
+    foreach ( $source as $key => $rows ) {
+      if ( $wanted && !isset( $wanted[ $key ] ) ) {
+        continue;
+      }
+      if ( in_array( $key, self::META_KEYS_NEVER_COPIED, true ) ) {
+        $skipped[ $key ] = 'names whoever is editing post #' . $from . ', so it belongs to that post and not to its content';
+        continue;
+      }
+      if ( !$overwrite && metadata_exists( 'post', $to, $key ) ) {
+        $skipped[ $key ] = 'already set on post #' . $to . '; pass overwrite to replace it';
+        continue;
+      }
+      // Replace rather than append, so overwriting a multi-valued key leaves the target
+      // holding the source's rows and not both sets. A no-op when the key is absent.
+      delete_post_meta( $to, $key );
+      $bytes = 0;
+      foreach ( (array) $rows as $value ) {
+        // Bytes are counted on the stored row, which is what actually moved.
+        $bytes += strlen( (string) $value );
+        add_post_meta( $to, $key, wp_slash( maybe_unserialize( $value ) ) );
+      }
+      $copied[ $key ] = [ 'bytes' => $bytes, 'rows' => count( (array) $rows ) ];
+    }
+    return [ $copied, $skipped ];
+  }
+
+  // How much one chunked meta value may stage, and how long an unfinished one survives.
+  //
+  // 4MB is measured against the real constraint. A staged value is one row in wp_options,
+  // which is LONGTEXT, so what actually binds is MySQL's max_allowed_packet: 16MB on a
+  // stock MariaDB/MySQL, and the whole INSERT has to fit inside it. 4MB leaves room for
+  // that and is still an order of magnitude past the largest Elementor page anyone
+  // reports, which is a few hundred KB.
+  //
+  // 15 minutes is chosen because a chunked write is one continuous exchange, so a longer
+  // gap means the caller went away. The expiry is the only thing keeping abandoned
+  // sessions from accumulating in wp_options, which is how this could otherwise be used
+  // to fill the database.
+  private const META_CHUNK_MAX_BYTES = 4194304;
+  private const META_CHUNK_TTL = 900;
+
+  /**
+  * Where a half-written meta value waits.
+  *
+  * A transient, for two reasons. It expires on its own, so an abandoned session cleans
+  * itself up with no cron and no bookkeeping of its own. And the name starts with "gmcp_",
+  * which GMCP_Core::option_guard() refuses, so the staging buffer cannot be read or
+  * rewritten through wp_get_option and wp_update_option. The one place it must never live
+  * is the live meta row, where a reader would take a partial value for the finished one.
+  */
+  private function meta_chunk_transient( string $session ): string {
+    return 'gmcp_meta_chunk_' . substr( preg_replace( '/[^A-Za-z0-9_\-]/', '', $session ), 0, 64 );
   }
   #endregion
 
@@ -616,6 +814,36 @@ class GMCP_Tools_Core {
         ],
         'accessLevel' => 'admin',
       ],
+      'wp_delete_option' => [
+        'name' => 'wp_delete_option',
+        'description' => 'Delete a WordPress option row outright. Use this when a stored value has to be ABSENT rather than empty, because some code only rebuilds a cache when it finds nothing: Elementor regenerates its theme-builder conditions cache only when the stored value is not an array, so a stored empty array reads as "already computed" and never self-heals, and removing the row is the only way back. Refuses the same credential-shaped keys wp_get_option and wp_update_option refuse, plus a short list of options WordPress cannot run without or cannot rebuild (siteurl, home, template, stylesheet, active_plugins, db_version, initial_db_version, cron, admin_email). rewrite_rules IS deletable: WordPress regenerates it, and deleting it is a normal permalink repair. A deletion is written to the audit log, but the undo journal keeps created and updated options only, so the deletion does NOT appear in wp_list_changes and wp_undo_change CANNOT put it back. Read the value with wp_get_option first if you might want it again. Reports honestly when the option did not exist; that is not a failure and nothing was deleted.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'key' => [ 'type' => 'string', 'description' => 'Option name to delete.' ],
+          ],
+          'required' => [ 'key' ],
+        ],
+        'accessLevel' => 'admin',
+      ],
+
+      /* -------- Caches -------- */
+      'wp_flush_cache' => [
+        'name' => 'wp_flush_cache',
+        'description' => 'Empty caches so the next request rebuilds from the database. scope "object" calls wp_cache_flush(): on a shared Redis or Memcached that can evict OTHER sites\' entries too, and every subsequent request on this site rebuilds from the database until the cache refills, so it is a real load spike, not a free operation. scope "transients" removes only EXPIRED transients, which is stale data; unexpired ones are left alone because they hold work already done. scope "post" purges the caches for one post (pass ID). scope "all" (default) does object plus transients. Every scope also purges the page-cache plugins this plugin can name (LiteSpeed, WP Rocket, W3 Total Cache, WP Super Cache, SpeedyCache) and fires the gmcp_cache_flushed action. It does NOT purge any CDN or reverse proxy (Cloudflare, Varnish, Fastly, a host edge cache), nor caches already handed to visitors: the result lists exactly what was purged and what was not, and you must purge the rest yourself.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'scope' => [
+              'type' => 'string',
+              'enum' => [ 'object', 'transients', 'post', 'all' ],
+              'description' => 'What to empty. Default "all" (object cache + expired transients).',
+            ],
+            'ID' => [ 'type' => 'integer', 'description' => 'Post ID. Required when scope is "post".' ],
+          ],
+        ],
+        'accessLevel' => 'admin',
+      ],
 
       /* -------- Counts -------- */
       'wp_count_posts' => [
@@ -731,6 +959,22 @@ class GMCP_Tools_Core {
             'meta_input' => [ 'type' => 'object', 'description' => 'Associative array of custom fields.' ],
           ],
           'required' => [ 'post_title' ],
+        ],
+        'accessLevel' => 'write',
+      ],
+      'wp_duplicate_post' => [
+        'name' => 'wp_duplicate_post',
+        'description' => 'Duplicate an existing post, page or custom post type, copying its content, excerpt, type, parent, menu order and comment/ping settings. The copy is a DRAFT unless you pass post_status, whatever the source\'s status was: a duplicate going live on a misread instruction is exactly what this plugin exists to prevent, so publishing is always a separate, deliberate call. include_meta (default true) copies every meta key except _edit_lock and _edit_last; the copy happens inside PHP, so an Elementor _elementor_data blob of any size moves without passing through a tool argument. include_terms (default true) copies the term assignments of every taxonomy registered to the post type. Returns the new post ID. The new post is journalled and can be removed with wp_delete_post, but the copied meta is not journalled.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'ID' => [ 'type' => 'integer', 'description' => 'Post to duplicate.' ],
+            'post_title' => [ 'type' => 'string', 'description' => 'Title for the copy. Defaults to the source title.' ],
+            'post_status' => [ 'type' => 'string', 'description' => 'Status for the copy. Defaults to "draft"; the source status is never inherited.' ],
+            'include_meta' => [ 'type' => 'boolean', 'description' => 'Copy custom fields (default true).' ],
+            'include_terms' => [ 'type' => 'boolean', 'description' => 'Copy taxonomy assignments (default true).' ],
+          ],
+          'required' => [ 'ID' ],
         ],
         'accessLevel' => 'write',
       ],
@@ -888,6 +1132,41 @@ class GMCP_Tools_Core {
           'required' => [ 'ID', 'key' ],
         ],
         'accessLevel' => 'admin',
+      ],
+      'wp_copy_post_meta' => [
+        'name' => 'wp_copy_post_meta',
+        'description' => 'Copy custom fields from one post to another inside PHP, so a value too large to survive a tool argument never has to leave the server: an Elementor _elementor_data blob is routinely over 100KB and cannot be read out and written back reliably. Copies every key by default; pass "keys" to copy only some. A key that already exists on the target is SKIPPED, not merged, unless overwrite is true. _edit_lock and _edit_last are never copied because they say who is editing the source, not what it contains. A key with several rows keeps all of them. Reports bytes copied per key and the reason for every skip. Post meta is not journalled, so this cannot be undone with wp_undo_change.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'from_id' => [ 'type' => 'integer', 'description' => 'Post to copy meta from.' ],
+            'to_id' => [ 'type' => 'integer', 'description' => 'Post to copy meta to.' ],
+            'keys' => [
+              'type' => 'array',
+              'items' => [ 'type' => 'string' ],
+              'description' => 'Meta keys to copy. Omit to copy every key on the source.',
+            ],
+            'overwrite' => [ 'type' => 'boolean', 'description' => 'Replace keys that already exist on the target (default false, which skips them).' ],
+          ],
+          'required' => [ 'from_id', 'to_id' ],
+        ],
+        'accessLevel' => 'write',
+      ],
+      'wp_write_post_meta_chunk' => [
+        'name' => 'wp_write_post_meta_chunk',
+        'description' => 'Write a post meta value that is too large to pass in one tool argument, a piece at a time. Pick any "session" id and send successive calls with the same session, ID and key; each call appends and answers with chunk_index, bytes_written and total_bytes staged. Nothing touches the post until the call that sets final: true, which assembles the staged bytes, writes the meta row and clears the staging, so an abandoned or half-sent value can never be read as real. A session is bound to the post and key it opened with and refuses a chunk aimed anywhere else. If the assembled string is valid JSON for an array or object it is decoded before storing, the same way wp_update_option decodes a JSON string, so a JSON-encoded Elementor payload becomes the array WordPress expects instead of a string; anything else is stored verbatim. Staging is capped and abandoned sessions expire. Post meta is not journalled, so the final write CANNOT be undone with wp_undo_change.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'session' => [ 'type' => 'string', 'description' => 'Any id you choose, reused for every chunk of one value.' ],
+            'ID' => [ 'type' => 'integer', 'description' => 'Target post ID.' ],
+            'key' => [ 'type' => 'string', 'description' => 'Target meta key.' ],
+            'data' => [ 'type' => 'string', 'description' => 'This chunk of the value, appended to what is already staged.' ],
+            'final' => [ 'type' => 'boolean', 'description' => 'True on the last chunk: assemble and write the meta row (default false).' ],
+          ],
+          'required' => [ 'session', 'ID', 'key', 'data' ],
+        ],
+        'accessLevel' => 'write',
       ],
 
       /* -------- Featured image -------- */
@@ -1197,7 +1476,7 @@ class GMCP_Tools_Core {
       case 'wp_delete_comment':
         return $this->preview_delete_comment( $a, $r );
     }
-    $r['error'] = [ 'code' => -32603, 'message' => "No preview is implemented for {$tool}." ];
+    $r = $this->error( $r, "No preview is implemented for {$tool}.", -32603 );
     return $r;
   }
 
@@ -1210,7 +1489,7 @@ class GMCP_Tools_Core {
   private function preview_delete_post( array $a, array $r ): array {
     $post = get_post( (int) ( $a['ID'] ?? 0 ) );
     if ( !$post ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'No post with ID ' . (int) ( $a['ID'] ?? 0 ) . '.' ];
+      $r = $this->error( $r, 'No post with ID ' . (int) ( $a['ID'] ?? 0 ) . '.', -32602 );
       return $r;
     }
     $force = !empty( $a['force'] );
@@ -1262,7 +1541,7 @@ class GMCP_Tools_Core {
   private function preview_update_post( array $a, array $r ): array {
     $post = get_post( (int) ( $a['ID'] ?? 0 ) );
     if ( !$post ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'No post with ID ' . (int) ( $a['ID'] ?? 0 ) . '.' ];
+      $r = $this->error( $r, 'No post with ID ' . (int) ( $a['ID'] ?? 0 ) . '.', -32602 );
       return $r;
     }
 
@@ -1304,12 +1583,12 @@ class GMCP_Tools_Core {
   private function preview_alter_post( array $a, array $r ): array {
     $post = get_post( (int) ( $a['ID'] ?? 0 ) );
     if ( !$post ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'No post with ID ' . (int) ( $a['ID'] ?? 0 ) . '.' ];
+      $r = $this->error( $r, 'No post with ID ' . (int) ( $a['ID'] ?? 0 ) . '.', -32602 );
       return $r;
     }
     $field = sanitize_key( $a['field'] ?? '' );
     if ( !in_array( $field, [ 'post_content', 'post_excerpt', 'post_title' ], true ) ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'field must be post_content, post_excerpt or post_title.' ];
+      $r = $this->error( $r, 'field must be post_content, post_excerpt or post_title.', -32602 );
       return $r;
     }
     $subject = (string) $post->$field;
@@ -1326,7 +1605,7 @@ class GMCP_Tools_Core {
       // the write then does not make, or miss ones it does.
       list( $pattern, $error ) = $this->compile_alter_regex( $search, isset( $a['flags'] ) && is_string( $a['flags'] ) ? $a['flags'] : '' );
       if ( $error !== null ) {
-        $r['error'] = [ 'code' => -32602, 'message' => $error ];
+        $r = $this->error( $r, $error, -32602 );
         return $r;
       }
       // Count without materialising anything. Asking for every match with
@@ -1338,7 +1617,7 @@ class GMCP_Tools_Core {
       $count = @preg_match_all( $pattern, $subject );
       if ( $count === false ) {
         $msg = function_exists( 'preg_last_error_msg' ) ? preg_last_error_msg() : 'PCRE error code ' . preg_last_error();
-        $r['error'] = [ 'code' => -32602, 'message' => 'That pattern failed against this content: ' . $msg ];
+        $r = $this->error( $r, 'That pattern failed against this content: ' . $msg, -32602 );
         return $r;
       }
       // Then walk out only the handful actually shown.
@@ -1359,7 +1638,7 @@ class GMCP_Tools_Core {
     }
     else {
       if ( $search === '' ) {
-        $r['error'] = [ 'code' => -32602, 'message' => 'search cannot be empty.' ];
+        $r = $this->error( $r, 'search cannot be empty.', -32602 );
         return $r;
       }
       $count = substr_count( $subject, $search );
@@ -1396,7 +1675,7 @@ class GMCP_Tools_Core {
     $taxonomy = sanitize_key( $a['taxonomy'] ?? '' );
     $term = get_term( (int) ( $a['term_id'] ?? 0 ), $taxonomy ?: '' );
     if ( !$term || is_wp_error( $term ) ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'No such term.' ];
+      $r = $this->error( $r, 'No such term.', -32602 );
       return $r;
     }
     $children = get_terms( [ 'taxonomy' => $term->taxonomy, 'parent' => $term->term_id, 'hide_empty' => false ] );
@@ -1419,7 +1698,7 @@ class GMCP_Tools_Core {
     $id = (int) ( $a['ID'] ?? 0 );
     $post = get_post( $id );
     if ( !$post || $post->post_type !== 'attachment' ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'No attachment with ID ' . $id . '.' ];
+      $r = $this->error( $r, 'No attachment with ID ' . $id . '.', -32602 );
       return $r;
     }
     $file = get_attached_file( $id );
@@ -1462,7 +1741,7 @@ class GMCP_Tools_Core {
     $id = (int) ( $a['comment_ID'] ?? 0 );
     $comment = get_comment( $id );
     if ( !$comment ) {
-      $r['error'] = [ 'code' => -32602, 'message' => 'No comment with ID ' . $id . '.' ];
+      $r = $this->error( $r, 'No comment with ID ' . $id . '.', -32602 );
       return $r;
     }
     $replies = get_comments( [ 'parent' => $id, 'count' => true ] );
@@ -1608,13 +1887,13 @@ class GMCP_Tools_Core {
         // correctly denying per-site Administrators) and refuse to assign a role
         // the caller cannot grant (e.g. administrator).
         if ( !current_user_can( 'create_users' ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'You are not allowed to create users.' ];
+          $r = $this->error( $r, 'You are not allowed to create users.', -32603 );
           break;
         }
         $role = sanitize_key( $a['role'] ?? get_option( 'default_role', 'subscriber' ) );
         require_once ABSPATH . 'wp-admin/includes/user.php'; // get_editable_roles()
         if ( $role !== '' && !array_key_exists( $role, get_editable_roles() ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'You are not allowed to assign this role.' ];
+          $r = $this->error( $r, 'You are not allowed to assign this role.', -32603 );
           break;
         }
         $data = [
@@ -1626,7 +1905,7 @@ class GMCP_Tools_Core {
         ];
         $uid = wp_insert_user( $data );
         if ( is_wp_error( $uid ) ) {
-          $r['error'] = [ 'code' => $uid->get_error_code(), 'message' => $uid->get_error_message() ];
+          $r = $this->error( $r, $uid->get_error_message(), $uid->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'User created ID ' . $uid );
@@ -1635,7 +1914,7 @@ class GMCP_Tools_Core {
 
       case 'wp_update_user':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $target_id = intval( $a['ID'] );
@@ -1647,7 +1926,7 @@ class GMCP_Tools_Core {
         // to edit_user enforces the same boundary core does, for every auth path.
         // Reported by Charles Vosburgh via responsible disclosure.
         if ( !current_user_can( 'edit_user', $target_id ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'You are not allowed to edit this user.' ];
+          $r = $this->error( $r, 'You are not allowed to edit this user.', -32603 );
           break;
         }
         $upd = [ 'ID' => $target_id ];
@@ -1662,13 +1941,13 @@ class GMCP_Tools_Core {
         if ( isset( $upd['role'] ) && $upd['role'] !== '' ) {
           require_once ABSPATH . 'wp-admin/includes/user.php'; // get_editable_roles()
           if ( !current_user_can( 'promote_user', $target_id ) || !array_key_exists( $upd['role'], get_editable_roles() ) ) {
-            $r['error'] = [ 'code' => -32603, 'message' => 'You are not allowed to assign this role.' ];
+            $r = $this->error( $r, 'You are not allowed to assign this role.', -32603 );
             break;
           }
         }
         $u = wp_update_user( $upd );
         if ( is_wp_error( $u ) ) {
-          $r['error'] = [ 'code' => $u->get_error_code(), 'message' => $u->get_error_message() ];
+          $r = $this->error( $r, $u->get_error_message(), $u->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'User #' . $u . ' updated' );
@@ -1723,7 +2002,7 @@ class GMCP_Tools_Core {
 
       case 'wp_create_comment':
         if ( empty( $a['post_id'] ) || empty( $a['comment_content'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'post_id & comment_content required' ];
+          $r = $this->error( $r, 'post_id & comment_content required', -32602 );
           break;
         }
         $ins = [
@@ -1737,7 +2016,7 @@ class GMCP_Tools_Core {
         $cid = wp_insert_comment( $ins );
         if ( is_wp_error( $cid ) ) {
           /** @var WP_Error $cid */
-          $r['error'] = [ 'code' => $cid->get_error_code(), 'message' => $cid->get_error_message() ];
+          $r = $this->error( $r, $cid->get_error_message(), $cid->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'Comment created ID ' . $cid );
@@ -1746,7 +2025,7 @@ class GMCP_Tools_Core {
 
       case 'wp_update_comment':
         if ( empty( $a['comment_ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'comment_ID required' ];
+          $r = $this->error( $r, 'comment_ID required', -32602 );
           break;
         }
         $c = [ 'comment_ID' => intval( $a['comment_ID'] ) ];
@@ -1757,7 +2036,7 @@ class GMCP_Tools_Core {
         }
         $cid = wp_update_comment( $c, true );
         if ( is_wp_error( $cid ) ) {
-          $r['error'] = [ 'code' => $cid->get_error_code(), 'message' => $cid->get_error_message() ];
+          $r = $this->error( $r, $cid->get_error_message(), $cid->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'Comment #' . $cid . ' updated' );
@@ -1766,7 +2045,7 @@ class GMCP_Tools_Core {
 
       case 'wp_delete_comment':
         if ( empty( $a['comment_ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'comment_ID required' ];
+          $r = $this->error( $r, 'comment_ID required', -32602 );
           break;
         }
         $done = wp_delete_comment( intval( $a['comment_ID'] ), !empty( $a['force'] ) );
@@ -1774,14 +2053,14 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, 'Comment #' . $a['comment_ID'] . ' deleted' );
         }
         else {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Deletion failed' ];
+          $r = $this->error( $r, 'Deletion failed', -32603 );
         }
         break;
 
         /* ===== Change journal ===== */
       case 'wp_list_changes':
         if ( !class_exists( 'GMCP_Journal' ) || !$this->core->get_option( 'mcp_change_journal' ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'The change journal is switched off for this site, so nothing is being recorded and nothing can be reverted. Turn it on under the MCP Server screen in the admin menu.' ];
+          $r = $this->error( $r, 'The change journal is switched off for this site, so nothing is being recorded and nothing can be reverted. Turn it on under the MCP Server screen in the admin menu.', -32603 );
           break;
         }
         $limit = isset( $a['limit'] ) ? max( 1, min( 40, (int) $a['limit'] ) ) : 20;
@@ -1790,12 +2069,12 @@ class GMCP_Tools_Core {
 
       case 'wp_undo_change':
         if ( !class_exists( 'GMCP_Journal' ) || !$this->core->get_option( 'mcp_change_journal' ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'The change journal is switched off for this site, so there is nothing on record to revert.' ];
+          $r = $this->error( $r, 'The change journal is switched off for this site, so there is nothing on record to revert.', -32603 );
           break;
         }
         $undo = GMCP_Journal::revert( (string) ( $a['id'] ?? '' ) );
         if ( !$undo['ok'] ) {
-          $r['error'] = [ 'code' => -32602, 'message' => $undo['message'] ];
+          $r = $this->error( $r, $undo['message'], -32602 );
           break;
         }
         $this->add_result_text( $r, $undo['message'] );
@@ -1806,7 +2085,7 @@ class GMCP_Tools_Core {
         $opt_key = $this->clean_option_key( $a['key'] );
         $permitted = $this->option_allowed( $opt_key );
         if ( $permitted !== true ) {
-          $r['error'] = [ 'code' => -32600, 'message' => $permitted ];
+          $r = $this->error( $r, $permitted, -32600 );
           break;
         }
         if ( !empty( $a['raw'] ) ) {
@@ -1842,7 +2121,7 @@ class GMCP_Tools_Core {
         $key = $this->clean_option_key( $a['key'] );
         $permitted = $this->option_allowed( $key );
         if ( $permitted !== true ) {
-          $r['error'] = [ 'code' => -32600, 'message' => $permitted ];
+          $r = $this->error( $r, $permitted, -32600 );
           break;
         }
         // The write policy, which option_allowed() does not cover and must not: that
@@ -1872,8 +2151,160 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, 'Option "' . $key . '" already had that value' );
         }
         else {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Update failed' ];
+          $r = $this->error( $r, 'Update failed', -32603 );
         }
+        break;
+
+      case 'wp_delete_option':
+        $key = $this->clean_option_key( $a['key'] ?? '' );
+        if ( $key === '' ) {
+          $r = $this->error( $r, 'key required', -32602 );
+          break;
+        }
+        // The same guard wp_get_option and wp_update_option pass. There is one
+        // sensitivity list on this site and this is it.
+        $permitted = $this->option_allowed( $key );
+        if ( $permitted !== true ) {
+          $r = $this->error( $r, $permitted, -32600 );
+          break;
+        }
+        // Anything the shared write policy will not let you change, this will not let you
+        // remove. Deleting a row is the harsher edit of the two, so a key too dangerous to
+        // set cannot be safe to drop, and composing the two lists here means a key added to
+        // the shared one is covered the day it is added rather than the day someone
+        // notices. The entries this file names itself win, because they answer the question
+        // that was actually asked: "set new_admin_email instead" is the right answer to a
+        // write and not to a deletion.
+        $undeletable = self::OPTIONS_NEVER_DELETED;
+        foreach ( GMCP_Core::unwritable_options() as $name => $why ) {
+          if ( !isset( $undeletable[ $name ] ) ) {
+            $undeletable[ $name ] = $why;
+          }
+        }
+        if ( isset( $undeletable[ strtolower( $key ) ] ) ) {
+          $r = $this->error(
+            $r,
+            'The option "' . $key . '" cannot be deleted through this API: '
+              . $undeletable[ strtolower( $key ) ]
+              . ' Change it with wp_update_option if you need a different value.',
+            -32600
+          );
+          break;
+        }
+        // "Absent" and "stored as false" are different states and get_option() returns
+        // false for both, so ask with a default nothing can legitimately hold. Saying a
+        // row was deleted when there was none to delete is the one answer this tool must
+        // not give: the caller is deleting precisely because absence is what it needs.
+        $absent = '__gmcp_option_absent__';
+        $previous = get_option( $key, $absent );
+        if ( $previous === $absent ) {
+          $this->add_result_text( $r, 'Option "' . $key . '" does not exist; nothing was deleted.' );
+          break;
+        }
+        // delete_option() fires deleted_option, which is what carries the deletion into
+        // the audit log. The undo journal deliberately records created and updated
+        // options only, so the deletion is on record but wp_undo_change cannot reverse it.
+        if ( delete_option( $key ) ) {
+          $text = 'Option "' . $key . '" deleted. The deletion is in the audit log, but it is not in the undo journal, so wp_undo_change cannot put it back.';
+          // Which is exactly why the value comes back with the answer: nothing else kept a
+          // copy, so this reply is the only chance to put the row back by hand. Withheld
+          // when it looks credential-shaped, by the same test that keeps such values out
+          // of the journal, so deleting cannot become a way to read one out. Withheld too
+          // when it is large, on the journal's threshold, since a reply is a worse place
+          // to carry a megabyte than the journal was.
+          $encoded = wp_json_encode( $previous, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
+          if ( GMCP_Core::holds_credential( $previous ) ) {
+            $text .= ' The value is not repeated here because it holds something credential-shaped.';
+          }
+          elseif ( !is_string( $encoded ) || strlen( $encoded ) > GMCP_Journal::MAX_VALUE ) {
+            $text .= ' The value was too large to repeat here, so it is gone.';
+          }
+          else {
+            $text .= "\n\nWhat was removed, since nothing else kept it:\n" . $encoded;
+          }
+          $this->add_result_text( $r, $text );
+        }
+        else {
+          $r = $this->error( $r, 'Deleting option "' . $key . '" failed.', -32603 );
+        }
+        break;
+
+        /* ===== Caches ===== */
+      case 'wp_flush_cache':
+        // An unrecognised scope is refused rather than quietly treated as "all". "all" is
+        // the widest thing this tool does, and a typo should never widen what was asked
+        // for; failing the call costs one retry and cannot surprise anyone.
+        $scope = (string) ( $a['scope'] ?? 'all' );
+        if ( !in_array( $scope, [ 'object', 'transients', 'post', 'all' ], true ) ) {
+          $r = $this->error( $r, 'Unknown scope "' . $scope . '". Use object, transients, post or all.', -32602 );
+          break;
+        }
+        $purged = [];
+        $unpurged = [];
+
+        if ( $scope === 'post' ) {
+          $flush_id = intval( $a['ID'] ?? 0 );
+          if ( !$flush_id || !get_post( $flush_id ) ) {
+            $r = $this->error( $r, 'scope "post" needs the ID of an existing post.', -32602 );
+            break;
+          }
+          // The existing per-post buster, which already fans out to the post-level
+          // purges of LiteSpeed and WP Rocket and to gmcp_post_changed. A site-wide
+          // page purge is deliberately NOT fired here: the caller asked about one post.
+          // Note that bust_post_cache() ignores a repeat for the same post within one
+          // PHP request, so flushing a post a tool just wrote in the same batched call
+          // is already done rather than done twice.
+          $this->bust_post_cache( $flush_id, [ 'tool' => 'wp_flush_cache' ] );
+          $purged[] = 'Post #' . $flush_id . ': object cache entries, plus the per-post purges of any LiteSpeed or WP Rocket install';
+          $unpurged[] = 'Every other post, and any site-wide page cache. Use scope "all" for those.';
+        }
+        else {
+          if ( $scope === 'object' || $scope === 'all' ) {
+            if ( wp_cache_flush() ) {
+              $purged[] = 'Object cache: every entry, so the next request rebuilds from the database';
+            }
+            else {
+              $unpurged[] = 'Object cache: wp_cache_flush() reported failure, so assume it still holds its entries';
+            }
+          }
+          if ( $scope === 'transients' || $scope === 'all' ) {
+            // Expired transients only. Deleting unexpired ones throws away work that has
+            // already been done rather than data that has gone stale, which is a cost
+            // with no cache-correctness benefit, so this tool does not offer it.
+            delete_expired_transients();
+            $purged[] = wp_using_ext_object_cache()
+              ? 'Expired transients: this site keeps transients in the object cache, where they expire on their own, so there was nothing in the database to remove'
+              : 'Expired transients (unexpired ones are left alone: they hold work already done, not stale data)';
+          }
+          $page_caches = $this->purge_page_caches();
+          if ( $page_caches ) {
+            $purged[] = 'Page caches: ' . implode( ', ', $page_caches );
+          }
+          else {
+            $unpurged[] = 'No page-cache plugin this tool can recognise is active (it knows LiteSpeed, WP Rocket, W3 Total Cache, WP Super Cache and SpeedyCache). Any other one is untouched.';
+          }
+        }
+
+        // The delegation half of the plugin's cache stance: anything we cannot name is
+        // somebody else's to purge, and this is where they hook to do it.
+        do_action( 'gmcp_cache_flushed', $scope, [ 'source' => 'mcp', 'tool' => 'wp_flush_cache', 'ID' => intval( $a['ID'] ?? 0 ) ] );
+
+        $unpurged[] = 'Any CDN or reverse proxy: Cloudflare, Varnish, Fastly, a host edge cache. None of these can be reached from PHP, so PURGE THESE YOURSELF or the front end keeps serving the old page. A site can wire the gmcp_cache_flushed action to do it automatically.';
+        $unpurged[] = 'Pages already delivered to visitors: browser caches and service workers keep serving what they have until it expires.';
+
+        $lines = [ 'Scope: ' . $scope, '', 'Purged:' ];
+        foreach ( $purged as $line ) {
+          $lines[] = '- ' . $line;
+        }
+        if ( !$purged ) {
+          $lines[] = '- nothing';
+        }
+        $lines[] = '';
+        $lines[] = 'NOT purged, and still stale until you deal with it:';
+        foreach ( $unpurged as $line ) {
+          $lines[] = '- ' . $line;
+        }
+        $this->add_result_text( $r, implode( "\n", $lines ) );
         break;
 
         /* ===== Counts ===== */
@@ -1887,7 +2318,7 @@ class GMCP_Tools_Core {
         $tax = sanitize_key( $a['taxonomy'] );
         $total = wp_count_terms( $tax, [ 'hide_empty' => false ] );
         if ( is_wp_error( $total ) ) {
-          $r['error'] = [ 'code' => $total->get_error_code(), 'message' => $total->get_error_message() ];
+          $r = $this->error( $r, $total->get_error_message(), $total->get_error_code() );
         }
         else {
           $this->add_result_text( $r, (string) $total );
@@ -1992,12 +2423,12 @@ class GMCP_Tools_Core {
         /* ===== Posts: single ===== */
       case 'wp_get_post':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post ID required (pass "ID", e.g. {"ID": 123}; "post_id" is also accepted).' ];
+          $r = $this->error( $r, 'Post ID required (pass "ID", e.g. {"ID": 123}; "post_id" is also accepted).', -32602 );
           break;
         }
         $p = get_post( intval( $a['ID'] ) );
         if ( !$p ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post not found' ];
+          $r = $this->error( $r, 'Post not found', -32602 );
           break;
         }
         $out = [
@@ -2018,7 +2449,7 @@ class GMCP_Tools_Core {
         /* ===== Posts: snapshot ===== */
       case 'wp_get_post_snapshot':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post ID required (pass "ID", e.g. {"ID": 123}; "post_id" is also accepted).' ];
+          $r = $this->error( $r, 'Post ID required (pass "ID", e.g. {"ID": 123}; "post_id" is also accepted).', -32602 );
           break;
         }
 
@@ -2026,7 +2457,7 @@ class GMCP_Tools_Core {
         $p = get_post( $post_id );
 
         if ( !$p ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post not found' ];
+          $r = $this->error( $r, 'Post not found', -32602 );
           break;
         }
 
@@ -2124,7 +2555,7 @@ class GMCP_Tools_Core {
         /* ===== Posts: create ===== */
       case 'wp_create_post':
         if ( empty( $a['post_title'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'post_title required' ];
+          $r = $this->error( $r, 'post_title required', -32602 );
           break;
         }
         $ins = [
@@ -2153,7 +2584,7 @@ class GMCP_Tools_Core {
 
         $new = wp_insert_post( wp_slash( $ins ), true );
         if ( is_wp_error( $new ) ) {
-          $r['error'] = [ 'code' => $new->get_error_code(), 'message' => $new->get_error_message() ];
+          $r = $this->error( $r, $new->get_error_message(), $new->get_error_code() );
         }
         else {
           if ( empty( $ins['meta_input'] ) && !empty( $meta_input ) && is_array( $meta_input ) ) {
@@ -2169,16 +2600,84 @@ class GMCP_Tools_Core {
         }
         break;
 
+        /* ===== Posts: duplicate ===== */
+      case 'wp_duplicate_post':
+        $src = get_post( intval( $a['ID'] ?? 0 ) );
+        if ( !$src ) {
+          $r = $this->error( $r, 'No post with ID ' . intval( $a['ID'] ?? 0 ) . '.', -32602 );
+          break;
+        }
+        $dup = [
+          'post_title' => ( $a['post_title'] ?? '' ) !== '' ? sanitize_text_field( $a['post_title'] ) : $src->post_title,
+          // A copy is a draft unless the caller says otherwise, and the source's own
+          // status is never inherited. The whole premise of this plugin is that one
+          // misread sentence should not put something in front of the public, and
+          // "duplicate this page" read off a comment would otherwise publish a second
+          // live page nobody asked for. Going live stays a separate, deliberate call.
+          'post_status' => sanitize_key( $a['post_status'] ?? 'draft' ),
+          'post_type' => $src->post_type,
+          // Stored content is copied verbatim, not re-sanitized. It is already on this
+          // site and store_html() is about markup an agent is introducing; running it
+          // over an existing page would quietly rewrite the original's markup in the copy.
+          'post_content' => $src->post_content,
+          'post_excerpt' => $src->post_excerpt,
+          'post_parent' => $src->post_parent,
+          'menu_order' => $src->menu_order,
+          'comment_status' => $src->comment_status,
+          'ping_status' => $src->ping_status,
+        ];
+        // wp_insert_post rather than a direct write, so the change listener sees the
+        // creation and the undo journal can account for it.
+        $copy_id = wp_insert_post( wp_slash( $dup ), true );
+        if ( is_wp_error( $copy_id ) ) {
+          $r = $this->error( $r, $copy_id->get_error_message(), $copy_id->get_error_code() );
+          break;
+        }
+        $copy_id = (int) $copy_id;
+
+        $dup_lines = [ 'Duplicated post #' . $src->ID . ' as new post ID ' . $copy_id . ' ("' . $dup['post_title'] . '", status ' . $dup['post_status'] . ').' ];
+
+        if ( !isset( $a['include_meta'] ) || $a['include_meta'] ) {
+          // The target is brand new, so overwrite is the honest setting: there is
+          // nothing of its own to protect.
+          [ $dup_copied, $dup_skipped ] = $this->copy_post_meta( (int) $src->ID, $copy_id, [], true );
+          $dup_lines[] = 'Meta: ' . count( $dup_copied ) . ' key(s) copied, ' . array_sum( array_column( $dup_copied, 'bytes' ) ) . ' bytes'
+            . ( $dup_skipped ? ', skipped ' . implode( ', ', array_keys( $dup_skipped ) ) : '' ) . '.';
+        }
+        else {
+          $dup_lines[] = 'Meta: not copied (include_meta false).';
+        }
+
+        if ( !isset( $a['include_terms'] ) || $a['include_terms'] ) {
+          $dup_terms = [];
+          foreach ( get_object_taxonomies( $src->post_type ) as $dup_tax ) {
+            $dup_ids = wp_get_object_terms( $src->ID, $dup_tax, [ 'fields' => 'ids' ] );
+            if ( is_wp_error( $dup_ids ) || !$dup_ids ) {
+              continue;
+            }
+            wp_set_object_terms( $copy_id, $dup_ids, $dup_tax );
+            $dup_terms[] = $dup_tax . ' (' . count( $dup_ids ) . ')';
+          }
+          $dup_lines[] = 'Terms: ' . ( $dup_terms ? implode( ', ', $dup_terms ) : 'none assigned on the source' ) . '.';
+        }
+        else {
+          $dup_lines[] = 'Terms: not copied (include_terms false).';
+        }
+
+        $this->bust_post_cache( $copy_id, [ 'tool' => 'wp_duplicate_post' ] );
+        $this->add_result_text( $r, implode( "\n", $dup_lines ) );
+        break;
+
         /* ===== Posts: write blocks ===== */
       case 'wp_write_blocks':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post ID required (pass "ID"; create the post first with wp_create_post).' ];
+          $r = $this->error( $r, 'Post ID required (pass "ID"; create the post first with wp_create_post).', -32602 );
           break;
         }
         $wb_id = intval( $a['ID'] );
         $wb_post = get_post( $wb_id );
         if ( !$wb_post ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post ' . $wb_id . ' not found.' ];
+          $r = $this->error( $r, 'Post ' . $wb_id . ' not found.', -32602 );
           break;
         }
         // Some MCP clients send arrays as JSON strings.
@@ -2188,7 +2687,7 @@ class GMCP_Tools_Core {
         }
         list( $wb_markup, $wb_err ) = $this->blocks_to_markup( $wb_blocks );
         if ( $wb_err !== null ) {
-          $r['error'] = [ 'code' => -32602, 'message' => $wb_err ];
+          $r = $this->error( $r, $wb_err, -32602 );
           break;
         }
         $wb_mode = in_array( $a['mode'] ?? 'replace', [ 'replace', 'append', 'prepend' ], true ) ? ( $a['mode'] ?? 'replace' ) : 'replace';
@@ -2203,7 +2702,7 @@ class GMCP_Tools_Core {
         }
         $wb_res = wp_update_post( wp_slash( [ 'ID' => $wb_id, 'post_content' => $wb_content ] ), true );
         if ( is_wp_error( $wb_res ) ) {
-          $r['error'] = [ 'code' => $wb_res->get_error_code(), 'message' => $wb_res->get_error_message() ];
+          $r = $this->error( $r, $wb_res->get_error_message(), $wb_res->get_error_code() );
           break;
         }
         $this->bust_post_cache( $wb_id, [ 'tool' => 'wp_write_blocks' ] );
@@ -2213,7 +2712,7 @@ class GMCP_Tools_Core {
         /* ===== Block patterns: list ===== */
       case 'wp_list_block_patterns':
         if ( !class_exists( 'WP_Block_Patterns_Registry' ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Block patterns are not available on this site.' ];
+          $r = $this->error( $r, 'Block patterns are not available on this site.', -32603 );
           break;
         }
         $bp_all = WP_Block_Patterns_Registry::get_instance()->get_all_registered();
@@ -2253,29 +2752,29 @@ class GMCP_Tools_Core {
         /* ===== Block patterns: insert ===== */
       case 'wp_insert_block_pattern':
         if ( empty( $a['ID'] ) || empty( $a['pattern'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Both "ID" and "pattern" (a name from wp_list_block_patterns) are required.' ];
+          $r = $this->error( $r, 'Both "ID" and "pattern" (a name from wp_list_block_patterns) are required.', -32602 );
           break;
         }
         if ( !class_exists( 'WP_Block_Patterns_Registry' ) ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Block patterns are not available on this site.' ];
+          $r = $this->error( $r, 'Block patterns are not available on this site.', -32603 );
           break;
         }
         $bp_name = sanitize_text_field( $a['pattern'] );
         $bp_reg = WP_Block_Patterns_Registry::get_instance();
         if ( !$bp_reg->is_registered( $bp_name ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Pattern "' . $bp_name . '" is not registered. Use wp_list_block_patterns to see available names.' ];
+          $r = $this->error( $r, 'Pattern "' . $bp_name . '" is not registered. Use wp_list_block_patterns to see available names.', -32602 );
           break;
         }
         $bp_pat = $bp_reg->get_registered( $bp_name );
         $bp_markup = (string) ( $bp_pat['content'] ?? '' );
         if ( $bp_markup === '' ) {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Pattern "' . $bp_name . '" has no content.' ];
+          $r = $this->error( $r, 'Pattern "' . $bp_name . '" has no content.', -32603 );
           break;
         }
         $bp_id = intval( $a['ID'] );
         $bp_post = get_post( $bp_id );
         if ( !$bp_post ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post ' . $bp_id . ' not found.' ];
+          $r = $this->error( $r, 'Post ' . $bp_id . ' not found.', -32602 );
           break;
         }
         $bp_mode = in_array( $a['mode'] ?? 'append', [ 'replace', 'append', 'prepend' ], true ) ? ( $a['mode'] ?? 'append' ) : 'append';
@@ -2290,7 +2789,7 @@ class GMCP_Tools_Core {
         }
         $bp_res = wp_update_post( wp_slash( [ 'ID' => $bp_id, 'post_content' => $bp_new ] ), true );
         if ( is_wp_error( $bp_res ) ) {
-          $r['error'] = [ 'code' => $bp_res->get_error_code(), 'message' => $bp_res->get_error_message() ];
+          $r = $this->error( $r, $bp_res->get_error_message(), $bp_res->get_error_code() );
           break;
         }
         $this->bust_post_cache( $bp_id, [ 'tool' => 'wp_insert_block_pattern' ] );
@@ -2300,7 +2799,7 @@ class GMCP_Tools_Core {
         /* ===== Posts: update ===== */
       case 'wp_update_post':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post ID required (pass "ID", e.g. {"ID": 123}; "post_id" is also accepted).' ];
+          $r = $this->error( $r, 'Post ID required (pass "ID", e.g. {"ID": 123}; "post_id" is also accepted).', -32602 );
           break;
         }
         $post_id = intval( $a['ID'] );
@@ -2313,7 +2812,7 @@ class GMCP_Tools_Core {
           $fields = json_decode( $fields, true );
           // Detect truncated/malformed JSON
           if ( $fields === null && strlen( $fields_raw ) > 0 ) {
-            $r['error'] = [ 'code' => -32602, 'message' => 'Fields parameter is invalid JSON (possibly truncated). Content may be too large for the transport. Raw length: ' . strlen( $fields_raw ) . ' bytes' ];
+            $r = $this->error( $r, 'Fields parameter is invalid JSON (possibly truncated). Content may be too large for the transport. Raw length: ' . strlen( $fields_raw ) . ' bytes', -32602 );
             break;
           }
         }
@@ -2361,7 +2860,7 @@ class GMCP_Tools_Core {
         if ( is_string( $meta_input ) ) {
           $meta_input = json_decode( $meta_input, true );
           if ( $meta_input === null && strlen( $meta_raw ) > 0 ) {
-            $r['error'] = [ 'code' => -32602, 'message' => 'meta_input parameter is invalid JSON (possibly truncated).' ];
+            $r = $this->error( $r, 'meta_input parameter is invalid JSON (possibly truncated).', -32602 );
             break;
           }
         }
@@ -2375,7 +2874,7 @@ class GMCP_Tools_Core {
           if ( isset( $a['fields'] ) || isset( $a['meta_input'] ) ) {
             $hint = ' (parameters were provided but parsed as empty - check for malformed JSON)';
           }
-          $r['error'] = [ 'code' => -32602, 'message' => 'No fields or meta_input provided to update. Pass post fields inside a "fields" object (or at the top level), e.g. {"ID": 123, "fields": {"post_title": "..."}}, and/or "meta_input" for custom fields.' . $hint ];
+          $r = $this->error( $r, 'No fields or meta_input provided to update. Pass post fields inside a "fields" object (or at the top level), e.g. {"ID": 123, "fields": {"post_title": "..."}}, and/or "meta_input" for custom fields.' . $hint, -32602 );
           break;
         }
 
@@ -2392,7 +2891,7 @@ class GMCP_Tools_Core {
           if ( $target_status === 'trash' && $current_status !== 'trash' ) {
             $trashed = wp_trash_post( $post_id );
             if ( !$trashed ) {
-              $r['error'] = [ 'code' => -32603, 'message' => 'wp_trash_post failed' ];
+              $r = $this->error( $r, 'wp_trash_post failed', -32603 );
               break;
             }
             unset( $c['post_status'] );
@@ -2401,7 +2900,7 @@ class GMCP_Tools_Core {
           elseif ( $current_status === 'trash' && $target_status !== 'trash' ) {
             $untrashed = wp_untrash_post( $post_id );
             if ( !$untrashed ) {
-              $r['error'] = [ 'code' => -32603, 'message' => 'wp_untrash_post failed' ];
+              $r = $this->error( $r, 'wp_untrash_post failed', -32603 );
               break;
             }
             // Leave post_status in $c: wp_untrash_post restores to a previous status, and
@@ -2413,7 +2912,7 @@ class GMCP_Tools_Core {
         if ( $has_fields ) {
           $u = wp_update_post( wp_slash( $c ), true );
           if ( is_wp_error( $u ) ) {
-            $r['error'] = [ 'code' => $u->get_error_code(), 'message' => $u->get_error_message() ];
+            $r = $this->error( $r, $u->get_error_message(), $u->get_error_code() );
             break;
           }
         }
@@ -2456,7 +2955,7 @@ class GMCP_Tools_Core {
         /* ===== Posts: delete ===== */
       case 'wp_delete_post':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $delete_id = intval( $a['ID'] );
@@ -2466,14 +2965,14 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, 'Post #' . $a['ID'] . ' deleted' );
         }
         else {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Deletion failed' ];
+          $r = $this->error( $r, 'Deletion failed', -32603 );
         }
         break;
 
         /* ===== Posts: alter (search/replace) ===== */
       case 'wp_alter_post':
         if ( empty( $a['ID'] ) || empty( $a['field'] ) || !isset( $a['search'] ) || !isset( $a['replace'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID, field, search, and replace required' ];
+          $r = $this->error( $r, 'ID, field, search, and replace required', -32602 );
           break;
         }
         $post_id = intval( $a['ID'] );
@@ -2486,13 +2985,13 @@ class GMCP_Tools_Core {
         // Validate field
         $allowed_fields = [ 'post_content', 'post_excerpt', 'post_title' ];
         if ( !in_array( $field, $allowed_fields, true ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Field must be: post_content, post_excerpt, or post_title' ];
+          $r = $this->error( $r, 'Field must be: post_content, post_excerpt, or post_title', -32602 );
           break;
         }
 
         $post = get_post( $post_id );
         if ( !$post ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Post not found' ];
+          $r = $this->error( $r, 'Post not found', -32602 );
           break;
         }
 
@@ -2502,13 +3001,13 @@ class GMCP_Tools_Core {
         if ( $is_regex ) {
           list( $compiled, $regex_err ) = $this->compile_alter_regex( $search, $flags );
           if ( $regex_err !== null ) {
-            $r['error'] = [ 'code' => -32602, 'message' => $regex_err ];
+            $r = $this->error( $r, $regex_err, -32602 );
             break;
           }
           $new_content = preg_replace( $compiled, $replace, $content, -1, $count );
           if ( $new_content === null ) {
             $msg = function_exists( 'preg_last_error_msg' ) ? preg_last_error_msg() : 'PCRE error code ' . preg_last_error();
-            $r['error'] = [ 'code' => -32603, 'message' => 'Regex replacement failed: ' . $msg ];
+            $r = $this->error( $r, 'Regex replacement failed: ' . $msg, -32603 );
             break;
           }
         }
@@ -2526,7 +3025,7 @@ class GMCP_Tools_Core {
         // FAQ, etc.) and silently corrupt the post. Pre-slash to compensate.
         $update = wp_update_post( wp_slash( [ 'ID' => $post_id, $field => $new_content ] ), true );
         if ( is_wp_error( $update ) ) {
-          $r['error'] = [ 'code' => $update->get_error_code(), 'message' => $update->get_error_message() ];
+          $r = $this->error( $r, $update->get_error_message(), $update->get_error_code() );
           break;
         }
 
@@ -2537,7 +3036,7 @@ class GMCP_Tools_Core {
         /* ===== Post-meta ===== */
       case 'wp_get_post_meta':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $pid = intval( $a['ID'] );
@@ -2547,7 +3046,7 @@ class GMCP_Tools_Core {
 
       case 'wp_update_post_meta':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $pid = intval( $a['ID'] );
@@ -2569,7 +3068,7 @@ class GMCP_Tools_Core {
           update_post_meta( $pid, sanitize_key( $a['key'] ), $a['value'] );
         }
         else {
-          $r['error'] = [ 'code' => -32602, 'message' => 'meta array or key/value required' ];
+          $r = $this->error( $r, 'meta array or key/value required', -32602 );
           break;
         }
         $this->add_result_text( $r, 'Meta updated for post #' . $pid );
@@ -2577,7 +3076,7 @@ class GMCP_Tools_Core {
 
       case 'wp_delete_post_meta':
         if ( empty( $a['ID'] ) || empty( $a['key'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID & key required' ];
+          $r = $this->error( $r, 'ID & key required', -32602 );
           break;
         }
         $pid = intval( $a['ID'] );
@@ -2588,14 +3087,153 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, 'Meta deleted on post #' . $pid );
         }
         else {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Deletion failed' ];
+          $r = $this->error( $r, 'Deletion failed', -32603 );
         }
+        break;
+
+      case 'wp_copy_post_meta':
+        $from_id = intval( $a['from_id'] ?? 0 );
+        $to_id = intval( $a['to_id'] ?? 0 );
+        if ( !$from_id || !get_post( $from_id ) ) {
+          $r = $this->error( $r, 'No source post with ID ' . $from_id . '.', -32602 );
+          break;
+        }
+        if ( !$to_id || !get_post( $to_id ) ) {
+          $r = $this->error( $r, 'No target post with ID ' . $to_id . '.', -32602 );
+          break;
+        }
+        // Some MCP clients send arrays as JSON strings.
+        $copy_keys = $a['keys'] ?? [];
+        if ( is_string( $copy_keys ) ) {
+          $copy_keys = json_decode( $copy_keys, true ) ?? [];
+        }
+        [ $copied, $skipped ] = $this->copy_post_meta( $from_id, $to_id, (array) $copy_keys, !empty( $a['overwrite'] ) );
+
+        $copy_lines = [];
+        if ( $copied ) {
+          $copy_lines[] = 'Copied ' . count( $copied ) . ' key(s) from post #' . $from_id . ' to post #' . $to_id
+            . ', ' . array_sum( array_column( $copied, 'bytes' ) ) . ' bytes in total:';
+          foreach ( $copied as $copy_key => $copy_stat ) {
+            $copy_lines[] = '- ' . $copy_key . ': ' . $copy_stat['bytes'] . ' bytes'
+              . ( $copy_stat['rows'] > 1 ? ' across ' . $copy_stat['rows'] . ' rows' : '' );
+          }
+        }
+        else {
+          $copy_lines[] = 'Nothing was copied from post #' . $from_id . ' to post #' . $to_id . '.';
+        }
+        if ( $skipped ) {
+          $copy_lines[] = '';
+          $copy_lines[] = 'Skipped:';
+          foreach ( $skipped as $copy_key => $copy_why ) {
+            $copy_lines[] = '- ' . $copy_key . ': ' . $copy_why;
+          }
+        }
+        $this->bust_post_cache( $to_id, [ 'tool' => 'wp_copy_post_meta' ] );
+        $this->add_result_text( $r, implode( "\n", $copy_lines ) );
+        break;
+
+      case 'wp_write_post_meta_chunk':
+        $chunk_session = (string) ( $a['session'] ?? '' );
+        $chunk_pid = intval( $a['ID'] ?? 0 );
+        $chunk_key = sanitize_key( $a['key'] ?? '' );
+        $chunk_data = $a['data'] ?? null;
+        $chunk_name = $this->meta_chunk_transient( $chunk_session );
+        if ( $chunk_name === $this->meta_chunk_transient( '' ) ) {
+          $r = $this->error( $r, 'session required, and it must contain letters, digits, "-" or "_".', -32602 );
+          break;
+        }
+        if ( !$chunk_pid || !get_post( $chunk_pid ) ) {
+          $r = $this->error( $r, 'No post with ID ' . $chunk_pid . '.', -32602 );
+          break;
+        }
+        if ( $chunk_key === '' ) {
+          $r = $this->error( $r, 'key required', -32602 );
+          break;
+        }
+        if ( !is_string( $chunk_data ) ) {
+          $r = $this->error( $r, 'data must be a string; send the value in pieces, not as an object.', -32602 );
+          break;
+        }
+
+        $staged = get_transient( $chunk_name );
+        if ( !is_array( $staged ) ) {
+          $staged = [ 'ID' => $chunk_pid, 'key' => $chunk_key, 'chunks' => 0, 'data' => '' ];
+        }
+        // A session stands for one value. Letting a later chunk point somewhere else
+        // would splice two payloads together and write the result to whichever target
+        // the last call named, which is a corrupt value on a post nobody was writing to.
+        if ( $staged['ID'] !== $chunk_pid || $staged['key'] !== $chunk_key ) {
+          $r = $this->error(
+            $r,
+            'Session "' . $chunk_session . '" is staging post #' . $staged['ID'] . ' meta "' . $staged['key']
+              . '", and this chunk targets post #' . $chunk_pid . ' meta "' . $chunk_key
+              . '". Use a different session id for a different value.',
+            -32600
+          );
+          break;
+        }
+        if ( strlen( $staged['data'] ) + strlen( $chunk_data ) > self::META_CHUNK_MAX_BYTES ) {
+          $r = $this->error(
+            $r,
+            'This chunk would take session "' . $chunk_session . '" past the ' . self::META_CHUNK_MAX_BYTES
+              . '-byte staging limit. Nothing was appended; the ' . strlen( $staged['data'] )
+              . ' bytes already staged are untouched and expire on their own.',
+            -32600
+          );
+          break;
+        }
+
+        $staged['data'] .= $chunk_data;
+        $staged['chunks']++;
+
+        if ( empty( $a['final'] ) ) {
+          // Re-setting the transient also restarts the expiry, so a session that is
+          // still being fed stays alive and one that stops being fed goes away.
+          set_transient( $chunk_name, $staged, self::META_CHUNK_TTL );
+          $this->add_result_text( $r, wp_json_encode( [
+            'session' => $chunk_session,
+            'chunk_index' => $staged['chunks'] - 1,
+            'bytes_written' => strlen( $chunk_data ),
+            'total_bytes' => strlen( $staged['data'] ),
+            'final' => false,
+          ], JSON_PRETTY_PRINT ) );
+          break;
+        }
+
+        $chunk_value = $staged['data'];
+        $chunk_stored_as = 'string';
+        // Same decode wp_update_option does, for the same reason: a caller that sends an
+        // Elementor payload as JSON must not end up with a JSON string in a meta row that
+        // every reader expects to hold an array.
+        if ( isset( $chunk_value[0] ) && ( $chunk_value[0] === '[' || $chunk_value[0] === '{' ) ) {
+          $chunk_decoded = json_decode( $chunk_value, true );
+          if ( json_last_error() === JSON_ERROR_NONE && is_array( $chunk_decoded ) ) {
+            $chunk_value = $chunk_decoded;
+            $chunk_stored_as = 'array';
+          }
+        }
+        // wp_slash for the reason copy_post_meta() gives: update_post_meta() unslashes,
+        // and an unslashed JSON payload loses the backslashes that make it valid JSON.
+        update_post_meta( $chunk_pid, $chunk_key, wp_slash( $chunk_value ) );
+        delete_transient( $chunk_name );
+        $this->bust_post_cache( $chunk_pid, [ 'tool' => 'wp_write_post_meta_chunk' ] );
+
+        $this->add_result_text( $r, wp_json_encode( [
+          'session' => $chunk_session,
+          'chunk_index' => $staged['chunks'] - 1,
+          'bytes_written' => strlen( $chunk_data ),
+          'total_bytes' => strlen( $staged['data'] ),
+          'final' => true,
+          'written_to' => [ 'ID' => $chunk_pid, 'key' => $chunk_key ],
+          'stored_as' => $chunk_stored_as,
+          'note' => 'Post meta is not journalled; wp_undo_change cannot reverse this write.',
+        ], JSON_PRETTY_PRINT ) );
         break;
 
         /* ===== Featured image ===== */
       case 'wp_set_featured_image':
         if ( empty( $a['post_id'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'post_id required' ];
+          $r = $this->error( $r, 'post_id required', -32602 );
           break;
         }
         $post_id = intval( $a['post_id'] );
@@ -2606,7 +3244,7 @@ class GMCP_Tools_Core {
             $this->add_result_text( $r, 'Featured image set on post #' . $post_id );
           }
           else {
-            $r['error'] = [ 'code' => -32603, 'message' => 'Failed to set thumbnail' ];
+            $r = $this->error( $r, 'Failed to set thumbnail', -32603 );
           }
         }
         else {
@@ -2645,7 +3283,7 @@ class GMCP_Tools_Core {
 
       case 'wp_create_term':
         if ( empty( $a['term_name'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'term_name required' ];
+          $r = $this->error( $r, 'term_name required', -32602 );
           break;
         }
         $tax = sanitize_key( $a['taxonomy'] );
@@ -2661,7 +3299,7 @@ class GMCP_Tools_Core {
         }
         $term = wp_insert_term( sanitize_text_field( $a['term_name'] ), $tax, $args );
         if ( is_wp_error( $term ) ) {
-          $r['error'] = [ 'code' => $term->get_error_code(), 'message' => $term->get_error_message() ];
+          $r = $this->error( $r, $term->get_error_message(), $term->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'Term ' . $term['term_id'] . ' created' );
@@ -2671,7 +3309,7 @@ class GMCP_Tools_Core {
       case 'wp_update_term':
         $tid = intval( $a['term_id'] ?? 0 );
         if ( !$tid ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'term_id required' ];
+          $r = $this->error( $r, 'term_id required', -32602 );
           break;
         }
         $tax = sanitize_key( $a['taxonomy'] );
@@ -2683,7 +3321,7 @@ class GMCP_Tools_Core {
         }
         $t = wp_update_term( $tid, $tax, $uargs );
         if ( is_wp_error( $t ) ) {
-          $r['error'] = [ 'code' => $t->get_error_code(), 'message' => $t->get_error_message() ];
+          $r = $this->error( $r, $t->get_error_message(), $t->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'Term ' . $tid . ' updated' );
@@ -2693,7 +3331,7 @@ class GMCP_Tools_Core {
       case 'wp_delete_term':
         $tid = intval( $a['term_id'] ?? 0 );
         if ( !$tid ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'term_id required' ];
+          $r = $this->error( $r, 'term_id required', -32602 );
           break;
         }
         $tax = sanitize_key( $a['taxonomy'] );
@@ -2702,13 +3340,13 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, 'Term ' . $tid . ' deleted' );
         }
         else {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Deletion failed' ];
+          $r = $this->error( $r, 'Deletion failed', -32603 );
         }
         break;
 
       case 'wp_get_post_terms':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $tax = sanitize_key( $a['taxonomy'] ?? 'category' );
@@ -2721,7 +3359,7 @@ class GMCP_Tools_Core {
 
       case 'wp_add_post_terms':
         if ( empty( $a['ID'] ) || empty( $a['terms'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID & terms required' ];
+          $r = $this->error( $r, 'ID & terms required', -32602 );
           break;
         }
         $terms = $a['terms'];
@@ -2733,7 +3371,7 @@ class GMCP_Tools_Core {
         $append = !isset( $a['append'] ) || $a['append'];
         $set = wp_set_post_terms( intval( $a['ID'] ), $terms, $tax, $append );
         if ( is_wp_error( $set ) ) {
-          $r['error'] = [ 'code' => $set->get_error_code(), 'message' => $set->get_error_message() ];
+          $r = $this->error( $r, $set->get_error_message(), $set->get_error_code() );
         }
         else {
           $this->add_result_text( $r, 'Terms set for post #' . $a['ID'] );
@@ -2776,7 +3414,7 @@ class GMCP_Tools_Core {
         $has_url = !empty( $a['url'] );
         $has_base64 = !empty( $a['base64'] ) && !empty( $a['filename'] );
         if ( !$has_url && !$has_base64 ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'Provide either url, or base64 + filename.' ];
+          $r = $this->error( $r, 'Provide either url, or base64 + filename.', -32602 );
           break;
         }
         try {
@@ -2833,14 +3471,14 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, wp_get_attachment_url( $id ) );
         }
         catch ( \Throwable $e ) {
-          $r['error'] = [ 'code' => $e->getCode() ?: -32603, 'message' => $e->getMessage() ];
+          $r = $this->error( $r, $e->getMessage(), $e->getCode() ?: -32603 );
         }
         break;
 
         /* ===== Media: upload alternative (two-step) ===== */
       case 'wp_upload_request':
         if ( empty( $a['filename'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'filename required' ];
+          $r = $this->error( $r, 'filename required', -32602 );
           break;
         }
         try {
@@ -2861,14 +3499,14 @@ class GMCP_Tools_Core {
           ], JSON_PRETTY_PRINT ) );
         }
         catch ( \Throwable $e ) {
-          $r['error'] = [ 'code' => $e->getCode() ?: -32603, 'message' => $e->getMessage() ];
+          $r = $this->error( $r, $e->getMessage(), $e->getCode() ?: -32603 );
         }
         break;
 
         /* ===== Media: update ===== */
       case 'wp_update_media':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $upd = [ 'ID' => intval( $a['ID'] ) ];
@@ -2883,7 +3521,7 @@ class GMCP_Tools_Core {
         }
         $u = wp_update_post( wp_slash( $upd ), true );
         if ( is_wp_error( $u ) ) {
-          $r['error'] = [ 'code' => $u->get_error_code(), 'message' => $u->get_error_message() ];
+          $r = $this->error( $r, $u->get_error_message(), $u->get_error_code() );
         }
         else {
           if ( $a['alt'] ?? '' ) {
@@ -2896,7 +3534,7 @@ class GMCP_Tools_Core {
         /* ===== Media: delete ===== */
       case 'wp_delete_media':
         if ( empty( $a['ID'] ) ) {
-          $r['error'] = [ 'code' => -32602, 'message' => 'ID required' ];
+          $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
         $d = wp_delete_post( intval( $a['ID'] ), !empty( $a['force'] ) );
@@ -2904,12 +3542,12 @@ class GMCP_Tools_Core {
           $this->add_result_text( $r, 'Media #' . $a['ID'] . ' deleted' );
         }
         else {
-          $r['error'] = [ 'code' => -32603, 'message' => 'Deletion failed' ];
+          $r = $this->error( $r, 'Deletion failed', -32603 );
         }
         break;
 
 
-      default: $r['error'] = [ 'code' => -32601, 'message' => 'Unknown tool' ];
+      default: $r = $this->error( $r, 'Unknown tool', -32601 );
     }
 
     // Generic post-write hook: fires after any successful content-mutating tool
@@ -2918,7 +3556,11 @@ class GMCP_Tools_Core {
     // search, write an audit log, etc. The options/object cache is already updated
     // by WordPress, but full-page caches (Varnish, WP Rocket, Cloudflare) are not,
     // so a cache layer should listen here. Reads never trigger it.
-    if ( empty( $r['error'] ) && $this->is_mutating_tool( $tool ) ) {
+    //
+    // A failure is an isError result now, not an error field, so both have to be tested
+    // or every refused write would announce itself as a change and purge caches for
+    // nothing.
+    if ( empty( $r['error'] ) && empty( $r['result']['isError'] ) && $this->is_mutating_tool( $tool ) ) {
       do_action( 'gmcp_mutate', $tool, $a, $r );
     }
     return $r;

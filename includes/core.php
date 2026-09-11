@@ -38,6 +38,8 @@ class GMCP_Core {
     // large, noisy surface next to the curated tools.
     'mcp_tools_rest' => false,
     'mcp_tools_woo' => false,
+    // Elementor: theme-builder conditions, and putting a library template on a page.
+    'mcp_tools_elementor' => false,
     'mcp_debug_mode' => false,
     // Keep a short history of tool calls, including refused ones, for the settings
     // screen. An agent otherwise operates with no visible record at all.
@@ -414,6 +416,19 @@ class GMCP_Core {
     // a dozen entries in front of a model that fail the moment it tries one.
     if ( $this->get_option( 'mcp_tools_woo' ) && class_exists( 'WooCommerce' ) ) {
       new GMCP_Tools_Woo();
+    }
+
+    // Same reasoning as WooCommerce above: without the page builder these tools are a dozen
+    // entries in front of a model that fail the moment it tries one.
+    //
+    // Elementor's own signal rather than class_exists(). Elementor registers its autoloader
+    // at file load and only then decides whether to boot, so the class resolves on a site
+    // where Elementor bailed out over an unsupported PHP version and never started. The
+    // action fires only when it really did start. It fires during Elementor's own
+    // plugins_loaded handler, which runs before this one because plugins load in directory
+    // order and "elementor" sorts before "guarded-mcp".
+    if ( $this->get_option( 'mcp_tools_elementor' ) && did_action( 'elementor/loaded' ) ) {
+      new GMCP_Tools_Elementor();
     }
   }
 

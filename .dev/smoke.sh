@@ -261,5 +261,88 @@ curl -sS "$BASE/.well-known/oauth-authorization-server" -o "$OUT/asm"
 check "OAuth server metadata at host root" "$(py 'import json,sys;print("ok" if "token_endpoint" in json.load(sys.stdin) else "err")' asm)" "ok"
 check "PKCE S256 advertised" "$(py 'import json,sys;print("S256" in json.load(sys.stdin).get("code_challenge_methods_supported",[]))' asm)" "True"
 
+echo "-- copying a design between posts --"
+# A value too large or too escaped to survive a tool argument. update_metadata() unslashes
+# what it is handed, so a JSON payload that went out to the caller and came back would lose
+# every escape in it and return broken, quite apart from the size. Copying happens in PHP.
+SRC_ID=$(docker compose exec -T cli wp eval '
+$id = wp_insert_post(["post_title"=>"Copy source","post_type"=>"page","post_status"=>"publish"]);
+update_post_meta($id,"_big_design",wp_slash(str_repeat("{\"t\":\"He said \\\"go\\\"\",\"u\":\"https:\\/\\/e.test\\/a\"}", 2000)));
+add_post_meta($id,"_many","one"); add_post_meta($id,"_many","two"); add_post_meta($id,"_many","three");
+update_post_meta($id,"_an_array",["a"=>1,"b"=>[2,3]]);
+echo $id;' 2>/dev/null | tr -d '\r\n')
+DST_ID=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Copy target","post_type"=>"page","post_status"=>"publish"]);' 2>/dev/null | tr -d '\r\n')
+call cp1 "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_copy_post_meta\",\"arguments\":{\"from_id\":$SRC_ID,\"to_id\":$DST_ID}}}"
+check "wp_copy_post_meta" "$(py 'import json,sys;d=json.load(sys.stdin);print("err" if d["result"].get("isError") else "ok")' cp1)" "ok"
+check "a large escaped value arrives intact" \
+  "$(docker compose exec -T cli wp eval "echo get_post_meta($DST_ID,'_big_design',true)===get_post_meta($SRC_ID,'_big_design',true)?'same':'differs';" 2>/dev/null | tr -d '\r\n')" "same"
+# maybe_serialize re-serializes anything that already looks serialized, so writing a raw
+# row back stores it doubly and the target reads out the serialized string itself.
+check "an array survives as an array, not as its serialization" \
+  "$(docker compose exec -T cli wp eval "var_export(get_post_meta($DST_ID,'_an_array',true)===['a'=>1,'b'=>[2,3]]);" 2>/dev/null | tr -d '\r\n')" "true"
+check "a multi-valued key stays three rows" \
+  "$(docker compose exec -T cli wp eval "echo count(get_post_meta($DST_ID,'_many'));" 2>/dev/null | tr -d '\r\n')" "3"
+# The keys that say who was editing the source belong to that post, not to its content.
+check "and the editing locks are not carried over" \
+  "$(docker compose exec -T cli wp eval "echo metadata_exists('post',$DST_ID,'_edit_last')?'copied':'skipped';" 2>/dev/null | tr -d '\r\n')" "skipped"
+call cp2 "{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_copy_post_meta\",\"arguments\":{\"from_id\":$SRC_ID,\"to_id\":$DST_ID}}}"
+check "a second copy does not overwrite without being asked" \
+  "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["content"][0]["text"];print("Nothing was copied" in t and "pass overwrite" in t)' cp2)" "True"
+check "and a multi-valued key overwritten stays three rows, not six" \
+  "$(docker compose exec -T cli wp eval "echo count(get_post_meta($DST_ID,'_many'));" 2>/dev/null | tr -d '\r\n')" "3"
+
+echo "-- duplicating a post --"
+call dup "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_duplicate_post\",\"arguments\":{\"ID\":$SRC_ID}}}"
+check "wp_duplicate_post" "$(verdict dup)" "ok"
+# A duplicate that inherits publish goes live on a misread instruction. Draft unless asked.
+check "and the copy is a draft even though the source is published" \
+  "$(docker compose exec -T cli wp eval "
+    \$q = get_posts(['post_type'=>'page','post_status'=>'any','title'=>'Copy source','numberposts'=>-1,'fields'=>'ids']);
+    \$s = array_values(array_diff(\$q, [$SRC_ID]));
+    echo \$s ? get_post_status(\$s[0]) : 'missing';" 2>/dev/null | tr -d '\r\n')" "draft"
+
+echo "-- writing an oversized value in chunks --"
+# The missing half of the round trip: a value too large for one argument used to be
+# write-only-never. Staging is never the live row, so a half-written value cannot be read.
+CH_ID=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Chunked","post_type"=>"page","post_status"=>"draft"]);' 2>/dev/null | tr -d '\r\n')
+python3 - "$OUT" "$CH_ID" <<'PYGEN'
+import json, sys
+out, pid = sys.argv[1], int(sys.argv[2])
+payload = ('{"blocks":[' + ','.join('{"id":"e%d","text":"He said \\"go\\" at https:\\/\\/e.test\\/a"}' % i for i in range(2500)) + ']}')
+open(out + '/chunk_payload.txt', 'w').write(payload)
+size = 40000
+chunks = [payload[i:i+size] for i in range(0, len(payload), size)]
+for n, c in enumerate(chunks):
+    args = {"session": "smoke1", "ID": pid, "key": "_chunked", "data": c, "final": n == len(chunks) - 1}
+    open('%s/chunk_%d.json' % (out, n), 'w').write(json.dumps(
+        {"jsonrpc": "2.0", "id": 70 + n, "method": "tools/call",
+         "params": {"name": "wp_write_post_meta_chunk", "arguments": args}}))
+open(out + '/chunk_count.txt', 'w').write(str(len(chunks)))
+PYGEN
+CH_N=$(cat "$OUT/chunk_count.txt")
+i=0
+while [ "$i" -lt "$CH_N" ]; do
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d @"$OUT/chunk_$i.json" -o "$OUT/chunk_r$i"
+  if [ "$i" -lt "$((CH_N-1))" ]; then
+    # Nothing may appear on the post until the last chunk. A partial value read as the
+    # finished one is the failure this staging exists to prevent.
+    check "chunk $i stages without touching the live row" \
+      "$(docker compose exec -T cli wp eval "echo metadata_exists('post',$CH_ID,'_chunked')?'present':'absent';" 2>/dev/null | tr -d '\r\n')" "absent"
+  fi
+  i=$((i+1))
+done
+check "the assembled value matches the source exactly" \
+  "$(docker compose exec -T cli wp eval "echo get_post_meta($CH_ID,'_chunked',true)===json_decode(file_get_contents('php://stdin'),true)?'same':'differs';" < "$OUT/chunk_payload.txt" 2>/dev/null | tr -d '\r\n')" "same"
+# JSON for an array is decoded on the way in, the same as wp_update_option does, so a
+# caller does not end up with a JSON string where WordPress expects an array.
+check "and JSON came back as an array rather than a string" \
+  "$(docker compose exec -T cli wp eval "echo is_array(get_post_meta($CH_ID,'_chunked',true))?'array':gettype(get_post_meta($CH_ID,'_chunked',true));" 2>/dev/null | tr -d '\r\n')" "array"
+call ch_a "{\"jsonrpc\":\"2.0\",\"id\":79,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_write_post_meta_chunk\",\"arguments\":{\"session\":\"smoke2\",\"ID\":$CH_ID,\"key\":\"_a\",\"data\":\"x\"}}}"
+call ch_b "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_write_post_meta_chunk\",\"arguments\":{\"session\":\"smoke2\",\"ID\":$CH_ID,\"key\":\"_b\",\"data\":\"x\"}}}"
+# A session id is bound to the post and key it started on. Without that, two callers
+# reusing an id would interleave their bytes into one value and neither would know.
+check "a session started on one target is refused on another" "$(verdict ch_b)" "error"
+
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

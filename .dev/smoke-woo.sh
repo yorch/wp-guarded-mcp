@@ -34,7 +34,11 @@ wpc() { docker compose exec -T cli wp "$@" 2>/dev/null | tr -d '\r\n'; }
 kcall() { curl -sS -X POST "$URL" -H "Authorization: Bearer $2" \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d "$3" -o "$OUT/$1"; }
 
-if [ "$(wpc plugin is-active woocommerce >/dev/null 2>&1 && echo yes || echo no)" != "yes" ]; then
+# Asked directly rather than through wpc: that helper ends in a pipe to tr, and a
+# pipeline exits with the status of its last command, so the test always read as yes and
+# the guard never fired. The suite then ran against a site with no shop and reported
+# thirty failures that were an absent plugin rather than a regression.
+if ! docker compose exec -T cli wp plugin is-active woocommerce >/dev/null 2>&1; then
   echo "WooCommerce is not active. Install it first:"
   echo "  docker compose exec -T cli wp plugin install woocommerce --activate"
   exit 2
