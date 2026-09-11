@@ -62,6 +62,38 @@ verdict() { py 'import json,sys;d=json.load(sys.stdin);print("error" if ("error"
 # The refusal text, wherever it ended up.
 refusal() { py 'import json,sys;d=json.load(sys.stdin);print(d["error"]["message"] if "error" in d else d["result"]["content"][0]["text"])' "$1"; }
 
+# Refuse to run without what this suite drives, rather than reporting its absence as a
+# regression. Three fresh stacks in a row produced a wall of failures that were a missing
+# prerequisite, and the backup ones land in the single place where a false negative is
+# expensive: this plugin treats "cannot tell" as a first-class answer precisely so nobody
+# reads a missing provider as a working one.
+#
+# futuretheme is the subtler one. The check above it already proves a MISSING theme is
+# refused; this one proves a theme needing a newer PHP is refused, and without the theme
+# present both assert the same thing and the second proves nothing. It passes on the
+# missing-theme branch, which is the wrong branch.
+#
+# Asked directly, never through a helper that ends in a pipe: a pipeline exits with its
+# last command's status, so a guard built on one can never fire.
+missing=""
+for p in updraftplus backuply; do
+  docker compose exec -T cli wp plugin is-installed "$p" >/dev/null 2>&1 || missing="$missing $p"
+done
+if [ -n "$missing" ]; then
+  echo "Missing backup plugins this suite drives:$missing"
+  echo "  docker compose exec -T cli wp plugin install$missing"
+  exit 2
+fi
+if ! docker compose exec -T wp test -f /var/www/html/wp-content/themes/futuretheme/style.css >/dev/null 2>&1; then
+  echo "The futuretheme fixture is missing, so the 'needs a newer PHP' check would pass"
+  echo "on the missing-theme branch instead. Create it:"
+  echo "  docker compose exec -T cli bash -c 'mkdir -p /var/www/html/wp-content/themes/futuretheme &&"
+  echo "    printf \"/*\\nTheme Name: Future Theme\\nRequires PHP: 99.0\\nVersion: 1.0\\n*/\\n\" \\"
+  echo "      > /var/www/html/wp-content/themes/futuretheme/style.css &&"
+  echo "    printf \"<?php\\n\" > /var/www/html/wp-content/themes/futuretheme/index.php'"
+  exit 2
+fi
+
 # Reset anything a previous run left behind. A smoke suite you cannot run twice is
 # not much of a smoke suite, and every failure on the second run was this rather than
 # a real regression: a menu that already existed, widgets that had accumulated, a
@@ -90,6 +122,13 @@ reset_state() {
   docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
   # A role that is dangerous WITHOUT holding edit_posts: the case the first guard missed.
   docker compose exec -T cli wp eval 'remove_role("api_admin"); add_role("api_admin","API Admin",["read"=>true,"manage_options"=>true]);' >/dev/null 2>&1
+  # The backup sections drive both adapters in sequence and expect to begin with
+  # UpdraftPlus driving and Backuply out of the way. Left however the last run ended them,
+  # the first section finds both active and reports Backuply, which reads as the older
+  # provider losing a contest it is supposed to win. That is a state fault presenting as a
+  # product fault, and it is what the rest of this function exists to prevent.
+  docker compose exec -T cli wp plugin activate updraftplus >/dev/null 2>&1
+  docker compose exec -T cli wp plugin deactivate backuply >/dev/null 2>&1
 }
 reset_state
 
