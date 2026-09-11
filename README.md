@@ -65,9 +65,9 @@ The token access level applies to bearer-token callers only. OAuth callers alway
 
 | Level | Content only | + administration | + WooCommerce | What it can do |
 |---|---|---|---|---|
-| `admin` | 43 | 69 | 81 | Everything, including deletes, users and options |
-| `readwrite` | 33 | 41 | 50 | Create and update, no destructive tools |
-| `readonly` | 17 | 25 | 29 | Reads only |
+| `admin` | 48 | 81 | 93 | Everything, including deletes, users and options |
+| `readwrite` | 36 | 47 | 56 | Create and update, no destructive tools |
+| `readonly` | 17 | 27 | 31 | Reads only |
 
 A **named key** narrows this further. It carries its own level, an optional expiry date,
 and an optional list of the only tools it may call, so a key handed to a deploy script
