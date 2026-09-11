@@ -224,6 +224,23 @@ keeps the history entry, so a set can be listed with most or all of its contents
 entry therefore reports what it actually still holds, and the reply counts separately how
 many contain a database, because a backup without one cannot put the site back.
 
+A backup plugin's own option rows are not a way round any of this. Withholding archive
+filenames from `wp_list_backups` was worth nothing while `wp_get_option` would hand over
+the same plugin's configuration, and on a site with offsite storage configured that meant
+the FTP password, the S3 access and secret keys, and the archive encryption passphrase,
+which is the single thing making a stored archive safe at rest. None of those row names
+contains `password`, `secret` or `key`, so the credential heuristic matched none of them,
+and because the audit log records a tool's response they were written to the database as
+well as returned. Rows belonging to UpdraftPlus, Backuply, BackWPup, All-in-One WP
+Migration and Duplicator are therefore refused by namespace, for reads and writes alike,
+with a refusal that names the two tools that answer the same questions safely. By prefix
+rather than by row, because those names change between plugin versions. Narrow it with
+`gmcp_backup_option_prefixes` if a site genuinely needs one of them.
+
+Refusing the writes matters on its own, separately from the reading: an agent that can
+rewrite `updraft_backup_history` can erase a site's record of its own backups, which the
+test for this demonstrates by doing exactly that against the unfixed code.
+
 There is no restore tool at any access level. Restoring discards everything since the
 backup, which is a larger irreversible act than anything else here, and no confirmation
 token makes that safe to hand to something reading instructions out of a comment queue.
@@ -448,6 +465,7 @@ Other hooks:
 | `gmcp_prompts` | Add or replace the ready-made prompts |
 | `gmcp_protected_options` | Option keys that must never be read, written or journalled |
 | `gmcp_protected_option_patterns` | Substrings that mark an option as credential-shaped |
+| `gmcp_backup_option_prefixes` | Namespaces whose option rows a backup plugin owns, refused for reads and writes |
 | `gmcp_credential_field_patterns` | Field names inside a value that mark it as a credential, used by both the change journal and the audit log |
 | `gmcp_audit_prune` | The daily cron event. Hook it to forward or archive entries before they are pruned |
 | `gmcp_backup_providers` | Register an adapter for a backup plugin this one cannot drive |
