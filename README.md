@@ -129,6 +129,33 @@ Reverting is gated twice: on the tool that made the change, and on the operation
 
 Two limits worth knowing. Values that look credential-shaped are not stored, judged by the field names inside them through `gmcp_credential_field_patterns` as well as by the option's own name, so those changes are recorded but cannot be reverted. That check is structural, so a secret held as a bare string under an innocuous option name is still stored. And it is not retroactive: adding an option to `gmcp_protected_options` refuses future reverts but does not scrub what is already recorded, so clear the journal after protecting something that was previously being written.
 
+**Backups.** `wp_backup_status` reports what is known; `wp_start_backup` asks the site's
+backup plugin to start one. Three things shape this more than the integration does.
+
+There is no common interface. Sixteen backup plugins with no dominant one, and the largest
+work in unrelated ways: UpdraftPlus fires a WordPress action, BackWPup wants a secret URL
+the site owner must first enable with a filter, and several keep scriptable export behind
+a paid tier. So there is a working adapter for UpdraftPlus, detection for BackWPup,
+All-in-One and Duplicator that names them and says why it cannot drive them, and
+`gmcp_backup_providers` for anything else.
+
+A backup is not finished when the call returns. Backups take minutes to hours and a tool
+call lives inside one request, so `wp_start_backup` starts one and says in as many words
+that it has not finished. Nothing here ever reports that a backup completed because of
+something it did.
+
+The dangerous failure is a false yes. Every other guard in this plugin fails closed, where
+a refusal costs an agent a sentence. This one would fail open, because a tool claiming a
+backup exists when it does not makes an agent *more* willing to do the irreversible thing.
+So "cannot tell" is a first-class answer, returned rather than flattened into a no, and
+the two-step confirmation *reports* the backup situation instead of gating on it. A gate
+would have to pass whenever it could not read a provider, and a control that silently
+passes is worse than an absent one because it gets counted.
+
+There is no restore tool at any access level. Restoring discards everything since the
+backup, which is a larger irreversible act than anything else here, and no confirmation
+token makes that safe to hand to something reading instructions out of a comment queue.
+
 **Prompts and resources.** The server offers six ready-made upkeep jobs through MCP prompts, and publishes recent posts, the comment queue and the site briefing as MCP resources a client can attach to a conversation. Every resource is backed by a tool and gated by it, so a resource is never a softer route to data than the tool it mirrors.
 
 Optionally the plugin can also generate tools from the site's own REST API routes. That is off by default because it is a large, generic surface next to the curated tools.
@@ -236,6 +263,7 @@ Other hooks:
 | `gmcp_protected_option_patterns` | Substrings that mark an option as credential-shaped |
 | `gmcp_credential_field_patterns` | Field names inside a value that mark it as a credential, used by both the change journal and the audit log |
 | `gmcp_audit_prune` | The daily cron event. Hook it to forward or archive entries before they are pruned |
+| `gmcp_backup_providers` | Register an adapter for a backup plugin this one cannot drive |
 | `gmcp_can_call_tool` | Answers whether the caller could call a given tool. The change journal asks it before replaying a write, so this is the gate on undo |
 | `gmcp_header_auth_only_tools` | Tools the URL-token endpoint may not reach, on top of every `admin`-level tool. Adds to and removes from the exception list; it cannot unblock an admin-level tool |
 | `gmcp_allow_remote_install` | Permit installs from a URL rather than the wordpress.org repository |

@@ -398,6 +398,12 @@ class GMCP_Server {
   * neither the role filter nor a key's tool list can see. Single use and MIME-checked, but
   * a capability handed out over a logged secret is the shape this whole route is about.
   *
+  * wp_start_backup is write level and writes nothing to the site. What it does is cause a
+  * complete copy of the database, every user and every email address in it, to be written
+  * to disk and, depending on the site's own settings, shipped to remote storage. It is
+  * also repeatable, so it is a way to spend a host's CPU and a site owner's storage bill.
+  * None of that is visible in the level, which describes what a tool changes.
+  *
   * wp_get_settings is read level and returns the administration email address, which is a
   * real person's address rather than a fact about the site. Changing it already costs a
   * confirmation token and a cooldown, so reading it out of an access log should not be
@@ -425,6 +431,7 @@ class GMCP_Server {
       'wp_get_site_health',
       'wp_upload_request',
       'wp_get_settings',
+      'wp_start_backup',
     ], $level );
 
     if ( in_array( $tool, (array) $exceptions, true ) ) {

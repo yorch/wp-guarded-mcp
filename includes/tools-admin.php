@@ -107,7 +107,15 @@ class GMCP_Tools_Admin {
 
     $token = bin2hex( random_bytes( 8 ) );
     set_transient( $key, $token, 2 * MINUTE_IN_SECONDS );
-    return $summary . " Nothing has been changed. To go ahead, call this tool again within two minutes with the same arguments plus confirm set to \"{$token}\".";
+
+    // The backup situation belongs in the summary rather than in a gate. Whoever reads
+    // this is about to approve something irreversible, and "the last backup finished
+    // eight days ago" is the fact that most changes their answer. Gating on it instead
+    // would have to fail open on any provider this plugin cannot read, and a control that
+    // silently passes is worse than an absent one, because it gets counted.
+    $backup = class_exists( 'GMCP_Backup' ) ? GMCP_Backup::confirmation_line() : '';
+
+    return $summary . $backup . " Nothing has been changed. To go ahead, call this tool again within two minutes with the same arguments plus confirm set to \"{$token}\".";
   }
 
   /**
@@ -494,6 +502,18 @@ class GMCP_Tools_Admin {
         ],
         'accessLevel' => 'admin',
       ],
+      'wp_backup_status' => [
+        'name' => 'wp_backup_status',
+        'description' => 'What is known about backups on this site: which backup plugin is active, when one last completed, whether one is running, and whether this plugin can start or read it at all. "Cannot tell" is a real answer here and is reported as such: a site may have perfectly good backups that this plugin cannot see.',
+        'inputSchema' => [ 'type' => 'object', 'properties' => [] ],
+        'accessLevel' => 'read',
+      ],
+      'wp_start_backup' => [
+        'name' => 'wp_start_backup',
+        'description' => 'Ask the site\'s backup plugin to start a full backup. It starts one; it does not wait for one. A backup takes minutes to hours and this call returns in seconds, so a successful reply means the job was started and NOT that a backup exists. Poll wp_backup_status until it reports a newly completed backup before doing anything you would want the backup for. There is deliberately no tool to restore.',
+        'inputSchema' => [ 'type' => 'object', 'properties' => [] ],
+        'accessLevel' => 'write',
+      ],
       /* -------- Site health -------- */
       'wp_get_site_health' => [
         'name' => 'wp_get_site_health',
@@ -720,6 +740,16 @@ class GMCP_Tools_Admin {
       case 'wp_get_audit_log':
         return $this->audit_log( $a, $r );
 
+      case 'wp_backup_status':
+        return $this->json( $r, GMCP_Backup::status() );
+
+      case 'wp_start_backup':
+        $started = GMCP_Backup::start();
+        if ( !$started['ok'] ) {
+          return $this->error( $r, $started['message'] );
+        }
+        return $this->text( $r, $started['message'] );
+
       case 'wp_site_briefing':
         return $this->site_briefing( $r );
 
@@ -768,7 +798,7 @@ class GMCP_Tools_Admin {
   private const READ_ONLY_TOOLS = [
     'wp_list_themes', 'wp_get_settings', 'wp_get_permalink_structure', 'wp_get_site_health',
     'wp_list_menus', 'wp_get_menu_items', 'wp_list_sidebars', 'wp_site_briefing',
-    'wp_get_audit_log',
+    'wp_get_audit_log', 'wp_backup_status',
   ];
 
   private function is_mutating_tool( string $tool ): bool {

@@ -865,6 +865,56 @@ check "nor is a deletion" \
 check "but the audit log has all three" \
   "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(DISTINCT tool) FROM {$wpdb->prefix}gmcp_audit WHERE tool IN (\"wp_create_post\",\"wp_update_post\",\"wp_delete_post\")");' 2>/dev/null | tr -d '\r\n')" "3"
 
+echo "-- backups: reporting, never pretending --"
+# The dangerous failure here is a false yes. Every other guard in this plugin fails
+# closed; a backup tool that claims a backup exists when it does not fails OPEN, because
+# it makes an agent more willing to do the irreversible thing. So the checks below are
+# about what it says when it does not know, as much as when it does.
+call bk_status '{"jsonrpc":"2.0","id":230,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
+check "status answers" "$(verdict bk_status)" "ok"
+bk() { py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print($1)" bk_status; }
+# UpdraftPlus is installed on this stack, so the drivable path is the one under test.
+check "it names the provider it found" "$(bk "d['provider']")" "UpdraftPlus"
+check "and reports it can both start and read it" "$(bk "str(d['can_start']) + ',' + str(d['can_tell'])")" "True,True"
+
+# Starting must never report completion. On a site with three posts UpdraftPlus finishes
+# inside the request, which is exactly the trap: testing here and concluding the operation
+# is synchronous would put a false promise in front of every real site.
+call bk_start '{"jsonrpc":"2.0","id":231,"method":"tools/call","params":{"name":"wp_start_backup","arguments":{}}}'
+check "starting succeeds" "$(verdict bk_start)" "ok"
+check "and says plainly that it is not finished" "$(refusal bk_start | grep -c 'not finished yet')" "1"
+check "and never claims a backup was taken" "$(refusal bk_start | grep -ci 'backup complete\|backup taken\|backed up successfully')" "0"
+
+# The two-step confirmation reports the situation rather than gating on it.
+call bk_confirm '{"jsonrpc":"2.0","id":232,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"akismet/akismet.php"}}}'
+check "a destructive confirmation carries the backup state" "$(refusal bk_confirm | grep -c 'UpdraftPlus backup')" "1"
+# Reporting, not gating: the operation must still be reachable.
+check "and still offers a token rather than refusing outright" "$(refusal bk_confirm | grep -c 'confirm set to')" "1"
+
+echo "-- backups: what it says when it cannot tell --"
+# A site running something this plugin cannot read still has backups. Saying "no backups"
+# there would be a lie in the direction that gets somebody hurt.
+docker compose exec -T cli wp plugin deactivate updraftplus >/dev/null 2>&1
+call bk_none '{"jsonrpc":"2.0","id":233,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
+check "with no provider it admits it cannot tell" \
+  "$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(str(d['can_tell']))" bk_none)" "False"
+check "and does not claim there are no backups" \
+  "$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print('yes' if 'not the same as there being none' in d['summary'] else 'no')" bk_none)" "yes"
+call bk_nostart '{"jsonrpc":"2.0","id":234,"method":"tools/call","params":{"name":"wp_start_backup","arguments":{}}}'
+check "and starting refuses rather than reporting success" "$(verdict bk_nostart)" "error"
+docker compose exec -T cli wp plugin activate updraftplus >/dev/null 2>&1
+
+# Access levels: reading is harmless, starting is a write, and neither may travel over a
+# secret that sits in an access log.
+call_url_token bk_ut '{"jsonrpc":"2.0","id":235,"method":"tools/call","params":{"name":"wp_start_backup","arguments":{}}}'
+check "starting a backup is refused over the URL-token route" "$(verdict bk_ut)" "error"
+call bk_tools '{"jsonrpc":"2.0","id":236,"method":"tools/call","params":{"name":"tools/list"}}'
+call bk_list '{"jsonrpc":"2.0","id":237,"method":"tools/list"}'
+# Restore is absent on purpose: it discards everything since the backup, which is a larger
+# irreversible act than anything else here, and no confirmation token makes that safe.
+check "there is no restore tool at any level" \
+  "$(py "import json,sys;t=[x['name'] for x in json.load(sys.stdin)['result']['tools']];print(len([n for n in t if 'restore' in n]))" bk_list)" "0"
+
 echo "-- rewrite rules and header handling (destructive: rebuilds .htaccess) --"
 # The hard flush is what writes .htaccess, and it only runs if save_mod_rewrite_rules()
 # exists. That lives in wp-admin/includes/misc.php and calls get_home_path() from

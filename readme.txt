@@ -41,6 +41,8 @@ Site administration, which is off by default and switched on from the settings s
 
 WooCommerce, on a switch of its own that only appears when the shop is installed: products, stock levels, orders, order notes, customers, and sales figures. Separate from site administration because the risk is a different shape. Anything carrying a customer's name, email address or delivery address needs full administrative access, the same level a list of usernames needs, so a read-only key sees products and sales figures and none of your customers. That is a statement about the shop tools, not about the whole plugin: a read-only key can still read your comments, and a comment carries the name its author put on it, which is already published on the page. Refunds are deliberately not included. Anything that emails a customer reports exactly who was written to, measured as it happens rather than guessed.
 
+Backups, if you have a backup plugin it can drive. An agent can ask for one before doing something risky, and see when one last completed. It starts a backup; it never claims one finished, because a backup takes minutes to hours and a tool call takes seconds. When it cannot see your backup plugin it says so rather than reporting that you have no backups. There is no restore tool, deliberately.
+
 One call orients an agent on the whole site: versions, theme, active plugins, post types with counts, the comment queue, the permalink structure and what changed recently. It replaces the half-dozen queries an agent otherwise makes at the start of every conversation.
 
 = Ready-made jobs and attachable content =
@@ -134,6 +136,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * Site administration tools, off by default: plugins, themes, menus, widgets, settings, permalinks and Site Health.
 * Two-step confirmation on destructive operations, wordpress.org-only installs, filtered post and widget markup, and refusal of any operation that would make the site or the endpoint unreachable.
 * Audit log of every tool call, refusals included, with redacted arguments, a tamper-evident hash chain, and automatic pruning.
+* Backup support: start one before a risky change and see when one last completed, with UpdraftPlus driven directly and a filter for anything else.
 * Connection test on the settings screen and in Site Health, which distinguishes an unreachable endpoint from credentials that never arrived.
 * WooCommerce tools on their own switch: products, stock, orders, order notes, customers and sales figures. No refunds.
 * Named keys with their own access level, expiry date and tool list, stored hashed.
