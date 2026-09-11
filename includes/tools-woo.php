@@ -227,22 +227,48 @@ class GMCP_Tools_Woo {
     }
 
     switch ( $tool ) {
-      case 'wc_list_products': return $this->list_products( $args, $r );
-      case 'wc_get_product': return $this->get_product( $args, $r );
-      case 'wc_create_product': return $this->create_product( $args, $r );
-      case 'wc_update_product': return $this->update_product( $args, $r );
-      case 'wc_set_stock': return $this->set_stock( $args, $r );
-      case 'wc_list_orders': return $this->list_orders( $args, $r );
-      case 'wc_get_order': return $this->get_order( $args, $r );
-      case 'wc_update_order_status': return $this->update_order_status( $args, $r );
-      case 'wc_add_order_note': return $this->add_order_note( $args, $r );
-      case 'wc_list_customers': return $this->list_customers( $args, $r );
-      case 'wc_sales_summary': return $this->sales_summary( $args, $r );
-      case 'wc_store_briefing': return $this->store_briefing( $args, $r );
+      case 'wc_list_products': $r = $this->list_products( $args, $r ); break;
+      case 'wc_get_product': $r = $this->get_product( $args, $r ); break;
+      case 'wc_create_product': $r = $this->create_product( $args, $r ); break;
+      case 'wc_update_product': $r = $this->update_product( $args, $r ); break;
+      case 'wc_set_stock': $r = $this->set_stock( $args, $r ); break;
+      case 'wc_list_orders': $r = $this->list_orders( $args, $r ); break;
+      case 'wc_get_order': $r = $this->get_order( $args, $r ); break;
+      case 'wc_update_order_status': $r = $this->update_order_status( $args, $r ); break;
+      case 'wc_add_order_note': $r = $this->add_order_note( $args, $r ); break;
+      case 'wc_list_customers': $r = $this->list_customers( $args, $r ); break;
+      case 'wc_sales_summary': $r = $this->sales_summary( $args, $r ); break;
+      case 'wc_store_briefing': $r = $this->store_briefing( $args, $r ); break;
+      default:
+        $r['error'] = [ 'code' => -32601, 'message' => 'Unknown tool' ];
+        return $r;
     }
-    $r['error'] = [ 'code' => -32601, 'message' => 'Unknown tool' ];
+
+    // The same post-write hook the other tool groups fire, and it was missing here.
+    //
+    // These tools go through the WooCommerce CRUD classes, which is right for storage but
+    // means nothing in this file touches wp_update_post, so none of the paths that
+    // normally announce a content change were running. An integration purging a full-page
+    // cache saw a price change and a stock change as silence. Most WooCommerce sites run
+    // such a cache, so the visible symptom is a shopper still being shown the old price,
+    // which is a worse failure than the stale page it would be anywhere else.
+    if ( empty( $r['error'] ) && in_array( $tool, self::MUTATING, true ) ) {
+      do_action( 'gmcp_mutate', $tool, $args, $r );
+    }
     return $r;
   }
+
+  /**
+  * Tools here that change the shop.
+  *
+  * Named rather than derived from the access level: wc_get_order is admin level and
+  * changes nothing, so a level test would fire the hook on reads and teach integrations
+  * to ignore it.
+  */
+  const MUTATING = [
+    'wc_create_product', 'wc_update_product', 'wc_set_stock',
+    'wc_update_order_status', 'wc_add_order_note',
+  ];
 
   #region Helpers
 

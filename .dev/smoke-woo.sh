@@ -190,6 +190,34 @@ for f in pii_prod pii_sales pii_brief; do
 done
 docker compose exec -T cli wp option delete gmcp_tokens >/dev/null 2>&1
 
+echo "-- the shop tools announce their writes --"
+# These go through the WooCommerce CRUD classes, so nothing here touches wp_update_post
+# and none of the usual content-change paths ran. An integration purging a full-page cache
+# saw a price change as silence, and most WooCommerce sites run such a cache, so the
+# visible symptom was a shopper still being shown the old price.
+docker compose exec -T wp sh -c 'cat > /var/www/html/wp-content/mu-plugins/mutate-probe.php <<"PHPEOF"
+<?php
+add_action( "gmcp_mutate", function ( $tool ) {
+  $seen = get_option( "probe_mutate", [] );
+  $seen[] = $tool;
+  update_option( "probe_mutate", $seen, false );
+}, 10, 1 );
+PHPEOF' >/dev/null 2>&1
+docker compose exec -T cli wp option delete probe_mutate >/dev/null 2>&1
+M_PROD=$(docker compose exec -T cli wp post list --post_type=product --format=ids 2>/dev/null | tr -d '\r\n' | awk '{print $1}')
+call mu_price "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_product\",\"arguments\":{\"id\":$M_PROD,\"regular_price\":\"44.00\"}}}"
+call mu_stock "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_set_stock\",\"arguments\":{\"id\":$M_PROD,\"quantity\":11}}}"
+call mu_read '{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"wc_list_products","arguments":{}}}'
+fired() { docker compose exec -T cli wp eval 'echo in_array("'"$1"'", (array) get_option("probe_mutate",[]), true) ? "fires" : "silent";' 2>/dev/null | tr -d '\r\n'; }
+check "a price change announces itself" "$(fired wc_update_product)" "fires"
+check "so does a stock change" "$(fired wc_set_stock)" "fires"
+# The control, and the reason the list is named rather than derived from the access level:
+# wc_get_order is admin level and changes nothing, so a level test would fire on reads and
+# teach an integration to ignore the hook entirely.
+check "but a read does not" "$(fired wc_list_products)" "silent"
+docker compose exec -T wp sh -c 'rm -f /var/www/html/wp-content/mu-plugins/mutate-probe.php' >/dev/null 2>&1
+docker compose exec -T cli wp option delete probe_mutate >/dev/null 2>&1
+
 echo "-- the switch really is a switch --"
 docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_woo"]=false;update_option("gmcp_options",$o);' >/dev/null 2>&1
 call w_off '{"jsonrpc":"2.0","id":16,"method":"tools/list"}'
