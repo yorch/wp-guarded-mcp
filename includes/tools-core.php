@@ -1845,6 +1845,15 @@ class GMCP_Tools_Core {
           $r['error'] = [ 'code' => -32600, 'message' => $permitted ];
           break;
         }
+        // The write policy, which option_allowed() does not cover and must not: that
+        // one answers "is this row a secret" and gates reads too, and reading siteurl
+        // is ordinary. This one answers "is this write safe", and without it every
+        // refusal wp_update_settings makes was reachable here by naming the same row.
+        $policy = GMCP_Core::option_write_policy( $key, $value );
+        if ( $policy !== true ) {
+          $r['error'] = [ 'code' => -32600, 'message' => $policy ];
+          break;
+        }
         // update_option() returns false both when the write fails AND when the value
         // already equals what is stored. Reporting the second as an error told the
         // agent its write had failed when the option held exactly what it asked for,

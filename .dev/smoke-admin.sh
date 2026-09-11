@@ -213,6 +213,59 @@ check "privileged role without edit_posts refused" \
 call s_role3 '{"jsonrpc":"2.0","id":37,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"default_role":"subscriber"}}}}'
 check "an ordinary default role is still allowed" "$(verdict s_role3)" "ok"
 
+# The same policy, asked through the other door. wp_update_settings enforced all of this
+# and wp_update_option enforced none of it, so every refusal above was reachable by
+# naming the same option through the generic writer: siteurl and home, which the settings
+# tool refuses because a wrong value leaves no way back; admin_email, which has a
+# confirmation flow precisely so one call cannot repoint password recovery; and
+# default_role, checked by construction in one tool and not at all in the other.
+#
+# Each check asserts the STORED value, not the response. A refusal message is easy to
+# emit and easy to emit while still writing.
+echo "-- the generic option writer obeys the same policy --"
+# Read, call, read back, PUT IT BACK, and only then compare. The obvious order gets this
+# wrong in a way that matters: these calls succeed when the policy is missing, so an
+# assertion made before the repair leaves siteurl pointing at evil.test. The site then
+# 301s, and the twelve unrelated checks after this one fail describing a catastrophe
+# rather than the one missing guard. A test for a guard must not depend on the guard.
+probe_refused() { # probe_refused <label> <file> <id> <option> <hostile value>
+  local was; was=$(docker compose exec -T cli wp option get "$4" 2>/dev/null | tr -d '\r\n')
+  call "$2" "{\"jsonrpc\":\"2.0\",\"id\":$3,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_option\",\"arguments\":{\"key\":\"$4\",\"value\":\"$5\"}}}"
+  local now; now=$(docker compose exec -T cli wp option get "$4" 2>/dev/null | tr -d '\r\n')
+  docker compose exec -T cli wp option update "$4" "$was" >/dev/null 2>&1
+  check "$1" "$now" "$was"
+}
+
+probe_refused "wp_update_option cannot rewrite siteurl" o_siteurl 41 siteurl http://evil.test
+probe_refused "nor home" o_home 42 home http://evil.test
+probe_refused "nor repoint the administration email past its confirmation" o_email 43 admin_email evil@evil.test
+call o_role '{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"default_role","value":"administrator"}}}'
+ROLE_NOW=$(docker compose exec -T cli wp option get default_role 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp option update default_role subscriber >/dev/null 2>&1
+check "nor set a privileged registration default" "$ROLE_NOW" "subscriber"
+check "and it says why rather than failing silently" \
+  "$(py 'import json,sys;print("to anyone who registers" in json.load(sys.stdin)["error"]["message"])' o_role)" "True"
+
+# Control. Without it, a policy that refused every write would pass all five checks above.
+call o_ok '{"jsonrpc":"2.0","id":45,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"blogdescription","value":"policy control tagline"}}}'
+check "control: an ordinary option write still goes through" \
+  "$(docker compose exec -T cli wp option get blogdescription 2>/dev/null | tr -d '\r\n')" "policy control tagline"
+
+# And the third door. Undo replays a write, so it has to ask the same question: a site
+# whose default_role was already privileged would otherwise have that value restorable
+# by reverting the change that closed it.
+docker compose exec -T cli wp option update default_role editor >/dev/null 2>&1
+call o_close '{"jsonrpc":"2.0","id":46,"method":"tools/call","params":{"name":"wp_update_settings","arguments":{"settings":{"default_role":"subscriber"}}}}'
+check "closing a privileged default role is allowed" \
+  "$(docker compose exec -T cli wp option get default_role 2>/dev/null | tr -d '\r\n')" "subscriber"
+call o_jlist '{"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+O_JID=$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next((x['id'] for x in e if 'default_role' in x['what']), ''))" o_jlist)
+check "control: the closing change was journalled" "$([ -n "$O_JID" ] && echo yes || echo no)" "yes"
+call o_undo "{\"jsonrpc\":\"2.0\",\"id\":48,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$O_JID\"}}}"
+UNDO_NOW=$(docker compose exec -T cli wp option get default_role 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp option update default_role subscriber >/dev/null 2>&1
+check "undo cannot restore the privileged default role" "$UNDO_NOW" "subscriber"
+
 # The admin-email flow mails an arbitrary address from this domain, with body text
 # drawn from blogname, which this same tool can rewrite. It needs a token and a cooldown.
 
