@@ -34,14 +34,37 @@ if ( !defined( 'ABSPATH' ) ) {
 * A row cap alone lets one enormous entry do it. A byte cap alone throws away last week
 * because of something that happened last year. So all three, and whichever is hit first
 * wins.
+*
+* WHAT WAS CALLED IS NOT WHAT CHANGED. An entry saying wp_update_post ran on post 12 with
+* certain arguments does not say that the post went from private to publish, and that is
+* usually the thing somebody is looking for. GMCP_Changes watches WordPress during the
+* call and reports what actually moved; the changes column holds a summary of it. A
+* summary rather than the values, because field-level copies of post bodies would eat the
+* pruning bounds, and because some of those values are passwords. @see
+* GMCP_Changes::summarise().
 */
 class GMCP_Audit {
 
-  const DB_VERSION = '1';
+  /**
+  * 2 added the changes column.
+  *
+  * The column is nullable and the hash chain reads a row without it the way it always
+  * did, so an existing log verifies unchanged across the upgrade rather than announcing
+  * on day one that every row has been tampered with. @see hash().
+  */
+  const DB_VERSION = '2';
   const CRON_HOOK = 'gmcp_audit_prune';
 
   /** Per-entry cap on the recorded arguments, before the row is written. */
   const MAX_ARGS = 64000;
+
+  /**
+  * And on the recorded changes, which share the entry with them.
+  *
+  * Smaller than the argument cap on purpose. A summary is meant to be read, and forty
+  * field diffs nobody reads still cost ninety days of disk under the retention bounds.
+  */
+  const MAX_CHANGES = 16000;
 
   /** Defaults, overridable from the settings screen. */
   const DEFAULT_DAYS = 90;
@@ -52,6 +75,15 @@ class GMCP_Audit {
   const NEVER_RECORD = [ 'user_pass', 'password', 'pass' ];
 
   public function __construct() {
+    // WordPress does not run the activation hook when a plugin is updated in place, so a
+    // site that upgrades without deactivating first would carry yesterday's table and
+    // every insert naming the new column would fail. Failing inserts in an audit log are
+    // the one loss this whole file exists to prevent, so the schema is checked here as
+    // well. The check is a comparison against an autoloaded option that is already in
+    // memory, not a query: cheap enough to do on every request that loads the plugin.
+    if ( get_option( 'gmcp_audit_db_version' ) !== self::DB_VERSION ) {
+      self::install();
+    }
     add_action( 'gmcp_tool_called', [ $this, 'record' ], 5 );
     add_action( self::CRON_HOOK, [ __CLASS__, 'prune' ] );
   }
@@ -88,6 +120,7 @@ class GMCP_Audit {
       outcome varchar(16) NOT NULL DEFAULT '',
       ms int(11) NOT NULL DEFAULT 0,
       args longtext NULL,
+      changes longtext NULL,
       detail text NULL,
       prev_hash char(64) NOT NULL DEFAULT '',
       hash char(64) NOT NULL DEFAULT '',
@@ -211,13 +244,22 @@ class GMCP_Audit {
       'ts' => gmdate( 'Y-m-d H:i:s' ),
       'actor' => (int) $user,
       'actor_name' => $user ? (string) ( get_userdata( $user )->user_login ?? '' ) : '',
-      'client' => mb_substr( (string) ( $call['client_name'] ?: '' ), 0, 191 ),
+      // The nearest thing to who was driving, and it is not the actor. A static bearer
+      // token borrows the lowest-numbered administrator, so actor says "admin" whoever
+      // sent the request. An OAuth grant names the app, a named key names its label, and
+      // a shared token names only itself; falling back to the client id means the column
+      // says "bearer" or "key:3" instead of nothing at all, which is a smaller claim but
+      // a true one.
+      'client' => mb_substr( (string) ( $call['client_name'] ?: ( $call['client_id'] ?? '' ) ), 0, 191 ),
       'auth_method' => mb_substr( (string) ( $call['auth_method'] ?? '' ), 0, 32 ),
       'tool' => mb_substr( (string) $call['tool'], 0, 64 ),
       'target' => $this->target( $args ),
       'outcome' => $failed ? 'refused' : 'ok',
       'ms' => (int) ( $call['duration_ms'] ?? 0 ),
       'args' => $this->storable_args( $args ),
+      'changes' => class_exists( 'GMCP_Changes' )
+        ? GMCP_Changes::summarise( GMCP_Changes::captured(), self::MAX_CHANGES )
+        : null,
       'detail' => $this->detail( $call, $failed ),
     ];
 
@@ -225,7 +267,26 @@ class GMCP_Audit {
     $row['prev_hash'] = $prev;
     $row['hash'] = self::hash( $row, $prev );
 
-    $wpdb->insert( self::table(), $row );
+    // Errors suppressed across the insert, and deliberately. wpdb prints a failed query
+    // straight to output when WP_DEBUG is on, and this runs inside the tool dispatcher's
+    // finally block, so the error text lands in front of the JSON-RPC body and the client
+    // gets a parse error instead of its result. A site with an out-of-date table would
+    // find every tool call broken rather than one audit entry missing. last_error is
+    // still set while suppressed, so nothing is lost but the printing.
+    $noisy = $wpdb->suppress_errors( true );
+    $written = $wpdb->insert( self::table(), $row );
+    $wpdb->suppress_errors( $noisy );
+
+    if ( $written === false ) {
+      // A lost audit entry is the failure this table exists to prevent, and it is the
+      // one failure that leaves no trace of itself: the next row chains to the one
+      // before, so nothing downstream ever notices. The likeliest cause is a schema
+      // older than the code, which the constructor tries to rule out. Say so loudly
+      // rather than returning quietly, because the alternative is a log that is wrong
+      // and looks intact.
+      error_log( '[Guarded MCP] audit entry NOT recorded for ' . $row['tool'] . ': '
+        . ( $wpdb->last_error ?: 'the database reported no error' ) );
+    }
   }
 
   /**
@@ -247,11 +308,30 @@ class GMCP_Audit {
   *
   * Fixed field order, because a hash over an associative array would depend on insertion
   * order and a later refactor would silently break every existing row.
+  *
+  * The changes column arrived after rows had already been written, and that is the
+  * awkward part. Hashing it unconditionally would have recomputed every existing row
+  * differently from the hash it was stored with, so an upgraded site would open the
+  * screen and be told its entire audit log had been tampered with. Re-signing the old
+  * rows would be worse: a chain the plugin rewrites on demand proves nothing.
+  *
+  * So the field list follows the row rather than the schema. A row with nothing in the
+  * changes column hashes over eleven fields exactly as it always did; a row with
+  * something in it covers twelve. Both rules are derived from the row's own contents, so
+  * verify() needs no record of when the column landed.
+  *
+  * This does not open a way out of the chain. Blanking the column on a row that had
+  * changes recorded makes the eleven-field recomputation disagree with the twelve-field
+  * hash that was stored, so the row is reported as altered, which is what it is.
   */
   private static function hash( array $row, string $prev ): string {
+    $fields = [ 'ts', 'actor', 'actor_name', 'client', 'auth_method', 'tool',
+      'target', 'outcome', 'ms', 'args', 'detail' ];
+    if ( (string) ( $row['changes'] ?? '' ) !== '' ) {
+      $fields[] = 'changes';
+    }
     $parts = [];
-    foreach ( [ 'ts', 'actor', 'actor_name', 'client', 'auth_method', 'tool',
-      'target', 'outcome', 'ms', 'args', 'detail' ] as $field ) {
+    foreach ( $fields as $field ) {
       $parts[] = (string) ( $row[ $field ] ?? '' );
     }
     return hash( 'sha256', $prev . "\x1f" . implode( "\x1f", $parts ) );
@@ -289,9 +369,12 @@ class GMCP_Audit {
       $params[] = (string) $filters['until'];
     }
     if ( !empty( $filters['search'] ) ) {
-      $where[] = '(target LIKE %s OR detail LIKE %s OR args LIKE %s)';
+      // Changes are searched too, which is how "what touched post 12" gets an answer: a
+      // bulk call records one target and a dozen changed objects, and the target column
+      // only ever names the first.
+      $where[] = '(target LIKE %s OR detail LIKE %s OR args LIKE %s OR changes LIKE %s)';
       $like = '%' . $wpdb->esc_like( (string) $filters['search'] ) . '%';
-      array_push( $params, $like, $like, $like );
+      array_push( $params, $like, $like, $like, $like );
     }
 
     $limit = max( 1, min( 500, (int) ( $filters['limit'] ?? 50 ) ) );
@@ -309,11 +392,19 @@ class GMCP_Audit {
     return (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . self::table() );
   }
 
-  /** Payload bytes rather than the table's reported size, which lags and rounds. */
+  /**
+  * Payload bytes rather than the table's reported size, which lags and rounds.
+  *
+  * Each column is coalesced separately rather than the sum being coalesced once. Most
+  * rows have no changes recorded, and adding LENGTH(changes) to the old expression would
+  * have made the whole addition NULL for every one of them, so the byte bound would have
+  * quietly measured only the handful of rows that changed something.
+  */
   public static function bytes(): int {
     global $wpdb;
     return (int) $wpdb->get_var(
-      'SELECT COALESCE(SUM(LENGTH(args) + LENGTH(detail)), 0) FROM ' . self::table()
+      'SELECT COALESCE(SUM(COALESCE(LENGTH(args), 0) + COALESCE(LENGTH(changes), 0)'
+      . ' + COALESCE(LENGTH(detail), 0)), 0) FROM ' . self::table()
     );
   }
 
