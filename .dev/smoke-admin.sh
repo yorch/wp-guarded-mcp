@@ -145,6 +145,10 @@ reset_state() {
   docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
   docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
   gmcp_clear_other_keys "smoke suite"
+  # The scheduled-events block schedules smoke_test_event and never cleared a previous
+  # run's, so a second run found two occurrences and three checks counting them failed.
+  # Every one of those failures was about arithmetic on leftovers, not about cron.
+  docker compose exec -T cli wp cron event delete smoke_test_event >/dev/null 2>&1
   # A role that is dangerous WITHOUT holding edit_posts: the case the first guard missed.
   docker compose exec -T cli wp eval 'remove_role("api_admin"); add_role("api_admin","API Admin",["read"=>true,"manage_options"=>true]);' >/dev/null 2>&1
   # The backup sections drive both adapters in sequence and expect to begin with

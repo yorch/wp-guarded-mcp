@@ -23,11 +23,11 @@ class GMCP_Core {
   * did not need editing during the extraction.
   */
   const DEFAULTS = [
-    // Empty means "no static token": OAuth is then the only way in, which is the
-    // safer default. The settings screen offers to generate one.
+    // Both retired, and kept only so the one-time migration can read what an older
+    // install stored. A shared token is carried over into a named key and this row is
+    // cleared; nothing writes either of them again. @see GMCP_Tokens::adopt_shared_token().
+    // Delete them once no install of a shared-token version plausibly remains.
     'mcp_bearer_token' => '',
-    // admin | readwrite | readonly. Applies to static-token callers. OAuth callers
-    // are always admin-gated by user_can_authorize().
     'mcp_role' => 'admin',
     // The built-in WordPress tools (posts, media, users, terms, comments, options).
     'mcp_tools_core' => true,

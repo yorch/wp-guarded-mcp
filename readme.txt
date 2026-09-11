@@ -99,13 +99,13 @@ The usual cause is that your server is not passing the Authorization header thro
 
 Yes. Nothing in the plugin is specific to one vendor. Any client that speaks the Model Context Protocol can connect.
 
-= What is the URL-token endpoint, and why can't it do everything? =
+= My server strips the Authorization header. Is there another way in? =
 
-If your server strips the Authorization header before PHP sees it, the plugin also answers on a URL that contains the token. That puts the secret in the request path, where proxies, access logs and browser history all keep it, so that route is deliberately narrowed. It cannot install anything, change settings or users, touch menus or widgets, read your settings, run the Site Health report, or hand out an upload link. It is not otherwise restricted: anyone holding that URL can write posts and comments, and can list your menus, widget areas, themes and permalink structure. Prefer the header, and press "Run the setup checks" if it is not arriving.
+Not any more, and that is deliberate. Earlier versions answered on a URL containing the credential, which put the secret in the request path, where proxies, access logs and browser history all keep a copy of every request. The plugin now recovers the header from the two places Apache commonly hides it, which covers most sites that appeared to be stripping it. Press "Run the setup checks" to find out whether yours is one of them: the check makes a real request with a short-lived key and tells you whether it arrived.
 
 = Can I limit what an agent is allowed to do? =
 
-Yes, three ways. A named key carries one of three access levels. The administration and WooCommerce tools are separate switches, both off by default. And a named key can be limited to a specific list of tools and given an expiry date. Developers can go further with filters: `gmcp_tools` to change the catalog, `gmcp_allow` to override the auth decision, and `gmcp_header_auth_only_tools` to restrict what the URL-token endpoint can reach.
+Yes, three ways. A named key carries one of three access levels. The administration and WooCommerce tools are separate switches, both off by default. And a named key can be limited to a specific list of tools and given an expiry date. Developers can go further with filters: `gmcp_tools` to change the catalog and `gmcp_allow` to override the auth decision.
 
 = Can I undo something an agent did? =
 

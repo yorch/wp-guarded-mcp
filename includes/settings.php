@@ -1081,7 +1081,7 @@ class GMCP_Settings {
               </label>
             </fieldset>
             <p class="description">
-              <?php esc_html_e( 'Administration tools install code on this site, so they are off by default. Installs are restricted to the wordpress.org repository, deletions take two steps, and they are refused entirely over the URL-token endpoint.', 'guarded-mcp' ); ?>
+              <?php esc_html_e( 'Administration tools install code on this site, so they are off by default. Installs are restricted to the wordpress.org repository, and deletions take two steps.', 'guarded-mcp' ); ?>
             </p>
             <?php if ( $woo ) : ?>
               <p class="description">

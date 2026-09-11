@@ -3,7 +3,7 @@
 /*
  * Derived from AI Engine 3.7.7 (labs/mcp.php), Copyright (C) Jordy Meow,
  * GPLv2 or later. Modified 2026 by Jorge Barnaby: renamed throughout, prompts and resources added, named keys, an audit
- * hook, per-tool access gating and the URL-token ceiling.
+ * hook and per-tool access gating.
  * See CREDITS.md for the full statement of changes.
  */
 
@@ -15,7 +15,6 @@
 * Current Implementation:
 * - Single Streamable HTTP endpoint (/mcp/v1/http), used by Claude, Claude Code and ChatGPT
 * - Authentication via OAuth (see oauth.php) or a static bearer token
-* - Optional URL-token endpoint (/mcp/v1/{token}) for clients that cannot send headers
 * - Properly handles agent cancellation signals (notifications/cancelled) to free workers immediately
 * - Caps how long an idle stream holds a PHP worker (see Connection Management below)
 * - Sends heartbeat signals to detect dead connections quickly
@@ -197,8 +196,8 @@ class GMCP_Server {
   * .htaccess was hand-written, reset, or never generated silently loses bearer auth and
   * gets a 401 that looks like a bad token.
   *
-  * That is the failure the URL-token route exists to work around, and since that route
-  * is now held to a lower ceiling, it is worth reading the header properly first.
+  * That is the failure the retired URL-token route existed to work around, and reading
+  * the header from where Apache actually put it is what made removing that route safe.
   * CGI and FastCGI setups also expose it as REDIRECT_HTTP_AUTHORIZATION.
   */
   private function authorization_header( $request ) {
@@ -916,9 +915,9 @@ class GMCP_Server {
   * resource layer is handed it as a callable, and the change journal reaches it through
   * the gmcp_can_call_tool filter before replaying a write.
   *
-  * It runs the same gates as execute_tool, in the same order, including the URL-token
-  * ceiling. Leaving that ceiling out would mean a caller barred from a tool because its
-  * secret is in the request path could still reach that tool's effect by another route.
+  * It runs the same gates as execute_tool, in the same order. Leaving any of them out
+  * would mean a caller barred from a tool could still reach that tool's effect by
+  * another route, which is what happened when the resource layer had its own answer.
   */
   public function resource_permitted( string $tool ): bool {
     if ( empty( $this->tool_access_levels ) ) {

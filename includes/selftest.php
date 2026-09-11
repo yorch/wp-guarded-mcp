@@ -138,21 +138,19 @@ class GMCP_SelfTest {
       ];
     }
 
-    // 5. The bearer path, which is separate from OAuth and fails differently.
-    $token = $core ? (string) $core->get_option( 'mcp_bearer_token' ) : '';
-    if ( $token === '' ) {
-      $checks[] = [ 'id' => 'bearer', 'status' => 'skip', 'label' => 'No bearer token set, so nothing to check', 'detail' => 'OAuth clients do not need one. Generate a token below if you want to connect a command-line agent.' ];
-    }
-    else {
-      $result = self::run();
-      $map = [ 'ok' => 'ok', 'error' => 'fail', 'warning' => 'warn', 'unknown' => 'skip' ];
-      $checks[] = [
-        'id' => 'bearer',
-        'status' => $map[ $result['status'] ] ?? 'skip',
-        'label' => $result['summary'],
-        'detail' => $result['detail'],
-      ];
-    }
+    // 5. The key path, which is separate from OAuth and fails differently. Always run
+    // now: it mints its own short-lived key, so there is no "no credential is set, so
+    // there is nothing to check" case, and the check answers on a site that has only
+    // ever used OAuth. That is the site most likely to discover a stripped header the
+    // hard way.
+    $result = self::run();
+    $map = [ 'ok' => 'ok', 'error' => 'fail', 'warning' => 'warn', 'unknown' => 'skip' ];
+    $checks[] = [
+      'id' => 'bearer',
+      'status' => $map[ $result['status'] ] ?? 'skip',
+      'label' => $result['summary'],
+      'detail' => $result['detail'],
+    ];
 
     return $checks;
   }
