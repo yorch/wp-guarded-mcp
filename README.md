@@ -140,11 +140,30 @@ Two limits worth knowing. Values that look credential-shaped are not stored, jud
 backup plugin to start one. Three things shape this more than the integration does.
 
 There is no common interface. Sixteen backup plugins with no dominant one, and the largest
-work in unrelated ways: UpdraftPlus fires a WordPress action, BackWPup wants a secret URL
-the site owner must first enable with a filter, and several keep scriptable export behind
-a paid tier. So there is a working adapter for UpdraftPlus, detection for BackWPup,
-All-in-One and Duplicator that names them and says why it cannot drive them, and
-`gmcp_backup_providers` for anything else.
+work in unrelated ways: UpdraftPlus fires a WordPress action, Backuply writes a job record
+and leaves a cron hook to pick it up, BackWPup wants a secret URL the site owner must first
+enable with a filter, and several keep scriptable export behind a paid tier. So there are
+working adapters for UpdraftPlus and Backuply, detection for BackWPup, All-in-One and
+Duplicator that names them and says why it cannot drive them, and `gmcp_backup_providers`
+for anything else. When more than one drivable plugin is active the first listed wins, and
+UpdraftPlus is listed first, so adding a provider never moves an existing site onto it.
+
+The route a plugin's own screen uses is often not a route. Each adapter is written against
+what a token-authenticated REST request actually has, which is not what the button calls.
+Backuply is the clearest case: the handler behind its Create Backup button lives in a file
+the plugin includes only when `wp_doing_ajax()`, and that handler then calls the site back
+over HTTP forwarding the administrator's browser cookies to a second handler that checks
+`current_user_can`. Neither half survives the trip, and no nonce fixes that. What is
+registered on every request is the cron hook Backuply runs its own unattended backups
+from, so the adapter writes the same job record the button writes and queues that, then
+kicks cron rather than waiting for the next visitor. It has to be a different request:
+everything under Backuply's runner ends in `die()`, so calling it inline would take the
+tool's own reply with it.
+
+Backuply also records nothing in the database about how a run ended. `backuply_last_backup`
+moves only on success, so a failure an hour ago and no attempt at all leave the same trace.
+The adapter reads the log Backuply copies aside when a job stops, which is what lets
+`wp_backup_status` say a backup exists *and* that the last attempt failed.
 
 A backup is not finished when the call returns. Backups take minutes to hours and a tool
 call lives inside one request, so `wp_start_backup` starts one and says in as many words
