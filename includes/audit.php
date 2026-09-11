@@ -327,45 +327,109 @@ class GMCP_Audit {
   *
   * @return array{ok:bool,checked:int,broken_at:?int,reason:string}
   */
-  public static function verify( int $limit = 5000 ): array {
+  /**
+  * How many rows the screen checks by default.
+  *
+  * Verifying the whole table means reading every recorded argument back out of the
+  * database, which on a full table is tens of megabytes, so it is not something to do on
+  * every page load. Recent rows are also where tampering matters: somebody hiding what
+  * they did last night is the case this exists for.
+  */
+  const VERIFY_RECENT = 1000;
+
+  /** Rows per query when walking. Bounds memory; the chain is carried across chunks. */
+  const VERIFY_CHUNK = 500;
+
+  /**
+  * Recompute the chain.
+  *
+  * Walks forward in id order, since each row depends on the one before, and starts from
+  * whatever the first row it sees claims as its predecessor. That is correct for a window
+  * as well as for the whole table: a chain that has been pruned, or that is being checked
+  * from the middle, legitimately begins pointing at something no longer present.
+  *
+  * Scope matters and is reported rather than assumed. This used to read the oldest 5,000
+  * rows of a table allowed to hold 50,000, and then say "the chain is intact across 5,000
+  * entries", which is true and reads as coverage. It meant that tampering with anything
+  * recent was never examined, and that a green line on the settings screen said least
+  * about the period somebody would most want to check.
+  *
+  * @param string $scope 'recent' for the newest VERIFY_RECENT rows, 'all' for everything.
+  * @return array{ok:bool,checked:int,imported:int,total:int,complete:bool,scope:string,broken_at:?int,reason:string}
+  */
+  public static function verify( string $scope = 'recent' ): array {
     global $wpdb;
-    $rows = $wpdb->get_results(
-      $wpdb->prepare( 'SELECT * FROM ' . self::table() . ' ORDER BY id ASC LIMIT %d', $limit ),
-      ARRAY_A
-    ) ?: [];
+    $table = self::table();
+    $total = self::count();
+
+    // For a window, find where it starts and walk forward from there. Walking backwards
+    // would mean holding the whole window to reverse it, which is what the chunking is
+    // here to avoid.
+    $from = 0;
+    if ( $scope !== 'all' && $total > self::VERIFY_RECENT ) {
+      $from = (int) $wpdb->get_var( $wpdb->prepare(
+        "SELECT id FROM {$table} ORDER BY id DESC LIMIT 1 OFFSET %d", self::VERIFY_RECENT - 1
+      ) );
+    }
 
     $prev = '';
     $checked = 0;
     $imported = 0;
-    foreach ( $rows as $row ) {
-      // Rows carried over from the option-based version have no hash: they were never
-      // part of a chain and cannot retroactively join one. Counted and reported, not
-      // treated as a break, or every upgraded site would be told on day one that its
-      // audit log had been tampered with.
-      if ( (string) $row['hash'] === '' ) {
-        $imported++;
-        continue;
+    $after = $from > 0 ? $from - 1 : 0;
+
+    while ( true ) {
+      $rows = $wpdb->get_results( $wpdb->prepare(
+        "SELECT * FROM {$table} WHERE id > %d ORDER BY id ASC LIMIT %d", $after, self::VERIFY_CHUNK
+      ), ARRAY_A );
+      if ( !$rows ) {
+        break;
       }
-      // The first hashed row legitimately points at something that is gone, either
-      // because the log was pruned or because imported rows precede it.
-      if ( $checked === 0 ) {
-        $prev = (string) $row['prev_hash'];
+      foreach ( $rows as $row ) {
+        $after = (int) $row['id'];
+
+        // Rows carried over from the option-based version have no hash: they were never
+        // part of a chain and cannot retroactively join one. Counted and reported, not
+        // treated as a break, or every upgraded site would be told on day one that its
+        // audit log had been tampered with.
+        if ( (string) $row['hash'] === '' ) {
+          $imported++;
+          continue;
+        }
+        if ( $checked === 0 ) {
+          $prev = (string) $row['prev_hash'];
+        }
+        if ( (string) $row['prev_hash'] !== $prev ) {
+          return self::verdict( false, $checked, $imported, $total, $scope, (int) $row['id'],
+            'a row is missing before this one, or its link was rewritten' );
+        }
+        if ( self::hash( $row, $prev ) !== (string) $row['hash'] ) {
+          return self::verdict( false, $checked, $imported, $total, $scope, (int) $row['id'],
+            'this row does not match its own hash, so its contents changed after it was written' );
+        }
+        $prev = (string) $row['hash'];
+        $checked++;
       }
-      if ( (string) $row['prev_hash'] !== $prev ) {
-        return [ 'ok' => false, 'checked' => $checked, 'imported' => $imported,
-          'broken_at' => (int) $row['id'],
-          'reason' => 'a row is missing before this one, or its link was rewritten' ];
-      }
-      if ( self::hash( $row, $prev ) !== (string) $row['hash'] ) {
-        return [ 'ok' => false, 'checked' => $checked, 'imported' => $imported,
-          'broken_at' => (int) $row['id'],
-          'reason' => 'this row does not match its own hash, so its contents changed after it was written' ];
-      }
-      $prev = (string) $row['hash'];
-      $checked++;
+      unset( $rows );
     }
-    return [ 'ok' => true, 'checked' => $checked, 'imported' => $imported,
-      'broken_at' => null, 'reason' => '' ];
+
+    return self::verdict( true, $checked, $imported, $total, $scope, null, '' );
+  }
+
+  private static function verdict( bool $ok, int $checked, int $imported, int $total,
+    string $scope, ?int $broken, string $reason ): array {
+    return [
+      'ok' => $ok,
+      'checked' => $checked,
+      'imported' => $imported,
+      'total' => $total,
+      'scope' => $scope,
+      // Whether every row in the table was looked at. A caller that only knows "intact"
+      // cannot tell a fully verified log from a tenth of one, which is the mistake the
+      // previous wording invited.
+      'complete' => ( $checked + $imported ) >= $total,
+      'broken_at' => $broken,
+      'reason' => $reason,
+    ];
   }
 
   #endregion

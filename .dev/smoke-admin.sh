@@ -823,6 +823,44 @@ check "the option name stays readable" \
 
 # An edited row and a deleted row have to look different from a real one, or this is a
 # history rather than an audit.
+# The check used to read the OLDEST 5,000 rows of a table allowed to hold 50,000, and
+# then say "intact across 5,000 entries", which is true and reads as coverage. Tampering
+# with anything recent was never examined, so a green line said least about the period
+# somebody would most want to check. It now walks the newest rows by default, in chunks,
+# and reports how much of the table it looked at.
+check "a recent row is inside the default window" \
+  "$(docker compose exec -T cli wp eval '
+     GMCP_Audit::clear();
+     global $wpdb; $t = $wpdb->prefix . "gmcp_audit";
+     $m = new ReflectionMethod( "GMCP_Audit", "hash" ); $m->setAccessible( true );
+     $prev = "";
+     for ( $i = 0; $i < 1200; $i++ ) {
+       $row = [ "ts" => gmdate("Y-m-d H:i:s"), "actor" => 0, "actor_name" => "", "client" => "",
+                "auth_method" => "", "tool" => "wp_get_posts", "target" => (string) $i,
+                "outcome" => "ok", "ms" => 1, "args" => "{}", "detail" => "" ];
+       $row["prev_hash"] = $prev; $row["hash"] = $m->invoke( null, $row, $prev );
+       $prev = $row["hash"]; $wpdb->insert( $t, $row );
+     }
+     $recent = (int) $wpdb->get_var( "SELECT id FROM $t ORDER BY id DESC LIMIT 1 OFFSET 5" );
+     $wpdb->query( $wpdb->prepare( "UPDATE $t SET target = %s WHERE id = %d", "tampered", $recent ) );
+     $v = GMCP_Audit::verify();
+     echo $v["ok"] ? "MISSED" : "detected";' 2>/dev/null | tr -d '\r\n')" "detected"
+# And the honesty half: a partial check must say it was partial, or a tenth of a log reads
+# as a whole one.
+check "a partial check says so" \
+  "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify();echo $v["complete"]?"claims complete":"says partial";' 2>/dev/null | tr -d '\r\n')" "says partial"
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+for i in 1 2 3; do
+  call vw_one "{\"jsonrpc\":\"2.0\",\"id\":24$i,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_posts\",\"arguments\":{\"limit\":1}}}"
+done
+check "and the full walk covers everything" \
+  "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify("all");echo $v["ok"] && $v["complete"] ? "complete" : "INCOMPLETE";' 2>/dev/null | tr -d '\r\n')" "complete"
+# Rows written by record() rather than by hand, so the check cannot pass or fail because
+# the seed disagreed with what the plugin actually writes. It did, once: actor is
+# NOT NULL DEFAULT 0, so an omitted actor hashes as "" and reads back as "0".
+check "and those rows were written by the plugin, not seeded" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_get_posts\"");' 2>/dev/null | tr -d '\r\n')" "3"
+
 check "the chain is intact before tampering" \
   "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify();echo $v["ok"]?"ok":"broken";' 2>/dev/null | tr -d '\r\n')" "ok"
 check "editing a row is detected" \

@@ -112,6 +112,21 @@ class GMCP_Settings {
       GMCP_Audit::clear();
       $this->notice = __( 'Audit log cleared.', 'guarded-mcp' );
     }
+    elseif ( $action === 'verify_audit' ) {
+      // The full walk reads every recorded argument back out of the database, which on a
+      // full table is tens of megabytes, so it is a button rather than something every
+      // page load pays for.
+      $chain = GMCP_Audit::verify( 'all' );
+      $this->notice = $chain['ok']
+        ? sprintf(
+            /* translators: 1: entries verified, 2: entries carried over unchained. */
+            __( 'Checked the whole chain: %1$d entries intact, %2$d carried over from before the log was chained.', 'guarded-mcp' ),
+            $chain['checked'], $chain['imported'] )
+        : sprintf(
+            /* translators: 1: entry id, 2: the reason. */
+            __( 'The chain breaks at entry %1$d: %2$s', 'guarded-mcp' ),
+            $chain['broken_at'], $chain['reason'] );
+    }
     elseif ( $action === 'prune_audit' ) {
       $gone = GMCP_Audit::prune();
       $total = array_sum( $gone );
@@ -809,12 +824,28 @@ class GMCP_Settings {
         (int) GMCP_Audit::retention_days()
       ); ?>
       <?php if ( $chain['ok'] ) : ?>
-        <span style="color:#00a32a"><?php printf(
-          esc_html__( 'The chain is intact across %d entries.', 'guarded-mcp' ), (int) $chain['checked'] ); ?></span>
+        <span style="color:#00a32a"><?php echo esc_html( $chain['complete']
+          ? sprintf(
+              /* translators: %d: number of entries verified. */
+              __( 'The chain is intact across all %d entries.', 'guarded-mcp' ), (int) $chain['checked'] )
+          // Saying only "intact" would let a tenth of a log read as a whole one, which is
+          // the mistake this wording exists to stop repeating.
+          : sprintf(
+              /* translators: 1: entries verified, 2: entries in total. */
+              __( 'The chain is intact across the %1$d most recent entries, of %2$d.', 'guarded-mcp' ),
+              (int) $chain['checked'], (int) $chain['total'] )
+        ); ?></span>
         <?php if ( !empty( $chain['imported'] ) ) : ?>
           <span style="color:#787c82"><?php printf(
             esc_html__( '%d older entries were carried over from before this log was chained and are not covered.', 'guarded-mcp' ),
             (int) $chain['imported'] ); ?></span>
+        <?php endif; ?>
+        <?php if ( !$chain['complete'] ) : ?>
+          <form method="post" style="display:inline">
+            <?php wp_nonce_field( self::NONCE_ACTION ); ?>
+            <input type="hidden" name="gmcp_action" value="verify_audit">
+            <button type="submit" class="button button-small"><?php esc_html_e( 'Check the whole chain', 'guarded-mcp' ); ?></button>
+          </form>
         <?php endif; ?>
       <?php else : ?>
         <strong style="color:#d63638"><?php printf(

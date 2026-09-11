@@ -1965,8 +1965,13 @@ class GMCP_Tools_Admin {
       'entries' => $rows,
       'total_recorded' => GMCP_Audit::count(),
       'retention_days' => GMCP_Audit::retention_days(),
+      // Coverage travels with the verdict. A caller told only "intact" cannot tell a
+      // fully checked log from a recent slice of one, and would report the wrong thing.
       'tamper_check' => $chain['ok']
-        ? 'The hash chain is intact across ' . $chain['checked'] . ' entries.'
+        ? ( $chain['complete']
+            ? 'The hash chain is intact across all ' . $chain['checked'] . ' entries.'
+            : 'The hash chain is intact across the ' . $chain['checked'] . ' most recent entries, of '
+              . $chain['total'] . '. Older entries were not checked here; a full check is available on the settings screen.' )
         : 'The hash chain breaks at entry ' . $chain['broken_at'] . ': ' . $chain['reason']
           . ' Treat everything from that point on as unverified.',
       'note' => 'Arguments are recorded with credential-shaped fields replaced, so a value reading "[redacted]" means a secret was passed rather than that the field was empty.',
