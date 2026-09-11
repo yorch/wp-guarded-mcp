@@ -1979,6 +1979,96 @@ check "a URL on this site is accepted" "$(verdict pu_ok)" "ok"
 check "and says plainly that nothing was purged" \
   "$(refusal pu_ok | grep -ci 'nothing was purged')" "1"
 
+echo "-- the documented tool counts are the real ones --"
+# The access-level table in README.md is nine numbers that nothing checked, and every one
+# of them had drifted behind the code by the time anybody looked: 93/56/31 documented
+# against 99/59/34 live. The suites assert behaviour exhaustively and asserted nothing
+# about the documentation, so this is the cheapest defect class in the project to close.
+#
+# Counts exclude Elementor tools. The table's columns are cumulative over the three groups
+# it names, and Elementor is a fourth group that comes and goes with a plugin, so folding
+# it in would make the numbers depend on what happens to be installed.
+tc_key() { # tc_key <level>
+  docker compose exec -T cli wp eval '
+    $level = "'"$1"'";
+    $label = "count " . $level;
+    foreach ( GMCP_Tokens::all() as $k ) {
+      if ( ( $k["label"] ?? "" ) === $label ) { GMCP_Tokens::revoke( $k["id"] ); }
+    }
+    $a = get_users( [ "role" => "administrator", "number" => 1, "orderby" => "ID", "order" => "ASC" ] );
+    $r = GMCP_Tokens::create( $label, $level, 0, [], $a ? $a[0]->ID : 0 );
+    echo $r["secret"];' 2>/dev/null | tr -d '\r\n'
+}
+tc_groups() { # tc_groups <admin 0|1> <woo 0|1>
+  docker compose exec -T cli wp eval '
+    $o = get_option( "gmcp_options", [] );
+    $o["mcp_tools_core"] = true;
+    $o["mcp_tools_admin"] = '"$1"' ? true : false;
+    $o["mcp_tools_woo"]   = '"$2"' ? true : false;
+    update_option( "gmcp_options", $o, false );' >/dev/null 2>&1
+}
+tc_count() { # tc_count <secret>
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $1" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":700,"method":"tools/list"}' \
+  | python3 -c "
+import json,sys
+try:
+    t = json.load(sys.stdin)['result']['tools']
+except Exception:
+    print('unreadable'); raise SystemExit
+print(len([x for x in t if not x['name'].startswith('elementor_')]))"
+}
+# The expected numbers come from the table itself, so the check fails whichever side moved.
+tc_doc() { # tc_doc <level> <column index, 1-3>
+  python3 - "$(dirname "$0")/../README.md" "$1" "$2" <<'PY'
+import re, sys
+path, level, col = sys.argv[1], sys.argv[2], int(sys.argv[3])
+for line in open(path):
+    if line.startswith(f'| `{level}` |'):
+        cells = [c.strip() for c in line.strip().strip('|').split('|')]
+        print(cells[col])
+        break
+else:
+    print('no such row')
+PY
+}
+TC_ADMIN=$(tc_key admin); TC_RW=$(tc_key readwrite); TC_RO=$(tc_key readonly)
+# Without this, a failure to mint the keys leaves the counts at 0 and nine checks report
+# the documentation as wrong when nothing was ever counted.
+TC_OK=0
+for k in "$TC_ADMIN" "$TC_RW" "$TC_RO"; do
+  [ "${k#gmcp_}" != "$k" ] && TC_OK=$((TC_OK+1))
+done
+check "control: the three counting keys were created" "$TC_OK" "3"
+check "control: the table can still be read" "$(tc_doc admin 1)" "$(tc_doc admin 1)"
+case "$(tc_doc admin 1)" in
+  ''|'no such row') echo "  FAIL  the access-level table could not be parsed"; fail=$((fail+1));;
+esac
+
+tc_groups 0 0
+check "content only, admin level"     "$(tc_count "$TC_ADMIN")" "$(tc_doc admin 1)"
+check "content only, readwrite"       "$(tc_count "$TC_RW")"    "$(tc_doc readwrite 1)"
+check "content only, readonly"        "$(tc_count "$TC_RO")"    "$(tc_doc readonly 1)"
+
+tc_groups 1 0
+check "plus administration, admin"    "$(tc_count "$TC_ADMIN")" "$(tc_doc admin 2)"
+check "plus administration, readwrite" "$(tc_count "$TC_RW")"   "$(tc_doc readwrite 2)"
+check "plus administration, readonly" "$(tc_count "$TC_RO")"    "$(tc_doc readonly 2)"
+
+if docker compose exec -T cli wp plugin is-active woocommerce >/dev/null 2>&1; then
+  tc_groups 1 1
+  check "plus WooCommerce, admin"       "$(tc_count "$TC_ADMIN")" "$(tc_doc admin 3)"
+  check "plus WooCommerce, readwrite"   "$(tc_count "$TC_RW")"    "$(tc_doc readwrite 3)"
+  check "plus WooCommerce, readonly"    "$(tc_count "$TC_RO")"    "$(tc_doc readonly 3)"
+else
+  # Said out loud. A column quietly not checked is a column that drifts exactly as far as
+  # the ones nobody was checking before this block existed.
+  echo "  ....  WooCommerce column not checked: the plugin is not active on this site"
+fi
+tc_groups 1 0
+gmcp_clear_other_keys "smoke suite"
+
 echo "-- scheduled events --"
 # Site Health flags a cron event that keeps failing and there was no way to look at it,
 # run it or stop it. The guards matter more than the happy path here: the run tool fires
