@@ -318,16 +318,6 @@ class GMCP_Audit {
   }
 
   /**
-  * Recompute the chain.
-  *
-  * Walks forward in id order, since each row depends on the one before. Returns the id of
-  * the first row that does not match, or null when the chain is intact. A gap in the ids
-  * is reported too: a deleted row leaves the next row's prev_hash pointing at something
-  * that is no longer there, which is exactly the case worth catching.
-  *
-  * @return array{ok:bool,checked:int,broken_at:?int,reason:string}
-  */
-  /**
   * How many rows the screen checks by default.
   *
   * Verifying the whole table means reading every recorded argument back out of the
@@ -347,6 +337,11 @@ class GMCP_Audit {
   * whatever the first row it sees claims as its predecessor. That is correct for a window
   * as well as for the whole table: a chain that has been pruned, or that is being checked
   * from the middle, legitimately begins pointing at something no longer present.
+  *
+  * A row deleted inside the walk is caught by that same link, since the row after it
+  * carries a prev_hash that no longer matches what now precedes it. A row deleted at the
+  * very start of the walk is not, because the first row's claim about its predecessor is
+  * what the walk adopts, and there is nothing left to contradict it.
   *
   * Scope matters and is reported rather than assumed. This used to read the oldest 5,000
   * rows of a table allowed to hold 50,000, and then say "the chain is intact across 5,000
