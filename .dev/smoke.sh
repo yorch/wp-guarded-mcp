@@ -538,8 +538,14 @@ check "_fields is advertised on the listers" \
   "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["tools"];d={x["name"]:x for x in t};print(all("_fields" in d[n]["inputSchema"]["properties"] for n in ("list_pages","list_posts","list_media")))' rlist)" "True"
 
 RF_ID=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Fields probe","post_type"=>"page","post_status"=>"publish","post_content"=>str_repeat("padding ",200)]);' 2>/dev/null | tr -d '\r\n')
-call rf_all  '{"jsonrpc":"2.0","id":91,"method":"tools/call","params":{"name":"list_pages","arguments":{"per_page":5}}}'
-call rf_slim '{"jsonrpc":"2.0","id":92,"method":"tools/call","params":{"name":"list_pages","arguments":{"per_page":5,"_fields":"id,title,status,link"}}}'
+# Scoped to this block's own page with include, not left to list whatever the site holds.
+# An unscoped list renders every page it returns, so one page carrying Elementor data that
+# Elementor itself refuses to render takes the whole call down with a TypeError, and the
+# measurement here fails describing a fault that is nothing to do with field selection.
+# smoke-elementor.sh leaves such a page behind, so this suite's result depended on whether
+# that one had been run first.
+call rf_all  "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\",\"params\":{\"name\":\"list_pages\",\"arguments\":{\"include\":[$RF_ID]}}}"
+call rf_slim "{\"jsonrpc\":\"2.0\",\"id\":92,\"method\":\"tools/call\",\"params\":{\"name\":\"list_pages\",\"arguments\":{\"include\":[$RF_ID],\"_fields\":\"id,title,status,link\"}}}"
 check "naming fields returns only those fields" \
   "$(py 'import json,sys;r=json.loads(json.load(sys.stdin,strict=False)["result"]["content"][0]["text"]);print(all(set(x)<={"id","title","status","link"} for x in r) and len(r)>0)' rf_slim)" "True"
 # The control for the check above: a probe that returned nothing, or a _fields that was
@@ -588,6 +594,42 @@ check "CONTROL: get_media, which never had the defect, is unchanged" "$(shape sh
 check "and a create reports the id of what it made" \
   "$(py 'import json,sys;t=json.load(sys.stdin,strict=False)["result"]["content"][0]["text"];print("id" in json.loads(t))' sh_create)" "True"
 docker compose exec -T cli wp post delete "$SH_MEDIA" --force >/dev/null 2>&1
+
+# The generated tools are cached in a transient for a day and nothing ever removed it, so
+# an upgrade that added or reshaped one was not merely unlisted for twenty-four hours: the
+# handler refuses a tool absent from that transient, so it was uncallable, and the caller
+# saw "unknown tool" with nothing pointing at a cache.
+#
+# Planting a sentinel into the cache and watching for it is what makes this measurable.
+# Asserting the transient is gone after a version change proves nothing on its own, because
+# the very next tools/list rebuilds it.
+docker compose exec -T cli wp eval '
+  $t = get_transient( GMCP_Tools_Rest::CACHE_KEY );
+  $t["zz_sentinel"] = [ "name" => "zz_sentinel", "description" => "planted", "category" => "Dynamic REST",
+    "inputSchema" => [ "type" => "object", "properties" => (object) [] ], "accessLevel" => "read" ];
+  set_transient( GMCP_Tools_Rest::CACHE_KEY, $t, DAY_IN_SECONDS );' >/dev/null 2>&1
+call up_before '{"jsonrpc":"2.0","id":98,"method":"tools/list"}'
+# The control. Without it, a sentinel that never landed and a cache correctly cleared read
+# exactly the same in the check below.
+check "CONTROL: the tool list really is served from the cache" \
+  "$(py 'import json,sys;print("zz_sentinel" in {t["name"] for t in json.load(sys.stdin)["result"]["tools"]})' up_before)" "True"
+docker compose exec -T cli wp option update gmcp_version '0.0.0-pretend-older' >/dev/null 2>&1
+call up_after '{"jsonrpc":"2.0","id":99,"method":"tools/list"}'
+check "a version change throws the generated tool cache away" \
+  "$(py 'import json,sys;print("zz_sentinel" in {t["name"] for t in json.load(sys.stdin)["result"]["tools"]})' up_after)" "False"
+check "and the recorded version catches up to the running one" \
+  "$(docker compose exec -T cli wp eval 'echo get_option("gmcp_version") === GMCP_VERSION ? "current" : "stale";' 2>/dev/null | tr -d '\r\n')" "current"
+# It has to be once, not every request: a purge on each call would rebuild the schemas
+# from every REST route on every tools/list.
+docker compose exec -T cli wp eval '
+  $t = get_transient( GMCP_Tools_Rest::CACHE_KEY );
+  $t["zz_sentinel2"] = [ "name" => "zz_sentinel2", "description" => "planted", "category" => "Dynamic REST",
+    "inputSchema" => [ "type" => "object", "properties" => (object) [] ], "accessLevel" => "read" ];
+  set_transient( GMCP_Tools_Rest::CACHE_KEY, $t, DAY_IN_SECONDS );' >/dev/null 2>&1
+call up_again '{"jsonrpc":"2.0","id":100,"method":"tools/list"}'
+check "and it does not fire again on the next request" \
+  "$(py 'import json,sys;print("zz_sentinel2" in {t["name"] for t in json.load(sys.stdin)["result"]["tools"]})' up_again)" "True"
+docker compose exec -T cli wp transient delete gmcp_tools_cache_v5 >/dev/null 2>&1
 docker compose exec -T cli wp post delete "$RF_ID" --force >/dev/null 2>&1
 # Quoted, and it was not: the shell substitutes REST_WAS bare, so (1==='1') compares an
 # int against a string under PHP's strict operator and is always false. The restore then

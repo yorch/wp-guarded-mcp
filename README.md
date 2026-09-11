@@ -256,6 +256,8 @@ token makes that safe to hand to something reading instructions out of a comment
 
 Optionally the plugin can also generate tools from the site's own REST API routes. That is off by default because it is a large, generic surface next to the curated tools.
 
+They are generated once and cached for a day, and that cache is thrown away on the first request after the plugin's version changes. It has to be: the cache does not only fill the tool listing, it gates dispatch, so before this a tool added by an upgrade was not merely missing from the list for twenty-four hours, it could not be called, and the failure read as "unknown tool" with nothing to point at the cause. A client holding its own stale copy of the tool list is a separate problem and not one a plugin can reach from here.
+
 Those generated tools return whole REST records, which is more than a model usually wants: rendered content it did not ask for, and a block of `_links` per row it has no way to follow. They take `_fields` for that, naming the fields to return and nothing else, and the difference is not marginal. Three empty pages come back as 4556 bytes whole and 186 with four fields named, and the gap widens with real content rather than closing. The parameter is WordPress's own and always worked; it was simply not declared on the generated schemas, so nothing reading a tool list could discover it. `wp_get_posts` remains the lighter tool when a plain list of posts will do.
 
 ## The settings screen
@@ -573,6 +575,7 @@ Other hooks:
 | `gmcp_tool_start` | Fires before a tool runs. Paired with `gmcp_tool_called`, it marks when a call is in flight |
 | `gmcp_change` | One observed change during a tool call, with the before and after values. What the change journal and the audit log both read |
 | `gmcp_prompts` | Add or replace the ready-made prompts |
+| `gmcp_upgraded` | Fires once on the first request after the plugin's version changes, with the new version. Anything of yours cached against the old build can be cleared here |
 | `gmcp_protected_options` | Option keys that must never be read, written or journalled |
 | `gmcp_protected_option_patterns` | Substrings that mark an option as credential-shaped |
 | `gmcp_backup_option_prefixes` | Namespaces whose option rows a backup plugin owns, refused for reads and writes |

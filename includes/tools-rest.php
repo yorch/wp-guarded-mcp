@@ -9,7 +9,12 @@
 class GMCP_Tools_Rest {
   // Bump the suffix when build_schema_from_args() changes so old cached schemas are ignored.
   // v5: _fields advertised.
-  private $cache_key = 'gmcp_tools_cache_v5';
+  //
+  // Public, and a constant rather than a property, because GMCP_Core clears it on an
+  // upgrade and the name has to have one home. Spelled out in two files, it is a name that
+  // gets bumped in one of them.
+  const CACHE_KEY = 'gmcp_tools_cache_v5';
+  private $cache_key = self::CACHE_KEY;
   private $allowed = [ 'posts', 'pages', 'media' ];
 
   public function __construct() {
