@@ -111,19 +111,25 @@ Two things make that preview trustworthy rather than decorative. It compiles the
 It also counts matches without collecting them. A pattern of `.` against a 400 KB post is 380,000 matches, and building an entry for each in order to display ten exhausted the memory limit, which made the cautious call more dangerous than the write it was protecting.
 
 **Undo.** `wp_list_changes` and `wp_undo_change` put back a setting or post an agent
-*modified*. The journal listens to WordPress rather than to the tools, so it also covers
-widgets, which live in options, and menu items, which are posts. Only writes made during
-a tool call are recorded, never a person's own edits.
+*modified*. The change capture layer listens to WordPress rather than to the tools, so it
+also covers widgets, which live in options, and menu items, which are posts. Only writes
+made during a tool call are recorded, never a person's own edits.
 
-It records modifications and not creations or deletions, and that is a real limit rather
-than a nicety. It listens on `post_updated` and `updated_option`, and WordPress does not
-fire `post_updated` when a post is inserted, so a post the agent created is not in the
-journal and neither is one it deleted. The same is true of users, comments, terms and post
-meta, none of which the journal listens for at all. The audit log sees every one of those
-calls, because it hooks the tool layer rather than the storage layer; it is undo, not the
-record, that is narrower than it looks. Deleting a post without `force` puts it in the
-trash, where WordPress can restore it, which covers the most common case by accident
-rather than by design.
+That layer is shared with the audit log, which wants the same facts from the other side:
+the journal keeps the previous value so it can put it back, the audit log keeps a
+description of the difference so a reader can see what moved. Two copies of the same diff
+would drift, and the day somebody added a field to one list the other would quietly stop
+mentioning it.
+
+Undo records modifications and not creations or deletions, and that is a real limit rather
+than a nicety. The capture layer reports both and the journal declines them: putting back
+a creation means deleting something, and putting back a deletion means recreating it, and
+neither is the same write in reverse. Users, comments, terms, plugins, themes and media
+are reported too and journalled none of them, for the same reason. Post meta is watched by
+nothing, because every post save writes `_edit_lock` and the noise would bury the signal.
+The audit log has all of it, which is the difference between the record and undo. Deleting
+a post without `force` puts it in the trash, where WordPress can restore it, which covers
+the most common case by accident rather than by design.
 
 Reverting is gated twice: on the tool that made the change, and on the operation the revert will perform, derived from the entry's own kind. Both are needed, because the recorded tool is whatever was in flight rather than what wrote the row. A plugin hooked on `save_post` that writes an option produces an option entry attributed to `wp_update_post`, and gating on that name alone let a write-level caller replay an admin-level option write.
 
@@ -183,8 +189,8 @@ limited to, when it expires and when it was last used, with a control to revoke 
 key's secret appears once, on creation, and is not recoverable afterwards.
 
 **Recent activity** is the audit log. Every tool call, refusals included, with the
-arguments it was given, who made it, what it was aimed at, how long it took and why it
-was turned down. Without it an agent works with no visible record at all: you can see
+arguments it was given, what it changed, what made it, what it was aimed at, how long it
+took and why it was turned down. Without it an agent works with no visible record at all: you can see
 that a plugin is gone, but not that your agent removed it, when, or that it tried three
 times first. Refusals are the interesting entries, which is why they are kept.
 
@@ -192,7 +198,7 @@ It lives in its own table, `{prefix}gmcp_audit`, indexed by time, tool and actor
 replaced an option row, which was a read-modify-write: two calls landing together could
 lose an entry, and it held a hundred rows at most.
 
-Three things about it are decisions rather than defaults.
+Five things about it are decisions rather than defaults.
 
 *Arguments are recorded, redacted.* An entry that does not say what was asked for is half
 an entry, but `wp_create_user` takes a password and `wp_update_option` takes whatever a
@@ -203,6 +209,21 @@ name in `wp_update_option` is deliberately kept, because the credential patterns
 written for field names inside a value, where `key` signals a secret, and at the top level
 of a call it is the name of the thing being changed.
 
+*What was called is not what changed.* An entry saying `wp_update_post` ran on post 12
+with certain arguments does not say the post went from private to publish, and that is
+usually the question. Each entry therefore carries a summary of what actually moved:
+which object, of what kind, and for each field the value before and the value after.
+Widgets, menus and menu items are named as what they are rather than as the option or
+post they are stored in.
+
+It is a summary rather than a copy, for two reasons. Field-level copies of post bodies
+would eat the retention bounds, so a value longer than a line is recorded as its size:
+"the title changed, and the body went from 1.4 KB to 1.6 KB" is the useful sentence, and
+a field that did not change is simply absent. And some of those values are passwords.
+Anything credential-shaped is recorded as `[redacted]` on both sides, judged by the same
+`gmcp_credential_field_patterns` the change journal uses, so the log says a password was
+changed without saying to what.
+
 *Each row hashes the one before it.* Nothing here stops somebody with database access
 editing a row, and pretending otherwise would be worse than not trying. What the chain
 does is make it visible: the screen recomputes it and names the first row that no longer
@@ -210,11 +231,27 @@ matches, and says whether the row was edited or one before it removed. That is t
 difference between a history and an audit. Rows carried over from the option-based
 version have no hash and are reported as uncovered rather than as tampering.
 
+The changes column arrived after rows had already been written, which the chain has to
+survive. It does it by choosing what to hash from the row rather than from the schema: a
+row with nothing in that column hashes exactly as it did before the column existed, and a
+row with something in it covers it too. An existing log therefore verifies unchanged
+across the upgrade instead of announcing that every row has been tampered with, and
+nothing was re-signed to achieve that, which would have made the chain worthless.
+Emptying the column on a row that had changes recorded is still caught, because the
+shorter recomputation no longer matches the longer hash that was stored.
+
 *Pruning is bounded three ways.* Age alone lets a runaway agent fill a disk in a day; a
 row cap alone lets one enormous entry do it; a byte cap alone throws away last week
 because of last year. So retention in days (90 by default, configurable), a hard cap of
-50,000 entries and one of 50 MB of recorded arguments, whichever is hit first, pruned by
+50,000 entries and one of 50 MB of recorded arguments and changes, whichever is hit first, pruned by
 a daily WP-Cron event. There are Prune now and Clear everything buttons on the screen.
+
+*Who is not overclaimed.* Two columns, because the honest answer needs both. `called_by`
+is the OAuth application, the named key's label, or the authentication method a shared
+token used: it is the closest this site has to who was driving. `acted_as` is the
+WordPress account the call ran as, and a static bearer token borrows the lowest-numbered
+administrator, so that name is the same whoever sent the request. The reply says so in
+as many words rather than leaving a reader to infer it.
 
 An agent can read the log through `wp_get_audit_log` at `admin` level, filtered by tool,
 outcome, date or free text, and the reply carries the tamper verdict so a caller is told
@@ -258,6 +295,7 @@ Other hooks:
 | `gmcp_stream_max_time` | Idle timeout for an open stream, default 180 seconds |
 | `gmcp_oauth_user_can_authorize` | Who may approve an OAuth connection |
 | `gmcp_tool_start` | Fires before a tool runs. Paired with `gmcp_tool_called`, it marks when a call is in flight |
+| `gmcp_change` | One observed change during a tool call, with the before and after values. What the change journal and the audit log both read |
 | `gmcp_prompts` | Add or replace the ready-made prompts |
 | `gmcp_protected_options` | Option keys that must never be read, written or journalled |
 | `gmcp_protected_option_patterns` | Substrings that mark an option as credential-shaped |
