@@ -374,7 +374,24 @@ class GMCP_Journal {
 
       $done = '';
       if ( $entry['kind'] === 'option' ) {
-        if ( !empty( $entry['absent'] ) ) {
+        // An undo is still a write, and the same policy applies to it. Being able to
+        // call wp_update_option is not the same as being allowed to make this write:
+        // a site whose default_role was already an editing role would otherwise have
+        // that value restorable by reverting the change that closed it, which is the
+        // refusal arriving one call late.
+        //
+        // Removing an option writes no value, so only the outright refusals can apply
+        // to it. Running the value checks over a deletion would refuse it for failing
+        // to be a valid value, which is true and beside the point.
+        $absent = !empty( $entry['absent'] );
+        $refusals = GMCP_Core::unwritable_options();
+        $policy = $absent
+          ? ( $refusals[ strtolower( (string) $entry['key'] ) ] ?? true )
+          : GMCP_Core::option_write_policy( (string) $entry['key'], $entry['previous'] ?? null );
+        if ( $policy !== true ) {
+          return [ 'ok' => false, 'message' => 'That change cannot be reverted. ' . $policy ];
+        }
+        if ( $absent ) {
           delete_option( $entry['key'] );
           $done = "Option \"{$entry['key']}\" removed, which is what it was before.";
         }

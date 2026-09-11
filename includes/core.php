@@ -115,6 +115,125 @@ class GMCP_Core {
   }
 
   /**
+  * Whether an option may be WRITTEN, and to this value.
+  *
+  * Separate from option_guard(), and the separation is the point. option_guard() asks
+  * whether a row is a secret, and gates reads and writes alike. This asks whether a
+  * write is safe, which is a different question with different answers: siteurl is not
+  * a secret and reading it is ordinary, but writing it wrongly ends the conversation.
+  *
+  * It lives here because three callers have to agree, and until this existed they did
+  * not. wp_update_settings enforced a policy; wp_update_option wrote the same rows with
+  * no policy at all; and the change journal put previous values back with neither. So
+  * every refusal the settings tool made was reachable by asking a different tool for the
+  * same write, which is not a weaker guard but an absent one:
+  *
+  *   wp_update_settings {"default_role": "administrator"}   refused by construction
+  *   wp_update_option   {"key": "default_role", ...}        went straight through
+  *
+  * The rule is attached to the option, not to the tool. A tool that writes options
+  * consults this, and a tool added later gets the policy by asking rather than by
+  * remembering to reimplement it.
+  *
+  * @param mixed $value The value about to be written, before coercion.
+  * @return true|string True if the write is allowed, otherwise the refusal message.
+  */
+  public static function option_write_policy( string $key, $value ) {
+    $key = strtolower( trim( $key ) );
+
+    $refused = self::unwritable_options();
+    if ( isset( $refused[ $key ] ) ) {
+      return $refused[ $key ];
+    }
+
+    // Construction checks, for keys that are writable but not to every value. A value
+    // this cannot judge is refused rather than waved through: the cost of getting that
+    // wrong is a refusal, and the cost of the other way round is open registration
+    // granting whatever the unjudged value turns out to mean.
+    if ( $key === 'default_role' ) {
+      return is_scalar( $value )
+        ? self::default_role_objection( (string) $value )
+        : 'The default role has to be the name of a role.';
+    }
+
+    return true;
+  }
+
+  /**
+  * Options no value makes safe, and why. Returned to the caller rather than swallowed,
+  * so an agent told no is told what to do instead.
+  *
+  * No filter, deliberately. option_guard() has one because its list is a heuristic that
+  * will occasionally block something harmless and a site needs a way to say so. This
+  * list is not a heuristic: each entry is a way to make the site unreachable or to
+  * repoint account recovery, and a filter here would exist mainly to be found by
+  * somebody looking for a way past it.
+  *
+  * @return array<string,string> option name => refusal message
+  */
+  public static function unwritable_options(): array {
+    return [
+      'siteurl' => 'Changing the site URL rewrites every generated URL including this API endpoint, and a wrong value locks wp-admin too, so there would be no way to undo it from here.',
+      'home' => 'Same as siteurl: a wrong value makes the site and this endpoint unreachable with no recovery path through the API.',
+      'admin_email' => 'Set "new_admin_email" instead. WordPress emails a confirmation link to the new address and only completes the change when someone clicks it. Writing admin_email directly skips that and silently repoints password recovery.',
+    ];
+  }
+
+  /**
+  * Whether a role is safe to hand to everyone who fills in the registration form.
+  *
+  * This started as "does the role have edit_posts", which was the wrong question and
+  * failed open. A role can carry manage_options, promote_users, edit_users or
+  * activate_plugins without carrying edit_posts, and a site with a hand-made
+  * "api_admin" role holding only read and manage_options sailed through: one call
+  * setting users_can_register with that default turned the public form into an
+  * administrator factory.
+  *
+  * Naming the dangerous capabilities is the same mistake one level up, because the list
+  * is open-ended and every plugin adds to it. Close it by construction instead: compare
+  * against what a subscriber gets, and refuse anything extra. The failure mode of
+  * getting that wrong is a refusal, not an escalation.
+  *
+  * The explicit list is a backstop for the case where the subscriber role itself has
+  * been widened, which would otherwise raise the floor and let everything through.
+  *
+  * @return true|string True if safe, otherwise the refusal message.
+  */
+  public static function default_role_objection( string $role_name ) {
+    $role = get_role( $role_name );
+    if ( !$role ) {
+      return "\"{$role_name}\" is not a role on this site.";
+    }
+
+    $granted = array_keys( array_filter( (array) $role->capabilities ) );
+
+    // Backstop: never acceptable for an account created by an anonymous form.
+    $never = [
+      'manage_options', 'promote_users', 'edit_users', 'create_users', 'delete_users',
+      'activate_plugins', 'install_plugins', 'edit_plugins', 'delete_plugins',
+      'switch_themes', 'install_themes', 'edit_themes', 'delete_themes',
+      'edit_files', 'unfiltered_html', 'manage_network', 'import', 'export',
+    ];
+    $dangerous = array_values( array_intersect( $granted, $never ) );
+    if ( $dangerous ) {
+      return "Refusing to make \"{$role_name}\" the default role: it grants "
+        . implode( ', ', $dangerous ) . ' to anyone who registers. Assign that role to specific accounts instead.';
+    }
+
+    // Anything beyond a subscriber is more than an anonymous signup should receive.
+    $subscriber = get_role( 'subscriber' );
+    if ( $subscriber ) {
+      $baseline = array_keys( array_filter( (array) $subscriber->capabilities ) );
+      $extra = array_values( array_diff( $granted, $baseline ) );
+      if ( $extra ) {
+        return "Refusing to make \"{$role_name}\" the default role: it grants "
+          . implode( ', ', $extra ) . ' beyond what a subscriber gets, to anyone who registers.';
+      }
+    }
+    return true;
+  }
+
+  /**
   * Field names that mark a value as credential-shaped.
   *
   * Lives here rather than in one subsystem because two of them need to agree: the change

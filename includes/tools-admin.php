@@ -1376,11 +1376,7 @@ class GMCP_Tools_Admin {
   * that asks for one is told the reason rather than just "unknown setting".
   */
   private function refused_settings(): array {
-    return [
-      'siteurl' => 'Changing the site URL rewrites every generated URL including this API endpoint, and a wrong value locks wp-admin too, so there would be no way to undo it from here.',
-      'home' => 'Same as siteurl: a wrong value makes the site and this endpoint unreachable with no recovery path through the API.',
-      'admin_email' => 'Set "new_admin_email" instead. WordPress emails a confirmation link to the new address and only completes the change when someone clicks it. Writing admin_email directly skips that and silently repoints password recovery.',
-    ];
+    return GMCP_Core::unwritable_options();
   }
 
   private function read_settings( array $r, array $a ): array {
@@ -1455,12 +1451,12 @@ class GMCP_Tools_Admin {
         continue;
       }
 
-      if ( $key === 'default_role' ) {
-        $unsafe = $this->default_role_objection( $clean );
-        if ( $unsafe !== true ) {
-          $skipped[ $key ] = $unsafe;
-          continue;
-        }
+      // The shared policy, so this tool and wp_update_option refuse the same writes.
+      // Asked after coercion, because the policy judges the value that will be stored.
+      $unsafe = GMCP_Core::option_write_policy( $key, $clean );
+      if ( $unsafe !== true ) {
+        $skipped[ $key ] = $unsafe;
+        continue;
       }
 
       if ( get_option( $key ) == $clean ) {
@@ -1475,60 +1471,6 @@ class GMCP_Tools_Admin {
       $out['not_changed'] = $skipped;
     }
     return $this->json( $r, $out );
-  }
-
-  /**
-  * Whether a role is safe to hand to everyone who fills in the registration form.
-  *
-  * This started as "does the role have edit_posts", which was the wrong question and
-  * failed open. A role can carry manage_options, promote_users, edit_users or
-  * activate_plugins without carrying edit_posts, and a site with a hand-made
-  * "api_admin" role holding only read and manage_options sailed through: one call
-  * setting users_can_register with that default turned the public form into an
-  * administrator factory.
-  *
-  * Naming the dangerous capabilities is the same mistake one level up, because the list
-  * is open-ended and every plugin adds to it. Close it by construction instead: compare
-  * against what a subscriber gets, and refuse anything extra. The failure mode of
-  * getting that wrong is a refusal, not an escalation.
-  *
-  * The explicit list is a backstop for the case where the subscriber role itself has
-  * been widened, which would otherwise raise the floor and let everything through.
-  *
-  * @return true|string True if safe, otherwise the refusal message.
-  */
-  private function default_role_objection( string $role_name ) {
-    $role = get_role( $role_name );
-    if ( !$role ) {
-      return "\"{$role_name}\" is not a role on this site.";
-    }
-
-    $granted = array_keys( array_filter( (array) $role->capabilities ) );
-
-    // Backstop: never acceptable for an account created by an anonymous form.
-    $never = [
-      'manage_options', 'promote_users', 'edit_users', 'create_users', 'delete_users',
-      'activate_plugins', 'install_plugins', 'edit_plugins', 'delete_plugins',
-      'switch_themes', 'install_themes', 'edit_themes', 'delete_themes',
-      'edit_files', 'unfiltered_html', 'manage_network', 'import', 'export',
-    ];
-    $dangerous = array_values( array_intersect( $granted, $never ) );
-    if ( $dangerous ) {
-      return "Refusing to make \"{$role_name}\" the default role: it grants "
-        . implode( ', ', $dangerous ) . ' to anyone who registers. Assign that role to specific accounts instead.';
-    }
-
-    // Anything beyond a subscriber is more than an anonymous signup should receive.
-    $subscriber = get_role( 'subscriber' );
-    if ( $subscriber ) {
-      $baseline = array_keys( array_filter( (array) $subscriber->capabilities ) );
-      $extra = array_values( array_diff( $granted, $baseline ) );
-      if ( $extra ) {
-        return "Refusing to make \"{$role_name}\" the default role: it grants "
-          . implode( ', ', $extra ) . ' beyond what a subscriber gets, to anyone who registers.';
-      }
-    }
-    return true;
   }
 
   /**
