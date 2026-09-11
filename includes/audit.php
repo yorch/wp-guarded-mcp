@@ -381,11 +381,17 @@ class GMCP_Audit {
   #region Reading
 
   /**
-  * @param array $filters tool, actor, outcome, since, until, search, limit, offset
+  * The WHERE for a set of filters, and the parameters that go with it.
+  *
+  * Shared so that counting and listing cannot disagree. They used to: count() accepted
+  * a filter array and ignored it, returning the whole table however the list had been
+  * narrowed. Nothing noticed while the screen showed a fixed fifty rows and quoted the
+  * total separately, and it became wrong the moment a pager divided one by the other.
+  *
+  * @return array{0:string,1:array} the WHERE clause without the keyword, and its params
   */
-  public static function query( array $filters = [] ): array {
+  private static function where( array $filters ): array {
     global $wpdb;
-    $table = self::table();
     $where = [ '1=1' ];
     $params = [];
 
@@ -416,19 +422,105 @@ class GMCP_Audit {
       array_push( $params, $like, $like, $like, $like );
     }
 
+    return [ implode( ' AND ', $where ), $params ];
+  }
+
+  /**
+  * @param array $filters tool, actor, outcome, since, until, search, limit, offset
+  */
+  public static function query( array $filters = [] ): array {
+    global $wpdb;
+    [ $where, $params ] = self::where( $filters );
+
     $limit = max( 1, min( 500, (int) ( $filters['limit'] ?? 50 ) ) );
     $offset = max( 0, (int) ( $filters['offset'] ?? 0 ) );
 
-    $sql = 'SELECT * FROM ' . $table . ' WHERE ' . implode( ' AND ', $where )
-      . ' ORDER BY id DESC LIMIT %d OFFSET %d';
+    // Allowlisted, because an order-by column cannot be a bound parameter and this one
+    // arrives from a query string. "when" maps to id rather than ts: they agree on order,
+    // ts has second resolution so a burst of calls sorts arbitrarily within a second, and
+    // id is unique and already the primary key.
+    $columns = [ 'when' => 'id', 'id' => 'id', 'tool' => 'tool', 'outcome' => 'outcome', 'ms' => 'ms' ];
+    $by = $columns[ (string) ( $filters['orderby'] ?? '' ) ] ?? 'id';
+    $dir = strtolower( (string) ( $filters['order'] ?? '' ) ) === 'asc' ? 'ASC' : 'DESC';
+    // Ties broken by id so a page boundary cannot show the same row twice or skip one.
+    $order = $by === 'id' ? "id {$dir}" : "{$by} {$dir}, id DESC";
+
+    $sql = 'SELECT * FROM ' . self::table() . ' WHERE ' . $where
+      . ' ORDER BY ' . $order . ' LIMIT %d OFFSET %d';
     array_push( $params, $limit, $offset );
 
     return $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A ) ?: [];
   }
 
+  /** How many rows match, so a pager can divide by a page size and be right. */
   public static function count( array $filters = [] ): int {
     global $wpdb;
-    return (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . self::table() );
+    [ $where, $params ] = self::where( $filters );
+    $sql = 'SELECT COUNT(*) FROM ' . self::table() . ' WHERE ' . $where;
+    return (int) ( $params
+      ? $wpdb->get_var( $wpdb->prepare( $sql, $params ) )
+      : $wpdb->get_var( $sql ) );
+  }
+
+  /** One entry by id, or null. The detail view's whole source. */
+  public static function get( int $id ): ?array {
+    global $wpdb;
+    $row = $wpdb->get_row( $wpdb->prepare(
+      'SELECT * FROM ' . self::table() . ' WHERE id = %d', $id
+    ), ARRAY_A );
+    return $row ?: null;
+  }
+
+  /**
+  * Whether one entry still matches its own hash.
+  *
+  * The chain verdict names an id, and until this existed the screen could not say
+  * anything about that id: the reader was told entry 412 was where the chain broke and
+  * had no way to look at 412. This answers for a single row, which is the question a
+  * person actually has once they have the number.
+  *
+  * It checks the row against itself and against the link it claims. It cannot tell you
+  * the chain is sound, because that is a property of the walk, not of one row.
+  *
+  * @return array{ok:bool,checked:bool,reason:string}
+  */
+  public static function verify_row( int $id ): array {
+    $row = self::get( $id );
+    if ( !$row ) {
+      return [ 'ok' => false, 'checked' => false, 'reason' => 'no such entry' ];
+    }
+    if ( (string) $row['hash'] === '' ) {
+      return [ 'ok' => true, 'checked' => false,
+        'reason' => 'carried over from before the log was chained, so it was never signed' ];
+    }
+    if ( self::hash( $row, (string) $row['prev_hash'], (int) $row['id'] <= self::hash_boundary() )
+      !== (string) $row['hash'] ) {
+      return [ 'ok' => false, 'checked' => true,
+        'reason' => 'this entry does not match its own hash, so its contents changed after it was written' ];
+    }
+    return [ 'ok' => true, 'checked' => true, 'reason' => '' ];
+  }
+
+  /**
+  * The tools and accounts that actually appear, for the filter menus.
+  *
+  * Drawn from the log rather than from the registry on purpose: a menu listing every
+  * tool the plugin has is a menu of mostly empty results, and it would omit the entries
+  * that matter most, namely calls to tools that have since been switched off.
+  *
+  * @return array{tools:string[],actors:array<int,string>}
+  */
+  public static function facets(): array {
+    global $wpdb;
+    $table = self::table();
+    $tools = $wpdb->get_col( "SELECT DISTINCT tool FROM {$table} WHERE tool <> '' ORDER BY tool ASC" );
+    $actors = [];
+    foreach ( $wpdb->get_results(
+      "SELECT DISTINCT actor, actor_name FROM {$table} WHERE actor > 0 ORDER BY actor_name ASC", ARRAY_A
+    ) as $row ) {
+      $actors[ (int) $row['actor'] ] = (string) $row['actor_name'];
+    }
+    return [ 'tools' => array_map( 'strval', $tools ?: [] ), 'actors' => $actors ];
   }
 
   /**
