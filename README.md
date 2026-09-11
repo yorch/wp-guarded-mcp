@@ -79,7 +79,11 @@ reading it back.
 
 **Content and site data**, on by default: posts and pages, block content, taxonomies and terms, comments, media (including upload by URL or by a one-time upload link), users, post meta, site options, post types, block patterns.
 
-Four of those exist because a value can be too large or too escaped to survive a tool argument. `wp_copy_post_meta` and `wp_duplicate_post` copy inside PHP, so a page design of 100KB never leaves the server. Size was never the only reason: `update_metadata()` unslashes whatever it is handed, so a value that went out to the caller and came back loses every escape in it and returns broken, however small it is. `wp_write_post_meta_chunk` is the general answer, staging a value across several calls and writing the meta row only on the last one, so a half-written value is never on the post for something else to read as finished. `wp_read_post_meta_chunk` is its mirror, so the round trip closes: it walks a value by byte offset, says how large the whole thing is and whether more remains, and returns each piece as base64.
+Four of those exist because a value can be too large or too escaped to survive a tool argument. `wp_copy_post_meta` and `wp_duplicate_post` copy inside PHP, so a page design of 100KB never leaves the server. Size was never the only reason: `update_metadata()` unslashes whatever it is handed, so a value that went out to the caller and came back loses every escape in it and returns broken, however small it is. `wp_write_post_meta_chunk` is the general answer, staging a value across several calls and writing the meta row only on the last one, so a half-written value is never on the post for something else to read as finished. `wp_read_post_meta_chunk` is its mirror, so the round trip closes: it walks a value by byte offset, says how large the whole thing is and whether more remains, and returns each piece as base64. A single piece is capped at 256KB,
+and that number is a policy rather than a limit: nothing failed in testing until the memory
+limit was lowered well below a stock host's, and on a normal one the tool will hand back any
+meta value the database can deliver. The cap sits sixteen times under the smallest failure
+measured, and is already more base64 than a model can use in one answer.
 
 That last detail is not fussiness. A chunk boundary falls wherever the byte count lands, which is routinely inside a multi-byte character, and a half-character is fine only if nothing tries to repair it. Sent as text it does not survive: `wp_json_encode` hands invalid UTF-8 to WordPress's own sanity check, which substitutes a placeholder and reports no error, so a slice ending on the first byte of an emoji comes back the same length with that byte turned into a question mark. Every cheap check passes and the reassembled document differs from the stored one. Base64 carries those bytes through untouched, and each chunk also carries a hash of the whole value, so a caller can tell that the value was rewritten under it mid-walk and that what it reassembled is what was stored. A duplicate is a draft unless you ask otherwise, because a copy that inherits `publish` goes live on a misread instruction.
 
@@ -375,7 +379,12 @@ different: a complete pass is a sentence, while a partial one is set apart on th
 "only part of the chain was checked" and gives all three numbers, so "1,000 of 8,300 entries
 were checked, the most recent first, and those are intact. The other 7,300 were not looked
 at." Reassurance and partial reassurance reading alike at a glance is the whole failure this
-guards against, since glancing is what a person does with it.
+guards against, since glancing is what a person does with it. The complete pass is scoped the same
+way for the same reason: it used to say "intact across all N entries" using the count of rows
+it verified, which excludes any carried over from before the log was chained, so on an
+upgraded site "all" named a smaller number than the table held. It now says how many were
+signed and how many were not, and on a site where nothing is signed it says there is no chain
+to check rather than reporting one intact across zero entries.
 An earlier version read the oldest rows instead and said only "intact across 1,000
 entries", which was true, read as a verdict on the whole log, and never examined the
 period anyone would most want to check.
@@ -419,6 +428,21 @@ with `=`, `+`, `-`, `@`, a tab or a carriage return are written with a leading a
 is visible in the file and deliberate. A spreadsheet treats such a cell as a formula and runs
 it, and this log carries post titles, refusal messages and comment text that an anonymous
 person wrote, which is the same reason the rest of the plugin is careful.
+
+*Meta keys are matched exactly.* They used to be lowercased on the way in, which is fine
+until it is not: a key spelled `myPlugin_Data` addressed a different row, or none, and a
+write created the wrong one while reporting success. Every meta tool now takes the key as
+given, and the empty string and `"0"` are refused rather than passed on, because WordPress
+tests a meta key for truth before using it and treats both as no key at all, so a read of
+`"0"` answers with every key on the post.
+
+One half of this cannot be fixed from here and is reported instead. The database compares
+`meta_key` case-insensitively, so `myPlugin_Data` and `myplugin_data` are one row to every
+write WordPress performs; reads come from a cache keyed by the spelling actually stored, and
+those compare exactly. Writing a key that differs only in case from one already on the post
+therefore updates that row, leaves its original spelling, and the value is then invisible to
+a read of the key you just wrote, with nothing erroring anywhere. The writers say which
+spelling a value landed under whenever it is not the one you asked for.
 
 *Who is not overclaimed.* Two columns, because the honest answer needs both. `called_by`
 is the OAuth application, the named key's label, or the authentication method a shared

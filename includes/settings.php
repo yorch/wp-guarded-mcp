@@ -1694,17 +1694,47 @@ class GMCP_Settings {
       ); ?>
       <?php // Only the complete pass is said here. The other two verdicts are blocks
       // below, because a partial check that reads like a whole one at a glance is the
-      // thing this arrangement exists to stop. ?>
-      <?php if ( $chain['ok'] && $chain['complete'] ) : ?>
+      // thing this arrangement exists to stop.
+      //
+      // A complete pass is three sentences rather than one, because "all" is a claim
+      // about the log and the walk only covers rows that carry a hash. Imported rows
+      // are skipped rather than failed and are not in checked, so on a site holding
+      // them the old sentence named the smaller number and still called it all.
+      //
+      // Most sites have no imported rows, and there this reads exactly as it always
+      // did: a caveat that applies to few readers should not be paid for by every one
+      // of them. Where there are some, the count is scoped to what was signed and the
+      // carried-over rows are named in the same sentence, which is why the muted line
+      // below no longer runs here. Two sentences dividing one fact between them is
+      // worse than one sentence holding it.
+      //
+      // "Intact" survives both, because a chain really was walked and really did hold.
+      // It does not survive the third: with nothing signed there is no chain, and a
+      // green "intact" over a log that could not be checked at all is the largest
+      // overclaim this screen could make. An empty log matches none of the three and
+      // says nothing, which is the same reasoning with the numbers at zero. ?>
+      <?php if ( $chain['ok'] && $chain['complete'] && $chain['checked'] > 0 && empty( $chain['imported'] ) ) : ?>
         <span class="gmcp-ok"><?php printf(
           /* translators: %s: number of entries verified. */
           esc_html__( 'The chain is intact across all %s entries.', 'guarded-mcp' ),
           esc_html( number_format_i18n( $chain['checked'] ) ) ); ?></span>
+      <?php elseif ( $chain['ok'] && $chain['complete'] && $chain['checked'] > 0 ) : ?>
+        <span class="gmcp-ok"><?php printf(
+          /* translators: 1: entries verified, 2: entries carried over from before the chain. */
+          esc_html__( 'The chain is intact across the %1$s signed entries; the other %2$s were carried over from before this log was chained and were never signed.', 'guarded-mcp' ),
+          esc_html( number_format_i18n( $chain['checked'] ) ),
+          esc_html( number_format_i18n( $chain['imported'] ) ) ); ?></span>
+      <?php elseif ( $chain['ok'] && $chain['complete'] && !empty( $chain['imported'] ) ) : ?>
+        <span class="gmcp-muted"><?php printf(
+          /* translators: %s: entries carried over from before the chain. */
+          esc_html__( 'None of the %s entries are signed: every one was carried over from before this log was chained, so there is no chain to check.', 'guarded-mcp' ),
+          esc_html( number_format_i18n( $chain['imported'] ) ) ); ?></span>
       <?php endif; ?>
-      <?php // Only alongside a verdict that reached the end of its walk. A break stops
-      // the walk, so the count is whatever had been passed by then rather than a count
-      // of the log. ?>
-      <?php if ( $chain['ok'] && !empty( $chain['imported'] ) ) : ?>
+      <?php // The partial block counts only what it checked against the whole table, so
+      // the carried-over rows still need saying beside it. Only alongside a verdict that
+      // reached the end of its walk: a break stops the walk, so the count is whatever
+      // had been passed by then rather than a count of the log. ?>
+      <?php if ( $chain['ok'] && !$chain['complete'] && !empty( $chain['imported'] ) ) : ?>
         <span class="gmcp-muted"><?php printf(
           esc_html__( '%s older entries were carried over from before this log was chained and are not covered.', 'guarded-mcp' ),
           esc_html( number_format_i18n( $chain['imported'] ) ) ); ?></span>
