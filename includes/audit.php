@@ -15,7 +15,7 @@ if ( !defined( 'ABSPATH' ) ) {
 * A table fixes both. An INSERT cannot lose a concurrent entry, rows are indexed by time,
 * tool and actor, and pruning is one DELETE rather than rewriting a serialized blob.
 *
-* Three things are worth explaining, because each is a decision rather than a default.
+* Four things are worth explaining, because each is a decision rather than a default.
 *
 * ARGUMENTS ARE RECORDED, REDACTED. An audit entry that does not say what was asked for
 * is half an entry. But wp_create_user and wp_update_user take a password, and

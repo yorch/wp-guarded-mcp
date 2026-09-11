@@ -232,13 +232,21 @@ difference between a history and an audit. Rows carried over from the option-bas
 version have no hash and are reported as uncovered rather than as tampering.
 
 The changes column arrived after rows had already been written, which the chain has to
-survive. It does it by choosing what to hash from the row rather than from the schema: a
-row with nothing in that column hashes exactly as it did before the column existed, and a
-row with something in it covers it too. An existing log therefore verifies unchanged
-across the upgrade instead of announcing that every row has been tampered with, and
-nothing was re-signed to achieve that, which would have made the chain worthless.
-Emptying the column on a row that had changes recorded is still caught, because the
-shorter recomputation no longer matches the longer hash that was stored.
+survive, and the first attempt at that was wrong in an instructive way. Hashing joined the
+columns with a separator, which is safe while the list of columns is fixed: moving content
+from one column into the next leaves a separator behind and the recomputation differs. It
+stops being safe as soon as the list can vary in length, which a nullable column makes it
+do. A row's recorded changes could be appended to the end of its neighbour and the column
+blanked, and the shorter recomputation would rebuild the longer string exactly, so the
+chain would call the row intact while the changes it covered had been erased from it. The
+hash therefore commits to the shape of a row as well as to its contents: each field
+contributes its name and the byte length of its value, prefixed by the field count.
+
+That cannot be applied backwards, because re-signing old rows under a new construction is
+the same as not signing them. The upgrade records the id of the last row written under the
+old one, and every row is checked the way it was written: the old join at or below that
+mark, the canonical encoding above it. Old rows keep verifying, new rows are unambiguous,
+and nothing was rewritten to make either true.
 
 *Pruning is bounded three ways.* Age alone lets a runaway agent fill a disk in a day; a
 row cap alone lets one enormous entry do it; a byte cap alone throws away last week
