@@ -521,5 +521,46 @@ check "a plain string with backslashes is stored verbatim" \
     echo get_post_meta($SL_ID, '_plain', true) === 'C:' . chr(92) . 'Users' . chr(92) . 'me'
       ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
 
+echo "-- the dynamic REST tools --"
+# This group is opt-in and had no coverage at all, which is how a reply shape nothing
+# could parse survived in it. Read the setting, turn it on, and put it back at the end
+# whatever happens in between: a suite that leaves the group switched on changes what
+# every later run of every other suite is testing.
+REST_WAS=$(docker compose exec -T cli wp eval 'echo !empty(get_option("gmcp_options",[])["mcp_tools_rest"]) ? "1" : "0";' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]); $o["mcp_tools_rest"]=true; update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+docker compose exec -T cli wp transient delete gmcp_tools_cache_v5 >/dev/null 2>&1
+call rlist '{"jsonrpc":"2.0","id":90,"method":"tools/list"}'
+check "the REST group appears when switched on" \
+  "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"list_pages","get_pages","create_pages","update_pages","delete_pages"}-n) or True)' rlist)" "True"
+# rest_do_request() has always honoured _fields; nothing advertised it, so no caller could
+# find it. An unadvertised parameter is an absent one as far as a model is concerned.
+check "_fields is advertised on the listers" \
+  "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["tools"];d={x["name"]:x for x in t};print(all("_fields" in d[n]["inputSchema"]["properties"] for n in ("list_pages","list_posts","list_media")))' rlist)" "True"
+
+RF_ID=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Fields probe","post_type"=>"page","post_status"=>"publish","post_content"=>str_repeat("padding ",200)]);' 2>/dev/null | tr -d '\r\n')
+call rf_all  '{"jsonrpc":"2.0","id":91,"method":"tools/call","params":{"name":"list_pages","arguments":{"per_page":5}}}'
+call rf_slim '{"jsonrpc":"2.0","id":92,"method":"tools/call","params":{"name":"list_pages","arguments":{"per_page":5,"_fields":"id,title,status,link"}}}'
+check "naming fields returns only those fields" \
+  "$(py 'import json,sys;r=json.loads(json.load(sys.stdin,strict=False)["result"]["content"][0]["text"]);print(all(set(x)<={"id","title","status","link"} for x in r) and len(r)>0)' rf_slim)" "True"
+# The control for the check above: a probe that returned nothing, or a _fields that was
+# ignored, would both leave the subset assertion looking fine. This proves the untrimmed
+# reply really is the heavy one, so the trimming is doing the work.
+check "CONTROL: the untrimmed reply really does carry the heavy fields" \
+  "$(py 'import json,sys;r=json.loads(json.load(sys.stdin,strict=False)["result"]["content"][0]["text"]);print(bool(r) and "_links" in r[0] and "content" in r[0])' rf_all)" "True"
+check "and trimming makes the reply markedly smaller" \
+  "$(python3 -c "
+import json
+a=json.load(open('$OUT/rf_all'),strict=False)['result']['content'][0]['text']
+b=json.load(open('$OUT/rf_slim'),strict=False)['result']['content'][0]['text']
+print(len(b) * 4 < len(a))")" "True"
+docker compose exec -T cli wp post delete "$RF_ID" --force >/dev/null 2>&1
+# Quoted, and it was not: the shell substitutes REST_WAS bare, so (1==='1') compares an
+# int against a string under PHP's strict operator and is always false. The restore then
+# switched the group OFF whatever it had found, which is the one thing a restore must not
+# do. Its own check caught it, which is why the check is there.
+docker compose exec -T cli wp eval "\$o=get_option('gmcp_options',[]); \$o['mcp_tools_rest']=('$REST_WAS'==='1'); update_option('gmcp_options',\$o,false);" >/dev/null 2>&1
+check "the REST group is back as it was found" \
+  "$(docker compose exec -T cli wp eval 'echo !empty(get_option("gmcp_options",[])["mcp_tools_rest"]) ? "1" : "0";' 2>/dev/null | tr -d '\r\n')" "$REST_WAS"
+
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

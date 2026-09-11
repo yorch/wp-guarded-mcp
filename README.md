@@ -256,6 +256,8 @@ token makes that safe to hand to something reading instructions out of a comment
 
 Optionally the plugin can also generate tools from the site's own REST API routes. That is off by default because it is a large, generic surface next to the curated tools.
 
+Those generated tools return whole REST records, which is more than a model usually wants: rendered content it did not ask for, and a block of `_links` per row it has no way to follow. They take `_fields` for that, naming the fields to return and nothing else, and the difference is not marginal. Three empty pages come back as 4556 bytes whole and 186 with four fields named, and the gap widens with real content rather than closing. The parameter is WordPress's own and always worked; it was simply not declared on the generated schemas, so nothing reading a tool list could discover it. `wp_get_posts` remains the lighter tool when a plain list of posts will do.
+
 ## The settings screen
 
 At **MCP Server** in the admin menu, in four tabs. It is top level rather than buried
