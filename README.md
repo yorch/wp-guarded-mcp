@@ -65,9 +65,9 @@ The token access level applies to bearer-token callers only. OAuth callers alway
 
 | Level | Content only | + administration | + WooCommerce | What it can do |
 |---|---|---|---|---|
-| `admin` | 43 | 69 | 81 | Everything, including deletes, users and options |
-| `readwrite` | 33 | 41 | 50 | Create and update, no destructive tools |
-| `readonly` | 17 | 25 | 29 | Reads only |
+| `admin` | 48 | 81 | 93 | Everything, including deletes, users and options |
+| `readwrite` | 36 | 47 | 56 | Create and update, no destructive tools |
+| `readonly` | 17 | 27 | 31 | Reads only |
 
 A **named key** narrows this further. It carries its own level, an optional expiry date,
 and an optional list of the only tools it may call, so a key handed to a deploy script
@@ -148,8 +148,9 @@ Reverting is gated twice: on the tool that made the change, and on the operation
 
 Two limits worth knowing. Values that look credential-shaped are not stored, judged by the field names inside them through `gmcp_credential_field_patterns` as well as by the option's own name, so those changes are recorded but cannot be reverted. That check is structural, so a secret held as a bare string under an innocuous option name is still stored. And it is not retroactive: adding an option to `gmcp_protected_options` refuses future reverts but does not scrub what is already recorded, so clear the journal after protecting something that was previously being written.
 
-**Backups.** `wp_backup_status` reports what is known; `wp_start_backup` asks the site's
-backup plugin to start one. Three things shape this more than the integration does.
+**Backups.** `wp_backup_status` reports what is known, `wp_list_backups` says which backups
+exist, and `wp_start_backup` asks the site's backup plugin to start one. Three things shape
+this more than the integration does.
 
 There is no common interface. Sixteen backup plugins with no dominant one, and the largest
 work in unrelated ways: UpdraftPlus fires a WordPress action, Backuply writes a job record
@@ -189,6 +190,33 @@ So "cannot tell" is a first-class answer, returned rather than flattened into a 
 the two-step confirmation *reports* the backup situation instead of gating on it. A gate
 would have to pass whenever it could not read a provider, and a control that silently
 passes is worse than an absent one because it gets counted.
+
+A listing must not hand out the keys. `wp_list_backups` returns when each backup finished,
+what it contains, how big it is and where it went. It never returns the archive's filename
+or path, and that omission is the design rather than an oversight. UpdraftPlus writes
+`backup_<date>_<site>_<nonce>-db.gz` into `wp-content/updraft`, where the nonce is the only
+thing making the URL unguessable: the `.htaccess` there says `deny from all`, which nginx
+never reads. Backuply inverts the arrangement, with a predictable filename inside a
+directory whose random suffix is the secret. Either way the on-disk name is a capability,
+and a database archive holds every user row and password hash on the site. So a backup is
+identified by when it finished, which answers every question an agent has a reason to ask
+and cannot be turned into a URL.
+
+That rule is enforced rather than asserted. `gmcp_backup_providers` is a public filter, so
+a sentence promising no filenames would only describe the two shipped adapters; every entry
+is reduced to the fields above whoever produced it, unknown keys are dropped, and the two
+free-text fields are withheld if they contain a path separator or an archive extension.
+This matters beyond the reply itself, because the audit log stores it.
+
+The same "cannot tell" rule applies. A provider this plugin cannot enumerate gets said so,
+and the `backups` key is absent rather than empty, because an empty list reads as "there
+are none". `total` is how many exist and `count` how many came back, so a capped listing
+can say which it is rather than guessing from the size of its own result.
+
+Existing is not the same as usable. UpdraftPlus prunes archives to its retention limit but
+keeps the history entry, so a set can be listed with most or all of its contents gone. Each
+entry therefore reports what it actually still holds, and the reply counts separately how
+many contain a database, because a backup without one cannot put the site back.
 
 There is no restore tool at any access level. Restoring discards everything since the
 backup, which is a larger irreversible act than anything else here, and no confirmation

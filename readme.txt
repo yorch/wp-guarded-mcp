@@ -45,7 +45,7 @@ A post's design can be copied or duplicated without the value passing through th
 
 Elementor, on a switch of its own that only appears when Elementor is installed: theme-builder conditions, regenerating Elementor's CSS, and putting a library template on a page. Setting a header through the generic tools looks like it worked and does not, because Elementor keeps a cached copy of which template applies where and writing only the template leaves that cache stale. These write both halves together and say what the cache holds. The design itself is copied inside PHP rather than through a tool argument, which would silently strip every escape in it.
 
-Backups, if you have a backup plugin it can drive. An agent can ask for one before doing something risky, and see when one last completed. It starts a backup; it never claims one finished, because a backup takes minutes to hours and a tool call takes seconds. When it cannot see your backup plugin it says so rather than reporting that you have no backups. There is no restore tool, deliberately.
+Backups, if you have a backup plugin it can drive. An agent can ask for one before doing something risky, list the backups that exist, and see when one last completed. A listing says when each finished, what is in it and where it went, and never the archive's filename, which on both supported plugins is what keeps it from being downloaded by anyone who guesses it. It starts a backup; it never claims one finished, because a backup takes minutes to hours and a tool call takes seconds. When it cannot see your backup plugin it says so rather than reporting that you have no backups. There is no restore tool, deliberately.
 
 One call orients an agent on the whole site: versions, theme, active plugins, post types with counts, the comment queue, the permalink structure and what changed recently. It replaces the half-dozen queries an agent otherwise makes at the start of every conversation.
 
@@ -140,7 +140,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * Site administration tools, off by default: plugins, themes, menus, widgets, settings, permalinks and Site Health.
 * Two-step confirmation on destructive operations, wordpress.org-only installs, filtered post and widget markup, and refusal of any operation that would make the site or the endpoint unreachable.
 * Audit log of every tool call, refusals included, with redacted arguments, a tamper-evident hash chain, and automatic pruning.
-* Backup support: start one before a risky change and see when one last completed, with UpdraftPlus and Backuply driven directly and a filter for anything else.
+* Backup support: start one before a risky change, list what exists and see when one last completed, with UpdraftPlus and Backuply driven directly and a filter for anything else. Listings never include archive filenames, because on both plugins the filename or its folder is what keeps the archive from being downloaded.
 * Connection test on the settings screen and in Site Health, which distinguishes an unreachable endpoint from credentials that never arrived.
 * WooCommerce tools on their own switch: products, stock, orders, order notes, customers and sales figures. No refunds.
 * Named keys with their own access level, expiry date and tool list, stored hashed.
