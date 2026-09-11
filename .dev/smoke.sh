@@ -9,6 +9,7 @@ set -u
 #   GMCP_URL=http://localhost:8081 ./smoke.sh
 BASE="${GMCP_URL:-http://localhost:8080}"
 URL="$BASE/wp-json/mcp/v1/http"
+URL_TOKEN_ROUTE="$BASE/wp-json/mcp/v1/testtoken1234567890"
 TOK='testtoken1234567890'
 OUT=$(mktemp -d)
 pass=0; fail=0
@@ -309,6 +310,29 @@ check "tools, prompts and resources are all declared" \
 
 check "reject bad token" "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'Authorization: Bearer nope' -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":8,"method":"tools/list"}')" "401"
 check "reject absent token" "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":9,"method":"tools/list"}')" "401"
+
+# The token-in-URL fallback exists for hosts that strip the Authorization header, and it
+# is registered on every site that has a bearer token whether that site needs it or not.
+# A URL ends up in access logs, browser history and referrer headers in a way a header
+# does not, so a site that connects with the header should be able to decline the route.
+#
+# The fixture is a file copied in rather than a heredoc written inline. The inline
+# version needed a heredoc inside a single-quoted sh -c inside a docker exec, the
+# terminator did not survive that, and the rest of this script was written into the PHP
+# file. Every request for the remainder of the run then returned 500, which reads as the
+# plugin being broken rather than the harness.
+docker compose exec -T cli mkdir -p /var/www/html/wp-content/mu-plugins
+docker cp "$(dirname "$0")/fixtures/gmcp-nourl.php" \
+  "${COMPOSE_PROJECT_NAME:-wptest}-cli-1":/var/www/html/wp-content/mu-plugins/gmcp-nourl.php >/dev/null
+check "control: the filter is actually registered" \
+  "$(docker compose exec -T cli wp eval 'echo has_filter("gmcp_url_token_route") ? "yes" : "no";' 2>/dev/null | tr -d '\r\n')" "yes"
+check "the URL-token route can be declined" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL_TOKEN_ROUTE" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":10,"method":"tools/list"}')" "404"
+check "control: the header route still answers with it off" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":11,"method":"tools/list"}')" "200"
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-nourl.php
+check "and it comes back when the filter goes" \
+  "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL_TOKEN_ROUTE" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":12,"method":"tools/list"}')" "200"
 
 curl -sS "$BASE/wp-json/mcp/v1/.well-known/oauth-protected-resource" -o "$OUT/prm"
 check "OAuth resource metadata" "$(py 'import json,sys;print("ok" if "authorization_servers" in json.load(sys.stdin) else "err")' prm)" "ok"

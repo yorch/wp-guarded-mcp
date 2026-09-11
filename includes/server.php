@@ -146,16 +146,32 @@ class GMCP_Server {
       'show_in_index' => false,
     ] );
 
-    // Alternative endpoint with bearer token embedded in URL path, for clients
-    // that cannot send Authorization headers. Only registered when a bearer
-    // token is configured. The token is high-entropy (wp_generate_password),
-    // compared with hash_equals, and the route is hidden (show_in_index=false).
-    // Kept because Claude Code and other MCP connectors currently work more
-    // reliably this way when proxies strip the Authorization header.
-    // TODO: Re-evaluate after 2026-12-27. Check whether connectors still need
-    // the URL-token fallback, or if header/OAuth auth has become reliable enough
-    // to deprecate it (flagged by WP.org automated security review, Jun 2026).
-    if ( !empty( $this->bearer_token ) ) {
+    // Alternative endpoint with the bearer token embedded in the URL path, for hosts
+    // that strip the Authorization header before PHP sees it. Registered only when a
+    // bearer token is configured. The token is high-entropy (wp_generate_password),
+    // compared with hash_equals, the route is hidden (show_in_index=false), and every
+    // admin-level tool is refused on it. @see tool_requires_header_auth().
+    //
+    // TODO: Re-evaluate after 2026-12-27, flagged by the wordpress.org automated
+    // security review in June 2026. Two things had already changed by September 2026 and
+    // are recorded here so the decision starts from evidence rather than from memory.
+    //
+    // The client half of the original reason has gone. Claude Code takes
+    // `--header "Authorization: Bearer ..."` directly, and the claude.ai connectors
+    // accept a static credential under a standard header name. The open bug reports are
+    // about the OAuth path not sending a token, which this route does not help with.
+    //
+    // The host half is smaller than it was, because authorization_header() now recovers
+    // the header from REDIRECT_HTTP_AUTHORIZATION and apache_request_headers(). On
+    // Apache the header usually arrives and is merely missing from $_SERVER, which was
+    // the common case. What is left is proxies that genuinely drop it.
+    //
+    // So the open question is no longer "do clients need this" but "how many hosts
+    // still do", and the cost is paid by every site with a bearer token whether it needs
+    // the route or not. Hence the filter below: a site can decline it today, and the
+    // default can be flipped once there is a reason to.
+    $offer_url_token = apply_filters( 'gmcp_url_token_route', true );
+    if ( !empty( $this->bearer_token ) && $offer_url_token ) {
       register_rest_route( $this->namespace, '/' . $this->bearer_token, [
         'methods' => [ 'GET', 'POST', 'DELETE' ],
         'callback' => [ $this, 'handle_streamable_http' ],
