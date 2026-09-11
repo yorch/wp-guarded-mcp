@@ -689,10 +689,73 @@ call c_set2 '{"jsonrpc":"2.0","id":146,"method":"tools/call","params":{"name":"w
 check "the rotated-out credential is not in the journal" \
   "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("gmcp_journal",[])),"sk_live_SUPERSECRET123")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
 call c_list '{"jsonrpc":"2.0","id":147,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":1}}}'
-# Silently skipping it would leave someone believing the change is reversible.
-check "and the entry says why it cannot be reverted" \
-  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0].get("not_reversible_because",""))' c_list)" \
+# The secret is gone from the record, which is the assertion above and has not changed.
+# What changed is everything around it: the value used to be dropped whole, so an option
+# that merely CONTAINS a credential-shaped field lost its undo entirely. Now the shape is
+# kept with those leaves blanked, and the entry says the restore will be partial rather
+# than letting someone believe it is complete.
+check "the change is still reversible, minus the credential" \
+  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0].get("reversible"))' c_list)" "True"
+check "and the entry says the restore will be partial" \
+  "$(py 'import json,sys;print("looked like credentials were never recorded" in json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0].get("partial_restore",""))' c_list)" "True"
+C_JID=$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0]["id"])' c_list)
+call c_undo "{\"jsonrpc\":\"2.0\",\"id\":150,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$C_JID\"}}}"
+check "undo puts back the field that was recorded" \
+  "$(docker compose exec -T cli wp eval 'echo get_option("acme_gateway_settings")["mode"];' 2>/dev/null | tr -d '\r\n')" "live"
+# The one thing undo must never do. Writing the marker over a live credential is not a
+# partial restore, it is destroying the secret the blanking existed to protect, which is
+# worse than having had no undo at all.
+check "and leaves the live credential alone rather than writing the marker over it" \
+  "$(docker compose exec -T cli wp eval 'echo get_option("acme_gateway_settings")["secret_key"];' 2>/dev/null | tr -d '\r\n')" "sk_test_rotated"
+# A value this cannot snapshot safely keeps the old all-or-nothing answer. An object is
+# one: restoring it from an array copy would put back a different type than was there.
+docker compose exec -T cli wp eval 'update_option("acme_object_settings", (object) [ "mode" => "live", "secret_key" => "sk_live_OBJECT" ]);' >/dev/null 2>&1
+call c_obj '{"jsonrpc":"2.0","id":151,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"acme_object_settings","value":{"mode":"test"}}}}'
+call c_objlist '{"jsonrpc":"2.0","id":152,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":1}}}'
+check "a value that cannot be snapshotted is still refused outright" \
+  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0].get("not_reversible_because",""))' c_objlist)" \
   "The previous value looked like it held a credential, so it was never stored."
+check "and that secret is not in the journal either" \
+  "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("gmcp_journal",[])),"sk_live_OBJECT")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
+docker compose exec -T cli wp option delete acme_object_settings >/dev/null 2>&1
+
+echo "-- redaction reaches every shape the detector reaches --"
+# The blanking has to be at least as thorough as holds_credential(), or it is a hole
+# rather than a guard. That function unpacks JSON and serialized strings before judging
+# them, so a secret under an innocuous field name arrives as a plain string that a
+# key-name-only redaction would copy out untouched and write to the journal.
+#
+# Each case plants the same token and greps the serialized result for it. The control
+# column is the same grep against the value BEFORE redaction: without it, a case that
+# failed to build its fixture and a case that was redacted correctly read identically.
+redaction_probe() { docker compose exec -T cli wp eval '
+  $S = "PLANTEDSECRET0001";
+  $cases = [
+    "named"      => [ "api_key" => $S, "colour" => "blue" ],
+    "nested"     => [ "cfg" => [ "inner" => [ "secret" => $S ] ] ],
+    "json"       => [ "cfg" => json_encode( [ "api_key" => $S ] ) ],
+    "serialized" => [ "cfg" => serialize( [ "password" => $S ] ) ],
+  ];
+  $leaked = 0; $unplanted = 0;
+  foreach ( $cases as $v ) {
+    if ( strpos( serialize( $v ), $S ) === false ) { $unplanted++; continue; }
+    [ $ok, $clean ] = GMCP_Core::redact_reversible( $v );
+    if ( $ok && strpos( serialize( $clean ), $S ) !== false ) { $leaked++; }
+  }
+  echo $leaked . ":" . $unplanted;' 2>/dev/null | tr -d '\r\n'; }
+check "no planted secret survives redaction, in any shape" "$(redaction_probe)" "0:0"
+# "0:0" is two assertions in one string, and the second half is the control: a case whose
+# fixture never contained the token is counted separately, so a probe that planted nothing
+# reports 0:4 rather than passing as though it had proved something.
+check "an innocent value is kept whole rather than blanked" \
+  "$(docker compose exec -T cli wp eval '
+    [ $ok, $clean ] = GMCP_Core::redact_reversible( [ "width" => 1000, "path" => "M450 75" ] );
+    echo $ok && $clean === [ "width" => 1000, "path" => "M450 75" ] ? "whole" : "altered";' 2>/dev/null | tr -d '\r\n')" "whole"
+check "and the Elementor case keeps everything but the key field" \
+  "$(docker compose exec -T cli wp eval '
+    [ $ok, $clean ] = GMCP_Core::redact_reversible( [ "content" => [ "path" => "M450", "key" => "eicon-star" ] ] );
+    echo $ok && $clean["content"]["path"] === "M450" && $clean["content"]["key"] === GMCP_Core::REDACTION_MARKER
+      ? "path kept, key blanked" : "wrong";' 2>/dev/null | tr -d '\r\n')" "path kept, key blanked"
 # The journal row holds previous values of other options, so it must not be readable.
 call c_read '{"jsonrpc":"2.0","id":148,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"gmcp_journal"}}}'
 check "the journal row cannot be read through the option tools" "$(verdict c_read)" "error"

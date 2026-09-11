@@ -367,6 +367,71 @@ class GMCP_Core {
     return false;
   }
 
+  /** What a blanked leaf reads as. One spelling, because the undo path matches against it. */
+  const REDACTION_MARKER = '[redacted]';
+
+  /**
+  * A copy of a value safe to keep a record of, or a refusal when it cannot be made one.
+  *
+  * The middle ground between holds_credential(), which refuses a whole value if any part
+  * of it looks secret, and redact(), which keeps the shape and blanks the leaves. It
+  * exists because the all-or-nothing answer was costing far more than it protected.
+  *
+  * Elementor stores its SVG icon registry under a "key" field holding a value like
+  * "eicon-star". "key" is one of the credential patterns and the patterns match as
+  * substrings, so the whole option was judged a credential and the change journal dropped
+  * the previous value, which is how an ordinary page build ended up with several changes
+  * marked permanently irreversible. The same substring rule reads "author" as "auth" and
+  * "keywords" and "monkey" as "key", so this was never going to be one plugin's problem.
+  *
+  * Loosening the patterns was the obvious alternative and is the wrong one. Bare "key" is
+  * genuinely how plugins store secrets, and a guard that fails open is the one direction
+  * that cannot be walked back once a credential is on disk in a second place. So the
+  * patterns are left exactly as strict as they were and the leaves they name are blanked
+  * instead. The 98% of an icon registry that is an SVG path comes back; the thing that
+  * looked like a secret does not.
+  *
+  * Two rules keep it honest.
+  *
+  * It must reach every shape holds_credential() reaches, or it is a hole rather than a
+  * guard. That function unpacks JSON and serialized strings before judging them, so a
+  * secret under an innocuous field name arrives as a string that redact() would have
+  * copied out verbatim. Any string leaf that holds_credential() flags is therefore blanked
+  * whole, rather than parsed and rebuilt: re-encoding a decoded blob is a second chance to
+  * get something wrong in the direction that writes the secret down.
+  *
+  * It refuses rather than guesses. An object anywhere in the value ends the attempt,
+  * because restoring one would put an array back where WordPress had an object, and a
+  * restore that changes the type of what it restores is its own defect. Running past the
+  * depth limit refuses for the same reason holds_credential() redacts there.
+  *
+  * @return array{0:bool,1:mixed} [ true, the safe copy ] or [ false, null ].
+  */
+  public static function redact_reversible( $value, int $depth = 0 ): array {
+    if ( $depth > 8 || is_object( $value ) ) {
+      return [ false, null ];
+    }
+    if ( is_string( $value ) ) {
+      return [ true, self::holds_credential( $value ) ? self::REDACTION_MARKER : $value ];
+    }
+    if ( !is_array( $value ) ) {
+      return [ true, $value ];
+    }
+    $out = [];
+    foreach ( $value as $k => $inner ) {
+      if ( is_string( $k ) && self::field_looks_secret( $k ) ) {
+        $out[ $k ] = self::REDACTION_MARKER;
+        continue;
+      }
+      [ $ok, $clean ] = self::redact_reversible( $inner, $depth + 1 );
+      if ( !$ok ) {
+        return [ false, null ];
+      }
+      $out[ $k ] = $clean;
+    }
+    return [ true, $out ];
+  }
+
   /**
   * A copy of a value with anything credential-shaped replaced.
   *
