@@ -231,6 +231,22 @@ matches, and says whether the row was edited or one before it removed. That is t
 difference between a history and an audit. Rows carried over from the option-based
 version have no hash and are reported as uncovered rather than as tampering.
 
+*And it says how much it checked.* Recomputing the whole table means reading every
+recorded argument back out of the database, which on a full one is tens of megabytes, so
+the screen checks the most recent thousand rows and offers a button for the rest. The
+count it reports is the count it read: "intact across all 412 entries" when that is the
+whole table, and "intact across the 1,000 most recent entries, of 8,300" when it is not.
+An earlier version read the oldest rows instead and said only "intact across 1,000
+entries", which was true, read as a verdict on the whole log, and never examined the
+period anyone would most want to check.
+
+Two things the chain cannot do, stated here rather than left to be assumed. It cannot
+notice that the log has been shortened from the front, because the first row the walk
+sees is the only thing that says what preceded it, and a chain with no external anchor has
+nothing to check that claim against. A truncated table verifies clean, and reports itself
+complete, because the total is counted from what survives. And it cannot tell you who
+edited a row, only that somebody did.
+
 The changes column arrived after rows had already been written, which the chain has to
 survive, and the first attempt at that was wrong in an instructive way. Hashing joined the
 columns with a separator, which is safe while the list of columns is fixed: moving content
