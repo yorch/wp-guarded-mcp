@@ -1642,7 +1642,14 @@ echo "-- the audit table repairs itself on upgrade --"
 # WordPress does not run the activation hook when a plugin is updated in place, so the
 # old table meets the new code. While it is broken nothing may be lost quietly, and it
 # has to repair itself on the next load.
-docker compose exec -T cli wp eval 'GMCP_Audit::clear();global $wpdb;$wpdb->query("ALTER TABLE {$wpdb->prefix}gmcp_audit DROP COLUMN changes");update_option("gmcp_audit_db_version","2");' >/dev/null 2>&1
+#
+# The marker is set from the constant rather than to a number. It has to read as current,
+# so install() skips and the table stays broken for the checks below. Written as a literal
+# it stopped meaning "current" the day the schema changed: the plugin saw a stale marker,
+# repaired the table before the first check ran, and three checks then measured a repair
+# that had already happened.
+GMCP_DB_VERSION=$(docker compose exec -T cli wp eval 'echo GMCP_Audit::DB_VERSION;' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();global $wpdb;$wpdb->query("ALTER TABLE {$wpdb->prefix}gmcp_audit DROP COLUMN changes");update_option("gmcp_audit_db_version",GMCP_Audit::DB_VERSION);' >/dev/null 2>&1
 check "the column really is gone" "$(have_changes_column)" "no"
 C_ROWS=$(audit_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit')
 call c_stale '{"jsonrpc":"2.0","id":229,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"limit":1}}}'
@@ -1658,7 +1665,7 @@ docker compose exec -T cli wp option update gmcp_audit_db_version 1 >/dev/null 2
 call c_fixed '{"jsonrpc":"2.0","id":230,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"limit":1}}}'
 check "the table repairs itself on the next load" "$(have_changes_column)" "yes"
 check "the version marker is brought up to date" \
-  "$(docker compose exec -T cli wp option get gmcp_audit_db_version 2>/dev/null | tr -d '\r\n')" "2"
+  "$(docker compose exec -T cli wp option get gmcp_audit_db_version 2>/dev/null | tr -d '\r\n')" "$GMCP_DB_VERSION"
 check "and entries are recorded again" \
   "$(audit_q "SELECT COUNT(*) > $C_ROWS FROM {\$wpdb->prefix}gmcp_audit")" "1"
 
@@ -1753,6 +1760,62 @@ check "a full flush succeeds" "$(verdict fc2)" "ok"
 # leave a caller believing the page is fresh.
 check "and it names the CDN it cannot reach" \
   "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["content"][0]["text"];print("NOT purged" in t and "CDN" in t)' fc2)" "True"
+
+echo "-- the audit log screen --"
+# The Refusals view is the one an operator opens first, and outcome was the one filtered
+# column with no index, on a table allowed to reach 50,000 rows.
+check "outcome is indexed" \
+  "$(docker compose exec -T cli wp db query 'SHOW INDEX FROM wp_gmcp_audit WHERE Key_name="outcome"' --skip-column-names 2>/dev/null | grep -c outcome)" "1"
+
+# Search used to run four unindexed LIKE over TEXT including args, which has a 50MB budget
+# across the table. It now reads target and detail unless the caller asks for more. The
+# shallow miss is the control: without it, a query matching everything would look like a
+# working deep search.
+audit_find() { # audit_find <term> <deep 0|1>
+  docker compose exec -T cli wp eval "
+    \$f = [ 'search' => '$1', 'deep' => $2 ];
+    echo (int) GMCP_Audit::count( \$f );" 2>/dev/null | tr -d '\r\n'
+}
+docker compose exec -T cli wp eval '
+  global $wpdb; $t = $wpdb->prefix . "gmcp_audit";
+  $wpdb->query( "DELETE FROM $t WHERE tool = \"smoke_scope\"" );' >/dev/null 2>&1
+# Seeded through the recorder rather than a hand-built INSERT, so the row has every column
+# the reader has and hashes like a real one.
+docker compose exec -T cli wp eval '
+  $a = new GMCP_Audit();
+  $a->record( [ "tool" => "smoke_scope", "args" => [ "needle" => "smokedeepneedle" ],
+    "status" => "ok", "user_id" => 1, "auth_method" => "bearer" ] );' >/dev/null 2>&1
+check "a term living only in the arguments is not found by default" "$(audit_find smokedeepneedle 0)" "0"
+check "and is found when deep search is asked for" "$(audit_find smokedeepneedle 1)" "1"
+# The pager divides count() by the page size, so a count that ignores a filter the list
+# honours offers pages of a list that does not exist. That happened here once already.
+check "count and query agree under deep search" \
+  "$(docker compose exec -T cli wp eval '
+     $f = [ "search" => "smokedeepneedle", "deep" => 1 ];
+     echo ( (int) GMCP_Audit::count( $f ) === count( GMCP_Audit::query( $f + [ "limit" => 50 ] ) ) ) ? "agree" : "differ";' 2>/dev/null | tr -d '\r\n')" "agree"
+
+# An export that claims to be the filtered view and quietly holds a different set is worse
+# than no export, because the row count looks plausible either way.
+check "export selects exactly what the filters select" \
+  "$(docker compose exec -T cli wp eval '
+     $f = [ "outcome" => "refused" ];
+     echo ( count( GMCP_Audit::export_rows( $f ) ) === (int) GMCP_Audit::count( $f ) ) ? "same" : "differ";' 2>/dev/null | tr -d '\r\n')" "same"
+
+# A spreadsheet runs a cell that opens with =, +, - or @, and this log carries text an
+# anonymous person wrote. Tab and carriage return count too: Excel skips them and reads
+# what follows. A plain number must survive, or a legitimate -1 becomes text.
+csv_cell() {
+  docker compose exec -T cli wp eval "
+    \$m = new ReflectionMethod( 'GMCP_Settings', 'csv_cell' );
+    \$m->setAccessible( true );
+    echo \$m->invoke( null, $1 );" 2>/dev/null | tr -d '\r\n'
+}
+check "a formula cell is made inert" "$(csv_cell "'=1+1'")" "'=1+1"
+check "and so is one behind a tab" "$(csv_cell "\"\\t=1+1\"")" "'	=1+1"
+check "a negative number is left alone" "$(csv_cell "'-1'")" "-1"
+check "and ordinary text is untouched" "$(csv_cell "'wp_create_post'")" "wp_create_post"
+docker compose exec -T cli wp eval '
+  global $wpdb; $wpdb->query( "DELETE FROM {$wpdb->prefix}gmcp_audit WHERE tool = \"smoke_scope\"" );' >/dev/null 2>&1
 
 echo "-- scheduled events --"
 # Site Health flags a cron event that keeps failing and there was no way to look at it,

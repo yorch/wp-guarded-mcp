@@ -51,8 +51,13 @@ class GMCP_Audit {
   * The column is nullable, and rows written before the upgrade keep verifying under the
   * construction that signed them, so an existing log verifies unchanged rather than
   * announcing on day one that every row has been tampered with. @see hash().
+  *
+  * 3 indexed outcome. No column was added and no row was rewritten, so nothing the chain
+  * signs is touched; the bump exists only because the constructor re-runs install() when
+  * the stored version differs, and that is what makes a site already carrying rows build
+  * the index.
   */
-  const DB_VERSION = '2';
+  const DB_VERSION = '3';
   const CRON_HOOK = 'gmcp_audit_prune';
 
   /** The last row written under the old hash construction. @see hash_boundary(). */
@@ -111,7 +116,19 @@ class GMCP_Audit {
     $table = self::table();
     $collate = $wpdb->get_charset_collate();
 
-
+    // outcome is keyed on its own rather than as (outcome, ts), although the list is
+    // always read newest first. InnoDB appends the primary key to every secondary index,
+    // so KEY outcome (outcome) is physically (outcome, id), and the list orders by id
+    // rather than by ts: query() maps "when" to id because ts has second resolution and a
+    // burst of calls sorts arbitrarily within a second. The plain key therefore already
+    // hands the refusals view its ORDER BY id DESC, and a pager reads successive pages
+    // straight off the index. Naming ts would build (outcome, ts, id), which no longer
+    // supplies that ordering and sends the same query to a filesort.
+    //
+    // Two distinct values is poor selectivity, and that is the right trade here: refusals
+    // are a small fraction of the table and are the view an operator opens first, while
+    // for outcome = 'ok' the optimizer ignores the index and walks the primary key, which
+    // is what it should do.
     dbDelta( "CREATE TABLE {$table} (
       id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
       ts datetime NOT NULL,
@@ -131,7 +148,8 @@ class GMCP_Audit {
       PRIMARY KEY  (id),
       KEY ts (ts),
       KEY tool (tool),
-      KEY actor (actor)
+      KEY actor (actor),
+      KEY outcome (outcome)
     ) {$collate};" );
 
     // Which rows predate the canonical hash encoding, noted after the table exists and
@@ -166,11 +184,28 @@ class GMCP_Audit {
   * Identify what a call was aimed at, for the indexed column.
   *
   * Ordered most specific first, so an update naming both an ID and a title records the
-  * ID. post_title is last because it is the only identifier a create has.
+  * ID. post_title is near the end because it is the only identifier a create has, and an
+  * id-shaped argument beside it is always the better answer. Three placements are worth
+  * saying out loud, because the list is otherwise read as arbitrary.
+  *
+  * hook carries wp_run_cron_event and wp_unschedule_cron_event, which have no other
+  * identifying argument at all. A refused cron call used to record no target, so the one
+  * row an operator most wanted to read said only that something was refused.
+  *
+  * to_id and page_id name the post being written TO. wp_copy_post_meta also takes
+  * from_id, and elementor_apply_template also takes template_id; neither is listed,
+  * because each is required alongside its partner and so could never be reached, and
+  * because the source of a copy is not what the call changed. Both still appear in the
+  * arguments, which the deep search reads.
+  *
+  * scope is last because it names a mode rather than a thing. It is reached only for a
+  * wp_flush_cache that named no post, where "object" or "transients" is the whole of what
+  * the call was aimed at; anything more specific outranks it.
   */
   private function target( array $args ): string {
-    foreach ( [ 'plugin', 'stylesheet', 'ID', 'post_id', 'item_id', 'widget_id', 'menu',
-      'key', 'sidebar', 'user_id', 'comment_ID', 'term_id', 'id', 'slug', 'name', 'post_title' ] as $key ) {
+    foreach ( [ 'plugin', 'stylesheet', 'hook', 'ID', 'post_id', 'item_id', 'widget_id',
+      'menu', 'key', 'sidebar', 'user_id', 'comment_ID', 'term_id', 'to_id', 'page_id',
+      'id', 'slug', 'name', 'post_title', 'scope' ] as $key ) {
       if ( isset( $args[ $key ] ) && is_scalar( $args[ $key ] ) ) {
         $value = (string) $args[ $key ];
         if ( $value !== '' ) {
@@ -414,19 +449,36 @@ class GMCP_Audit {
       $params[] = (string) $filters['until'];
     }
     if ( !empty( $filters['search'] ) ) {
-      // Changes are searched too, which is how "what touched post 12" gets an answer: a
-      // bulk call records one target and a dozen changed objects, and the target column
-      // only ever names the first.
-      $where[] = '(target LIKE %s OR detail LIKE %s OR args LIKE %s OR changes LIKE %s)';
+      // A leading-wildcard LIKE cannot use an index, so every column named here is read
+      // in full for every row considered. target and detail are bounded at 191 and 1000
+      // bytes; args and changes are longtext, 64000 and 16000 bytes to a row against a
+      // 50MB budget across the table. Searching all four therefore costs two orders of
+      // magnitude more than searching the two small ones, on a screen where most searches
+      // are looking for a post id or a phrase from a refusal.
+      //
+      // So the default is the two small columns, and deep puts the other two back rather
+      // than removing the capability. Searching changes is how "what touched post 12"
+      // gets an answer: a bulk call records one target and a dozen changed objects, and
+      // the target column only ever names the first. That question still has an answer.
+      // It now has to be asked for, and the screen has to offer the asking.
+      $columns = [ 'target', 'detail' ];
+      if ( !empty( $filters['deep'] ) ) {
+        array_push( $columns, 'args', 'changes' );
+      }
       $like = '%' . $wpdb->esc_like( (string) $filters['search'] ) . '%';
-      array_push( $params, $like, $like, $like, $like );
+      $clauses = [];
+      foreach ( $columns as $column ) {
+        $clauses[] = "{$column} LIKE %s";
+        $params[] = $like;
+      }
+      $where[] = '(' . implode( ' OR ', $clauses ) . ')';
     }
 
     return [ implode( ' AND ', $where ), $params ];
   }
 
   /**
-  * @param array $filters tool, actor, outcome, since, until, search, limit, offset
+  * @param array $filters tool, actor, outcome, since, until, search, deep, limit, offset
   */
   public static function query( array $filters = [] ): array {
     global $wpdb;
@@ -450,6 +502,88 @@ class GMCP_Audit {
     array_push( $params, $limit, $offset );
 
     return $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A ) ?: [];
+  }
+
+  /**
+  * How much of an export may be held in memory at once, as payload bytes.
+  *
+  * Not a row count, because rows are not a fixed size. This is the number that decides
+  * how many of them actually come back. @see export_rows().
+  */
+  const EXPORT_MAX_BYTES = 20000000;
+
+  /** Rows per query while exporting, so one result set cannot be the thing that breaks. */
+  const EXPORT_CHUNK = 500;
+
+  /**
+  * The rows the current filters select, newest first, for a file the reader keeps.
+  *
+  * It builds its WHERE with where(), the same one the list and the count use, so an
+  * export cannot select a different set from the screen that offered it. A second filter
+  * builder would drift, and the first time it did, the export would quietly disagree with
+  * the page it claims to be a copy of while looking exactly as authoritative.
+  *
+  * IT CAN RETURN FEWER ROWS THAN MATCH, AND THE CALLER MUST SAY SO. $limit is a row
+  * ceiling, and rows have no fixed size: args alone is capped at MAX_ARGS bytes each, so
+  * the default 50,000 rows is up to three gigabytes and no PHP process will hold it.
+  * Pretending otherwise would mean an export that dies half-written, which on this screen
+  * is worse than a short one. So the walk also stops at EXPORT_MAX_BYTES of payload.
+  *
+  * Because rows come newest first, stopping always cuts the oldest end: what comes back
+  * is the newest N that fit, never a hole in the middle. Compare the returned count
+  * against count( $filters ) to find out whether it happened, and tell the reader when it
+  * did. A truncated export that looks complete is the failure worth avoiding here.
+  *
+  * The real ceiling depends on what was logged. At the byte budget above, an ordinary log
+  * of a few hundred bytes a row exports the whole 50,000; a log full of maximal argument
+  * blobs stops after roughly three hundred rows. Both are honest, and only the second
+  * needs saying to the reader.
+  *
+  * The budget is set where it is because the payload is not what the export costs. Twenty
+  * megabytes of columns measured a hundred and five megabytes of PHP, once the rows are
+  * arrays of strings, which is most of the forty the front end is given and a good share
+  * of the two hundred and fifty-six an administration screen raises itself to. Whatever
+  * writes the file should write it a row at a time rather than build one string from all
+  * of them, or it doubles that again for nothing.
+  *
+  * @param array $filters the same shape query() takes; limit, offset and orderby are
+  *   ignored, since an export is always the whole match, newest first
+  * @return array<int,array<string,mixed>> whole rows, detail, args, changes, prev_hash
+  *   and hash included
+  */
+  public static function export_rows( array $filters, int $limit = 50000 ): array {
+    global $wpdb;
+    [ $where, $params ] = self::where( $filters );
+    $limit = max( 1, min( self::MAX_ROWS, $limit ) );
+
+    // Walked by id rather than by OFFSET: an offset makes the database count past every
+    // row it already returned, so the last page of a large export costs the most.
+    $sql = 'SELECT * FROM ' . self::table() . ' WHERE ' . $where
+      . ' AND id < %d ORDER BY id DESC LIMIT %d';
+
+    $rows = [];
+    $bytes = 0;
+    $before = PHP_INT_MAX;
+
+    while ( count( $rows ) < $limit ) {
+      $chunk = $wpdb->get_results( $wpdb->prepare( $sql, array_merge(
+        $params, [ $before, min( self::EXPORT_CHUNK, $limit - count( $rows ) ) ]
+      ) ), ARRAY_A );
+      if ( !$chunk ) {
+        break;
+      }
+      foreach ( $chunk as $row ) {
+        $before = (int) $row['id'];
+        $rows[] = $row;
+        $bytes += strlen( (string) $row['args'] ) + strlen( (string) $row['changes'] )
+          + strlen( (string) $row['detail'] );
+        if ( $bytes >= self::EXPORT_MAX_BYTES ) {
+          return $rows;
+        }
+      }
+    }
+
+    return $rows;
   }
 
   /** How many rows match, so a pager can divide by a page size and be right. */

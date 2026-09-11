@@ -153,6 +153,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * Copy post meta between posts, duplicate a post, and write an oversized value across several calls, so a large or heavily escaped design never has to pass through a tool argument. A duplicate is a draft unless you ask otherwise.
 * Delete an option, not only set one, so a stale cache that only clears by removing the row can be cleared. Nine options are refused, each with what breaks if it goes. The reply carries the removed value, because undo cannot put it back.
 * Flush the object cache, expired transients or one post, and say plainly which CDN or reverse proxy it could not reach and you still have to purge yourself.
+* The audit log screen folds repeated identical calls into one counted row, says on the row why a call was refused, names the way a caller got in beside the client, searches the small columns by default with a checkbox for the rest, and exports the filtered view as CSV or JSON.
 * Elementor tools on their own switch: theme-builder conditions written to both the template and Elementor's cached registry, regenerate CSS, and apply a library template to a page without the design passing through a tool argument.
 
 == Upgrade Notice ==
