@@ -1145,6 +1145,12 @@ check "a new row lands above the boundary" \
   "$(audit_q 'SELECT COUNT(*) > 3 FROM {$wpdb->prefix}gmcp_audit')" "1"
 check "and old and new constructions verify in one chain" \
   "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify();echo $v["ok"]?"intact":"BROKEN at ".$v["broken_at"];' 2>/dev/null | tr -d '\r\n')" "intact"
+# The same chain under a full walk, since the windowed default and the whole-table scope
+# start in different places and only the second one begins below the boundary mark.
+check "and under a full walk, which reports its own coverage" \
+  "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify("all");echo $v["ok"] && $v["complete"] ? "intact and complete" : "BROKEN";' 2>/dev/null | tr -d '\r\n')" "intact and complete"
+check "and the walk really crossed the mark, so that verdict covers both constructions" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$b=(int)get_option("gmcp_audit_hash_boundary");$t=$wpdb->prefix."gmcp_audit";echo ((int)$wpdb->get_var("SELECT COUNT(*) FROM $t WHERE id <= $b") > 0 && (int)$wpdb->get_var("SELECT COUNT(*) FROM $t WHERE id > $b") > 0) ? "both sides" : "ONE SIDE ONLY";' 2>/dev/null | tr -d '\r\n')" "both sides"
 # Clearing resets the boundary, or the ids TRUNCATE hands back would be checked the old
 # way and every new row would read as tampered with.
 docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
