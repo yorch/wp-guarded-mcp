@@ -143,8 +143,23 @@ class GMCP_Journal {
       'tool' => (string) ( $change['tool'] ?? '' ),
     ];
     if ( GMCP_Core::holds_credential( $old ) ) {
-      $entry['previous'] = null;
-      $entry['redacted'] = true;
+      // Keep the shape with the secret-looking leaves blanked, rather than dropping the
+      // value whole. Dropping was costing every option that merely contains a field named
+      // key, author or password-something its undo, which on an Elementor build is most of
+      // them, and buying nothing the blanking does not also buy.
+      //
+      // redact_reversible() refuses some values outright, an object or anything nested
+      // past its limit, and those keep the old behaviour. A refusal here is the safe
+      // answer and stays one.
+      [ $can_snapshot, $clean ] = GMCP_Core::redact_reversible( $old );
+      if ( $can_snapshot ) {
+        $entry['previous'] = $this->storable( $clean );
+        $entry['partly_redacted'] = true;
+      }
+      else {
+        $entry['previous'] = null;
+        $entry['redacted'] = true;
+      }
     }
     else {
       $entry['previous'] = $this->storable( $old );
@@ -181,6 +196,46 @@ class GMCP_Journal {
       $entry['note'] = 'Part of the previous version was too large to keep, so reverting will restore only what fits.';
     }
     $this->record( $entry );
+  }
+
+  /**
+  * A snapshot made writable again, by putting the live value back under every leaf that
+  * was blanked when the snapshot was taken.
+  *
+  * The one thing an undo must never do is write the redaction marker into a live option.
+  * That is not a partial restore, it is destroying the credential the blanking existed to
+  * protect, which is worse than having no undo at all.
+  *
+  * So a blanked leaf takes whatever is there now, and when nothing is there now the key is
+  * dropped rather than written empty. Everything else comes from the snapshot, including
+  * keys the current value has since gained: the snapshot is a faithful copy of what the
+  * option was, and restoring it means those go, exactly as they would for an option that
+  * was never redacted at all.
+  *
+  * @param mixed $snapshot The recorded value, with markers where leaves were blanked.
+  * @param mixed $current  What the option holds now.
+  * @param int   $kept     Out: how many leaves were left at their current value.
+  */
+  private static function refill( $snapshot, $current, int &$kept ) {
+    if ( $snapshot === GMCP_Core::REDACTION_MARKER ) {
+      $kept++;
+      return $current;
+    }
+    if ( !is_array( $snapshot ) ) {
+      return $snapshot;
+    }
+    $out = [];
+    foreach ( $snapshot as $k => $inner ) {
+      $has_current = is_array( $current ) && array_key_exists( $k, $current );
+      if ( $inner === GMCP_Core::REDACTION_MARKER && !$has_current ) {
+        // Nothing to put back and nothing safe to write. Leaving the key out restores the
+        // option as closely as it can be restored, and writing the marker would not.
+        $kept++;
+        continue;
+      }
+      $out[ $k ] = self::refill( $inner, $has_current ? $current[ $k ] : null, $kept );
+    }
+    return $out;
   }
 
   /** Big previous values are described rather than copied, so the option stays small. */
@@ -247,6 +302,13 @@ class GMCP_Journal {
       $why = self::reversible( $entry );
       if ( $why !== true ) {
         $row['not_reversible_because'] = $why;
+      }
+      // Said out loud rather than left to be discovered. "Reversible" on its own would
+      // promise a restore this entry cannot give, and a caller deciding whether to undo
+      // needs to know the credential-shaped fields will stay as they are.
+      elseif ( !empty( $entry['partly_redacted'] ) ) {
+        $row['partial_restore'] = 'Fields that looked like credentials were never recorded. '
+          . 'Everything else goes back; those are left exactly as they are now.';
       }
       $out[] = $row;
     }
@@ -384,10 +446,23 @@ class GMCP_Journal {
         // to it. Running the value checks over a deletion would refuse it for failing
         // to be a valid value, which is true and beside the point.
         $absent = !empty( $entry['absent'] );
+
+        // What will actually be written, worked out before the policy is asked about it.
+        // A partly redacted snapshot is not the value that goes to disk: the blanked
+        // leaves take whatever the option holds now, because writing the marker over a
+        // live credential would destroy the thing the blanking protected. Asking the
+        // policy about the snapshot instead would be asking about a value that is never
+        // written.
+        $kept = 0;
+        $restore = $entry['previous'] ?? null;
+        if ( !$absent && !empty( $entry['partly_redacted'] ) ) {
+          $restore = self::refill( $restore, get_option( (string) $entry['key'] ), $kept );
+        }
+
         $refusals = GMCP_Core::unwritable_options();
         $policy = $absent
           ? ( $refusals[ strtolower( (string) $entry['key'] ) ] ?? true )
-          : GMCP_Core::option_write_policy( (string) $entry['key'], $entry['previous'] ?? null );
+          : GMCP_Core::option_write_policy( (string) $entry['key'], $restore );
         if ( $policy !== true ) {
           return [ 'ok' => false, 'message' => 'That change cannot be reverted. ' . $policy ];
         }
@@ -396,8 +471,13 @@ class GMCP_Journal {
           $done = "Option \"{$entry['key']}\" removed, which is what it was before.";
         }
         else {
-          update_option( $entry['key'], $entry['previous'] );
+          update_option( $entry['key'], $restore );
           $done = "Option \"{$entry['key']}\" restored to its previous value.";
+          if ( $kept > 0 ) {
+            $done .= ' ' . $kept . ' field' . ( $kept === 1 ? '' : 's' )
+              . ' looked like a credential and was never recorded, so '
+              . ( $kept === 1 ? 'it was' : 'they were' ) . ' left exactly as found rather than overwritten.';
+          }
         }
       }
       else {

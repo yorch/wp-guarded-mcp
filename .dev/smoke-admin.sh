@@ -689,10 +689,73 @@ call c_set2 '{"jsonrpc":"2.0","id":146,"method":"tools/call","params":{"name":"w
 check "the rotated-out credential is not in the journal" \
   "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("gmcp_journal",[])),"sk_live_SUPERSECRET123")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
 call c_list '{"jsonrpc":"2.0","id":147,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":1}}}'
-# Silently skipping it would leave someone believing the change is reversible.
-check "and the entry says why it cannot be reverted" \
-  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0].get("not_reversible_because",""))' c_list)" \
+# The secret is gone from the record, which is the assertion above and has not changed.
+# What changed is everything around it: the value used to be dropped whole, so an option
+# that merely CONTAINS a credential-shaped field lost its undo entirely. Now the shape is
+# kept with those leaves blanked, and the entry says the restore will be partial rather
+# than letting someone believe it is complete.
+check "the change is still reversible, minus the credential" \
+  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0].get("reversible"))' c_list)" "True"
+check "and the entry says the restore will be partial" \
+  "$(py 'import json,sys;print("looked like credentials were never recorded" in json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0].get("partial_restore",""))' c_list)" "True"
+C_JID=$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0]["id"])' c_list)
+call c_undo "{\"jsonrpc\":\"2.0\",\"id\":150,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$C_JID\"}}}"
+check "undo puts back the field that was recorded" \
+  "$(docker compose exec -T cli wp eval 'echo get_option("acme_gateway_settings")["mode"];' 2>/dev/null | tr -d '\r\n')" "live"
+# The one thing undo must never do. Writing the marker over a live credential is not a
+# partial restore, it is destroying the secret the blanking existed to protect, which is
+# worse than having had no undo at all.
+check "and leaves the live credential alone rather than writing the marker over it" \
+  "$(docker compose exec -T cli wp eval 'echo get_option("acme_gateway_settings")["secret_key"];' 2>/dev/null | tr -d '\r\n')" "sk_test_rotated"
+# A value this cannot snapshot safely keeps the old all-or-nothing answer. An object is
+# one: restoring it from an array copy would put back a different type than was there.
+docker compose exec -T cli wp eval 'update_option("acme_object_settings", (object) [ "mode" => "live", "secret_key" => "sk_live_OBJECT" ]);' >/dev/null 2>&1
+call c_obj '{"jsonrpc":"2.0","id":151,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"acme_object_settings","value":{"mode":"test"}}}}'
+call c_objlist '{"jsonrpc":"2.0","id":152,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":1}}}'
+check "a value that cannot be snapshotted is still refused outright" \
+  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0].get("not_reversible_because",""))' c_objlist)" \
   "The previous value looked like it held a credential, so it was never stored."
+check "and that secret is not in the journal either" \
+  "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("gmcp_journal",[])),"sk_live_OBJECT")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
+docker compose exec -T cli wp option delete acme_object_settings >/dev/null 2>&1
+
+echo "-- redaction reaches every shape the detector reaches --"
+# The blanking has to be at least as thorough as holds_credential(), or it is a hole
+# rather than a guard. That function unpacks JSON and serialized strings before judging
+# them, so a secret under an innocuous field name arrives as a plain string that a
+# key-name-only redaction would copy out untouched and write to the journal.
+#
+# Each case plants the same token and greps the serialized result for it. The control
+# column is the same grep against the value BEFORE redaction: without it, a case that
+# failed to build its fixture and a case that was redacted correctly read identically.
+redaction_probe() { docker compose exec -T cli wp eval '
+  $S = "PLANTEDSECRET0001";
+  $cases = [
+    "named"      => [ "api_key" => $S, "colour" => "blue" ],
+    "nested"     => [ "cfg" => [ "inner" => [ "secret" => $S ] ] ],
+    "json"       => [ "cfg" => json_encode( [ "api_key" => $S ] ) ],
+    "serialized" => [ "cfg" => serialize( [ "password" => $S ] ) ],
+  ];
+  $leaked = 0; $unplanted = 0;
+  foreach ( $cases as $v ) {
+    if ( strpos( serialize( $v ), $S ) === false ) { $unplanted++; continue; }
+    [ $ok, $clean ] = GMCP_Core::redact_reversible( $v );
+    if ( $ok && strpos( serialize( $clean ), $S ) !== false ) { $leaked++; }
+  }
+  echo $leaked . ":" . $unplanted;' 2>/dev/null | tr -d '\r\n'; }
+check "no planted secret survives redaction, in any shape" "$(redaction_probe)" "0:0"
+# "0:0" is two assertions in one string, and the second half is the control: a case whose
+# fixture never contained the token is counted separately, so a probe that planted nothing
+# reports 0:4 rather than passing as though it had proved something.
+check "an innocent value is kept whole rather than blanked" \
+  "$(docker compose exec -T cli wp eval '
+    [ $ok, $clean ] = GMCP_Core::redact_reversible( [ "width" => 1000, "path" => "M450 75" ] );
+    echo $ok && $clean === [ "width" => 1000, "path" => "M450 75" ] ? "whole" : "altered";' 2>/dev/null | tr -d '\r\n')" "whole"
+check "and the Elementor case keeps everything but the key field" \
+  "$(docker compose exec -T cli wp eval '
+    [ $ok, $clean ] = GMCP_Core::redact_reversible( [ "content" => [ "path" => "M450", "key" => "eicon-star" ] ] );
+    echo $ok && $clean["content"]["path"] === "M450" && $clean["content"]["key"] === GMCP_Core::REDACTION_MARKER
+      ? "path kept, key blanked" : "wrong";' 2>/dev/null | tr -d '\r\n')" "path kept, key blanked"
 # The journal row holds previous values of other options, so it must not be readable.
 call c_read '{"jsonrpc":"2.0","id":148,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"gmcp_journal"}}}'
 check "the journal row cannot be read through the option tools" "$(verdict c_read)" "error"
@@ -1853,6 +1916,68 @@ check "a negative number is left alone" "$(csv_cell "'-1'")" "-1"
 check "and ordinary text is untouched" "$(csv_cell "'wp_create_post'")" "wp_create_post"
 docker compose exec -T cli wp eval '
   global $wpdb; $wpdb->query( "DELETE FROM {$wpdb->prefix}gmcp_audit WHERE tool = \"smoke_scope\"" );' >/dev/null 2>&1
+
+echo "-- editing a menu item --"
+# wp_update_nav_menu_item() blanks every field you do not name, and treats position 0 as
+# "append", while the first item of any menu is genuinely stored at 0. So a naive rename
+# clears the URL and moves the top item to the bottom, with nothing erroring. Both are
+# asserted on the STORED row: wp_get_nav_menu_items() renumbers menu_order on the objects
+# it returns, so a comparison built on it compares two renumbered views and sees nothing.
+MENU_ID=$(docker compose exec -T cli wp eval '
+  $m = wp_create_nav_menu( "Smoke Menu " . wp_rand( 1000, 9999 ) );
+  $a = wp_update_nav_menu_item( $m, 0, [ "menu-item-title" => "First", "menu-item-url" => "https://example.test/one",
+    "menu-item-type" => "custom", "menu-item-status" => "publish" ] );
+  $b = wp_update_nav_menu_item( $m, 0, [ "menu-item-title" => "Second", "menu-item-url" => "https://example.test/two",
+    "menu-item-type" => "custom", "menu-item-status" => "publish" ] );
+  echo $m . "|" . $a . "|" . $b;' 2>/dev/null | tr -d '\r\n')
+M_ID=$(echo "$MENU_ID" | cut -d'|' -f1); ITEM_A=$(echo "$MENU_ID" | cut -d'|' -f2); ITEM_B=$(echo "$MENU_ID" | cut -d'|' -f3)
+ORDER_BEFORE=$(docker compose exec -T cli wp post get "$ITEM_A" --field=menu_order 2>/dev/null | tr -d '\r\n')
+call mi_rename "{\"jsonrpc\":\"2.0\",\"id\":240,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_menu_item\",\"arguments\":{\"item_id\":$ITEM_A,\"title\":\"First Renamed\"}}}"
+check "a menu item can be renamed" "$(verdict mi_rename)" "ok"
+check "and the rename leaves its URL alone" \
+  "$(docker compose exec -T cli wp eval "echo get_post_meta($ITEM_A,'_menu_item_url',true);" 2>/dev/null | tr -d '\r\n')" "https://example.test/one"
+# The one that catches the position-0 append. Renaming the FIRST item is the case that
+# breaks, because its stored menu_order is 0 and core reads that as "not specified".
+check "and does not move it to the end of the menu" \
+  "$(docker compose exec -T cli wp post get "$ITEM_A" --field=menu_order 2>/dev/null | tr -d '\r\n')" "$ORDER_BEFORE"
+# A repair after the write would leave the audit log describing a change that did not
+# happen, because menu_order is one of the post fields the change layer watches.
+check "and the log does not record a move that never happened" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$c=(string)$wpdb->get_var("SELECT changes FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_update_menu_item\" ORDER BY id DESC LIMIT 1");echo strpos($c,"menu_order")===false?"clean":"RECORDED A MOVE";' 2>/dev/null | tr -d '\r\n')" "clean"
+call mi_self "{\"jsonrpc\":\"2.0\",\"id\":241,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_menu_item\",\"arguments\":{\"item_id\":$ITEM_A,\"parent_id\":$ITEM_A}}}"
+check "an item cannot be its own parent" "$(verdict mi_self)" "error"
+
+echo "-- menu slugs and the audit --"
+# WordPress appends a numbered suffix when a derived slug is taken, and the slug is what an
+# Elementor Nav Menu widget stores. Creating "main-menu-2" silently leaves that widget
+# pointing at the other menu, rendering an empty nav with no error anywhere.
+docker compose exec -T cli wp eval 'if ( ! get_term_by( "slug", "smoke-taken", "nav_menu" ) ) { wp_insert_term( "Smoke Taken", "nav_menu", [ "slug" => "smoke-taken" ] ); }' >/dev/null 2>&1
+call ms_dup '{"jsonrpc":"2.0","id":242,"method":"tools/call","params":{"name":"wp_create_menu","arguments":{"name":"Another","slug":"smoke-taken"}}}'
+check "a taken menu slug is refused rather than suffixed" "$(verdict ms_dup)" "error"
+check "and no second menu was created under a suffix" \
+  "$(docker compose exec -T cli wp eval 'echo get_term_by("slug","smoke-taken-2","nav_menu") ? "SUFFIXED" : "none";' 2>/dev/null | tr -d '\r\n')" "none"
+call mh_report '{"jsonrpc":"2.0","id":243,"method":"tools/call","params":{"name":"wp_menu_health","arguments":{}}}'
+check "the menu health report runs" "$(verdict mh_report)" "ok"
+# It reads Elementor data, and Elementor may not be installed. That must be a sentence,
+# never an error: the report is worth most on a site where something is already wrong.
+check "and it reports rather than failing when Elementor is absent" \
+  "$(py 'import json,sys;print("ok" if not json.load(sys.stdin)["result"].get("isError") else "err")' mh_report)" "ok"
+
+echo "-- purging one URL --"
+call pu_foreign '{"jsonrpc":"2.0","id":244,"method":"tools/call","params":{"name":"wp_purge_url","arguments":{"urls":["https://evil.example/x"]}}}'
+check "a URL on another site is refused" "$(verdict pu_foreign)" "error"
+# A host that merely STARTS with this site's host is the case a prefix comparison passes.
+call pu_prefix '{"jsonrpc":"2.0","id":245,"method":"tools/call","params":{"name":"wp_purge_url","arguments":{"urls":["http://localhost:8101.evil.example/x"]}}}'
+check "and so is a host that merely starts with ours" "$(verdict pu_prefix)" "error"
+# Every per-URL purge below turns the URL into a filesystem path and globs it.
+call pu_trav '{"jsonrpc":"2.0","id":246,"method":"tools/call","params":{"name":"wp_purge_url","arguments":{"urls":["/../../etc/passwd"]}}}'
+check "and a path stepping outside the site is refused" "$(verdict pu_trav)" "error"
+call pu_ok '{"jsonrpc":"2.0","id":247,"method":"tools/call","params":{"name":"wp_purge_url","arguments":{"urls":["/hello-world/"]}}}'
+check "a URL on this site is accepted" "$(verdict pu_ok)" "ok"
+# With no page cache installed the honest answer is that nothing was purged. Reporting
+# success here is how a caller comes to believe a stale page is fresh.
+check "and says plainly that nothing was purged" \
+  "$(refusal pu_ok | grep -ci 'nothing was purged')" "1"
 
 echo "-- scheduled events --"
 # Site Health flags a cron event that keeps failing and there was no way to look at it,

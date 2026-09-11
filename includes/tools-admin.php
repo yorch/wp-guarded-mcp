@@ -552,11 +552,12 @@ class GMCP_Tools_Admin {
       ],
       'wp_create_menu' => [
         'name' => 'wp_create_menu',
-        'description' => 'Create an empty navigation menu. Optionally assign it to one or more theme locations at the same time.',
+        'description' => 'Create an empty navigation menu. Optionally assign it to one or more theme locations at the same time. Takes an optional slug, which is what anything outside WordPress stores to name the menu, an Elementor Nav Menu widget among them; WordPress derives one from the name when it is omitted. A slug already in use is refused rather than accepted with a numbered suffix, because a consumer built against "main-menu" finds nothing when the menu is created as "main-menu-2".',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
             'name' => [ 'type' => 'string' ],
+            'slug' => [ 'type' => 'string', 'description' => 'Menu slug. Derived from the name when omitted; refused when another menu already holds it.' ],
             'locations' => [ 'type' => 'array', 'items' => [ 'type' => 'string' ], 'description' => 'Theme location slugs from wp_list_menus.' ],
           ],
           'required' => [ 'name' ],
@@ -595,6 +596,23 @@ class GMCP_Tools_Admin {
         ],
         'accessLevel' => 'admin',
       ],
+      'wp_update_menu_item' => [
+        'name' => 'wp_update_menu_item',
+        'description' => 'Change one menu item in place: its title, its URL, which item it sits under, its position, or whether it opens in a new tab. Only the fields passed change. Everything else is read and written back as it was, because WordPress\'s own updater blanks every field an update omits, which leaves the item sitting in the menu with no link and no error. Refuses to move an item under itself, under one of its own descendants, or under an item in another menu: each of those breaks the menu silently. A post_type or taxonomy item takes its link from the thing it points at, so setting url on one is refused rather than stored and ignored. position is the stored order counting from 0, the same number wp_get_menu_items reports.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'item_id' => [ 'type' => 'integer', 'description' => 'Menu item id, from wp_get_menu_items.' ],
+            'title' => [ 'type' => 'string' ],
+            'url' => [ 'type' => 'string', 'description' => 'Custom items only.' ],
+            'parent_id' => [ 'type' => 'integer', 'description' => 'Menu item id to nest under, in the same menu. 0 moves it back to the top level.' ],
+            'position' => [ 'type' => 'integer', 'description' => 'Stored order within the menu, counting from 0.' ],
+            'target' => [ 'type' => 'string', 'description' => '_blank to open in a new tab, empty string for the same tab. WordPress stores nothing else.' ],
+          ],
+          'required' => [ 'item_id' ],
+        ],
+        'accessLevel' => 'admin',
+      ],
       'wp_delete_menu_item' => [
         'name' => 'wp_delete_menu_item',
         'description' => 'Remove one item from a menu. Its children are moved up to the item\'s own parent rather than being orphaned.',
@@ -616,6 +634,12 @@ class GMCP_Tools_Admin {
           ],
           'required' => [ 'location' ],
         ],
+        'accessLevel' => 'admin',
+      ],
+      'wp_menu_health' => [
+        'name' => 'wp_menu_health',
+        'description' => 'Read-only report on this site\'s navigation: every menu with its slug, id and item count, which theme locations have a menu and which are empty, items pointing at something missing, draft, private, trashed or password protected, items orphaned by a deleted parent, and every Elementor document whose stored layout names a menu slug, saying whether that slug exists. That last one is what this is for: an Elementor Nav Menu widget stores the menu it renders by slug, so a menu that was renamed, rebuilt, or created with a numbered slug leaves the widget rendering an empty nav, with nothing said about it on the front end or in wp-admin. Changes nothing. Menus referenced by id rather than by slug, as the classic WordPress menu widget stores them, are not inspected, and a site without Elementor reports none rather than failing.',
+        'inputSchema' => [ 'type' => 'object', 'properties' => [] ],
         'accessLevel' => 'admin',
       ],
 
@@ -819,11 +843,17 @@ class GMCP_Tools_Admin {
       case 'wp_add_menu_item':
         return $this->add_menu_item( $r, $a );
 
+      case 'wp_update_menu_item':
+        return $this->update_menu_item( $r, $a );
+
       case 'wp_delete_menu_item':
         return $this->delete_menu_item( $r, $a );
 
       case 'wp_assign_menu_location':
         return $this->assign_menu_location( $r, $a );
+
+      case 'wp_menu_health':
+        return $this->audit_menus( $r );
 
       case 'wp_list_sidebars':
         return $this->list_sidebars( $r );
@@ -857,7 +887,7 @@ class GMCP_Tools_Admin {
   */
   private const READ_ONLY_TOOLS = [
     'wp_list_themes', 'wp_get_settings', 'wp_get_permalink_structure', 'wp_get_site_health',
-    'wp_list_menus', 'wp_get_menu_items', 'wp_list_sidebars', 'wp_site_briefing',
+    'wp_list_menus', 'wp_get_menu_items', 'wp_menu_health', 'wp_list_sidebars', 'wp_site_briefing',
     'wp_get_audit_log', 'wp_backup_status', 'wp_list_backups', 'wp_list_cron_events',
   ];
 
@@ -2143,7 +2173,7 @@ class GMCP_Tools_Admin {
         'object_id' => (int) $item->object_id,
         'url' => $item->url,
         'parent_id' => (int) $item->menu_item_parent,
-        'position' => (int) $item->menu_order,
+        'position' => (int) get_post_field( 'menu_order', $item->ID ),
       ];
     }
     return $this->json( $r, [ 'menu' => $menu->name, 'menu_id' => (int) $menu->term_id, 'items' => $out ] );
@@ -2161,7 +2191,44 @@ class GMCP_Tools_Admin {
     if ( wp_get_nav_menu_object( $name ) ) {
       return $this->error( $r, "A menu called \"{$name}\" already exists." );
     }
-    $menu_id = wp_create_nav_menu( $name );
+
+    /*
+    * The slug is the menu's external name. An Elementor Nav Menu widget stores it, and so
+    * does anything else that names a menu from outside WordPress, while the id and the
+    * display name are private to the site.
+    *
+    * wp_create_nav_menu() derives it from the name and passes slug => null, and
+    * wp_unique_term_slug() then appends a numbered suffix when the derived slug is taken.
+    * That is the silent half of the problem this exists for: a caller that asked for
+    * "main-menu" gets "main-menu-2", every reference built against "main-menu" resolves to
+    * nothing, and the site renders an empty nav with no error. So a taken slug is refused,
+    * with what holds it, rather than quietly renamed.
+    */
+    $slug = isset( $a['slug'] ) ? sanitize_title( (string) $a['slug'] ) : '';
+    if ( isset( $a['slug'] ) && $slug === '' ) {
+      return $this->error( $r, 'The slug given is empty once WordPress has sanitised it. A slug is lowercase letters, numbers and hyphens. Omit slug to have one derived from the name.' );
+    }
+    if ( $slug !== '' ) {
+      $holder = get_term_by( 'slug', $slug, 'nav_menu' );
+      if ( $holder ) {
+        return $this->error( $r, "The slug \"{$slug}\" already belongs to the menu \"{$holder->name}\" (id {$holder->term_id}). WordPress would create this one as \"{$slug}-2\" and anything referencing \"{$slug}\" by name, an Elementor Nav Menu widget among them, would keep pointing at the other menu. Choose another slug, or rename that menu first." );
+      }
+    }
+
+    if ( $slug === '' ) {
+      $menu_id = wp_create_nav_menu( $name );
+    }
+    else {
+      // What wp_create_nav_menu() does, with the slug it will not pass on. The action is
+      // fired here rather than left out because that is the hook a cache or an index
+      // listens to, and a menu created through this tool should look the same to them as
+      // one created any other way.
+      $term = wp_insert_term( $name, 'nav_menu', [ 'slug' => $slug, 'description' => '', 'parent' => 0 ] );
+      $menu_id = is_wp_error( $term ) ? $term : (int) $term['term_id'];
+      if ( !is_wp_error( $menu_id ) ) {
+        do_action( 'wp_create_nav_menu', $menu_id, [ 'menu-name' => $name ] );
+      }
+    }
     if ( is_wp_error( $menu_id ) ) {
       return $this->error( $r, 'Could not create the menu: ' . $menu_id->get_error_message() );
     }
@@ -2173,7 +2240,15 @@ class GMCP_Tools_Admin {
         $assigned[] = $location;
       }
     }
-    return $this->json( $r, [ 'menu_id' => (int) $menu_id, 'name' => $name, 'locations' => $assigned ] );
+    $created = wp_get_nav_menu_object( (int) $menu_id );
+    return $this->json( $r, [
+      'menu_id' => (int) $menu_id,
+      'name' => $name,
+      // Read back rather than echoed: when no slug was asked for, this is the only place
+      // the caller learns what WordPress derived, suffix included.
+      'slug' => $created ? $created->slug : '',
+      'locations' => $assigned,
+    ] );
   }
 
   private function delete_menu( array $r, array $a ): array {
@@ -2274,6 +2349,248 @@ class GMCP_Tools_Admin {
     return $this->json( $r, [ 'item_id' => (int) $item_id, 'menu_id' => (int) $menu->term_id, 'title' => $title ] );
   }
 
+  /**
+  * How far up a menu tree this is willing to walk before calling it broken.
+  *
+  * A real menu is two or three levels deep. The bound is not about depth, it is about a
+  * menu that already contains a cycle, from an import or a hand-edited row: without it
+  * the walk that exists to prevent cycles is itself the thing that hangs the request.
+  */
+  const MENU_DEPTH_LIMIT = 100;
+
+  /** Elementor documents examined by one audit before it stops and says it stopped. */
+  const AUDIT_ELEMENTOR_LIMIT = 500;
+
+  /** Which menu an item belongs to, or 0 for an item that belongs to none. */
+  private function menu_of_item( int $item_id ): int {
+    $terms = wp_get_object_terms( $item_id, 'nav_menu', [ 'fields' => 'ids' ] );
+    if ( is_wp_error( $terms ) || empty( $terms ) ) {
+      return 0;
+    }
+    return (int) $terms[0];
+  }
+
+  /**
+  * Every field wp_update_nav_menu_item() takes, read back off the row.
+  *
+  * This exists because that function is not the partial update it looks like: it parses
+  * the arguments over defaults that are empty strings, so naming only the title clears
+  * the URL, the object id, the target and the rest. The item stays in the menu and stops
+  * working, and nothing errors.
+  *
+  * Read from the post and its meta rather than through wp_setup_nav_menu_item(). That
+  * returns the item as the front end renders it, with the display filters applied and
+  * with a title resolved from the target post when the item has none of its own. Writing
+  * that back turns a derived title into a stored one, and the item silently stops
+  * following the page it points at.
+  *
+  * Everything is slashed on the way out. wp_insert_post() and update_post_meta() both
+  * unslash what they are handed, so a title or a URL holding a quote or a backslash
+  * loses one on every edit if it is passed back as it was read.
+  */
+  private function menu_item_fields( WP_Post $post ): array {
+    $id = (int) $post->ID;
+    $classes = get_post_meta( $id, '_menu_item_classes', true );
+    return [
+      'menu-item-db-id' => $id,
+      'menu-item-object-id' => (int) get_post_meta( $id, '_menu_item_object_id', true ),
+      'menu-item-object' => (string) get_post_meta( $id, '_menu_item_object', true ),
+      'menu-item-parent-id' => (int) get_post_meta( $id, '_menu_item_menu_item_parent', true ),
+      'menu-item-position' => (int) $post->menu_order,
+      'menu-item-type' => (string) get_post_meta( $id, '_menu_item_type', true ),
+      'menu-item-title' => wp_slash( $post->post_title ),
+      'menu-item-url' => wp_slash( (string) get_post_meta( $id, '_menu_item_url', true ) ),
+      'menu-item-description' => wp_slash( $post->post_content ),
+      'menu-item-attr-title' => wp_slash( $post->post_excerpt ),
+      'menu-item-target' => (string) get_post_meta( $id, '_menu_item_target', true ),
+      'menu-item-classes' => implode( ' ', is_array( $classes ) ? $classes : [] ),
+      'menu-item-xfn' => (string) get_post_meta( $id, '_menu_item_xfn', true ),
+      // Core reads this as a two-way switch: anything that is not 'draft' publishes. So
+      // the stored status has to come back, or editing the title of an item somebody
+      // left unpublished would publish it.
+      'menu-item-status' => $post->post_status === 'draft' ? 'draft' : 'publish',
+      // Omitted, these resolve to "now", so every edit would bump the item's date.
+      'menu-item-post-date' => $post->post_date,
+      'menu-item-post-date-gmt' => $post->post_date_gmt,
+    ];
+  }
+
+  /**
+  * Whether one menu item may be moved under another.
+  *
+  * A menu is a tree stored as a flat list of posts, each naming its parent in postmeta,
+  * and nothing in WordPress checks that the result is still a tree. Three shapes each
+  * break a menu with no error anywhere: an item under itself, where core quietly drops
+  * the parent instead so the caller is told it worked and nothing moved; an item under
+  * one of its own descendants, which is a cycle the walker follows until the request
+  * dies; and a parent in a different menu, where the item vanishes from the rendered
+  * menu and stays in the database looking fine.
+  *
+  * @return true|string True if the move is safe, otherwise why it is not.
+  */
+  private function may_reparent( int $item_id, int $parent_id, int $menu_id, string $menu_name ) {
+    if ( $parent_id === 0 ) {
+      return true;
+    }
+    if ( $parent_id === $item_id ) {
+      return "Menu item {$item_id} cannot be its own parent. WordPress would accept the call and drop the parent, so nothing would move and the reply would say it had.";
+    }
+    if ( !is_nav_menu_item( $parent_id ) ) {
+      return "{$parent_id} is not a menu item id, so it cannot be a parent. Use wp_get_menu_items to find one.";
+    }
+    $parent_menu = $this->menu_of_item( $parent_id );
+    if ( $parent_menu !== $menu_id ) {
+      $other = $parent_menu ? wp_get_nav_menu_object( $parent_menu ) : null;
+      $where = $other ? "the menu \"{$other->name}\"" : 'no menu at all';
+      return "Menu item {$parent_id} belongs to {$where}, not to \"{$menu_name}\". An item parented across menus disappears from the rendered menu while still sitting in the database.";
+    }
+
+    $at = $parent_id;
+    $steps = 0;
+    while ( $at > 0 && $steps < self::MENU_DEPTH_LIMIT ) {
+      if ( $at === $item_id ) {
+        return "Menu item {$parent_id} is below item {$item_id} already, so this would make the menu a loop. Move {$parent_id} out first.";
+      }
+      $at = (int) get_post_meta( $at, '_menu_item_menu_item_parent', true );
+      $steps++;
+    }
+    if ( $at > 0 ) {
+      return "The chain of parents above item {$parent_id} is more than " . self::MENU_DEPTH_LIMIT . " deep, which means the menu already contains a loop. Whether this move is safe cannot be worked out, so it is refused; repair the existing parents first.";
+    }
+    return true;
+  }
+
+  /**
+  * Change named fields on one menu item and leave the rest alone.
+  *
+  * See menu_item_fields() for why every field is written back rather than just the ones
+  * that changed, and the comment on the write below for why position needs handling on
+  * top of that.
+  */
+  private function update_menu_item( array $r, array $a ): array {
+    $may = $this->may( 'edit_theme_options', 'changing a menu' );
+    if ( $may !== true ) {
+      return $this->error( $r, $may );
+    }
+    $item_id = isset( $a['item_id'] ) ? (int) $a['item_id'] : 0;
+    if ( $item_id <= 0 || !is_nav_menu_item( $item_id ) ) {
+      return $this->error( $r, "{$item_id} is not a menu item id. Use wp_get_menu_items to find one." );
+    }
+    $post = get_post( $item_id );
+    $menu_id = $this->menu_of_item( $item_id );
+    if ( !$menu_id ) {
+      return $this->error( $r, "Menu item {$item_id} belongs to no menu, so there is no menu to update it in. WordPress leaves items in this state when a menu is edited in wp-admin and not saved; wp_delete_menu_item removes one." );
+    }
+    $menu = wp_get_nav_menu_object( $menu_id );
+    $menu_name = $menu ? $menu->name : (string) $menu_id;
+
+    $fields = $this->menu_item_fields( $post );
+    $type = $fields['menu-item-type'];
+    $changed = [];
+
+    if ( array_key_exists( 'title', $a ) ) {
+      $title = sanitize_text_field( (string) $a['title'] );
+      if ( $title === '' ) {
+        return $this->error( $r, 'A menu item title cannot be empty. Omit title to leave it as it is.' );
+      }
+      $fields['menu-item-title'] = wp_slash( $title );
+      $changed[] = 'title';
+    }
+
+    if ( array_key_exists( 'url', $a ) ) {
+      if ( $type !== 'custom' ) {
+        return $this->error( $r, "Menu item {$item_id} is a \"{$type}\" item, so its link is taken from the thing it points at and WordPress discards a URL set on it without saying so. Change that object's own permalink, or delete this item and add a custom one in its place." );
+      }
+      $url = esc_url_raw( trim( (string) $a['url'] ) );
+      if ( $url === '' ) {
+        return $this->error( $r, 'A custom menu item needs a URL, and the one given is empty or was rejected as a URL. Omit url to leave it as it is.' );
+      }
+      $fields['menu-item-url'] = wp_slash( $url );
+      $changed[] = 'url';
+    }
+
+    if ( array_key_exists( 'target', $a ) ) {
+      $target = trim( (string) $a['target'] );
+      if ( $target !== '' && $target !== '_blank' ) {
+        return $this->error( $r, 'target takes "_blank" to open in a new tab or an empty string to open in the same one. WordPress stores nothing else here, so any other value would be silently dropped.' );
+      }
+      $fields['menu-item-target'] = $target;
+      $changed[] = 'target';
+    }
+
+    if ( array_key_exists( 'parent_id', $a ) ) {
+      $parent_id = (int) $a['parent_id'];
+      $allowed = $this->may_reparent( $item_id, $parent_id, $menu_id, $menu_name );
+      if ( $allowed !== true ) {
+        return $this->error( $r, $allowed );
+      }
+      $fields['menu-item-parent-id'] = $parent_id;
+      $changed[] = 'parent_id';
+    }
+
+    if ( array_key_exists( 'position', $a ) ) {
+      $position = (int) $a['position'];
+      if ( $position < 0 ) {
+        return $this->error( $r, 'position counts from 0 and cannot be negative.' );
+      }
+      $fields['menu-item-position'] = $position;
+      $changed[] = 'position';
+    }
+
+    if ( !$changed ) {
+      return $this->error( $r, 'Nothing to change. Pass at least one of title, url, parent_id, position or target.' );
+    }
+
+    /*
+    * Position has to be pinned through the write rather than repaired after it.
+    *
+    * wp_update_nav_menu_item() reads a position of 0 as "not specified, put it last",
+    * and the first item of any menu is genuinely stored at 0, so handing an item its own
+    * position back appends it: renaming the top item moves it to the bottom. The usual
+    * fix is to write menu_order back to the posts table afterwards. That works, and here
+    * it would also make the audit log lie: the change recorder watches post_updated and
+    * would report menu_order going 0 to 3 in a call that left it at 0. Filtering the row
+    * on its way into the write means the wrong value is never stored and there is nothing
+    * to undo. The repair below stays as the proof that it landed, because a filter some
+    * other plugin registers later could still overwrite it, and it uses $wpdb rather than
+    * wp_update_post() because that would re-run the insert sanitisers over post_content,
+    * which on a menu item is its description.
+    */
+    $intended = (int) $fields['menu-item-position'];
+    $pin = function ( $data, $postarr ) use ( $item_id, $intended ) {
+      if ( isset( $postarr['ID'] ) && (int) $postarr['ID'] === $item_id ) {
+        $data['menu_order'] = $intended;
+      }
+      return $data;
+    };
+    add_filter( 'wp_insert_post_data', $pin, 999, 2 );
+    $result = wp_update_nav_menu_item( $menu_id, $item_id, $fields );
+    remove_filter( 'wp_insert_post_data', $pin, 999 );
+
+    if ( is_wp_error( $result ) ) {
+      return $this->error( $r, 'Could not update the item: ' . $result->get_error_message() );
+    }
+
+    $stored = (int) get_post_field( 'menu_order', $item_id );
+    if ( $stored !== $intended ) {
+      global $wpdb;
+      $wpdb->update( $wpdb->posts, [ 'menu_order' => $intended ], [ 'ID' => $item_id ] );
+      clean_post_cache( $item_id );
+      $stored = (int) get_post_field( 'menu_order', $item_id );
+    }
+
+    return $this->json( $r, [
+      'item_id' => $item_id,
+      'menu_id' => $menu_id,
+      'menu' => $menu_name,
+      'changed' => $changed,
+      'title' => get_post_field( 'post_title', $item_id ),
+      'url' => (string) get_post_meta( $item_id, '_menu_item_url', true ),
+      'parent_id' => (int) get_post_meta( $item_id, '_menu_item_menu_item_parent', true ),
+      'position' => $stored,
+    ] );
+  }
+
   private function delete_menu_item( array $r, array $a ): array {
     $may = $this->may( 'edit_theme_options', 'changing a menu' );
     if ( $may !== true ) {
@@ -2349,6 +2666,311 @@ class GMCP_Tools_Admin {
     return $result === true
       ? $this->text( $r, "Assigned \"{$menu->name}\" to the \"{$location}\" location." )
       : $this->error( $r, $result );
+  }
+
+  /**
+  * What is wrong with this site's navigation, in one read-only pass.
+  *
+  * The half that earns this tool is the Elementor one. A menu is referenced from three
+  * places that do not know about each other: a theme location, a menu item's own target,
+  * and a widget's stored settings. The first two are visible in wp-admin. The third is
+  * not: an Elementor Nav Menu widget stores the menu by slug inside _elementor_data, and
+  * a slug that does not resolve renders an empty nav, with no notice, no error and no
+  * broken page. Somebody then spends an afternoon on it.
+  *
+  * Nothing here writes, so it is in the read-only list and fires no mutation hook.
+  */
+  private function audit_menus( array $r ): array {
+    $menus = [];
+    $problems = [];
+    $slugs = [];
+
+    foreach ( wp_get_nav_menus() as $menu ) {
+      $slugs[ $menu->slug ] = $menu->name;
+      $items = $this->menu_items_including_broken( $menu );
+
+      $present = [];
+      foreach ( $items as $item ) {
+        $present[ (int) $item->ID ] = true;
+      }
+      foreach ( $items as $item ) {
+        foreach ( $this->menu_item_faults( $item, $present ) as $fault ) {
+          $problems[] = [
+            'menu' => $menu->slug,
+            'item_id' => (int) $item->ID,
+            'title' => (string) $item->title,
+            'problem' => $fault,
+          ];
+        }
+      }
+
+      $assigned = [];
+      foreach ( get_nav_menu_locations() as $location => $menu_id ) {
+        if ( (int) $menu_id === (int) $menu->term_id ) {
+          $assigned[] = $location;
+        }
+      }
+      $menus[] = [
+        'id' => (int) $menu->term_id,
+        'name' => $menu->name,
+        'slug' => $menu->slug,
+        'items' => count( $items ),
+        'locations' => $assigned,
+      ];
+    }
+
+    $locations = [];
+    $empty_locations = 0;
+    $current = get_nav_menu_locations();
+    foreach ( get_registered_nav_menus() as $location => $label ) {
+      $menu_id = isset( $current[ $location ] ) ? (int) $current[ $location ] : 0;
+      $object = $menu_id ? wp_get_nav_menu_object( $menu_id ) : null;
+      $locations[] = [
+        'location' => $location,
+        'description' => $label,
+        'menu' => $object ? $object->name : null,
+        'menu_slug' => $object ? $object->slug : null,
+      ];
+      if ( $menu_id && !$object ) {
+        // A location can outlive the menu it names: deleting a menu does not clear the
+        // theme mod, so the location reads as assigned and renders nothing.
+        $problems[] = [ 'location' => $location, 'problem' => "Assigned to menu id {$menu_id}, which no longer exists, so this location renders nothing." ];
+      }
+      elseif ( !$object ) {
+        $empty_locations++;
+      }
+    }
+
+    $elementor = $this->elementor_menu_references( $slugs );
+    $dangling = 0;
+    foreach ( $elementor['references'] as $reference ) {
+      if ( !$reference['exists'] ) {
+        $dangling++;
+      }
+    }
+
+    $out = [
+      'summary' => sprintf(
+        '%d menu(s), %d theme location(s) with no menu, %d problem(s) found, %d Elementor reference(s) to a menu slug that does not exist.',
+        count( $menus ),
+        $empty_locations,
+        count( $problems ),
+        $dangling
+      ),
+      'menus' => $menus,
+      'locations' => $locations,
+      'problems' => $problems,
+      'elementor' => $elementor,
+    ];
+    if ( empty( $locations ) ) {
+      $out['note'] = 'The active theme registers no menu locations. Block themes place navigation in template parts instead, so nothing here is assigned by a location.';
+    }
+    return $this->json( $r, $out );
+  }
+
+  /**
+  * The items in a menu, including the ones that do not work.
+  *
+  * Not wp_get_nav_menu_items(), which is the wrong reader for an audit twice over. It
+  * runs its results through _is_valid_nav_menu_item() whenever is_admin() is false, and a
+  * REST request is not admin, so every item whose target has been deleted, the exact
+  * thing this is looking for, is filtered out before it can be reported: the audit would
+  * quietly find nothing wrong with a menu full of dead links. It also skips the query
+  * entirely when the menu's cached term count is 0, and renumbers menu_order on the
+  * objects it returns, so what it reports is the rendered menu rather than the stored one.
+  *
+  * wp_setup_nav_menu_item() is still used, because the fields it derives are what the
+  * checks need, but nothing is dropped before the caller sees it.
+  *
+  * @return array
+  */
+  private function menu_items_including_broken( $menu ): array {
+    $items = get_posts( [
+      'post_type' => 'nav_menu_item',
+      'post_status' => 'publish,draft',
+      'numberposts' => -1,
+      'orderby' => 'menu_order',
+      'order' => 'ASC',
+      'update_menu_item_cache' => true,
+      'tax_query' => [ [
+        'taxonomy' => 'nav_menu',
+        'field' => 'term_taxonomy_id',
+        'terms' => $menu->term_taxonomy_id,
+      ] ],
+    ] );
+    return array_map( 'wp_setup_nav_menu_item', $items );
+  }
+
+  /**
+  * Everything wrong with one menu item, as sentences.
+  *
+  * The status cases are not pedantry. A menu item keeps its own copy of the title, and
+  * core's front-end filter only drops items whose target is missing or trashed, so a
+  * draft or private target still puts its headline in the public navigation behind a
+  * link the visitor cannot open, and a password-protected one advertises that it exists.
+  *
+  * @param object $item An item as wp_get_nav_menu_items() returns it.
+  * @param array $present Item ids in the same menu, as a lookup.
+  */
+  private function menu_item_faults( $item, array $present ): array {
+    $faults = [];
+    $object_id = (int) $item->object_id;
+
+    if ( $item->post_status !== 'publish' ) {
+      $faults[] = "The item itself is \"{$item->post_status}\" rather than published, so it does not render.";
+    }
+
+    $parent = (int) $item->menu_item_parent;
+    if ( $parent && !isset( $present[ $parent ] ) ) {
+      // Children name their parent in postmeta rather than through the post tree, so
+      // deleting a parent leaves them pointing at an id that is not there any more.
+      $faults[] = "Its parent item {$parent} is not in this menu, so it is orphaned and does not render.";
+    }
+
+    if ( $item->type === 'post_type' ) {
+      $target = $object_id ? get_post( $object_id ) : null;
+      if ( !$target ) {
+        $faults[] = "Points at post {$object_id}, which no longer exists.";
+      }
+      elseif ( $target->post_status !== 'publish' ) {
+        $faults[] = "Points at post {$object_id}, which is \"{$target->post_status}\". Its title is in the public menu behind a link visitors cannot open.";
+      }
+      elseif ( $target->post_password !== '' ) {
+        $faults[] = "Points at post {$object_id}, which is password protected, so the menu advertises a page the visitor cannot read.";
+      }
+    }
+    elseif ( $item->type === 'taxonomy' ) {
+      $term = $object_id ? get_term( $object_id, (string) $item->object ) : null;
+      if ( !$term || is_wp_error( $term ) ) {
+        $faults[] = "Points at {$item->object} term {$object_id}, which no longer exists.";
+      }
+    }
+    elseif ( $item->type === 'post_type_archive' ) {
+      if ( !post_type_exists( (string) $item->object ) ) {
+        $faults[] = "Points at the archive of post type \"{$item->object}\", which is not registered any more. It is usually a plugin that has been deactivated.";
+      }
+    }
+    elseif ( trim( (string) $item->url ) === '' ) {
+      $faults[] = 'A custom item with no URL, so it renders as text nobody can click.';
+    }
+
+    return $faults;
+  }
+
+  /**
+  * Elementor documents that name a menu slug, and whether the slug resolves.
+  *
+  * On the cost of finding them. _elementor_data is a JSON string routinely over 100KB and
+  * a site can hold hundreds of them, so the obvious query, selecting the meta rows and
+  * looking inside each in PHP, pulls every Elementor layout on the site into memory to
+  * read one setting from each. This asks the database to do the filtering and brings back
+  * ids only: the meta_key index narrows the scan to Elementor's own rows, and the LIKE
+  * is the settings key spelled exactly as the widget stores it, so what survives both is
+  * the handful of documents that could possibly name a menu. Those are then read one at a
+  * time and dropped from the meta cache afterwards, which keeps the peak at one document
+  * rather than all of them.
+  *
+  * Elementor being absent is not an error and not an empty answer either. The documents
+  * are ordinary postmeta and outlive the plugin, so a site that deactivated Elementor
+  * still has widgets that will render the moment it comes back; the scan runs either way
+  * and the reply says which situation it is.
+  */
+  private function elementor_menu_references( array $slugs ): array {
+    global $wpdb;
+
+    $active = did_action( 'elementor/loaded' ) > 0;
+    $limit = self::AUDIT_ELEMENTOR_LIMIT;
+    $ids = $wpdb->get_col( $wpdb->prepare(
+      "SELECT DISTINCT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value LIKE %s ORDER BY post_id ASC LIMIT %d",
+      '_elementor_data',
+      '%' . $wpdb->esc_like( '"menu"' ) . '%',
+      $limit + 1
+    ) );
+    $ids = array_map( 'intval', (array) $ids );
+    $truncated = count( $ids ) > $limit;
+    if ( $truncated ) {
+      $ids = array_slice( $ids, 0, $limit );
+    }
+
+    $references = [];
+    $unreadable = [];
+    foreach ( $ids as $id ) {
+      $data = get_post_meta( $id, '_elementor_data', true );
+      $tree = is_string( $data ) ? json_decode( $data, true ) : $data;
+      // Dropped straight after reading: the document is the large thing here and
+      // get_post_meta() would otherwise hold every one of them for the rest of the call.
+      wp_cache_delete( $id, 'post_meta' );
+
+      if ( !is_array( $tree ) ) {
+        $unreadable[] = $id;
+        continue;
+      }
+      $found = [];
+      $this->walk_elementor_elements( $tree, $found );
+      if ( !$found ) {
+        continue;
+      }
+      $post = get_post( $id );
+      foreach ( $found as $one ) {
+        $references[] = [
+          'post_id' => $id,
+          'post_type' => $post ? $post->post_type : '',
+          'title' => $post ? $post->post_title : '',
+          'status' => $post ? $post->post_status : '',
+          'widget' => $one['widget'],
+          'menu_slug' => $one['menu_slug'],
+          'exists' => isset( $slugs[ $one['menu_slug'] ] ),
+        ];
+      }
+    }
+
+    $out = [
+      'active' => $active,
+      'documents_searched' => count( $ids ),
+      'references' => $references,
+    ];
+    if ( $truncated ) {
+      $out['truncated'] = "More than {$limit} Elementor documents name a menu. Only the first {$limit} by post id were read.";
+    }
+    if ( $unreadable ) {
+      $out['unreadable'] = 'These posts hold an _elementor_data value that is not valid JSON, so nothing could be checked in them: ' . implode( ', ', $unreadable ) . '.';
+    }
+    if ( !$active && ( $references || $ids ) ) {
+      $out['note'] = 'Elementor is not loaded on this site, so none of these documents is being rendered at the moment. They are stored as ordinary post meta and will be used again if it is reactivated.';
+    }
+    elseif ( !$active ) {
+      $out['note'] = 'Elementor is not loaded on this site and no Elementor document names a menu, so there is nothing here to go wrong.';
+    }
+    return $out;
+  }
+
+  /**
+  * Collect menu references from an Elementor element tree.
+  *
+  * The reference is the "menu" setting, which is where Elementor's Nav Menu widget and
+  * the clones of it put a menu slug. Recursion is bounded by json_decode(), which refuses
+  * a document nested deeper than 512 long before this is reached.
+  */
+  private function walk_elementor_elements( array $nodes, array &$found ): void {
+    foreach ( $nodes as $node ) {
+      if ( !is_array( $node ) ) {
+        continue;
+      }
+      $settings = isset( $node['settings'] ) && is_array( $node['settings'] ) ? $node['settings'] : [];
+      if ( isset( $settings['menu'] ) && is_string( $settings['menu'] ) && $settings['menu'] !== '' ) {
+        $found[] = [
+          // Reported rather than filtered on, because the setting name is a convention
+          // and a widget this does not know about may use it for something else. A reader
+          // who sees a widget type they do not recognise can say so; a filter that only
+          // admitted "nav-menu" would miss every fork of it silently.
+          'widget' => isset( $node['widgetType'] ) ? (string) $node['widgetType'] : (string) ( $node['elType'] ?? 'element' ),
+          'menu_slug' => $settings['menu'],
+        ];
+      }
+      if ( isset( $node['elements'] ) && is_array( $node['elements'] ) ) {
+        $this->walk_elementor_elements( $node['elements'], $found );
+      }
+    }
   }
 
   #endregion

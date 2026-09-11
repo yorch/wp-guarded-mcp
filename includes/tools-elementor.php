@@ -45,6 +45,38 @@ class GMCP_Tools_Elementor {
   const DATA_META = '_elementor_data';
 
   /**
+  * The two ways one post comes to depend on a template, and neither is a foreign key.
+  *
+  * elementor_apply_template's shortcode mode writes [elementor-template id="N"] into the
+  * page content; Elementor's own template widgets store the id under a template_id setting
+  * inside _elementor_data. Nothing in WordPress or in Elementor stops the template being
+  * deleted or unpublished underneath either of them, and neither failure says anything: the
+  * shortcode page prints its own source, the widget page renders a gap.
+  */
+  const TEMPLATE_SHORTCODE = 'elementor-template';
+  const TEMPLATE_ID_SETTINGS = [ 'template_id', 'templateID' ];
+
+  /**
+  * Statuses in which a reference is being rendered for somebody right now.
+  *
+  * Everything else is reported too rather than filtered out. A draft's reference breaks the
+  * moment the draft is published, which is after the template is gone and nobody is looking,
+  * and a scheduled post is a draft with an alarm clock on it. The status travels with every
+  * row so the caller can tell a live page from one that is only waiting.
+  */
+  const LIVE_STATUSES = [ 'publish', 'private' ];
+
+  /**
+  * How many candidate rows a reference search pulls back before it gives up and says so.
+  *
+  * A cap rather than a page, because the question this feeds is "is anything still pointing
+  * at this template", and a truncated yes answers it as well as a complete one does. A
+  * truncated no does not, which is why hitting the cap is reported rather than rounded down
+  * to an empty list.
+  */
+  const SCAN_LIMIT = 500;
+
+  /**
   * Which theme-builder location each template type belongs to.
   *
   * Elementor registers four locations and more than one template type lands in each: a 404
@@ -79,6 +111,16 @@ class GMCP_Tools_Elementor {
   const TOUCH_OPTION = [
     'elementor_list_templates', 'elementor_get_conditions', 'elementor_set_conditions',
   ];
+
+  /**
+  * Tools that read only WordPress's own tables and so still answer with Elementor gone.
+  *
+  * The reference query asks wp_posts and wp_postmeta what points at a template. Deactivating
+  * Elementor does not remove a single one of those rows, and it is exactly the moment the
+  * answer is worth having, because every referencing page has just started printing the
+  * shortcode as literal text. Refusing here would withhold the diagnosis for the fault.
+  */
+  const NEEDS_NO_ELEMENTOR = [ 'elementor_template_references' ];
 
   public function __construct() {
     add_action( 'rest_api_init', [ $this, 'rest_api_init' ] );
@@ -158,6 +200,19 @@ class GMCP_Tools_Elementor {
         ],
         'accessLevel' => 'admin',
       ],
+      'elementor_template_references' => [
+        'name' => 'elementor_template_references',
+        'description' => 'Find every post that depends on an Elementor library template, before deleting or unpublishing it. Covers both routes a reference takes: the [elementor-template id="N"] shortcode that elementor_apply_template writes into page content, and a template_id setting inside a page\'s _elementor_data, which is how Elementor\'s own template and loop widgets embed one template in another. Shortcodes are parsed rather than substring-matched, so id="12" is not reported as a reference to template 1 or 123. Drafts, scheduled and trashed posts are included and labelled, because a draft\'s reference breaks when it is published, which is long after the template is gone. Revisions and auto-drafts are excluded. Reads only the posts and postmeta tables, so it still answers when Elementor is deactivated, which is when every referencing page has just started printing the shortcode as text. Reports what it did not search. Changes nothing, and refuses nothing: no tool in this plugin consults this before deleting a template, so this is a question to ask first, not a guard that will stop you.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'template_id' => [ 'type' => 'integer', 'description' => 'The template to look for. An id that is not a template, or no longer a post at all, is searched for anyway: that is how dangling references left behind by a deletion are found.' ],
+            'limit' => [ 'type' => 'integer', 'description' => 'Most referring posts to return per route. Default 50, maximum 200. A truncated answer says so.' ],
+          ],
+          'required' => [ 'template_id' ],
+        ],
+        'accessLevel' => 'read',
+      ],
     ];
   }
 
@@ -171,7 +226,7 @@ class GMCP_Tools_Elementor {
     // when Elementor has loaded, but a plugin can be deactivated between that check and
     // this call, and every Elementor lookup below would then be a fatal rather than a
     // sentence the caller can act on.
-    if ( !did_action( 'elementor/loaded' ) ) {
+    if ( !did_action( 'elementor/loaded' ) && !in_array( $tool, self::NEEDS_NO_ELEMENTOR, true ) ) {
       return $this->error( $r, 'Elementor is not loaded on this site, so its tools cannot run.' );
     }
 
@@ -191,6 +246,7 @@ class GMCP_Tools_Elementor {
       case 'elementor_set_conditions': $r = $this->set_conditions( $args, $r ); break;
       case 'elementor_regenerate_css': $r = $this->regenerate_css( $args, $r ); break;
       case 'elementor_apply_template': $r = $this->apply_template( $args, $r ); break;
+      case 'elementor_template_references': $r = $this->template_references( $args, $r ); break;
       default:
         $r['error'] = [ 'code' => -32601, 'message' => 'Unknown tool' ];
         return $r;
@@ -648,6 +704,17 @@ class GMCP_Tools_Elementor {
         return $this->error( $r, 'The [elementor-template] shortcode is not registered on this site. It comes with Elementor Pro or PRO Elements; the free Elementor plugin does not provide it, and the page would show the shortcode as literal text. Use mode "copy" instead, which duplicates the template onto the page and needs nothing extra.' );
       }
 
+      // Setting post_content replaces it whole, so any template the page already pointed at
+      // through a shortcode stops being pointed at. That is a reference this tool is about to
+      // break, and the page it breaks it on is the one in front of us, so it is named rather
+      // than left for the caller to discover from a rendering difference.
+      $replaced = $this->matching_other_templates( $page->post_content, $template_id );
+      if ( $replaced !== [] ) {
+        $notes[] = count( $replaced ) === 1
+          ? 'The content being replaced already pointed at template #' . $replaced[0] . ' through a shortcode. That link is gone now; only #' . $template_id . ' is left.'
+          : 'The content being replaced already pointed at templates #' . implode( ', #', $replaced ) . ' through shortcodes. Those links are gone now; only #' . $template_id . ' is left.';
+      }
+
       // Elementor renders a page's own document instead of its content, so leaving the old
       // data in place would mean the shortcode never ran and the page looked unchanged.
       if ( $had_data ) {
@@ -666,6 +733,15 @@ class GMCP_Tools_Elementor {
         return $this->error( $r, 'The page content could not be updated: ' . $done->get_error_message() );
       }
       $notes[] = 'The page stays linked to template #' . $template_id . ', so later edits to the template appear here too.';
+
+      // The reference this call just created is the one nothing else in the plugin watches.
+      // Both warnings are about the same silent failure from opposite ends: a template that
+      // cannot render leaves the shortcode printing as text, and a deletion later does the
+      // same thing to a page that worked. Saying it here is the only place either is cheap.
+      if ( !in_array( $template->post_status, self::LIVE_STATUSES, true ) ) {
+        $notes[] = 'Template #' . $template_id . ' is ' . $template->post_status . ', not published, and Elementor renders nothing for a template in that state. Publish it, or this page shows an empty space where the template should be.';
+      }
+      $notes[] = 'Nothing refuses a later delete or unpublish of template #' . $template_id . ' on account of this page. elementor_template_references is the query that finds what points at a template; ask it before removing one.';
     }
     else {
       if ( !$this->copy_meta( $template_id, $page_id, self::DATA_META ) ) {
@@ -704,6 +780,351 @@ class GMCP_Tools_Elementor {
       'replaced_existing_design' => $had_data,
       'notes' => $notes,
     ] );
+  }
+
+  #endregion
+
+  #region References
+
+  /**
+  * What still points at a template, by both routes, with two very different costs.
+  *
+  * The shortcode half has to read post_content, and WordPress indexes nothing in that column:
+  * wp_posts carries indexes on post_name, post_parent, post_author and the type/status/date
+  * triple, and not one of them narrows a LIKE on the body. So this is a full scan of wp_posts
+  * and its cost is the size of the content column rather than the row count. Nothing indexes
+  * it, and the fix would be a fulltext index this plugin has no business adding to somebody
+  * else's table, so the scan is named rather than hidden. What keeps it survivable is that
+  * the pattern is the shortcode name, which almost no row contains.
+  *
+  * The _elementor_data half looks worse and is far cheaper. wp_postmeta is indexed on
+  * meta_key, so naming the key first narrows the LIKE to the posts actually built with
+  * Elementor. That pattern also carries the id, which matters here and not above: these rows
+  * run past 100KB each and pulling every one of them back to look inside is the expensive
+  * mistake available in this query.
+  *
+  * Both prefilters are deliberately looser than the answer. The precision is added afterwards
+  * in PHP, where the shortcode is parsed and the JSON decoded, because matching id="12" as a
+  * substring reports template 1 and template 123 as well, and a refusal built on that would
+  * block a deletion that was safe.
+  */
+  private function template_references( array $a, array $r ): array {
+    $template_id = isset( $a['template_id'] ) ? (int) $a['template_id'] : 0;
+    if ( $template_id <= 0 ) {
+      return $this->error( $r, 'template_id must be the positive ID of an Elementor library template.' );
+    }
+    $limit = max( 1, min( 200, isset( $a['limit'] ) ? (int) $a['limit'] : 50 ) );
+
+    // A missing template, or one that is not a template at all, is searched for rather than
+    // refused. An id whose post is gone is exactly the interesting case: the references it
+    // left behind are still in the content and still rendering nothing.
+    $template = get_post( $template_id );
+
+    $shortcode = $this->shortcode_references( $template_id, $limit );
+    $data = $this->data_references( $template_id, $limit );
+    $rows = array_merge( $shortcode['rows'], $data['rows'] );
+
+    $live = 0;
+    foreach ( $rows as $row ) {
+      if ( $row['live'] ) {
+        $live++;
+      }
+    }
+    $truncated = $shortcode['truncated'] || $data['truncated'];
+
+    // Every note here describes something about the rows, so each is held back when there are
+    // no rows for it to describe. An empty answer that still warns about what is "below" reads
+    // as a partial one, and the whole value of an empty answer is that it is trustworthy.
+    $notes = [];
+    if ( !$template ) {
+      $notes[] = 'There is no post #' . $template_id . ' on this site.'
+        . ( $rows === [] ? '' : ' Everything listed is a dangling reference: the shortcode prints as text and the widget renders nothing.' );
+    }
+    elseif ( $template->post_type !== 'elementor_library' ) {
+      $notes[] = 'Post #' . $template_id . ' is a ' . $template->post_type . ', not an Elementor library template.'
+        . ( $rows === [] ? ' The search ran anyway.' : ' The search ran anyway, so everything listed points at an id that is not a template.' );
+    }
+    elseif ( !in_array( $template->post_status, self::LIVE_STATUSES, true ) && $rows !== [] ) {
+      $notes[] = 'The template itself is ' . $template->post_status . ', not published. Elementor renders nothing for a template in that state, so every reference listed is already broken.';
+    }
+
+    if ( !did_action( 'elementor/loaded' ) ) {
+      $notes[] = 'Elementor is not loaded on this site. These rows come from the posts and postmeta tables, which Elementor\'s absence does not change, so the list is complete,'
+        . ( $rows === [] ? '' : ' but every page listed is currently rendering its raw shortcode or an empty gap.' );
+    }
+    elseif ( $shortcode['rows'] !== [] && !shortcode_exists( self::TEMPLATE_SHORTCODE ) ) {
+      $notes[] = 'The [' . self::TEMPLATE_SHORTCODE . '] shortcode is not registered on this site: it comes with Elementor Pro or PRO Elements, not with the free plugin. Every shortcode reference listed is printing as literal text on the front end right now, whatever state the template is in.';
+    }
+
+    if ( $truncated ) {
+      $notes[] = 'More than ' . self::SCAN_LIMIT . ' candidate rows matched, so this list is incomplete. Treat it as "at least these", never as "only these".';
+    }
+
+    $summary = $rows === []
+      ? 'Nothing found that references template #' . $template_id . ' by either route.'
+      : count( $rows ) . ' reference' . ( count( $rows ) === 1 ? '' : 's' ) . ' to template #' . $template_id . ', ' . $live . ' of them on a published or private post. Deleting or unpublishing this template breaks every one of them, and no tool in this plugin will stop you: wp_delete_post and wp_update_post do not consult this query.';
+
+    return $this->json( $r, [
+      'template' => [
+        'id' => $template_id,
+        'exists' => (bool) $template,
+        'title' => $template ? $template->post_title : null,
+        'post_type' => $template ? $template->post_type : null,
+        'status' => $template ? $template->post_status : null,
+        'template_type' => $template ? (string) get_post_meta( $template_id, self::TYPE_META, true ) : null,
+      ],
+      'elementor_loaded' => (bool) did_action( 'elementor/loaded' ),
+      'shortcode_registered' => shortcode_exists( self::TEMPLATE_SHORTCODE ),
+      'counts' => [
+        'total' => count( $rows ),
+        'live' => $live,
+        'shortcode' => count( $shortcode['rows'] ),
+        'elementor_data' => count( $data['rows'] ),
+      ],
+      'notes' => $notes,
+      'references' => $rows,
+      'truncated' => $truncated,
+      'searched' => [
+        'shortcode' => 'Every post except revisions and auto-drafts, matched on the literal "[' . self::TEMPLATE_SHORTCODE . '" and then parsed with shortcode_parse_atts. post_content carries no index, so this is a full scan of the posts table.',
+        'elementor_data' => 'Only posts holding an ' . self::DATA_META . ' row that already names this id, found through the meta_key index and then JSON-decoded to confirm the id is a widget setting rather than a coincidence in the text.',
+        'candidates_examined' => [ 'shortcode' => $shortcode['candidates'], 'elementor_data' => $data['candidates'] ],
+      ],
+      'not_searched' => [
+        'Post revisions and auto-drafts, which are copies nobody renders.',
+        'Options, so a template embedded through a widget, a theme option or the site editor is not found.',
+        'Theme and plugin files, so a do_shortcode() or a hard-coded template id in PHP is not found.',
+        'Other sites in a multisite network: this reads the current site\'s tables only.',
+        'Any settings key other than ' . implode( ' and ', self::TEMPLATE_ID_SETTINGS ) . ', so a plugin storing a template id under its own name is not found.',
+      ],
+      'summary' => $summary,
+    ] );
+  }
+
+  /** Posts whose content holds [elementor-template id="N"], parsed rather than matched. */
+  private function shortcode_references( int $template_id, int $limit ): array {
+    global $wpdb;
+
+    $like = '%' . $wpdb->esc_like( '[' . self::TEMPLATE_SHORTCODE ) . '%';
+    $candidates = $wpdb->get_results( $wpdb->prepare(
+      "SELECT ID, post_title, post_type, post_status, post_content FROM {$wpdb->posts}
+        WHERE post_content LIKE %s AND post_type != 'revision' AND post_status != 'auto-draft'
+        ORDER BY ID ASC LIMIT %d",
+      $like,
+      self::SCAN_LIMIT + 1
+    ) );
+    $candidates = is_array( $candidates ) ? $candidates : [];
+    $truncated = count( $candidates ) > self::SCAN_LIMIT;
+    $candidates = array_slice( $candidates, 0, self::SCAN_LIMIT );
+
+    $rows = [];
+    foreach ( $candidates as $candidate ) {
+      foreach ( $this->matching_shortcodes( (string) $candidate->post_content, $template_id ) as $found ) {
+        if ( count( $rows ) >= $limit ) {
+          return [ 'rows' => $rows, 'candidates' => count( $candidates ), 'truncated' => true ];
+        }
+        $rows[] = $this->reference_row( $candidate, 'shortcode', 'Post content holds ' . $found . '.' );
+      }
+    }
+    return [ 'rows' => $rows, 'candidates' => count( $candidates ), 'truncated' => $truncated ];
+  }
+
+  /**
+  * Every template the shortcodes in one body name, as id => the shortcode that named it.
+  *
+  * shortcode_parse_atts rather than a pattern over the id, because the id can be written
+  * id="45", id='45' or id=45 and a pattern that covers all three either misses a form or
+  * matches 456. Parsing settles that, and settles attribute order and extra attributes with
+  * it. An id that is not a number parses to 0, which is no template, so it is dropped.
+  *
+  * The lookahead after the name is what stops [elementor-template-something] being read as
+  * this shortcode. \b would not: the hyphen is already a word boundary.
+  */
+  private function templates_in_shortcodes( string $content ): array {
+    if ( strpos( $content, '[' . self::TEMPLATE_SHORTCODE ) === false ) {
+      return [];
+    }
+    $pattern = '/\[' . preg_quote( self::TEMPLATE_SHORTCODE, '/' ) . '(?=[\s\/\]])([^\]]*)\]/';
+    if ( !preg_match_all( $pattern, $content, $matches, PREG_SET_ORDER ) ) {
+      return [];
+    }
+
+    $found = [];
+    foreach ( $matches as $match ) {
+      $atts = shortcode_parse_atts( $match[1] );
+      if ( !is_array( $atts ) || !isset( $atts['id'] ) ) {
+        continue;
+      }
+      $id = (int) trim( (string) $atts['id'] );
+      if ( $id > 0 && !isset( $found[ $id ] ) ) {
+        $found[ $id ] = $this->snippet( $match[0] );
+      }
+    }
+    return $found;
+  }
+
+  /** The shortcodes in one body that really do name this template. */
+  private function matching_shortcodes( string $content, int $template_id ): array {
+    $found = $this->templates_in_shortcodes( $content );
+    return isset( $found[ $template_id ] ) ? [ $found[ $template_id ] ] : [];
+  }
+
+  /** Template ids a body's shortcodes name, other than the one about to replace them. */
+  private function matching_other_templates( string $content, int $except ): array {
+    $ids = array_keys( $this->templates_in_shortcodes( $content ) );
+    return array_values( array_diff( $ids, [ $except ] ) );
+  }
+
+  /** Posts whose _elementor_data embeds this template through a widget's template_id. */
+  private function data_references( int $template_id, int $limit ): array {
+    global $wpdb;
+
+    // Quoted and bare forms of each settings key. The bare one is a prefix match and will
+    // also pull 456 back for 45; the decode below is what removes it.
+    $likes = [];
+    foreach ( self::TEMPLATE_ID_SETTINGS as $setting ) {
+      $likes[] = '%' . $wpdb->esc_like( '"' . $setting . '":"' . $template_id . '"' ) . '%';
+      $likes[] = '%' . $wpdb->esc_like( '"' . $setting . '":' . $template_id ) . '%';
+    }
+    $where = implode( ' OR ', array_fill( 0, count( $likes ), 'm.meta_value LIKE %s' ) );
+
+    $candidates = $wpdb->get_results( $wpdb->prepare(
+      "SELECT p.ID, p.post_title, p.post_type, p.post_status, m.meta_value
+        FROM {$wpdb->postmeta} m INNER JOIN {$wpdb->posts} p ON p.ID = m.post_id
+        WHERE m.meta_key = %s AND ( {$where} )
+          AND p.post_type != 'revision' AND p.post_status != 'auto-draft'
+        ORDER BY p.ID ASC LIMIT %d",
+      array_merge( [ self::DATA_META ], $likes, [ self::SCAN_LIMIT + 1 ] )
+    ) );
+    $candidates = is_array( $candidates ) ? $candidates : [];
+    $truncated = count( $candidates ) > self::SCAN_LIMIT;
+    $candidates = array_slice( $candidates, 0, self::SCAN_LIMIT );
+
+    $rows = [];
+    foreach ( $candidates as $candidate ) {
+      $raw = (string) $candidate->meta_value;
+      $found = $this->data_widget_hits( $raw, $template_id );
+      $hits = $found['hits'];
+
+      // Three different reasons the decode found nothing, and only one of them is a no.
+      //
+      // The bare-integer prefilter above is a prefix match, so template 113 pulls back every
+      // document naming 1136 as well. A clean decode that finds nothing and no exact literal
+      // anywhere is that case, and it is a real negative: reporting it would be the false
+      // match this whole design exists to avoid, and it would block a safe deletion.
+      //
+      // The other two are reported rather than dropped. A document that will not parse cannot
+      // be ruled out, and an exact literal sitting somewhere the walk does not look is very
+      // likely a reference through something newer than this code. Silence on either is the
+      // one outcome the caller has no way back from.
+      if ( $hits === [] ) {
+        if ( !$found['parsed'] ) {
+          $hits = [ 'the document could not be parsed, so whether it references this template was not settled either way' ];
+        }
+        elseif ( $this->names_id_exactly( $raw, $template_id ) ) {
+          $hits = [ 'the document names this id exactly, but not under a settings key this recognises, so it may be a reference through a widget this does not know' ];
+        }
+        else {
+          continue;
+        }
+      }
+      foreach ( $hits as $hit ) {
+        if ( count( $rows ) >= $limit ) {
+          return [ 'rows' => $rows, 'candidates' => count( $candidates ), 'truncated' => true ];
+        }
+        $rows[] = $this->reference_row( $candidate, 'elementor_data', ucfirst( $hit ) . '.' );
+      }
+    }
+    return [ 'rows' => $rows, 'candidates' => count( $candidates ), 'truncated' => $truncated ];
+  }
+
+  /**
+  * Where in one Elementor document this template id is used as a widget setting.
+  *
+  * Whether the document parsed at all travels back with the answer, because an empty list
+  * from a document that parsed and an empty list from one that did not are opposite results.
+  */
+  private function data_widget_hits( string $json, int $template_id ): array {
+    $document = json_decode( $json, true );
+    if ( !is_array( $document ) ) {
+      return [ 'parsed' => false, 'hits' => [] ];
+    }
+    $hits = [];
+    $this->walk_for_template( $document, $template_id, $hits );
+    return [ 'parsed' => true, 'hits' => array_values( array_unique( $hits ) ) ];
+  }
+
+  /**
+  * Whether the raw document contains this id as a complete settings value, not a prefix of one.
+  *
+  * The delimiters are what make it exact. Elementor writes its documents with json_encode,
+  * which puts no space after a colon, so a bare integer value is always followed by a comma
+  * or a closing brace and "template_id":113 cannot be read out of "template_id":1136.
+  */
+  private function names_id_exactly( string $json, int $template_id ): bool {
+    foreach ( self::TEMPLATE_ID_SETTINGS as $setting ) {
+      foreach ( [ '"' . $template_id . '"', $template_id . ',', $template_id . '}' ] as $value ) {
+        if ( strpos( $json, '"' . $setting . '":' . $value ) !== false ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+  * Walk an Elementor document looking for a settings key that names this template.
+  *
+  * Elementor nests sections inside containers inside columns to whatever depth the page was
+  * built to, and the widget that carries the reference can sit at any of them, so the walk
+  * has to be general. Only a value directly under "settings" counts: the same integer in a
+  * heading's text is not a reference, and treating it as one is how this would start
+  * refusing safe deletions.
+  */
+  private function walk_for_template( array $node, int $template_id, array &$hits ): void {
+    if ( isset( $node['settings'] ) && is_array( $node['settings'] ) ) {
+      $widget = '';
+      foreach ( [ 'widgetType', 'elType' ] as $key ) {
+        if ( isset( $node[ $key ] ) && is_string( $node[ $key ] ) && $node[ $key ] !== '' ) {
+          $widget = $node[ $key ];
+          break;
+        }
+      }
+      foreach ( self::TEMPLATE_ID_SETTINGS as $setting ) {
+        if ( !isset( $node['settings'][ $setting ] ) ) {
+          continue;
+        }
+        $value = $node['settings'][ $setting ];
+        if ( ( is_string( $value ) || is_int( $value ) ) && (int) $value === $template_id ) {
+          $hits[] = 'the ' . ( $widget === '' ? 'element' : '"' . $this->snippet( $widget ) . '" widget' ) . ' embeds it through its ' . $setting . ' setting';
+        }
+      }
+    }
+
+    foreach ( $node as $key => $child ) {
+      if ( $key !== 'settings' && is_array( $child ) ) {
+        $this->walk_for_template( $child, $template_id, $hits );
+      }
+    }
+  }
+
+  /** One referring post, with enough of its state to tell a live page from a waiting one. */
+  private function reference_row( $post, string $via, string $detail ): array {
+    return [
+      'id' => (int) $post->ID,
+      'title' => (string) $post->post_title,
+      'post_type' => (string) $post->post_type,
+      'status' => (string) $post->post_status,
+      'live' => in_array( (string) $post->post_status, self::LIVE_STATUSES, true ),
+      'url' => get_permalink( (int) $post->ID ),
+      'via' => $via,
+      'detail' => $detail,
+    ];
+  }
+
+  /** Somebody else wrote this text, so it is trimmed before it goes back out in a sentence. */
+  private function snippet( string $text, int $length = 120 ): string {
+    $text = trim( (string) preg_replace( '/\s+/', ' ', $text ) );
+    return strlen( $text ) > $length ? substr( $text, 0, $length ) . '...' : $text;
   }
 
   #endregion

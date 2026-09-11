@@ -252,7 +252,12 @@ add_action( "gmcp_mutate", function ( $tool ) {
   $seen[] = $tool;
   update_option( "probe_mutate", $seen, false );
 }, 10, 1 );
-PHPEOF' >/dev/null 2>&1
+PHPEOF'
+# The control for the two assertions below, and it has to come first. "But a read does not"
+# is not one: it expects silence, which is exactly what a probe that was never installed
+# reports, so it passed throughout the period the probe was broken.
+check "CONTROL: the mutation probe is installed and can observe" \
+  "$(docker compose exec -T wp sh -c 'test -f /var/www/html/wp-content/mu-plugins/mutate-probe.php && echo present || echo absent' 2>/dev/null | tr -d '\r\n')" "present"
 docker compose exec -T cli wp option delete probe_mutate >/dev/null 2>&1
 # The probe is a fixture, so it gets the same treatment as any other: asserted, not
 # assumed. Without this, a fixture that was never written reports the hook as silent,

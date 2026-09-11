@@ -450,5 +450,194 @@ call ch_b "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{
 # reusing an id would interleave their bytes into one value and neither would know.
 check "a session started on one target is refused on another" "$(verdict ch_b)" "error"
 
+echo "-- the everyday meta tool keeps backslashes --"
+# update_post_meta() unslashes what it is given, so a value carrying backslashes arrives
+# stripped: a JSON payload stops parsing, a regex stops matching and a Windows path loses
+# its separators. The chunk tool has always compensated with wp_slash(); the everyday tool
+# did not, and answered "Meta updated" over the mangled write.
+#
+# Asserted against the STORED value, never the reply. The reply was already truthful-
+# looking while the row was wrong, which is the whole defect.
+SL_ID=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Slashes","post_type"=>"page","post_status"=>"draft"]);' 2>/dev/null | tr -d '\r\n')
+python3 - "$OUT" "$SL_ID" <<'PYSLASH'
+import json, sys
+out, pid = sys.argv[1], int(sys.argv[2])
+# A regex, a Windows path and an escaped solidus: the three shapes that lose meaning when
+# a backslash is dropped. Written as a JSON *string*, which is how a client sends one.
+value = r'{"re":"\\d+","win":"C:\\path","url":"https:\/\/e.test"}'
+open(out + '/slash_kv.json', 'w').write(json.dumps(
+    {"jsonrpc": "2.0", "id": 81, "method": "tools/call",
+     "params": {"name": "wp_update_post_meta",
+                "arguments": {"ID": pid, "key": "_slashed", "value": value}}}))
+open(out + '/slash_map.json', 'w').write(json.dumps(
+    {"jsonrpc": "2.0", "id": 82, "method": "tools/call",
+     "params": {"name": "wp_update_post_meta",
+                "arguments": {"ID": pid, "meta": {"_slashed_map": value}}}}))
+# The control for the pair above: the same bytes through the tool that was already
+# correct. If this one ever fails too, the probe is broken rather than the everyday tool.
+open(out + '/slash_chunk.json', 'w').write(json.dumps(
+    {"jsonrpc": "2.0", "id": 83, "method": "tools/call",
+     "params": {"name": "wp_write_post_meta_chunk",
+                "arguments": {"session": "slash1", "ID": pid, "key": "_slashed_chunk",
+                              "data": value, "final": True}}}))
+PYSLASH
+for f in slash_kv slash_map slash_chunk; do
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d @"$OUT/$f.json" -o "$OUT/$f"
+done
+# get_post_meta() returns the array WordPress stored. Comparing against the literal the
+# payload means keeps the assertion readable and independent of how it was serialized.
+slashed() { # slashed <meta key>
+  docker compose exec -T cli wp eval "
+    \$v = get_post_meta($SL_ID, '$1', true);
+    echo (is_array(\$v) && \$v['re'] === '\\\\d+' && \$v['win'] === 'C:\\\\path'
+          && \$v['url'] === 'https://e.test') ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n'
+}
+check "key/value form keeps its backslashes" "$(slashed _slashed)" "intact"
+check "and the meta map form keeps them too" "$(slashed _slashed_map)" "intact"
+check "CONTROL: the chunk tool, already correct, agrees" "$(slashed _slashed_chunk)" "intact"
+# Decoding matches wp_write_post_meta_chunk and wp_update_option: a caller that sends an
+# array as JSON must not find a JSON string where every reader expects an array.
+check "JSON for an array is stored as an array" \
+  "$(docker compose exec -T cli wp eval "echo gettype(get_post_meta($SL_ID,'_slashed',true));" 2>/dev/null | tr -d '\r\n')" "array"
+# The other half of that rule: text that merely contains a backslash is not JSON and must
+# survive verbatim, not be coerced into anything.
+# Built in Python, not in the shell. Written inline, the escaping needed four levels of
+# quoting and landed on a doubled backslash, which the unslashing then reduced to the
+# single one the assertion wanted: the test passed on broken code by cancelling the bug
+# against itself.
+python3 - "$OUT" "$SL_ID" <<'PYPLAIN'
+import json, sys
+out, pid = sys.argv[1], int(sys.argv[2])
+open(out + '/slash_plain.json', 'w').write(json.dumps(
+    {"jsonrpc": "2.0", "id": 84, "method": "tools/call",
+     "params": {"name": "wp_update_post_meta",
+                "arguments": {"ID": pid, "key": "_plain", "value": r"C:\Users\me"}}}))
+PYPLAIN
+curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' -d @"$OUT/slash_plain.json" -o "$OUT/slash_plain"
+check "a plain string with backslashes is stored verbatim" \
+  "$(docker compose exec -T cli wp eval "
+    echo get_post_meta($SL_ID, '_plain', true) === 'C:' . chr(92) . 'Users' . chr(92) . 'me'
+      ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
+
+echo "-- the dynamic REST tools --"
+# This group is opt-in and had no coverage at all, which is how a reply shape nothing
+# could parse survived in it. Read the setting, turn it on, and put it back at the end
+# whatever happens in between: a suite that leaves the group switched on changes what
+# every later run of every other suite is testing.
+REST_WAS=$(docker compose exec -T cli wp eval 'echo !empty(get_option("gmcp_options",[])["mcp_tools_rest"]) ? "1" : "0";' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]); $o["mcp_tools_rest"]=true; update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+docker compose exec -T cli wp transient delete gmcp_tools_cache_v5 >/dev/null 2>&1
+call rlist '{"jsonrpc":"2.0","id":90,"method":"tools/list"}'
+check "the REST group appears when switched on" \
+  "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"list_pages","get_pages","create_pages","update_pages","delete_pages"}-n) or True)' rlist)" "True"
+# rest_do_request() has always honoured _fields; nothing advertised it, so no caller could
+# find it. An unadvertised parameter is an absent one as far as a model is concerned.
+check "_fields is advertised on the listers" \
+  "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["tools"];d={x["name"]:x for x in t};print(all("_fields" in d[n]["inputSchema"]["properties"] for n in ("list_pages","list_posts","list_media")))' rlist)" "True"
+
+RF_ID=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Fields probe","post_type"=>"page","post_status"=>"publish","post_content"=>str_repeat("padding ",200)]);' 2>/dev/null | tr -d '\r\n')
+# Scoped to this block's own page with include, not left to list whatever the site holds.
+# An unscoped list renders every page it returns, so one page carrying Elementor data that
+# Elementor itself refuses to render takes the whole call down with a TypeError, and the
+# measurement here fails describing a fault that is nothing to do with field selection.
+# smoke-elementor.sh leaves such a page behind, so this suite's result depended on whether
+# that one had been run first.
+call rf_all  "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\",\"params\":{\"name\":\"list_pages\",\"arguments\":{\"include\":[$RF_ID]}}}"
+call rf_slim "{\"jsonrpc\":\"2.0\",\"id\":92,\"method\":\"tools/call\",\"params\":{\"name\":\"list_pages\",\"arguments\":{\"include\":[$RF_ID],\"_fields\":\"id,title,status,link\"}}}"
+check "naming fields returns only those fields" \
+  "$(py 'import json,sys;r=json.loads(json.load(sys.stdin,strict=False)["result"]["content"][0]["text"]);print(all(set(x)<={"id","title","status","link"} for x in r) and len(r)>0)' rf_slim)" "True"
+# The control for the check above: a probe that returned nothing, or a _fields that was
+# ignored, would both leave the subset assertion looking fine. This proves the untrimmed
+# reply really is the heavy one, so the trimming is doing the work.
+check "CONTROL: the untrimmed reply really does carry the heavy fields" \
+  "$(py 'import json,sys;r=json.loads(json.load(sys.stdin,strict=False)["result"]["content"][0]["text"]);print(bool(r) and "_links" in r[0] and "content" in r[0])' rf_all)" "True"
+check "and trimming makes the reply markedly smaller" \
+  "$(python3 -c "
+import json
+a=json.load(open('$OUT/rf_all'),strict=False)['result']['content'][0]['text']
+b=json.load(open('$OUT/rf_slim'),strict=False)['result']['content'][0]['text']
+print(len(b) * 4 < len(a))")" "True"
+
+# Every reply must carry content as a LIST OF BLOCKS. format_tool_result() used to decide
+# a handler had already built an envelope by testing for a key called "content", and a
+# WordPress post has a content field of its own holding {raw, rendered, protected}. So a
+# created page was mistaken for a finished envelope and passed through whole: the client
+# found an object where the protocol requires an array, called the reply malformed and
+# discarded it, and the caller could not read back the id of the page it had just made.
+shape() { # shape <response file>
+  python3 -c "
+import json, sys
+d = json.load(open('$OUT/' + sys.argv[1]), strict=False)
+c = d.get('result', {}).get('content')
+print('blocks' if isinstance(c, list) and c and all(
+    isinstance(b, dict) and 'type' in b and 'text' in b for b in c) else 'malformed')
+" "$1"; }
+SH_PAGE=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Shape probe","post_type"=>"page","post_status"=>"draft"]);' 2>/dev/null | tr -d '\r\n')
+SH_MEDIA=$(docker compose exec -T cli wp eval 'echo wp_insert_attachment(["post_title"=>"Shape media","post_mime_type"=>"image/gif","post_status"=>"inherit"], false, 0);' 2>/dev/null | tr -d '\r\n')
+call sh_create '{"jsonrpc":"2.0","id":93,"method":"tools/call","params":{"name":"create_pages","arguments":{"title":"Shape created","status":"draft"}}}'
+call sh_get    "{\"jsonrpc\":\"2.0\",\"id\":94,\"method\":\"tools/call\",\"params\":{\"name\":\"get_pages\",\"arguments\":{\"id\":$SH_PAGE}}}"
+call sh_update "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\",\"params\":{\"name\":\"update_pages\",\"arguments\":{\"id\":$SH_PAGE,\"title\":\"Shape renamed\"}}}"
+call sh_delete "{\"jsonrpc\":\"2.0\",\"id\":96,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_pages\",\"arguments\":{\"id\":$SH_PAGE}}}"
+call sh_media  "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\",\"params\":{\"name\":\"get_media\",\"arguments\":{\"id\":$SH_MEDIA}}}"
+for t in create get update delete; do
+  check "${t}_pages answers with a block list" "$(shape sh_$t)" "blocks"
+done
+# Media never had the defect, because an attachment has no content field for the key test
+# to trip over. Kept as a control: it is the shape the others should always have had, and
+# if it ever reports malformed the probe is wrong rather than the tools.
+check "CONTROL: get_media, which never had the defect, is unchanged" "$(shape sh_media)" "blocks"
+# The point of the fix rather than a restatement of it. A create whose reply the client
+# discards is a write the caller cannot follow up, and re-listing to find the new id was
+# the workaround this removes.
+check "and a create reports the id of what it made" \
+  "$(py 'import json,sys;t=json.load(sys.stdin,strict=False)["result"]["content"][0]["text"];print("id" in json.loads(t))' sh_create)" "True"
+docker compose exec -T cli wp post delete "$SH_MEDIA" --force >/dev/null 2>&1
+
+# The generated tools are cached in a transient for a day and nothing ever removed it, so
+# an upgrade that added or reshaped one was not merely unlisted for twenty-four hours: the
+# handler refuses a tool absent from that transient, so it was uncallable, and the caller
+# saw "unknown tool" with nothing pointing at a cache.
+#
+# Planting a sentinel into the cache and watching for it is what makes this measurable.
+# Asserting the transient is gone after a version change proves nothing on its own, because
+# the very next tools/list rebuilds it.
+docker compose exec -T cli wp eval '
+  $t = get_transient( GMCP_Tools_Rest::CACHE_KEY );
+  $t["zz_sentinel"] = [ "name" => "zz_sentinel", "description" => "planted", "category" => "Dynamic REST",
+    "inputSchema" => [ "type" => "object", "properties" => (object) [] ], "accessLevel" => "read" ];
+  set_transient( GMCP_Tools_Rest::CACHE_KEY, $t, DAY_IN_SECONDS );' >/dev/null 2>&1
+call up_before '{"jsonrpc":"2.0","id":98,"method":"tools/list"}'
+# The control. Without it, a sentinel that never landed and a cache correctly cleared read
+# exactly the same in the check below.
+check "CONTROL: the tool list really is served from the cache" \
+  "$(py 'import json,sys;print("zz_sentinel" in {t["name"] for t in json.load(sys.stdin)["result"]["tools"]})' up_before)" "True"
+docker compose exec -T cli wp option update gmcp_version '0.0.0-pretend-older' >/dev/null 2>&1
+call up_after '{"jsonrpc":"2.0","id":99,"method":"tools/list"}'
+check "a version change throws the generated tool cache away" \
+  "$(py 'import json,sys;print("zz_sentinel" in {t["name"] for t in json.load(sys.stdin)["result"]["tools"]})' up_after)" "False"
+check "and the recorded version catches up to the running one" \
+  "$(docker compose exec -T cli wp eval 'echo get_option("gmcp_version") === GMCP_VERSION ? "current" : "stale";' 2>/dev/null | tr -d '\r\n')" "current"
+# It has to be once, not every request: a purge on each call would rebuild the schemas
+# from every REST route on every tools/list.
+docker compose exec -T cli wp eval '
+  $t = get_transient( GMCP_Tools_Rest::CACHE_KEY );
+  $t["zz_sentinel2"] = [ "name" => "zz_sentinel2", "description" => "planted", "category" => "Dynamic REST",
+    "inputSchema" => [ "type" => "object", "properties" => (object) [] ], "accessLevel" => "read" ];
+  set_transient( GMCP_Tools_Rest::CACHE_KEY, $t, DAY_IN_SECONDS );' >/dev/null 2>&1
+call up_again '{"jsonrpc":"2.0","id":100,"method":"tools/list"}'
+check "and it does not fire again on the next request" \
+  "$(py 'import json,sys;print("zz_sentinel2" in {t["name"] for t in json.load(sys.stdin)["result"]["tools"]})' up_again)" "True"
+docker compose exec -T cli wp transient delete gmcp_tools_cache_v5 >/dev/null 2>&1
+docker compose exec -T cli wp post delete "$RF_ID" --force >/dev/null 2>&1
+# Quoted, and it was not: the shell substitutes REST_WAS bare, so (1==='1') compares an
+# int against a string under PHP's strict operator and is always false. The restore then
+# switched the group OFF whatever it had found, which is the one thing a restore must not
+# do. Its own check caught it, which is why the check is there.
+docker compose exec -T cli wp eval "\$o=get_option('gmcp_options',[]); \$o['mcp_tools_rest']=('$REST_WAS'==='1'); update_option('gmcp_options',\$o,false);" >/dev/null 2>&1
+check "the REST group is back as it was found" \
+  "$(docker compose exec -T cli wp eval 'echo !empty(get_option("gmcp_options",[])["mcp_tools_rest"]) ? "1" : "0";' 2>/dev/null | tr -d '\r\n')" "$REST_WAS"
+
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

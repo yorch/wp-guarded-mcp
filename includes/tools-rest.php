@@ -8,7 +8,13 @@
 
 class GMCP_Tools_Rest {
   // Bump the suffix when build_schema_from_args() changes so old cached schemas are ignored.
-  private $cache_key = 'gmcp_tools_cache_v4';
+  // v5: _fields advertised.
+  //
+  // Public, and a constant rather than a property, because GMCP_Core clears it on an
+  // upgrade and the name has to have one home. Spelled out in two files, it is a name that
+  // gets bumped in one of them.
+  const CACHE_KEY = 'gmcp_tools_cache_v5';
+  private $cache_key = self::CACHE_KEY;
   private $allowed = [ 'posts', 'pages', 'media' ];
 
   public function __construct() {
@@ -37,7 +43,12 @@ class GMCP_Tools_Rest {
             if ( !empty( $endpoint['methods']['GET'] ) ) {
               $tools[ "list_{$resource}" ] = [
                 'name' => "list_{$resource}",
-                'description' => "List {$resource}",
+                'description' => "List {$resource} through the WordPress REST API. Every field of every row "
+                  . 'is returned by default, which includes the fully rendered content and a block of '
+                  . '_links per row, so a page of real posts is large out of all proportion to what is '
+                  . 'usually wanted. Name the fields with _fields, e.g. "id,title,status,link", whenever '
+                  . 'the whole record is not needed. wp_get_posts is the lighter tool when a plain list '
+                  . 'of posts will do.',
                 'category' => 'Dynamic REST',
                 'inputSchema' => $this->build_schema_from_args( $endpoint['args'] ),
                 'outputSchema' => $this->build_output_schema(),
@@ -160,6 +171,22 @@ class GMCP_Tools_Rest {
         $schema['required'][] = $name;
       }
     }
+
+    // _fields is a WordPress-wide REST parameter rather than an endpoint one, so it is
+    // absent from $args and never reached a caller, even though rest_do_request() has
+    // always honoured it. Advertising costs nothing and the difference is not marginal:
+    // three empty pages came back as 4556 bytes, and as 186 with four fields named. Most
+    // of the rest is per-row _links the model has no way to follow and rendered content
+    // it did not ask for, so the gap widens with real pages rather than closing.
+    //
+    // Added here rather than per-tool because it trims any response, a create or update
+    // reply included, and here is the one place these schemas are built.
+    $schema['properties']['_fields'] = [
+      'type' => 'string',
+      'description' => 'Comma-separated list of fields to return, e.g. "id,title,status,link". '
+        . 'Omit to get every field, which includes rendered content and a _links block per row '
+        . 'and is usually far more than is wanted. Nested fields use dots, e.g. "title.rendered".',
+    ];
 
     return $this->normalize_schema_node( $schema );
   }
