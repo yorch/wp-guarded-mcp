@@ -321,16 +321,28 @@ check "reject absent token" "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "
 # terminator did not survive that, and the rest of this script was written into the PHP
 # file. Every request for the remainder of the run then returned 500, which reads as the
 # plugin being broken rather than the harness.
-docker compose exec -T cli mkdir -p /var/www/html/wp-content/mu-plugins
-docker cp "$(dirname "$0")/fixtures/gmcp-nourl.php" \
-  "${COMPOSE_PROJECT_NAME:-wptest}-cli-1":/var/www/html/wp-content/mu-plugins/gmcp-nourl.php >/dev/null
+#
+# Copied and removed as root. `docker cp` creates any missing parent as root, the cli
+# service runs as www-data, and removing a file needs write permission on its DIRECTORY
+# rather than on the file. So the www-data rm failed with "Permission denied", the suite
+# ignored the exit status, the fixture stayed installed, and the next check saw a 404 it
+# read as the route failing to come back. Worse, it left the stack with the route
+# disabled for every later run.
+MU_DIR=/var/www/html/wp-content/mu-plugins
+CLI="${COMPOSE_PROJECT_NAME:-wptest}-cli-1"
+docker exec -u 0 "$CLI" mkdir -p "$MU_DIR"
+docker cp "$(dirname "$0")/fixtures/gmcp-nourl.php" "$CLI:$MU_DIR/gmcp-nourl.php" >/dev/null
 check "control: the filter is actually registered" \
   "$(docker compose exec -T cli wp eval 'echo has_filter("gmcp_url_token_route") ? "yes" : "no";' 2>/dev/null | tr -d '\r\n')" "yes"
 check "the URL-token route can be declined" \
   "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL_TOKEN_ROUTE" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":10,"method":"tools/list"}')" "404"
 check "control: the header route still answers with it off" \
   "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":11,"method":"tools/list"}')" "200"
-docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-nourl.php
+docker exec -u 0 "$CLI" rm -f "$MU_DIR/gmcp-nourl.php"
+# Asserted rather than assumed. A removal that fails quietly leaves the site filtered for
+# every run after this one, and the symptom appears on a different check.
+check "control: the fixture really was removed" \
+  "$(docker exec "$CLI" sh -c "test -e $MU_DIR/gmcp-nourl.php && echo present || echo gone")" "gone"
 check "and it comes back when the filter goes" \
   "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL_TOKEN_ROUTE" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":12,"method":"tools/list"}')" "200"
 
