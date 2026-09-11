@@ -38,10 +38,26 @@ Run the suites:
 
 ```
 ./smoke.sh          # transport, auth, content tools, prompts, resources, previews
+
+# smoke-admin.sh drives both backup adapters, so it needs both plugins present. It
+# activates and deactivates them itself.
+docker compose exec -T cli wp plugin install updraftplus backuply --activate
 ./smoke-admin.sh    # administration tools and every guard; rebuilds .htaccess, destructive
 
 docker compose exec -T cli wp plugin install woocommerce --activate
 ./smoke-woo.sh      # the shop tools; needs WooCommerce
+```
+
+`smoke-admin.sh` also expects a theme named `futuretheme` that declares a PHP version this
+site cannot meet, to prove activation is refused for a reason other than the theme being
+absent. Without it that check still passes, on the missing-theme branch, which is the
+wrong branch:
+
+```
+docker compose exec -T cli bash -c 'mkdir -p /var/www/html/wp-content/themes/futuretheme &&
+  printf "/*\nTheme Name: Future Theme\nRequires PHP: 99.0\nVersion: 1.0\n*/\n" \
+    > /var/www/html/wp-content/themes/futuretheme/style.css &&
+  printf "<?php\n" > /var/www/html/wp-content/themes/futuretheme/index.php'
 ```
 
 Never run `wp plugin install --force` against this stack. The plugin directory is a bind

@@ -1003,10 +1003,89 @@ check "a destructive confirmation carries the backup state" "$(refusal bk_confir
 # Reporting, not gating: the operation must still be reachable.
 check "and still offers a token rather than refusing outright" "$(refusal bk_confirm | grep -c 'confirm set to')" "1"
 
+echo "-- backups: Backuply, where the button's route is not a route --"
+# The second drivable provider, and the one that shows these adapters are written against
+# what a REST request actually has. Backuply's Create Backup button posts to a handler in
+# a file the plugin includes only under wp_doing_ajax(), and that handler calls the site
+# back over HTTP carrying the administrator's browser cookies. From here the function does
+# not exist and there are no cookies, so the adapter goes through the cron hook Backuply
+# runs its own unattended backups on instead.
+#
+# UpdraftPlus wins detection while both are active, so it comes off for this section. A
+# check that quietly exercised UpdraftPlus a second time would pass without ever reaching
+# the code it names.
+docker compose exec -T cli wp plugin deactivate updraftplus >/dev/null 2>&1
+docker compose exec -T cli wp plugin activate backuply >/dev/null 2>&1
+# Back to a site that has never completed a backup, which the third assertion below needs,
+# and which is also what clears the archive the previous run of this suite left on disk.
+docker compose exec -T cli wp eval '
+  delete_option( "backuply_last_backup" );
+  delete_option( "backuply_status" );
+  foreach ( glob( BACKUPLY_BACKUP_DIR . "backups_info-*/*.php" ) as $f ) { if ( basename( $f ) !== "index.php" ) { @unlink( $f ); } }
+  foreach ( glob( BACKUPLY_BACKUP_DIR . "backups-*/*.tar.gz" ) as $f ) { @unlink( $f ); }
+  @unlink( BACKUPLY_BACKUP_DIR . "backuply_backup_log.php" );
+' >/dev/null 2>&1
+
+call bky_status '{"jsonrpc":"2.0","id":240,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
+bky() { py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print($1)" "$2"; }
+check "Backuply is detected once UpdraftPlus is out of the way" "$(bky "d['provider']" bky_status)" "Backuply"
+check "and is reported as both startable and readable" "$(bky "str(d['can_start']) + ',' + str(d['can_tell'])" bky_status)" "True,True"
+check "with nothing yet to fall back on" "$(bky "str(d['last_completed'])" bky_status)" "None"
+
+call bky_start '{"jsonrpc":"2.0","id":241,"method":"tools/call","params":{"name":"wp_start_backup","arguments":{}}}'
+check "starting succeeds" "$(verdict bky_start)" "ok"
+# The reply is the tool being polite about what it asked for. This is the evidence that it
+# asked: a job queued on the hook Backuply itself runs backups from.
+check "and really queues Backuply's own backup hook" \
+  "$(docker compose exec -T cli wp cron event list --fields=hook 2>/dev/null | grep -c backuply_backup_cron)" "1"
+call bky_queued '{"jsonrpc":"2.0","id":242,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
+check "and a queued job reads as in flight, never as a backup that exists" \
+  "$(bky "str(d['running']) + ',' + str(d['last_completed'])" bky_queued)" "True,None"
+# Backuply keeps one job record, so a second start would overwrite the first and leave
+# neither finishable. Refusing is half of it; saying which refusal this is is the half an
+# agent can act on, because this one means wait and the other means stop.
+call bky_again '{"jsonrpc":"2.0","id":243,"method":"tools/call","params":{"name":"wp_start_backup","arguments":{}}}'
+check "a second start while one is in flight is refused" "$(verdict bky_again)" "error"
+check "and the refusal says which refusal it is" "$(refusal bky_again | grep -c 'already has a backup in flight')" "1"
+
+# Run the queued job from here rather than waiting on the site's own cron. This stack
+# cannot reach itself over HTTP: WordPress believes it is on the published port while
+# Apache listens on 80 inside the container, so the loopback spawn_cron fires goes
+# nowhere. That is a property of the stack and not of the tool, which is why the check
+# above asserts the job was queued and the ones below assert what running it produces.
+docker compose exec -T cli wp cron event run backuply_backup_cron >/dev/null 2>&1
+call bky_done '{"jsonrpc":"2.0","id":244,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
+check "running the job leaves a real archive on disk" \
+  "$(docker compose exec -T cli wp eval 'echo count( glob( BACKUPLY_BACKUP_DIR . "backups-*/*.tar.gz" ) );' 2>/dev/null | tr -d '\r\n')" "1"
+check "and the status counts it" "$(bky "d['count']" bky_done)" "1"
+check "and stops calling a finished job running" "$(bky "str(d['running'])" bky_done)" "False"
+check "and reads it as having succeeded" "$(bky "str(d['last_succeeded'])" bky_done)" "True"
+
+# A failed Backuply run writes nothing to the database: backuply_last_backup only moves on
+# success, so a failure an hour ago and no attempt at all leave the same trace. Without
+# reading the log this would report the older backup with no hint that the last try broke.
+docker compose exec -T cli wp eval 'file_put_contents( BACKUPLY_BACKUP_DIR . "backuply_backup_log.php", "<?php exit();?>\nCould not write archive|error|100\nBackup failed|error|100\n" );' >/dev/null 2>&1
+call bky_fail '{"jsonrpc":"2.0","id":245,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
+check "a failed last run is read out of the log rather than assumed fine" \
+  "$(bky "str(d['last_succeeded']) + ',' + str(d['last_errors'])" bky_fail)" "False,2"
+check "and the summary says not to rely on it" \
+  "$(bky "'yes' if 'do not rely on it' in d['summary'] else 'no'" bky_fail)" "yes"
+
+# The confirmation line names whichever provider was found, not a hardcoded one.
+call bky_confirm '{"jsonrpc":"2.0","id":246,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"akismet/akismet.php"}}}'
+check "a destructive confirmation carries Backuply's state too" "$(refusal bky_confirm | grep -c 'Backuply backup')" "1"
+
+# Adding a provider must not move an existing site onto it. UpdraftPlus is listed first
+# and stays first.
+docker compose exec -T cli wp plugin activate updraftplus >/dev/null 2>&1
+call bky_order '{"jsonrpc":"2.0","id":247,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
+check "with both active the older provider still wins" "$(bky "d['provider']" bky_order)" "UpdraftPlus"
+
 echo "-- backups: what it says when it cannot tell --"
 # A site running something this plugin cannot read still has backups. Saying "no backups"
-# there would be a lie in the direction that gets somebody hurt.
-docker compose exec -T cli wp plugin deactivate updraftplus >/dev/null 2>&1
+# there would be a lie in the direction that gets somebody hurt. Both drivable providers
+# come off: leaving one on would test the wrong branch and still pass.
+docker compose exec -T cli wp plugin deactivate updraftplus backuply >/dev/null 2>&1
 call bk_none '{"jsonrpc":"2.0","id":233,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
 check "with no provider it admits it cannot tell" \
   "$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(str(d['can_tell']))" bk_none)" "False"
@@ -1014,7 +1093,7 @@ check "and does not claim there are no backups" \
   "$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print('yes' if 'not the same as there being none' in d['summary'] else 'no')" bk_none)" "yes"
 call bk_nostart '{"jsonrpc":"2.0","id":234,"method":"tools/call","params":{"name":"wp_start_backup","arguments":{}}}'
 check "and starting refuses rather than reporting success" "$(verdict bk_nostart)" "error"
-docker compose exec -T cli wp plugin activate updraftplus >/dev/null 2>&1
+docker compose exec -T cli wp plugin activate updraftplus backuply >/dev/null 2>&1
 
 # Access levels: reading is harmless, starting is a write, and neither may travel over a
 # secret that sits in an access log.

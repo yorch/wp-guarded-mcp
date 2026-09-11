@@ -136,7 +136,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * Site administration tools, off by default: plugins, themes, menus, widgets, settings, permalinks and Site Health.
 * Two-step confirmation on destructive operations, wordpress.org-only installs, filtered post and widget markup, and refusal of any operation that would make the site or the endpoint unreachable.
 * Audit log of every tool call, refusals included, with redacted arguments, a tamper-evident hash chain, and automatic pruning.
-* Backup support: start one before a risky change and see when one last completed, with UpdraftPlus driven directly and a filter for anything else.
+* Backup support: start one before a risky change and see when one last completed, with UpdraftPlus and Backuply driven directly and a filter for anything else.
 * Connection test on the settings screen and in Site Health, which distinguishes an unreachable endpoint from credentials that never arrived.
 * WooCommerce tools on their own switch: products, stock, orders, order notes, customers and sales figures. No refunds.
 * Named keys with their own access level, expiry date and tool list, stored hashed.

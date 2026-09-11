@@ -8,14 +8,22 @@ if ( !defined( 'ABSPATH' ) ) {
 * Starting a backup, and being honest about what that does and does not mean.
 *
 * An agent about to delete a plugin or rewrite a page would sensibly want a backup first.
-* Three things make that harder than it sounds, and each one shapes what is here.
+* Four things make that harder than it sounds, and each one shapes what is here.
 *
 * THERE IS NO COMMON INTERFACE. Sixteen backup plugins with no dominant one, and the
-* largest work in unrelated ways: UpdraftPlus fires a WordPress action, BackWPup wants a
-* secret URL the site owner must first switch on with a filter, and several keep
-* programmatic export behind a paid tier. So this ships adapters for what can actually be
-* driven from a REST request and verified, names the rest as detected-but-not-drivable,
-* and offers gmcp_backup_providers for anything else. It does not pretend to be universal.
+* largest work in unrelated ways: UpdraftPlus fires a WordPress action, Backuply writes a
+* job record and leaves a cron hook to pick it up, BackWPup wants a secret URL the site
+* owner must first switch on with a filter, and several keep programmatic export behind a
+* paid tier. So this ships adapters for what can actually be driven from a REST request
+* and verified, names the rest as detected-but-not-drivable, and offers
+* gmcp_backup_providers for anything else. It does not pretend to be universal.
+*
+* THE ROUTE THE ADMIN SCREEN USES IS OFTEN NOT A ROUTE. Every adapter here was written
+* against what is loaded on a token-authenticated REST request, not against what the
+* plugin's own button calls. Backuply is the clearest case: its start handler lives in a
+* file included only under wp_doing_ajax(), and that handler then calls the site back over
+* HTTP forwarding the administrator's browser cookies. Neither half survives the trip, so
+* the adapter goes through the door Backuply uses for its own unattended backups instead.
 *
 * A BACKUP IS NOT FINISHED WHEN THE CALL RETURNS. Backups take minutes to hours; a tool
 * call lives inside one PHP request. So start() starts, and nothing here ever reports that
@@ -85,6 +93,24 @@ class GMCP_Backup {
             'last_errors' => $errors,
           ];
         },
+      ],
+
+      // Backuply, free or Pro: the Pro plugin loads this same code base, so both answer
+      // to the same constants and functions and neither needs its own entry.
+      'backuply' => [
+        'name' => 'Backuply',
+        'installed' => function () {
+          // Tested against what a REST request actually has, which is not the same as the
+          // plugin being active. backuply_create_backup, the function behind the Create
+          // Backup button, genuinely does not exist here: Backuply includes the file
+          // holding it only when wp_doing_ajax(). backuply_backup_execute does, because
+          // init.php defines it at the top level on every request.
+          return defined( 'BACKUPLY_VERSION' )
+            && function_exists( 'backuply_backup_execute' )
+            && function_exists( 'backuply_get_backups_info' );
+        },
+        'start' => function ( array $args ) { return self::backuply_start(); },
+        'state' => function () { return self::backuply_state(); },
       ],
 
       // Known, detectable, and not drivable from here. Named rather than ignored so the
@@ -191,7 +217,7 @@ class GMCP_Backup {
   public static function start(): array {
     $provider = self::detect();
     if ( !$provider ) {
-      return [ 'ok' => false, 'message' => 'No backup plugin this one can drive is active. Install UpdraftPlus, or register an adapter through the gmcp_backup_providers filter.' ];
+      return [ 'ok' => false, 'message' => 'No backup plugin this one can drive is active. Install UpdraftPlus or Backuply, or register an adapter through the gmcp_backup_providers filter.' ];
     }
     if ( !is_callable( $provider['start'] ?? null ) ) {
       return [ 'ok' => false, 'message' => $provider['name'] . ' is active but cannot be started from here. ' . ( $provider['why_not'] ?? '' ) ];
@@ -200,7 +226,11 @@ class GMCP_Backup {
     $before = is_callable( $provider['state'] ?? null ) ? call_user_func( $provider['state'] ) : null;
     $result = call_user_func( $provider['start'], [] );
     if ( empty( $result['ok'] ) ) {
-      return [ 'ok' => false, 'message' => $provider['name'] . ' refused to start a backup.' ];
+      // An adapter that knows why gets to say so. "Refused" on its own tells an agent
+      // nothing it can act on, and the two real reasons want opposite responses: wait,
+      // for a backup already running, and stop, for a provider that cannot queue one.
+      $why = trim( (string) ( $result['message'] ?? '' ) );
+      return [ 'ok' => false, 'message' => $why !== '' ? $why : $provider['name'] . ' refused to start a backup.' ];
     }
 
     $message = sprintf(
@@ -235,4 +265,155 @@ class GMCP_Backup {
     }
     return $line;
   }
+
+  #region Backuply
+
+  /**
+  * Queue a Backuply backup, in a request that is not this one.
+  *
+  * Backuply's Create Backup button posts to an admin-ajax action, and that handler then
+  * calls the site back over HTTP carrying the administrator's browser cookies, landing on
+  * a second handler that checks current_user_can( 'activate_plugins' ). A REST request
+  * authenticated with a bearer token has no cookies to forward, so the loopback arrives
+  * logged out and is refused. This is not a matter of finding the right nonce.
+  *
+  * What is registered on every request is backuply_backup_cron, wired to
+  * backuply_backup_execute. That is the same hook Backuply's own scheduled backups run
+  * on, which makes it the supported way in rather than a way around: the job record below
+  * is the one the button writes.
+  *
+  * It has to be a different request. Everything under backuply_backup_execute ends in
+  * die(), on the failure paths as much as the success ones, so calling it here would take
+  * this tool's own reply with it and the caller would see a dropped connection.
+  */
+  private static function backuply_start(): array {
+    if ( self::backuply_running() ) {
+      return [
+        'ok' => false,
+        'message' => 'Backuply already has a backup in flight. Backuply keeps one job record, so starting a second would overwrite the first and leave neither finishable. Call wp_backup_status until it reports nothing running.',
+      ];
+    }
+
+    // Both halves, whatever the site's saved defaults say. wp_start_backup offers a full
+    // backup, and a site whose Backuply screen is left on database-only would otherwise
+    // hand back a partial one under that name, which is exactly the false yes this file
+    // is arranged against. Where it goes is a different question, and one the site owner
+    // has already answered in Backuply: an empty location is Backuply's own local folder.
+    $settings = (array) get_option( 'backuply_settings', [] );
+    $job = [
+      'backup_dir' => '1',
+      'backup_db' => '1',
+      'backup_location' => (string) ( $settings['backup_location'] ?? '' ),
+    ];
+
+    backuply_create_log_file();
+    update_option( 'backuply_backup_stopped', false, false );
+    update_option( 'backuply_status', $job );
+
+    if ( !wp_schedule_single_event( time(), 'backuply_backup_cron' ) ) {
+      // Leaving the record behind would show a job on Backuply's own screen that nothing
+      // is going to run, and would read as "running" here until it went stale.
+      delete_option( 'backuply_status' );
+      return [
+        'ok' => false,
+        'message' => 'Backuply was ready but WordPress would not queue the event that runs the job, so nothing was started. A backup may already be queued, or something is filtering the cron schedule.',
+      ];
+    }
+
+    // Kick the runner rather than waiting for the next visitor to the site. This is a
+    // non-blocking loopback, so it returns whether or not anything answers, and it is
+    // sent even on a site with DISABLE_WP_CRON, where the switch that skips cron sits in
+    // the request handler rather than in here.
+    spawn_cron();
+
+    return [ 'ok' => true ];
+  }
+
+  /** What Backuply knows, in the shape status() merges. */
+  private static function backuply_state(): array {
+    // Written only when a backup finishes successfully, which is what makes it usable as
+    // last_completed: a failed run leaves the previous value alone rather than moving it.
+    $last = (int) get_option( 'backuply_last_backup', 0 );
+    $log = self::backuply_last_log();
+
+    return [
+      'last_completed' => $last ?: null,
+      'running' => self::backuply_running(),
+      'count' => count( (array) backuply_get_backups_info() ),
+      'last_succeeded' => $log['succeeded'],
+      'last_errors' => $log['errors'],
+    ];
+  }
+
+  /**
+  * Whether a Backuply backup is in flight.
+  *
+  * Not backuply_active(), which is the call this looks like it should make and which
+  * answers false while a backup is running: it tests $status['last_time'], and no line in
+  * Backuply ever writes that key. The key the job does refresh, at the start of every
+  * chunk, is last_update.
+  *
+  * A record with no last_update at all is one this plugin has just written and whose first
+  * chunk has not run yet. That is in flight too, and falling back to whether the event is
+  * still queued keeps a job that never starts from reading as running for good.
+  */
+  private static function backuply_running(): bool {
+    $status = get_option( 'backuply_status' );
+    if ( !is_array( $status ) || !$status ) {
+      return false;
+    }
+    $updated = (int) ( $status['last_update'] ?? 0 );
+    if ( $updated === 0 ) {
+      return (bool) wp_next_scheduled( 'backuply_backup_cron' );
+    }
+    // The same window Backuply uses to declare a job dead, so a crashed backup stops
+    // being reported as running at the moment Backuply stops believing in it too.
+    $window = defined( 'BACKUPLY_TIMEOUT_TIME' ) ? (int) BACKUPLY_TIMEOUT_TIME : 300;
+    return ( time() - $updated ) < $window;
+  }
+
+  /**
+  * How the last Backuply run ended, read out of the log it copies aside when a job stops.
+  *
+  * There is no option recording this. backuply_last_backup is written on success only, so
+  * on its own it cannot tell a backup that failed an hour ago from no attempt at all,
+  * and that difference is the whole point of asking. Each log line is
+  * "message|status|percent", and a run ends on a line whose status is success or error.
+  *
+  * Nulls rather than guesses when the log cannot be read whole: an error count taken from
+  * part of a file is a smaller number than the truth, in the direction that reassures.
+  */
+  private static function backuply_last_log(): array {
+    $unknown = [ 'succeeded' => null, 'errors' => null ];
+    if ( !defined( 'BACKUPLY_BACKUP_DIR' ) ) {
+      return $unknown;
+    }
+
+    $file = BACKUPLY_BACKUP_DIR . 'backuply_backup_log.php';
+    $size = is_readable( $file ) ? (int) @filesize( $file ) : 0;
+    if ( $size <= 0 || $size > MB_IN_BYTES ) {
+      return $unknown;
+    }
+
+    $lines = @file( $file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
+    if ( !is_array( $lines ) ) {
+      return $unknown;
+    }
+
+    $errors = 0;
+    $succeeded = null;
+    foreach ( $lines as $line ) {
+      $status = (string) ( explode( '|', $line )[1] ?? '' );
+      if ( $status === 'error' ) {
+        $errors++;
+        $succeeded = false;
+      }
+      elseif ( $status === 'success' ) {
+        $succeeded = true;
+      }
+    }
+    return [ 'succeeded' => $succeeded, 'errors' => $errors ];
+  }
+
+  #endregion
 }
