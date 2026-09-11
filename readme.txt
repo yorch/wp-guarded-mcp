@@ -61,7 +61,7 @@ The settings screen shows the endpoint. There are two ways in.
 
 **OAuth**, for clients that support it. Paste the endpoint URL into the client. It discovers the authorization server, sends you to a WordPress login, and shows a consent screen. Nothing to configure and no shared secret. Only administrators can approve a connection, and the token stops working if that account stops being an administrator.
 
-**A named key**, for clients that cannot do OAuth, such as a command-line agent. Create one on the Access tab and give it to the client. You choose whether it gets read-only, read and write, or full administrative access, when it expires, and which tools it may call. A key is shown once and stored only as a hash, and it acts as the administrator who made it, so the log can say who a call belonged to.
+**A named key**, for clients that cannot do OAuth, such as a command-line agent. Create one on the Access page and give it to the client. You choose whether it gets read-only, read and write, or full administrative access, when it expires, and which tools it may call. A key is shown once and stored only as a hash, and it acts as the administrator who made it, so the log can say who a call belonged to.
 
 For more than one client, create **named keys** instead. Each carries a label so you can tell clients apart in the activity list, can expire on its own, and can be limited to a named list of tools. A key for a deploy script that may read posts and nothing else is a different kind of object from one that can delete a theme. Keys are stored hashed and shown once.
 
@@ -75,9 +75,9 @@ It makes outbound requests in exactly three situations, all of them WordPress's 
 
 1. Install and activate the plugin.
 2. Open MCP Server in the admin menu.
-3. On the Connect tab, copy the snippet for your client. It is filled in with this site's real endpoint, and with your token for clients that need one.
-4. Press "Run the setup checks" on that same tab if anything does not connect. It walks the same steps a client does and tells you which one failed, rather than leaving you to guess.
-5. If you want an agent to manage plugins, themes, menus, widgets or settings, switch on the site administration tools on the Tools tab. They are off by default.
+3. On the Connect page, copy the snippet for your client. It is filled in with this site's real endpoint, and with your token for clients that need one.
+4. Press "Run the setup checks" on that same page if anything does not connect. It walks the same steps a client does and tells you which one failed, rather than leaving you to guess.
+5. If you want an agent to manage plugins, themes, menus, widgets or settings, switch on the site administration tools on the Tools page. They are off by default.
 
 == Frequently Asked Questions ==
 
@@ -127,10 +127,10 @@ It has not been tested on multisite. The code has network-aware branches, but un
 
 == Screenshots ==
 
-1. The Connect tab: the endpoint to give your agent, ready-made snippets for Claude Desktop and Claude Code, and the connection check.
+1. The Connect page: the endpoint to give your agent, ready-made snippets for Claude Desktop and Claude Code, and the connection check.
 2. The consent screen an administrator sees when an OAuth client asks to connect.
-3. The Access tab: named keys, each with its own access level, tool list and expiry.
-4. The Logs tab: every call an agent made, refusals included, with the reason each was turned down. Filter by tool, account or recency, and search.
+3. The Access page: named keys, each with its own access level, tool list and expiry.
+4. The Audit Log page: every call an agent made, refusals included, with the reason each was turned down. Filter by tool, account or recency, and search.
 5. One entry in full: what changed, field by field, with the values before and after, the arguments as they were recorded, and the entry's place in the hash chain.
 
 == Changelog ==

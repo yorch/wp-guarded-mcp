@@ -5,26 +5,41 @@ if ( !defined( 'ABSPATH' ) ) {
 }
 
 /**
-* The whole admin surface: one page, four tabs.
+* The whole admin surface: one menu, five pages.
 *
 * Plain PHP and core's own form styles on purpose. The upstream plugin shipped a 1.1 MB
 * minified React bundle with no source in the repository, which made the settings screen
 * the one part of the plugin nobody could edit. Everything here is readable and fits on
 * a screen.
 *
-* The tabs are query arguments rather than anything client side, so the screen works with
-* JavaScript off and every tab is a link somebody can bookmark or send to a colleague.
+* The pages are separate submenu items rather than anything client side, so every page
+* works with JavaScript off and each one is a link somebody can bookmark or send to a
+* colleague.
 */
 class GMCP_Settings {
 
   const PAGE_SLUG = 'guarded-mcp-settings';
+  const PAGE_ACCESS = 'guarded-mcp-access';
+  const PAGE_TOOLS = 'guarded-mcp-tools';
+  const PAGE_LOGGING = 'guarded-mcp-logging';
+  const PAGE_LOGS = 'guarded-mcp-logs';
   const NONCE_ACTION = 'gmcp_save_settings';
 
   /**
-  * The tabs, in the order they appear, and the order somebody meets them: connect a
-  * client, decide who may connect, decide what they may touch, then read what they did.
+  * The pages, in the order they appear, and the order somebody meets them: connect a
+  * client, decide who may connect, decide what they may touch, decide what gets
+  * remembered, then read what they did.
+  *
+  * The array maps the historic tab name to its page slug, so page_url() keeps
+  * accepting the same argument and every caller survives the move from tabs to pages.
   */
-  const TABS = [ 'connect', 'access', 'tools', 'logs' ];
+  const PAGES = [
+    'connect' => self::PAGE_SLUG,
+    'access' => self::PAGE_ACCESS,
+    'tools' => self::PAGE_TOOLS,
+    'logging' => self::PAGE_LOGGING,
+    'logs' => self::PAGE_LOGS,
+  ];
 
   private $core = null;
   private $notice = null;
@@ -33,6 +48,7 @@ class GMCP_Settings {
     $this->core = $core;
     add_action( 'admin_menu', [ $this, 'add_menu' ] );
     add_action( 'admin_init', [ $this, 'maybe_handle_post' ] );
+    add_action( 'admin_init', [ $this, 'maybe_redirect_legacy_tab' ] );
     // A plugin whose whole configuration lives on one screen should link to it from
     // the row people are looking at when they activate it.
     add_filter( 'plugin_action_links_' . plugin_basename( GMCP_ENTRY ), [ $this, 'action_links' ] );
@@ -58,48 +74,138 @@ class GMCP_Settings {
   }
 
   /**
-  * Where the settings screen lives, in one place so a move does not strand links.
+  * Where a settings page lives, in one place so a move does not strand links.
   *
-  * The tab is omitted when empty, which lands on the first one. Callers that do not
-  * care which tab they get should keep passing nothing.
+  * The page key is historic: callers pass 'connect', 'access', 'tools', 'logging'
+  * or 'logs' and get the page that tab became. Empty lands on the first page. Callers
+  * that do not care which page they get should keep passing nothing.
   */
-  public static function page_url( string $tab = '' ): string {
-    $args = [ 'page' => self::PAGE_SLUG ];
-    if ( $tab !== '' ) {
-      $args['tab'] = $tab;
+  public static function page_url( string $page_key = '' ): string {
+    $slug = $page_key !== '' && isset( self::PAGES[ $page_key ] ) ? self::PAGES[ $page_key ] : self::PAGE_SLUG;
+    return add_query_arg( [ 'page' => $slug ], admin_url( 'admin.php' ) );
+  }
+
+  /**
+  * The page a slug names, or the first page when the slug is none of ours.
+  *
+  * The POST forms submit back to the page they were rendered on, so the redirect
+  * after a save is answered by the request itself rather than by a hidden field
+  * naming where to return to.
+  */
+  private static function page_for_slug( string $slug ): string {
+    $pages = array_values( self::PAGES );
+    return in_array( $slug, $pages, true ) ? $slug : self::PAGE_SLUG;
+  }
+
+  /**
+  * Old bookmarks and sent links still name a tab on the parent page. Send each one
+  * to the page that tab became, carrying its entry, filter, paging or sort along,
+  * so the move from tabs to pages does not strand them. Anything else is dropped,
+  * notices included: see the carry list below for why.
+  */
+  public function maybe_redirect_legacy_tab(): void {
+    if ( !is_admin() || ( defined( 'DOING_AJAX' ) && DOING_AJAX ) ) {
+      return;
     }
-    return add_query_arg( $args, admin_url( 'admin.php' ) );
+    if ( !isset( $_GET['page'], $_GET['tab'] ) ) {
+      return;
+    }
+    $page = sanitize_key( wp_unslash( $_GET['page'] ) );
+    $page_key = sanitize_key( wp_unslash( $_GET['tab'] ) );
+    if ( $page !== self::PAGE_SLUG || !isset( self::PAGES[ $page_key ] ) ) {
+      return;
+    }
+    $target = self::page_url( $page_key );
+    // Carry only what names something on the new page: an entry id, a log filter,
+    // the list table's paging and sort. Everything else is dropped, gmcp_notice
+    // included: carrying arbitrary text into a green success-styled box would let a
+    // crafted link put words in the screen's mouth.
+    $carry = [ 'entry', 's', 'gmcp_outcome', 'gmcp_tool', 'gmcp_actor', 'gmcp_since', 'gmcp_deep', 'paged', 'orderby', 'order' ];
+    foreach ( wp_unslash( $_GET ) as $key => $value ) {
+      $key = sanitize_key( $key );
+      if ( !in_array( $key, $carry, true ) || !is_scalar( $value ) ) {
+        continue;
+      }
+      $target = add_query_arg( $key, rawurlencode( (string) $value ), $target );
+    }
+    wp_safe_redirect( $target );
+    exit;
   }
 
   public function add_menu() {
     // Top level rather than buried under Settings. This is the only screen the plugin
     // has, it is the first thing anyone needs after activating, and "Settings, then
-    // scroll" is a poor answer to "where do I connect my agent".
-    $hook = add_menu_page(
+    // scroll" is a poor answer to "where do I connect my agent". The first submenu
+    // repeats the parent, which is WordPress convention: without it the parent label
+    // still opens the first page but the submenu highlights nothing.
+    $hooks = [];
+    $hooks[] = $hook = add_menu_page(
       __( 'MCP Server', 'guarded-mcp' ),
       __( 'MCP Server', 'guarded-mcp' ),
       'manage_options',
       self::PAGE_SLUG,
-      [ $this, 'render' ],
+      [ $this, 'render_connect_page' ],
       self::menu_icon(),
       80 // Just above Settings.
     );
-    // Hooked to this screen's own admin_head so the rules load on this page and nowhere
-    // else. There is no stylesheet to enqueue and no build step to produce one; what is
-    // here is the handful of things core has no class for.
-    add_action( 'admin_head-' . $hook, [ $this, 'print_styles' ] );
+    $hooks[] = add_submenu_page(
+      self::PAGE_SLUG,
+      __( 'Connection', 'guarded-mcp' ),
+      __( 'Connection', 'guarded-mcp' ),
+      'manage_options',
+      self::PAGE_SLUG,
+      [ $this, 'render_connect_page' ]
+    );
+    $hooks[] = add_submenu_page(
+      self::PAGE_SLUG,
+      __( 'Access', 'guarded-mcp' ),
+      __( 'Access', 'guarded-mcp' ),
+      'manage_options',
+      self::PAGE_ACCESS,
+      [ $this, 'render_access_page' ]
+    );
+    $hooks[] = add_submenu_page(
+      self::PAGE_SLUG,
+      __( 'Tools', 'guarded-mcp' ),
+      __( 'Tools', 'guarded-mcp' ),
+      'manage_options',
+      self::PAGE_TOOLS,
+      [ $this, 'render_tools_page' ]
+    );
+    $hooks[] = add_submenu_page(
+      self::PAGE_SLUG,
+      __( 'Logging', 'guarded-mcp' ),
+      __( 'Logging', 'guarded-mcp' ),
+      'manage_options',
+      self::PAGE_LOGGING,
+      [ $this, 'render_logging_page' ]
+    );
+    $hooks[] = $logs_hook = add_submenu_page(
+      self::PAGE_SLUG,
+      __( 'Audit Log', 'guarded-mcp' ),
+      __( 'Audit Log', 'guarded-mcp' ),
+      'manage_options',
+      self::PAGE_LOGS,
+      [ $this, 'render_logs_page' ]
+    );
+    // Hooked to each screen's own admin_head so the rules load on these pages and
+    // nowhere else. There is no stylesheet to enqueue and no build step to produce
+    // one; what is here is the handful of things core has no class for.
+    foreach ( $hooks as $screen_hook ) {
+      add_action( 'admin_head-' . $screen_hook, [ $this, 'print_styles' ] );
+    }
     // Screen Options gives the reader the per-page control the list table reads. It has
-    // to be registered on the screen's load hook: by the time render() runs, the Screen
-    // Options panel has already been built and an option added then is never shown.
-    add_action( 'load-' . $hook, [ $this, 'add_screen_options' ] );
+    // to be registered on the screen's load hook: by the time the page renders, the
+    // Screen Options panel has already been built and an option added then is never shown.
+    // Only the audit log page needs it, now that each page has its own load hook.
+    add_action( 'load-' . $logs_hook, [ $this, 'add_screen_options' ] );
   }
 
   /**
   * The per-page setting for the audit log.
   *
-  * Registered on every tab rather than only the log, because the load hook fires before
-  * the tab is known to matter and WordPress simply shows no panel on screens whose
-  * option nothing reads. Guarding it would add a branch to save nothing.
+  * Registered only on the logs page's load hook. WordPress simply shows no panel on
+  * screens whose option nothing reads, so the other pages need no guard.
   */
   public function add_screen_options(): void {
     add_screen_option( 'per_page', [
@@ -205,7 +311,7 @@ class GMCP_Settings {
   /**
   * Which option this screen writes, and how each is read out of the request.
   *
-  * Split out because a form now covers one tab rather than the whole screen. An
+  * Split out because a form now covers one page rather than the whole screen. An
   * unchecked box and a box that was never rendered look identical in $_POST, so without
   * a record of what a given form was responsible for, saving the bearer token would read
   * every tool group as unticked and switch them all off.
@@ -301,12 +407,16 @@ class GMCP_Settings {
     }
 
     // Redirect so a refresh does not repeat the action, and carry the notice across.
-    // The tab comes back with the form so the answer appears where the question was
-    // asked, rather than bouncing to the first tab on every save.
-    $tab = isset( $_POST['gmcp_tab'] ) ? sanitize_key( wp_unslash( $_POST['gmcp_tab'] ) ) : '';
+    // The form posts back to the page it was rendered on, so the answer appears
+    // where the question was asked, rather than bouncing to the first page on save.
+    // The page comes from the request's own query string rather than the form: every
+    // form on these screens submits back to the page it was rendered on, so the two
+    // agree, and a forged page value can at most misplace a notice, never an action.
+    $slug = isset( $_REQUEST['page'] ) ? sanitize_key( wp_unslash( $_REQUEST['page'] ) ) : '';
+    $page_key = array_search( self::page_for_slug( $slug ), self::PAGES, true );
     $url = add_query_arg(
       [ 'gmcp_notice' => $this->notice ? rawurlencode( $this->notice ) : null ],
-      self::page_url( in_array( $tab, self::TABS, true ) ? $tab : '' )
+      self::page_url( is_string( $page_key ) ? $page_key : '' )
     );
     wp_safe_redirect( $url );
     exit;
@@ -595,21 +705,17 @@ class GMCP_Settings {
     return get_rest_url( null, 'mcp/v1/http' );
   }
 
-  private function current_tab(): string {
-    $tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : '';
-    return in_array( $tab, self::TABS, true ) ? $tab : 'connect';
-  }
-
   /**
-  * The hidden pair every POST form on this screen carries: the action, and the tab to
-  * come back to. The nonce is printed alongside so no form can forget one of the three.
+  * The hidden action every POST form on these screens carries. The nonce is printed
+  * alongside so no form can forget either of the two. The page to come back to is
+  * the page the form was rendered on, which the request already says, so nothing
+  * else travels with it.
   */
-  private function form_head( string $action, string $tab ): void {
+  private function form_head( string $action ): void {
     wp_nonce_field( self::NONCE_ACTION );
     printf(
-      '<input type="hidden" name="gmcp_action" value="%s"><input type="hidden" name="gmcp_tab" value="%s">',
-      esc_attr( $action ),
-      esc_attr( $tab )
+      '<input type="hidden" name="gmcp_action" value="%s">',
+      esc_attr( $action )
     );
   }
 
@@ -618,55 +724,65 @@ class GMCP_Settings {
     printf( '<input type="hidden" name="gmcp_fields" value="%s">', esc_attr( implode( ' ', $keys ) ) );
   }
 
-  public function render() {
+  /**
+  * One page of the five: the capability gate, the notice and the wrap, shared so the
+  * five callbacks differ only in their title and their body.
+  */
+  private function render_page( string $title, callable $body ): void {
     if ( !current_user_can( 'manage_options' ) ) {
       wp_die( esc_html__( 'You do not have permission to view this page.', 'guarded-mcp' ) );
     }
 
-    $options = $this->core->get_all_options( true );
-    $tab = $this->current_tab();
     $notice = isset( $_GET['gmcp_notice'] ) ? sanitize_text_field( wp_unslash( $_GET['gmcp_notice'] ) ) : '';
-
-    $labels = [
-      'connect' => __( 'Connect', 'guarded-mcp' ),
-      'access' => __( 'Access', 'guarded-mcp' ),
-      'tools' => __( 'Tools', 'guarded-mcp' ),
-      'logs' => __( 'Logs', 'guarded-mcp' ),
-    ];
     ?>
     <div class="wrap">
-      <h1><?php esc_html_e( 'MCP Server', 'guarded-mcp' ); ?></h1>
+      <h1><?php echo esc_html( $title ); ?></h1>
 
       <?php if ( $notice !== '' ) : ?>
         <div class="notice notice-success is-dismissible"><p><?php echo esc_html( $notice ); ?></p></div>
       <?php endif; ?>
 
-      <nav class="nav-tab-wrapper wp-clearfix" aria-label="<?php esc_attr_e( 'MCP Server sections', 'guarded-mcp' ); ?>">
-        <?php foreach ( self::TABS as $slug ) : $active = $slug === $tab; ?>
-          <a href="<?php echo esc_url( self::page_url( $slug ) ); ?>"
-             class="nav-tab<?php echo $active ? ' nav-tab-active' : ''; ?>"
-             <?php echo $active ? 'aria-current="page"' : ''; ?>>
-            <?php echo esc_html( $labels[ $slug ] ); ?>
-          </a>
-        <?php endforeach; ?>
-      </nav>
-
-      <?php
-      if ( $tab === 'access' ) {
-        $this->render_access( $options );
-      }
-      elseif ( $tab === 'tools' ) {
-        $this->render_tools( $options );
-      }
-      elseif ( $tab === 'logs' ) {
-        $this->render_logs( $options );
-      }
-      else {
-        $this->render_connect();
-      }
-      ?>
+      <?php $body(); ?>
     </div>
     <?php
+  }
+
+  /** The Connection page, and the parent menu callback. */
+  public function render_connect_page() {
+    $this->render_page( __( 'Connection', 'guarded-mcp' ), function () {
+      $this->render_connect();
+    } );
+  }
+
+  /** The Access page. */
+  public function render_access_page() {
+    $this->render_page( __( 'Access', 'guarded-mcp' ), function () {
+      $options = $this->core->get_all_options( true );
+      $this->render_access( $options );
+    } );
+  }
+
+  /** The Tools page. */
+  public function render_tools_page() {
+    $this->render_page( __( 'Tools', 'guarded-mcp' ), function () {
+      $options = $this->core->get_all_options( true );
+      $this->render_tools( $options );
+    } );
+  }
+
+  /** The Logging page. */
+  public function render_logging_page() {
+    $this->render_page( __( 'Logging', 'guarded-mcp' ), function () {
+      $options = $this->core->get_all_options( true );
+      $this->render_logging( $options );
+    } );
+  }
+
+  /** The Audit Log page. */
+  public function render_logs_page() {
+    $this->render_page( __( 'Audit Log', 'guarded-mcp' ), function () {
+      $this->render_logs();
+    } );
   }
 
   #endregion
@@ -701,7 +817,7 @@ class GMCP_Settings {
             value="<?php echo esc_attr( $endpoint ); ?>"
             onfocus="this.select()">
           <p class="description">
-            <?php esc_html_e( 'Clients that support OAuth need nothing else: they will send you to a WordPress login and a consent screen. Clients that cannot do OAuth use the bearer token from the Access tab.', 'guarded-mcp' ); ?>
+            <?php esc_html_e( 'Clients that support OAuth need nothing else: they will send you to a WordPress login and a consent screen. Clients that cannot do OAuth use a named key from the Access page.', 'guarded-mcp' ); ?>
           </p>
           <p class="description">
             <?php
@@ -732,9 +848,9 @@ class GMCP_Settings {
       <h3><?php esc_html_e( 'Claude Code', 'guarded-mcp' ); ?></h3>
       <p class="description">
         <?php printf(
-          /* translators: %s: a link to the Access tab. */
+          /* translators: %s: a link to the Access page. */
           esc_html__( 'Run this in your project, with a key from %s in place of YOUR_KEY. It stores the key in Claude Code\'s own configuration.', 'guarded-mcp' ),
-          '<a href="' . esc_url( self::page_url( 'access' ) ) . '">' . esc_html__( 'the Access tab', 'guarded-mcp' ) . '</a>'
+          '<a href="' . esc_url( self::page_url( 'access' ) ) . '">' . esc_html__( 'the Access page', 'guarded-mcp' ) . '</a>'
         ); ?>
       </p>
       <label class="screen-reader-text" for="gmcp_recipe_cli"><?php esc_html_e( 'Command for Claude Code', 'guarded-mcp' ); ?></label>
@@ -766,8 +882,8 @@ class GMCP_Settings {
           <strong><?php esc_html_e( 'No bearer token is set yet.', 'guarded-mcp' ); ?></strong>
           <?php
           printf(
-            /* translators: %s: link to the Access tab. */
-            esc_html__( 'Generate one on the %s tab and this snippet will fill itself in. OAuth clients do not need one.', 'guarded-mcp' ),
+            /* translators: %s: link to the Access page. */
+            esc_html__( 'Generate one on the %s page and this snippet will fill itself in. OAuth clients do not need one.', 'guarded-mcp' ),
             '<a href="' . esc_url( self::page_url( 'access' ) ) . '">' . esc_html__( 'Access', 'guarded-mcp' ) . '</a>'
           );
           ?>
@@ -777,7 +893,7 @@ class GMCP_Settings {
 
     <h2 class="title"><?php esc_html_e( 'Is this site ready', 'guarded-mcp' ); ?></h2>
     <form method="post">
-      <?php $this->form_head( 'self_test', 'connect' ); ?>
+      <?php $this->form_head( 'self_test' ); ?>
       <button type="submit" class="button button-secondary"><?php esc_html_e( 'Run the setup checks', 'guarded-mcp' ); ?></button>
     </form>
     <?php $this->render_report(); ?>
@@ -913,7 +1029,7 @@ class GMCP_Settings {
             </td>
             <td>
               <form method="post">
-                <?php $this->form_head( 'revoke_key', 'access' ); ?>
+                <?php $this->form_head( 'revoke_key' ); ?>
                 <input type="hidden" name="key_id" value="<?php echo esc_attr( $key['id'] ); ?>">
                 <button type="submit" class="button button-small">
                   <?php esc_html_e( 'Revoke', 'guarded-mcp' ); ?>
@@ -929,7 +1045,7 @@ class GMCP_Settings {
 
     <h3><?php esc_html_e( 'Create a key', 'guarded-mcp' ); ?></h3>
     <form method="post">
-      <?php $this->form_head( 'create_key', 'access' ); ?>
+      <?php $this->form_head( 'create_key' ); ?>
       <table class="form-table" role="presentation">
         <tr>
           <th scope="row"><label for="key_label"><?php esc_html_e( 'Label', 'guarded-mcp' ); ?></label></th>
@@ -1006,7 +1122,7 @@ class GMCP_Settings {
             <td><?php echo esc_html( $app['last_used'] ? $this->format_date( $app['last_used'] ) : __( 'Never', 'guarded-mcp' ) ); ?></td>
             <td>
               <form method="post">
-                <?php $this->form_head( 'revoke_app', 'access' ); ?>
+                <?php $this->form_head( 'revoke_app' ); ?>
                 <input type="hidden" name="app_id" value="<?php echo esc_attr( $app['id'] ); ?>">
                 <button type="submit" class="button button-small">
                   <?php esc_html_e( 'Revoke', 'guarded-mcp' ); ?>
@@ -1025,7 +1141,7 @@ class GMCP_Settings {
 
   #region Tools
 
-  /** What a connected agent is offered. Nothing on this tab is about who may connect. */
+  /** What a connected agent is offered. Nothing on this page is about who may connect. */
   private function render_tools( array $options ): void {
     $woo = class_exists( 'WooCommerce' );
     $elementor = did_action( 'elementor/loaded' );
@@ -1046,7 +1162,7 @@ class GMCP_Settings {
     <h2 class="title"><?php esc_html_e( 'Tool groups', 'guarded-mcp' ); ?></h2>
     <form method="post">
       <?php
-      $this->form_head( 'save', 'tools' );
+      $this->form_head( 'save' );
       $this->form_fields( $keys );
       ?>
       <table class="form-table" role="presentation">
@@ -1109,20 +1225,26 @@ class GMCP_Settings {
   #region Logs
 
   /**
-  * What the plugin records, and the record itself.
+  * What the plugin records.
   *
-  * The switches used to sit four hundred lines away from the log they fill, under a
-  * heading about tools. Reading the log and deciding whether to keep one are the same
-  * job, so they are the same tab.
+  * Deliberately not on the same page as the log itself. The switches are set once
+  * and the table is visited daily, and the table buried below a settings form served
+  * neither. The switched-off notice over there links back here, so the way from an
+  * empty log to its switch is still one click.
   */
-  private function render_logs( array $options ): void {
+  private function render_logging( array $options ): void {
     ?>
-    <p class="gmcp-intro"><?php esc_html_e( 'An agent that leaves no record is an agent you cannot review. These are the three things the plugin can remember, and below them, what it has remembered so far.', 'guarded-mcp' ); ?></p>
+    <p class="gmcp-intro"><?php
+      printf(
+        /* translators: %s: link to the Audit Log page. */
+        esc_html__( 'An agent that leaves no record is an agent you cannot review. These are the three things the plugin can remember. What it has remembered so far lives on the %s.', 'guarded-mcp' ),
+        '<a href="' . esc_url( self::page_url( 'logs' ) ) . '">' . esc_html__( 'Audit Log page', 'guarded-mcp' ) . '</a>'
+      ); ?></p>
 
     <h2 class="title"><?php esc_html_e( 'What gets recorded', 'guarded-mcp' ); ?></h2>
     <form method="post">
       <?php
-      $this->form_head( 'save', 'logs' );
+      $this->form_head( 'save' );
       $this->form_fields( [ 'mcp_activity_log', 'mcp_audit_days', 'mcp_change_journal', 'mcp_debug_mode' ] );
       ?>
       <table class="form-table" role="presentation">
@@ -1174,8 +1296,25 @@ class GMCP_Settings {
       </table>
       <?php submit_button(); ?>
     </form>
+    <?php
+  }
 
-    <h2 class="title"><?php esc_html_e( 'The audit log', 'guarded-mcp' ); ?></h2>
+  /**
+  * The record itself: the table, one entry, or the off notice.
+  *
+  * Nothing to configure here on purpose. The switches that fill this table live on
+  * the Logging page, one menu item away, because a settings form above the table
+  * buried the thing people visit daily under the thing they set once.
+  */
+  private function render_logs(): void {
+    ?>
+    <p class="gmcp-intro"><?php
+      printf(
+        /* translators: %s: link to the Logging page. */
+        esc_html__( 'What the plugin has remembered so far. The switches that decide what gets recorded live on the %s.', 'guarded-mcp' ),
+        '<a href="' . esc_url( self::page_url( 'logging' ) ) . '">' . esc_html__( 'Logging page', 'guarded-mcp' ) . '</a>'
+      ); ?></p>
+
     <?php $this->render_activity(); ?>
     <?php
   }
@@ -1211,7 +1350,10 @@ class GMCP_Settings {
   */
   private function render_activity(): void {
     if ( empty( $this->core->get_option( 'mcp_activity_log' ) ) ) {
-      echo '<p>' . esc_html__( 'The audit log is switched off, so nothing is being recorded. Switch it on above and calls from then on will appear here.', 'guarded-mcp' ) . '</p>';
+      printf(
+        '<p>' . esc_html__( 'The audit log is switched off, so nothing is being recorded. Switch it on on the %s and calls from then on will appear here.', 'guarded-mcp' ) . '</p>',
+        '<a href="' . esc_url( self::page_url( 'logging' ) ) . '">' . esc_html__( 'Logging page', 'guarded-mcp' ) . '</a>'
+      );
       return;
     }
 
@@ -1583,7 +1725,9 @@ class GMCP_Settings {
   private function render_entry_list(): void {
     $filters = self::log_filters( $_GET );
     $outcome = $filters['outcome'];
-
+    ?>
+    <h2 class="title"><?php esc_html_e( 'The audit log', 'guarded-mcp' ); ?></h2>
+    <?php
     $table = new GMCP_Audit_Table( $filters );
     $table->prepare_items();
 
@@ -1606,9 +1750,8 @@ class GMCP_Settings {
     ?>
     <form method="get">
       <?php // These travel with every filter, search and page link, or submitting the
-      // search box drops the reader onto the first tab of a screen they were not on. ?>
-      <input type="hidden" name="page" value="<?php echo esc_attr( self::PAGE_SLUG ); ?>">
-      <input type="hidden" name="tab" value="logs">
+      // search box drops the reader onto the Connection page they were not on. ?>
+      <input type="hidden" name="page" value="<?php echo esc_attr( self::PAGE_LOGS ); ?>">
       <?php if ( $filters['outcome'] !== '' ) : ?>
         <input type="hidden" name="gmcp_outcome" value="<?php echo esc_attr( $filters['outcome'] ); ?>">
       <?php endif; ?>
@@ -1691,11 +1834,11 @@ class GMCP_Settings {
           esc_html( number_format_i18n( $chain['total'] ) ),
           esc_html( number_format_i18n( max( 0, (int) $chain['total'] - (int) $chain['checked'] ) ) )
         ); ?></p>
-        <?php // Through form_head, not by hand: the POST redirects, and a form that
-        // forgets gmcp_tab sends the reader to the first tab to read a verdict about
-        // the log they were just looking at. ?>
+        <?php // Through form_head, not by hand: the POST redirects back to the page it
+        // was submitted from, and a form that forgets its action sends the reader
+        // nowhere useful to read a verdict about the log they were just looking at. ?>
         <form method="post">
-          <?php $this->form_head( 'verify_audit', 'logs' ); ?>
+          <?php $this->form_head( 'verify_audit' ); ?>
           <button type="submit" class="button"><?php esc_html_e( 'Check the whole chain', 'guarded-mcp' ); ?></button>
         </form>
       </div>
@@ -1754,22 +1897,22 @@ class GMCP_Settings {
 
     <div class="gmcp-actions">
       <form method="post">
-        <?php $this->form_head( 'prune_audit', 'logs' ); ?>
+        <?php $this->form_head( 'prune_audit' ); ?>
         <button type="submit" class="button"><?php esc_html_e( 'Prune now', 'guarded-mcp' ); ?></button>
       </form>
       <form method="post">
-        <?php $this->form_head( 'clear_activity', 'logs' ); ?>
+        <?php $this->form_head( 'clear_activity' ); ?>
         <button type="submit" class="button"><?php esc_html_e( 'Clear everything', 'guarded-mcp' ); ?></button>
       </form>
       <?php // Each carries the filters it was pressed under, so the file holds the rows
       // on screen. A separate form per button because the action is a hidden field. ?>
       <form method="post">
-        <?php $this->form_head( 'export_csv', 'logs' ); ?>
+        <?php $this->form_head( 'export_csv' ); ?>
         <?php self::filter_fields( $filters ); ?>
         <button type="submit" class="button"><?php esc_html_e( 'Export as CSV', 'guarded-mcp' ); ?></button>
       </form>
       <form method="post">
-        <?php $this->form_head( 'export_json', 'logs' ); ?>
+        <?php $this->form_head( 'export_json' ); ?>
         <?php self::filter_fields( $filters ); ?>
         <button type="submit" class="button"><?php esc_html_e( 'Export as JSON', 'guarded-mcp' ); ?></button>
       </form>
