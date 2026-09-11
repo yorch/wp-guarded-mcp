@@ -639,6 +639,189 @@ class GMCP_Tools_Core {
     return $purged;
   }
 
+  // How many URLs one wp_purge_url call may name.
+  //
+  // Twenty because that is the size of the problem the tool exists for: a template or a
+  // menu change that touched a handful of pages. It is not a memory or a packet limit.
+  // The real per-URL cost is that W3 Total Cache's flush_url() fans out to whatever CDN
+  // and reverse-proxy add-ons that install has configured, so each URL can be a network
+  // round trip on a stranger's infrastructure, and WP Rocket's is a recursive glob over
+  // the cache directory. Past twenty the honest answer is that the site is stale, not
+  // that twenty-five pages are, and wp_flush_cache says that in one call.
+  //
+  // Over the cap the call is refused rather than trimmed, for the reason the whole
+  // surface is written: purging the first twenty and dropping the rest would hand back a
+  // success naming URLs that are still being served from cache.
+  private const PURGE_URL_MAX = 20;
+
+  /**
+  * Turn what a caller passed into a URL on THIS site, or say why it is not one.
+  *
+  * A cache purge is the one operation here that can reach past the site: LiteSpeed and
+  * WP Rocket take the URL at its word, and a site that has wired gmcp_url_purged to a
+  * CDN will hand whatever arrives to that CDN's API. So "a URL" means a URL under
+  * home_url(), and anything else is refused before a single purge runs.
+  *
+  * Three of the checks are load-bearing and look like fussiness until you write the
+  * hostile input for them:
+  *
+  * The host is compared for equality, never with strpos(). "example.com.evil.com" ends
+  * with nothing suspicious and contains the real host; only an exact match refuses it.
+  *
+  * A leading "//" is not a path. wp_parse_url( '//evil.com/x' ) reports host evil.com,
+  * so a protocol-relative URL that looks like a path to the eye is a foreign domain to
+  * the parser, and it has to take the full-URL branch to be refused there.
+  *
+  * The path prefix matters only on a subdirectory install, where home is
+  * https://host/blog/ and https://host/ is a different site sharing the host. Comparing
+  * against "/blog" alone would also accept "/blogger", so the match is the directory or
+  * something below it.
+  *
+  * What comes back is rebuilt from home_url()'s own scheme, host and port rather than
+  * echoed from the input, so a caller reaching an https site over http gets the URL
+  * WordPress itself would generate, which is the one the caches are keyed by. Userinfo
+  * and the fragment are dropped on the way through: neither reaches the server, so
+  * neither can be part of a cache key.
+  *
+  * @return array{0: string, 1: string} [canonical URL, reason for refusal]; exactly one is non-empty.
+  */
+  private function purge_url_target( string $raw ): array {
+    $home = wp_parse_url( home_url( '/' ) );
+    $home_host = strtolower( (string) ( $home['host'] ?? '' ) );
+    $home_port = isset( $home['port'] ) ? (int) $home['port'] : 0;
+    $home_dir = '/' . trim( (string) ( $home['path'] ?? '' ), '/' );
+    $home_root = ( $home['scheme'] ?? 'http' ) . '://' . $home_host . ( $home_port ? ':' . $home_port : '' );
+
+    $hash = strpos( $raw, '#' );
+    if ( $hash !== false ) {
+      $raw = substr( $raw, 0, $hash );
+    }
+    // After the fragment, not before: "/page/ #top" would otherwise leave a trailing
+    // space inside the URL handed to every purge below.
+    $raw = trim( $raw );
+    if ( $raw === '' ) {
+      return [ '', 'an empty string is not a URL' ];
+    }
+    // Checked before the branch, because it is wrong in both. Every purge downstream
+    // turns the URL into a filesystem path under its own cache directory and globs it,
+    // so a ".." segment is an instruction to look outside that directory. No permalink
+    // this site can generate contains one.
+    if ( in_array( '..', explode( '/', explode( '?', $raw, 2 )[0] ), true ) ) {
+      return [ '', 'the path steps up through "..", which no permalink on this site does and which would reach outside a cache directory' ];
+    }
+
+    // A bare path is resolved through home_url(), which is the only reading that is
+    // right on a subdirectory install: "/contact/" under a site at /blog/ means
+    // /blog/contact/, and that is the URL its caches hold.
+    if ( $raw[0] === '/' && substr( $raw, 0, 2 ) !== '//' ) {
+      return [ home_url( $raw ), '' ];
+    }
+
+    $parts = wp_parse_url( $raw );
+    if ( !is_array( $parts ) || empty( $parts['host'] ) ) {
+      return [ '', 'this is neither a full URL nor a path beginning with "/". Pass ' . $home_root . '/page/ or /page/' ];
+    }
+    $scheme = strtolower( (string) ( $parts['scheme'] ?? '' ) );
+    if ( $scheme !== '' && $scheme !== 'http' && $scheme !== 'https' ) {
+      return [ '', 'the scheme is "' . $scheme . '", and only http and https name a page this site serves' ];
+    }
+    $host = strtolower( (string) $parts['host'] );
+    $port = isset( $parts['port'] ) ? (int) $parts['port'] : 0;
+    if ( $host !== $home_host || $port !== $home_port ) {
+      return [ '', 'it is on "' . $host . ( $port ? ':' . $port : '' ) . '", and this site is "' . $home_host . ( $home_port ? ':' . $home_port : '' ) . '". This tool purges only its own site' ];
+    }
+    $path = (string) ( $parts['path'] ?? '' );
+    if ( $path === '' ) {
+      $path = '/';
+    }
+    if ( $home_dir !== '/' && $path !== $home_dir && strpos( $path, $home_dir . '/' ) !== 0 ) {
+      return [ '', 'it is outside "' . $home_dir . '/", which is where this site lives on that host' ];
+    }
+    $query = (string) ( $parts['query'] ?? '' );
+    return [ $home_root . $path . ( $query !== '' ? '?' . $query : '' ), '' ];
+  }
+
+  /**
+  * Purge one URL from the page caches this plugin can name, and say what each one did.
+  *
+  * Same stance as purge_page_caches(), and the same guards for the same reason: a name
+  * that has since changed is a no-op rather than a fatal. The difference is that here
+  * "absent" has to be reported as loudly as "purged", because a caller who asked for one
+  * URL and got an empty list has not been told the page is fresh — it is still being
+  * served from whatever cache this tool could not see.
+  *
+  * The object cache is deliberately not touched. Its entries are keyed by post, option
+  * and term, never by URL, so there is nothing here to select on; the only lever is
+  * wp_cache_flush(), which drops every entry for every page and is precisely the
+  * site-wide rebuild this tool exists to avoid. wp_flush_cache scope "post" is the
+  * narrow version, and the reply points at it.
+  *
+  * @return array{purged: string[], declined: string[], absent: string[]}
+  */
+  private function purge_url_caches( string $url ): array {
+    $purged = [];
+    $declined = [];
+    $absent = [];
+
+    // LiteSpeed's documented per-URL purge action, registered beside litespeed_purge_all
+    // in its src/api.cls.php. It takes a full URL or a bare path.
+    // docs.litespeedtech.com/lscache/lscwp/api/
+    if ( has_action( 'litespeed_purge_url' ) ) {
+      do_action( 'litespeed_purge_url', $url );
+      $purged[] = 'LiteSpeed Cache';
+    }
+    else {
+      $absent[] = 'LiteSpeed Cache';
+    }
+    // WP Rocket's per-URL clear, the narrow sibling of the rocket_clean_domain() that
+    // purge_page_caches() calls. It is RECURSIVE and its own documentation says so:
+    // passing /blog/ clears everything matching /blog/(.*) as well, with no wildcard.
+    // That is more than was asked for, so it is reported rather than left to be found
+    // out. docs.wp-rocket.me/article/91-rocketcleanfiles
+    if ( function_exists( 'rocket_clean_files' ) ) {
+      rocket_clean_files( $url );
+      $purged[] = 'WP Rocket (and everything below this path: its per-URL clear is recursive)';
+    }
+    else {
+      $absent[] = 'WP Rocket';
+    }
+    // W3 Total Cache's public per-URL flush, declared in its w3-total-cache-api.php
+    // beside the w3tc_flush_all() used for the whole site.
+    if ( function_exists( 'w3tc_flush_url' ) ) {
+      w3tc_flush_url( $url );
+      $purged[] = 'W3 Total Cache';
+    }
+    else {
+      $absent[] = 'W3 Total Cache';
+    }
+    // WP Super Cache's per-URL delete, from wp-cache-phase2.php. It returns false rather
+    // than raising when it will not act, and it refuses any URL carrying "?" outright,
+    // so the return value is reported instead of assumed. Treating a false as a purge is
+    // the exact failure this tool is written against.
+    if ( function_exists( 'wpsc_delete_url_cache' ) ) {
+      if ( wpsc_delete_url_cache( $url ) ) {
+        $purged[] = 'WP Super Cache';
+      }
+      else {
+        $declined[] = 'WP Super Cache did nothing with this URL. It refuses any URL carrying a query string, and it matches on the path below the site home';
+      }
+    }
+    else {
+      $absent[] = 'WP Super Cache';
+    }
+    // SpeedyCache keeps its purges on a static class in main/delete.php rather than
+    // behind functions or actions; Delete::url() is the per-URL sibling of the
+    // Delete::all_cache() purge_page_caches() calls, and it takes a URL or a list.
+    if ( is_callable( [ '\SpeedyCache\Delete', 'url' ] ) ) {
+      call_user_func( [ '\SpeedyCache\Delete', 'url' ], $url );
+      $purged[] = 'SpeedyCache';
+    }
+    else {
+      $absent[] = 'SpeedyCache';
+    }
+    return [ 'purged' => $purged, 'declined' => $declined, 'absent' => $absent ];
+  }
+
   /** Meta keys that say who is editing the source post rather than what it contains. */
   private const META_KEYS_NEVER_COPIED = [ '_edit_lock', '_edit_last' ];
 
@@ -1006,6 +1189,23 @@ class GMCP_Tools_Core {
             ],
             'ID' => [ 'type' => 'integer', 'description' => 'Post ID. Required when scope is "post".' ],
           ],
+        ],
+        'accessLevel' => 'admin',
+      ],
+
+      'wp_purge_url' => [
+        'name' => 'wp_purge_url',
+        'description' => 'Purge the cached copy of particular URLs on this site, instead of dropping every cache at once the way wp_flush_cache does. Use it after changing one page, or a template that affects a handful of pages: a whole-site flush on a busy site sends every visitor to the database at once. Takes "urls", a list of up to 20; each entry is a full URL on this site or a path beginning with "/" (resolved against the site home, which matters on a subdirectory install). A URL on ANY other host is refused and NOTHING is purged, even if only one entry in the list is foreign, because a purge is handed on to caches and CDNs that take it at its word and no tool here asks anyone to drop somebody else\'s page. More than 20 URLs is refused rather than trimmed, so no URL is ever left believed-fresh. It purges the per-URL caches of the page-cache plugins this plugin can name (LiteSpeed Cache, WP Rocket, W3 Total Cache, WP Super Cache, SpeedyCache) and fires the gmcp_url_purged action for each URL. WP Rocket\'s per-URL clear is recursive, so it also drops everything below the path. It does NOT touch the object cache: those entries are keyed by post, option and term rather than by URL, so the only lever is the all-or-nothing flush this tool exists to avoid; use wp_flush_cache scope "post" for one post, or scope "object" for the lot. It does NOT purge any CDN or reverse proxy (Cloudflare, Varnish, Fastly, a host edge cache) unless the site has wired one to the hook itself. The reply names, per URL, which purges ran and which of those plugins were absent, and when it recognised no page cache at all it says so instead of reporting success.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'urls' => [
+              'type' => 'array',
+              'items' => [ 'type' => 'string' ],
+              'description' => 'Up to 20 URLs on this site. Full URL or a path beginning with "/". A foreign host, or more than 20 entries, refuses the whole call.',
+            ],
+          ],
+          'required' => [ 'urls' ],
         ],
         'accessLevel' => 'admin',
       ],
@@ -2514,6 +2714,132 @@ class GMCP_Tools_Core {
         foreach ( $unpurged as $line ) {
           $lines[] = '- ' . $line;
         }
+        $this->add_result_text( $r, implode( "\n", $lines ) );
+        break;
+
+      case 'wp_purge_url':
+        $raw_urls = $a['urls'] ?? null;
+        // One URL sent as a bare string is the shape a model reaches for first and it is
+        // unambiguous, so it is accepted rather than refused over punctuation.
+        if ( is_string( $raw_urls ) ) {
+          $raw_urls = [ $raw_urls ];
+        }
+        if ( !is_array( $raw_urls ) || !$raw_urls ) {
+          $r = $this->error( $r, 'wp_purge_url needs "urls": a list of one or more URLs on this site.', -32602 );
+          break;
+        }
+        if ( count( $raw_urls ) > self::PURGE_URL_MAX ) {
+          $r = $this->error( $r, 'That call named ' . count( $raw_urls ) . ' URLs, and wp_purge_url takes at most ' . self::PURGE_URL_MAX . ' in one call. Nothing was purged. Split the list, or use wp_flush_cache if the whole site really is stale. The cap is refused rather than trimmed so that no URL is left believed-fresh.', -32602 );
+          break;
+        }
+
+        // Every URL is resolved before any of them is purged, and one bad entry refuses
+        // the whole call. Purging nineteen and burying "number seven was refused" in the
+        // reply is the shape of mistake that gets skimmed past, and stopping here costs
+        // nothing because nothing has happened yet.
+        $purge_targets = [];
+        $purge_refused = [];
+        foreach ( $raw_urls as $raw_url ) {
+          if ( !is_scalar( $raw_url ) ) {
+            $purge_refused[] = 'an entry that is not a string';
+            continue;
+          }
+          [ $purge_target, $purge_why ] = $this->purge_url_target( (string) $raw_url );
+          if ( $purge_target === '' ) {
+            $purge_refused[] = '"' . (string) $raw_url . '": ' . $purge_why;
+            continue;
+          }
+          // Two spellings of one page, "/contact/" and its full URL, are one purge.
+          $purge_targets[ $purge_target ] = true;
+        }
+        if ( $purge_refused ) {
+          $r = $this->error(
+            $r,
+            'Nothing was purged, because this call names something that is not a URL on this site (' . home_url( '/' ) . "):\n- "
+              . implode( "\n- ", $purge_refused )
+              . "\nThe whole call is refused rather than the bad entries alone, so that no page is left believed-fresh.",
+            -32602
+          );
+          break;
+        }
+        $purge_targets = array_keys( $purge_targets );
+
+        $purge_lines = [];
+        $purge_absent = [];
+        $purge_any = false;
+        // Purged and recognised are different claims, and the headline needs both. A site
+        // running only WP Super Cache, asked for URLs that all carry a query string, has
+        // purged nothing AND has a page cache, so neither "purged" nor "no page cache
+        // here" would be true of it.
+        $purge_recognised = false;
+        foreach ( $purge_targets as $purge_target ) {
+          $purge_outcome = $this->purge_url_caches( $purge_target );
+          // Which plugins are absent is a property of the site rather than of the URL, so
+          // every pass reports the same list and it is stated once, below, instead of
+          // being repeated under each URL.
+          $purge_absent = $purge_outcome['absent'];
+          $purge_lines[] = $purge_target;
+          foreach ( $purge_outcome['purged'] as $purge_name ) {
+            $purge_lines[] = '  purged: ' . $purge_name;
+            $purge_any = true;
+            $purge_recognised = true;
+          }
+          foreach ( $purge_outcome['declined'] as $purge_note ) {
+            $purge_lines[] = '  NOT purged: ' . $purge_note;
+            $purge_recognised = true;
+          }
+          if ( !$purge_outcome['purged'] && !$purge_outcome['declined'] ) {
+            $purge_lines[] = '  purged: nothing, for the reason above';
+          }
+        }
+
+        // Sites wire their own CDN and reverse-proxy purges, and a per-URL purge needs the
+        // URL, which gmcp_cache_flushed's scope string has nowhere to carry. Hence a
+        // URL-shaped action of its own, fired once per URL.
+        //
+        // gmcp_cache_flushed still fires when nothing listens to the new one. A site that
+        // wired a CDN purge to it before this tool existed must not be silently bypassed
+        // by a tool added afterwards: dropping the whole edge cache is broader than was
+        // asked for, but a reply saying "purged" while the edge keeps serving the old page
+        // is the failure this plugin is written against, and over-purging is the direction
+        // that can be walked back. Wiring gmcp_url_purged is what turns the fallback off.
+        $purge_hook_wired = has_action( 'gmcp_url_purged' );
+        foreach ( $purge_targets as $purge_target ) {
+          do_action( 'gmcp_url_purged', $purge_target, [ 'source' => 'mcp', 'tool' => 'wp_purge_url' ] );
+        }
+        if ( !$purge_hook_wired ) {
+          do_action( 'gmcp_cache_flushed', 'url', [ 'source' => 'mcp', 'tool' => 'wp_purge_url', 'urls' => $purge_targets ] );
+        }
+
+        $lines = [];
+        if ( $purge_any ) {
+          $lines[] = 'Purged ' . count( $purge_targets ) . ( count( $purge_targets ) === 1 ? ' URL on ' : ' URLs on ' ) . home_url( '/' ) . '.';
+        }
+        elseif ( $purge_recognised ) {
+          $lines[] = 'NOTHING WAS PURGED. The page caches this tool recognised here were asked and did nothing with these URLs; each one says why below.';
+        }
+        else {
+          $lines[] = 'NOTHING WAS PURGED. No page-cache plugin that this tool can purge a single URL of is active on this site: it knows LiteSpeed Cache, WP Rocket, W3 Total Cache, WP Super Cache and SpeedyCache, and none of them answered. If this site caches pages some other way, these URLs are still being served from it.';
+        }
+        $lines[] = '';
+        $lines = array_merge( $lines, $purge_lines );
+        $lines[] = '';
+        $lines[] = 'NOT purged, and still stale until you deal with it:';
+        // Only worth saying when some of the five WERE here. When none were, the opening
+        // line has already named all five and repeating them reads as a second finding.
+        if ( $purge_absent && $purge_recognised ) {
+          $lines[] = '- Not active here, so nothing was asked of them: ' . implode( ', ', $purge_absent ) . '.';
+        }
+        $lines[] = '- Any other page-cache plugin: this tool knows only the five named above.';
+        $lines[] = '- The object cache. Its entries are keyed by post, option and term rather than by URL, so there is no per-URL purge to make. wp_flush_cache scope "post" clears one post; scope "object" clears every entry and makes the next request for every page rebuild from the database.';
+        $lines[] = $purge_hook_wired
+          ? '- Any CDN or reverse proxy, unless the gmcp_url_purged listener this site has wired reaches it. Nothing in PHP reaches Cloudflare, Varnish, Fastly or a host edge cache on its own, so confirm that listener covers these URLs before believing the front end is fresh.'
+          : '- Any CDN or reverse proxy: Cloudflare, Varnish, Fastly, a host edge cache. None of these can be reached from PHP and nothing on this site listens to gmcp_url_purged, so PURGE THESE YOURSELF or the front end keeps serving the old page.';
+        $lines[] = '- Pages already delivered to visitors: browser caches and service workers keep serving what they have until it expires.';
+        $lines[] = '';
+        $lines[] = $purge_hook_wired
+          ? 'Hooks: gmcp_url_purged fired once per URL. gmcp_cache_flushed was NOT fired, because this site listens to gmcp_url_purged and a site-wide purge is not what was asked for.'
+          : 'Hooks: gmcp_url_purged fired once per URL, and nothing on this site listens to it. gmcp_cache_flushed also fired with scope "url", as the fallback for a CDN purge wired before this tool existed; a listener there that ignores its scope argument will have purged the whole site.';
         $this->add_result_text( $r, implode( "\n", $lines ) );
         break;
 
