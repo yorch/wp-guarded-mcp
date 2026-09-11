@@ -223,6 +223,29 @@ It lives in its own table, `{prefix}gmcp_audit`, indexed by time, tool and actor
 replaced an option row, which was a read-modify-write: two calls landing together could
 lose an entry, and it held a hundred rows at most.
 
+It is read through a list, one row per call, and a page for any single entry. The list is
+a WordPress list table, so it pages, sorts by column, remembers how many rows you want
+under Screen Options, and behaves like the rest of wp-admin. It filters by tool, by
+account, by how recently, and by whether the call was refused, that last one as a link
+rather than a menu because refusals are what the table is kept for.
+
+Each row is one line. That is a constraint rather than a simplification: the previous
+screen printed every changed field inline, so a single call that touched eight objects
+pushed the next call off the screen, and a list you scroll past to reach the next entry
+has stopped being a list. The row says what the call changed in a phrase, and the entry
+page has room for the rest.
+
+The entry page holds everything the log recorded, which the list deliberately does not:
+the full refusal message rather than the first 160 characters, every changed field with
+its before and after, the arguments as they were stored, and the entry's own hash and the
+one it follows. It also says whether that entry still matches its own hash, and says in
+the same breath that this is a statement about one entry and not about the chain.
+
+There is no checkbox column and no bulk actions, which is a decision. Every bulk action a
+log could offer is a deletion, and rows here hash the row before them: removing one from
+the middle is exactly what the chain exists to make visible, so putting a convenient
+button on it would be building the attack into the product.
+
 Five things about it are decisions rather than defaults.
 
 *Arguments are recorded, redacted.* An entry that does not say what was asked for is half
@@ -255,6 +278,9 @@ does is make it visible: the screen recomputes it and names the first row that n
 matches, and says whether the row was edited or one before it removed. That is the
 difference between a history and an audit. Rows carried over from the option-based
 version have no hash and are reported as uncovered rather than as tampering.
+
+The verdict names an entry, and the screen links to it, so "the chain breaks at entry
+412" leads to entry 412 rather than handing you a number and no way to use it.
 
 *And it says how much it checked.* Recomputing the whole table means reading every
 recorded argument back out of the database, which on a full one is tens of megabytes, so

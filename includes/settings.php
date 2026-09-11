@@ -36,6 +36,15 @@ class GMCP_Settings {
     // A plugin whose whole configuration lives on one screen should link to it from
     // the row people are looking at when they activate it.
     add_filter( 'plugin_action_links_' . plugin_basename( GMCP_ENTRY ), [ $this, 'action_links' ] );
+    // Registering the screen option is not enough to make it persist. WordPress saves
+    // only the options it recognises, and for anything else set_screen_options() asks
+    // this filter and discards the value when nothing answers. Without it the panel
+    // renders, accepts a number, reloads, and shows the old page size: a control that
+    // looks like it works. Registered here rather than on the screen's load hook,
+    // because the save runs before that hook does.
+    add_filter( 'set_screen_option_gmcp_audit_per_page', static function ( $status, $option, $value ) {
+      return max( 1, min( 500, (int) $value ) );
+    }, 10, 3 );
   }
 
   public function action_links( $links ) {
@@ -79,6 +88,25 @@ class GMCP_Settings {
     // else. There is no stylesheet to enqueue and no build step to produce one; what is
     // here is the handful of things core has no class for.
     add_action( 'admin_head-' . $hook, [ $this, 'print_styles' ] );
+    // Screen Options gives the reader the per-page control the list table reads. It has
+    // to be registered on the screen's load hook: by the time render() runs, the Screen
+    // Options panel has already been built and an option added then is never shown.
+    add_action( 'load-' . $hook, [ $this, 'add_screen_options' ] );
+  }
+
+  /**
+  * The per-page setting for the audit log.
+  *
+  * Registered on every tab rather than only the log, because the load hook fires before
+  * the tab is known to matter and WordPress simply shows no panel on screens whose
+  * option nothing reads. Guarding it would add a branch to save nothing.
+  */
+  public function add_screen_options(): void {
+    add_screen_option( 'per_page', [
+      'label' => __( 'Audit entries per page', 'guarded-mcp' ),
+      'default' => 25,
+      'option' => 'gmcp_audit_per_page',
+    ] );
   }
 
   /**
@@ -134,6 +162,10 @@ class GMCP_Settings {
       .gmcp-detail { color: #787c82; font-size: 12px; }
       /* Darker than .gmcp-detail on purpose: what a call changed outranks what it said. */
       .gmcp-change { color: #1d2327; font-size: 12px; }
+      /* Long enough to wrap on a narrow screen rather than widen the table. */
+      .gmcp-hash { font-size: 11px; word-break: break-all; }
+      /* A refusal is worth spotting from across the table, not by reading it. */
+      tr.gmcp-row-refused td { box-shadow: inset 3px 0 0 #d63638; }
       .gmcp-args { white-space: pre-wrap; font-size: 11px; margin: 4px 0 0; }
       .gmcp-summary { cursor: pointer; color: #2271b1; font-size: 12px; }
       .gmcp-limits { font-size: 11px; }
@@ -978,6 +1010,11 @@ class GMCP_Settings {
   * minutes, "3 mins ago" is the more useful reading anyway.
   */
   private function ago( int $timestamp ): string {
+    return self::ago_for( $timestamp );
+  }
+
+  /** The same, reachable from the list table, which is not a method of this class. */
+  public static function ago_for( int $timestamp ): string {
     $now = time();
     if ( $timestamp > $now - 10 ) {
       return __( 'just now', 'guarded-mcp' );
@@ -990,145 +1027,261 @@ class GMCP_Settings {
   }
 
   /**
-  * What an entry changed, as one line per object.
+  * The audit log: one entry in full, or the list.
   *
-  * The stored summary is JSON because the column has to be searchable and machine
-  * readable for the tool. This is the reading of it, and it stays one line per object:
-  * the screen is a list of calls, and a call that touched eight things should not push
-  * the next call off the page.
-  *
-  * @return string[]
+  * A single `entry` in the query string wins, because a reader who followed a link to
+  * one record wants that record and not the list they came from. The chain verdict names
+  * an id, so that link has to lead somewhere.
   */
-  private function changed_lines( $json ): array {
-    $records = $json ? json_decode( (string) $json, true ) : null;
-    if ( !is_array( $records ) ) {
-      return [];
-    }
-    $lines = [];
-    foreach ( $records as $record ) {
-      if ( isset( $record['__gmcp_more'] ) ) {
-        $lines[] = sprintf(
-          /* translators: %d: number of further changes not recorded in detail. */
-          __( 'and %d more changes, too many to record in one entry', 'guarded-mcp' ),
-          (int) $record['__gmcp_more']
-        );
-        continue;
-      }
-      $what = trim( (string) ( $record['what'] ?? '' ) );
-      $label = (string) ( $record['label'] ?? '' );
-      if ( $label !== '' ) {
-        $what .= ' "' . mb_substr( $label, 0, 40 ) . '"';
-      }
-      $fields = [];
-      foreach ( (array) ( $record['fields'] ?? [] ) as $field => $pair ) {
-        $from = $pair['from'] ?? null;
-        $to = $pair['to'] ?? null;
-        $fields[] = $from === null
-          ? sprintf( '%s set to %s', $field, mb_substr( (string) $to, 0, 40 ) )
-          : sprintf( '%s %s → %s', $field, mb_substr( (string) $from, 0, 40 ), mb_substr( (string) $to, 0, 40 ) );
-      }
-      $lines[] = $fields
-        ? sprintf( '%s %s: %s', (string) ( $record['op'] ?? '' ), $what, implode( ', ', $fields ) )
-        : sprintf( '%s %s', (string) ( $record['op'] ?? '' ), $what );
-    }
-    return $lines;
-  }
-
   private function render_activity(): void {
     if ( empty( $this->core->get_option( 'mcp_activity_log' ) ) ) {
       echo '<p>' . esc_html__( 'The audit log is switched off, so nothing is being recorded. Switch it on above and calls from then on will appear here.', 'guarded-mcp' ) . '</p>';
       return;
     }
 
-    $search = isset( $_GET['gmcp_q'] ) ? sanitize_text_field( wp_unslash( $_GET['gmcp_q'] ) ) : '';
-    $only = isset( $_GET['gmcp_outcome'] ) ? sanitize_key( wp_unslash( $_GET['gmcp_outcome'] ) ) : '';
-    $entries = GMCP_Audit::query( [
-      'limit' => 50,
-      'search' => $search,
-      'outcome' => in_array( $only, [ 'ok', 'refused' ], true ) ? $only : '',
-    ] );
-    $total = GMCP_Audit::count();
-    ?>
-    <form method="get" style="margin-bottom:10px">
-      <input type="hidden" name="page" value="<?php echo esc_attr( self::PAGE_SLUG ); ?>">
-      <?php // Without this the filter form throws you back to the first tab on submit. ?>
-      <input type="hidden" name="tab" value="logs">
-      <label class="screen-reader-text" for="gmcp_q"><?php esc_html_e( 'Search the audit log', 'guarded-mcp' ); ?></label>
-      <input type="search" id="gmcp_q" name="gmcp_q" value="<?php echo esc_attr( $search ); ?>"
-             placeholder="<?php esc_attr_e( 'Search targets, arguments and refusal messages', 'guarded-mcp' ); ?>"
-             class="regular-text">
-      <label class="screen-reader-text" for="gmcp_outcome"><?php esc_html_e( 'Filter by outcome', 'guarded-mcp' ); ?></label>
-      <select id="gmcp_outcome" name="gmcp_outcome">
-        <option value=""><?php esc_html_e( 'Everything', 'guarded-mcp' ); ?></option>
-        <option value="refused" <?php selected( $only, 'refused' ); ?>><?php esc_html_e( 'Refusals only', 'guarded-mcp' ); ?></option>
-        <option value="ok" <?php selected( $only, 'ok' ); ?>><?php esc_html_e( 'Successes only', 'guarded-mcp' ); ?></option>
-      </select>
-      <button type="submit" class="button"><?php esc_html_e( 'Filter', 'guarded-mcp' ); ?></button>
-    </form>
+    $entry = isset( $_GET['entry'] ) ? (int) $_GET['entry'] : 0;
+    if ( $entry > 0 ) {
+      $this->render_entry( $entry );
+      return;
+    }
 
-    <?php if ( empty( $entries ) ) : ?>
-      <p><?php echo $search || $only
-        ? esc_html__( 'Nothing matches that.', 'guarded-mcp' )
-        : esc_html__( 'No tool calls recorded yet. Anything an agent does will appear here.', 'guarded-mcp' ); ?></p>
+    $this->render_entry_list();
+  }
+
+  /** Everything the log holds about one call, with nothing behind a summary. */
+  private function render_entry( int $id ): void {
+    $e = GMCP_Audit::get( $id );
+    $back = GMCP_Settings::page_url( 'logs' );
+    if ( !$e ) {
+      printf(
+        '<p>%s</p><p><a href="%s">%s</a></p>',
+        esc_html__( 'There is no entry with that number. It may have been pruned: entries are removed oldest first once any of the retention bounds is reached.', 'guarded-mcp' ),
+        esc_url( $back ),
+        esc_html__( 'Back to the log', 'guarded-mcp' )
+      );
+      return;
+    }
+
+    $stamp = strtotime( $e['ts'] . ' UTC' );
+    $row = GMCP_Audit::verify_row( $id );
+    ?>
+    <p><a href="<?php echo esc_url( $back ); ?>">&larr; <?php esc_html_e( 'Back to the log', 'guarded-mcp' ); ?></a></p>
+
+    <h3><?php printf( esc_html__( 'Entry #%d', 'guarded-mcp' ), (int) $e['id'] ); ?>
+      <code><?php echo esc_html( (string) $e['tool'] ); ?></code>
+      <?php if ( (string) $e['outcome'] === 'ok' ) : ?>
+        <span class="gmcp-ok"><?php esc_html_e( 'Done', 'guarded-mcp' ); ?></span>
+      <?php else : ?>
+        <span class="gmcp-fail"><?php esc_html_e( 'Refused', 'guarded-mcp' ); ?></span>
+      <?php endif; ?>
+    </h3>
+
+    <table class="widefat gmcp-table">
+      <tbody>
+        <tr>
+          <th scope="row"><?php esc_html_e( 'When', 'guarded-mcp' ); ?></th>
+          <td><?php echo esc_html( wp_date( 'Y-m-d H:i:s', $stamp ) ); ?>
+            <span class="gmcp-muted"><?php echo esc_html( self::ago_for( $stamp ) ); ?></span></td>
+        </tr>
+        <tr>
+          <th scope="row"><?php esc_html_e( 'Target', 'guarded-mcp' ); ?></th>
+          <td><?php echo (string) $e['target'] !== '' ? '<code>' . esc_html( (string) $e['target'] ) . '</code>' : '&mdash;'; ?></td>
+        </tr>
+        <tr>
+          <th scope="row"><?php esc_html_e( 'Called by', 'guarded-mcp' ); ?></th>
+          <td>
+            <?php echo esc_html( (string) ( $e['client'] ?: $e['auth_method'] ) ); ?>
+            <?php if ( (string) $e['actor_name'] !== '' ) : ?>
+              <br><span class="gmcp-muted"><?php echo esc_html( sprintf(
+                __( 'ran as %s', 'guarded-mcp' ), $e['actor_name'] ) ); ?></span>
+              <?php // Said in full here rather than as a tooltip. The list has to be
+              // terse; this page is where somebody came to find out what it means. ?>
+              <p class="description"><?php esc_html_e( 'The WordPress account the call ran as. A shared bearer token borrows one administrator account, so this names the account, not the person.', 'guarded-mcp' ); ?></p>
+            <?php endif; ?>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row"><?php esc_html_e( 'Took', 'guarded-mcp' ); ?></th>
+          <td><?php echo esc_html( sprintf( '%dms', (int) $e['ms'] ) ); ?></td>
+        </tr>
+        <?php if ( (string) ( $e['detail'] ?? '' ) !== '' ) : ?>
+          <tr>
+            <th scope="row"><?php echo (string) $e['outcome'] === 'ok'
+              ? esc_html__( 'What it reported', 'guarded-mcp' )
+              : esc_html__( 'Why it was refused', 'guarded-mcp' ); ?></th>
+            <?php // In full. The list truncates at 160 characters, and a refusal message
+            // is the most interesting content in this whole table. ?>
+            <td><?php echo esc_html( (string) $e['detail'] ); ?></td>
+          </tr>
+        <?php endif; ?>
+      </tbody>
+    </table>
+
+    <?php $changes = $this->change_records( $e['changes'] ?? null ); ?>
+    <h4><?php esc_html_e( 'What changed', 'guarded-mcp' ); ?></h4>
+    <?php if ( !$changes ) : ?>
+      <p class="gmcp-muted"><?php esc_html_e( 'Nothing was recorded as changed. A read changes nothing, and a refused call did not get far enough to.', 'guarded-mcp' ); ?></p>
     <?php else : ?>
       <table class="widefat striped">
         <thead>
           <tr>
-            <th scope="col"><?php esc_html_e( 'When', 'guarded-mcp' ); ?></th>
-            <th scope="col"><?php esc_html_e( 'Tool', 'guarded-mcp' ); ?></th>
-            <th scope="col"><?php esc_html_e( 'Target', 'guarded-mcp' ); ?></th>
-            <?php // Not "Who". A shared token borrows one administrator account, so the
-            // account below is the same whoever sent the request, and a column headed
-            // "Who" invites a reader to believe something this site cannot know. ?>
-            <th scope="col"><?php esc_html_e( 'Called by', 'guarded-mcp' ); ?></th>
-            <th scope="col"><?php esc_html_e( 'Result', 'guarded-mcp' ); ?></th>
+            <th scope="col"><?php esc_html_e( 'Object', 'guarded-mcp' ); ?></th>
+            <th scope="col"><?php esc_html_e( 'Field', 'guarded-mcp' ); ?></th>
+            <th scope="col"><?php esc_html_e( 'Was', 'guarded-mcp' ); ?></th>
+            <th scope="col"><?php esc_html_e( 'Became', 'guarded-mcp' ); ?></th>
           </tr>
         </thead>
         <tbody>
-          <?php foreach ( $entries as $e ) : ?>
+        <?php foreach ( $changes as $record ) : ?>
+          <?php if ( isset( $record['__gmcp_more'] ) ) : ?>
+            <tr><td colspan="4" class="gmcp-muted"><?php printf(
+              /* translators: %d: number of further changes not recorded in detail. */
+              esc_html__( 'and %d more changes, too many to record in one entry', 'guarded-mcp' ),
+              (int) $record['__gmcp_more'] ); ?></td></tr>
+            <?php continue; ?>
+          <?php endif; ?>
+          <?php
+          $what = trim( (string) ( $record['op'] ?? '' ) . ' ' . (string) ( $record['what'] ?? '' ) );
+          $label = (string) ( $record['label'] ?? '' );
+          $fields = (array) ( $record['fields'] ?? [] );
+          $first = true;
+          ?>
+          <?php if ( !$fields ) : ?>
             <tr>
-              <td class="gmcp-nowrap"><?php echo esc_html( $this->ago( strtotime( $e['ts'] . ' UTC' ) ) ); ?></td>
-              <td><code><?php echo esc_html( $e['tool'] ); ?></code></td>
-              <td><?php echo $e['target'] !== '' ? '<code>' . esc_html( $e['target'] ) . '</code>' : '&mdash;'; ?></td>
-              <td>
-                <?php echo esc_html( $e['client'] ?: $e['auth_method'] ); ?>
-                <?php if ( $e['actor_name'] !== '' ) : ?>
-                  <span class="gmcp-muted" title="<?php esc_attr_e( 'The WordPress account the call ran as. A shared bearer token borrows one administrator, so this does not identify a person.', 'guarded-mcp' ); ?>">
-                    <?php echo esc_html( sprintf( __( 'ran as %s', 'guarded-mcp' ), $e['actor_name'] ) ); ?></span>
-                <?php endif; ?>
-              </td>
-              <td>
-                <?php if ( $e['outcome'] === 'ok' ) : ?>
-                  <span class="gmcp-ok"><?php esc_html_e( 'Done', 'guarded-mcp' ); ?></span>
-                  <span class="gmcp-muted"><?php echo esc_html( sprintf( '(%dms)', (int) $e['ms'] ) ); ?></span>
-                <?php else : ?>
-                  <span class="gmcp-fail"><?php esc_html_e( 'Refused', 'guarded-mcp' ); ?></span>
-                <?php endif; ?>
-                <?php if ( $e['detail'] !== '' && $e['detail'] !== null ) : ?>
-                  <div class="gmcp-detail"><?php echo esc_html( mb_substr( $e['detail'], 0, 160 ) ); ?></div>
-                <?php endif; ?>
-                <?php foreach ( $this->changed_lines( $e['changes'] ?? null ) as $line ) : ?>
-                  <div class="gmcp-change"><?php echo esc_html( $line ); ?></div>
-                <?php endforeach; ?>
-                <?php if ( !empty( $e['args'] ) && $e['args'] !== '[]' && $e['args'] !== '{}' ) : ?>
-                  <details style="margin-top:4px">
-                    <summary class="gmcp-summary"><?php esc_html_e( 'arguments', 'guarded-mcp' ); ?></summary>
-                    <pre class="gmcp-args"><?php
-                      echo esc_html( wp_json_encode( json_decode( $e['args'], true ), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) ); ?></pre>
-                  </details>
-                <?php endif; ?>
-              </td>
+              <td><?php echo esc_html( $what ); ?>
+                <?php if ( $label !== '' ) : ?><br><span class="gmcp-muted"><?php echo esc_html( $label ); ?></span><?php endif; ?></td>
+              <td colspan="3" class="gmcp-muted"><?php esc_html_e( 'no field values recorded', 'guarded-mcp' ); ?></td>
             </tr>
-          <?php endforeach; ?>
+          <?php else : ?>
+            <?php foreach ( $fields as $field => $pair ) : ?>
+              <tr>
+                <?php if ( $first ) : // One cell spanning the object's fields, so the eye
+                  // groups them without the name repeating down the column. ?>
+                  <td rowspan="<?php echo (int) count( $fields ); ?>">
+                    <?php echo esc_html( $what ); ?>
+                    <?php if ( $label !== '' ) : ?><br><span class="gmcp-muted"><?php echo esc_html( $label ); ?></span><?php endif; ?>
+                  </td>
+                  <?php $first = false; ?>
+                <?php endif; ?>
+                <td><code><?php echo esc_html( (string) $field ); ?></code></td>
+                <td><?php echo $this->value_cell( $pair['from'] ?? null, __( 'not set', 'guarded-mcp' ) ); ?></td>
+                <td><?php echo $this->value_cell( $pair['to'] ?? null, __( 'removed', 'guarded-mcp' ) ); ?></td>
+              </tr>
+            <?php endforeach; ?>
+          <?php endif; ?>
+        <?php endforeach; ?>
         </tbody>
       </table>
     <?php endif; ?>
 
+    <h4><?php esc_html_e( 'Arguments it was given', 'guarded-mcp' ); ?></h4>
+    <?php if ( empty( $e['args'] ) || in_array( $e['args'], [ '[]', '{}' ], true ) ) : ?>
+      <p class="gmcp-muted"><?php esc_html_e( 'None.', 'guarded-mcp' ); ?></p>
+    <?php else : ?>
+      <pre class="gmcp-args"><?php echo esc_html( (string) wp_json_encode(
+        json_decode( (string) $e['args'], true ), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) ); ?></pre>
+      <p class="description"><?php esc_html_e( 'Anything that looked like a credential was replaced before this was written. A field reading [redacted] is itself information: it says a secret was passed.', 'guarded-mcp' ); ?></p>
+    <?php endif; ?>
+
+    <h4><?php esc_html_e( 'Its place in the chain', 'guarded-mcp' ); ?></h4>
+    <p>
+      <?php if ( !$row['checked'] ) : ?>
+        <span class="gmcp-muted"><?php echo esc_html( $row['reason'] ); ?></span>
+      <?php elseif ( $row['ok'] ) : ?>
+        <span class="gmcp-ok"><?php esc_html_e( 'This entry still matches its own hash.', 'guarded-mcp' ); ?></span>
+        <?php // Said plainly, because the stronger reading is the tempting one: one row
+        // verifying is not the chain verifying, and the chain is checked on the list. ?>
+        <span class="gmcp-muted"><?php esc_html_e( 'That is about this entry alone. Whether the chain around it is whole is checked on the log itself.', 'guarded-mcp' ); ?></span>
+      <?php else : ?>
+        <strong class="gmcp-fail"><?php echo esc_html( $row['reason'] ); ?></strong>
+      <?php endif; ?>
+    </p>
+    <table class="widefat gmcp-table">
+      <tbody>
+        <tr><th scope="row"><?php esc_html_e( 'Follows', 'guarded-mcp' ); ?></th>
+          <td><code class="gmcp-hash"><?php echo esc_html( (string) $e['prev_hash'] ?: '—' ); ?></code></td></tr>
+        <tr><th scope="row"><?php esc_html_e( 'This entry', 'guarded-mcp' ); ?></th>
+          <td><code class="gmcp-hash"><?php echo esc_html( (string) $e['hash'] ?: '—' ); ?></code></td></tr>
+      </tbody>
+    </table>
+    <?php
+  }
+
+  /** A recorded value, or a word for its absence. */
+  private function value_cell( $value, string $absent ): string {
+    if ( $value === null || $value === '' ) {
+      return '<span class="gmcp-muted">' . esc_html( $absent ) . '</span>';
+    }
+    if ( (string) $value === '[redacted]' ) {
+      return '<span class="gmcp-muted" title="' . esc_attr__( 'Recorded as changed, but the value looked like a credential and was not kept.', 'guarded-mcp' ) . '">[redacted]</span>';
+    }
+    return '<code>' . esc_html( (string) $value ) . '</code>';
+  }
+
+  /** The changes column, decoded, or an empty list if it holds nothing usable. */
+  private function change_records( $json ): array {
+    $records = $json ? json_decode( (string) $json, true ) : null;
+    return is_array( $records ) ? $records : [];
+  }
+
+  /**
+  * The log itself, as a list table.
+  *
+  * Filters are read here rather than inside the table, so one place decides what a
+  * query-string value is allowed to mean and the table is handed values it need not
+  * check again.
+  */
+  private function render_entry_list(): void {
+    $outcome = isset( $_GET['gmcp_outcome'] ) ? sanitize_key( wp_unslash( $_GET['gmcp_outcome'] ) ) : '';
+    $days = isset( $_GET['gmcp_since'] ) ? sanitize_key( wp_unslash( $_GET['gmcp_since'] ) ) : '';
+    $filters = [
+      'search' => isset( $_GET['s'] ) ? sanitize_text_field( wp_unslash( $_GET['s'] ) ) : '',
+      'outcome' => in_array( $outcome, [ 'ok', 'refused' ], true ) ? $outcome : '',
+      'tool' => isset( $_GET['gmcp_tool'] ) ? sanitize_key( wp_unslash( $_GET['gmcp_tool'] ) ) : '',
+      'actor' => isset( $_GET['gmcp_actor'] ) ? (int) $_GET['gmcp_actor'] : 0,
+      'since_days' => in_array( $days, [ '1', '7', '30' ], true ) ? $days : '',
+    ];
+    if ( $filters['since_days'] !== '' ) {
+      $filters['since'] = gmdate( 'Y-m-d H:i:s', time() - ( (int) $filters['since_days'] * DAY_IN_SECONDS ) );
+    }
+
+    $table = new GMCP_Audit_Table( $filters );
+    $table->prepare_items();
+
+    // Refusals are the entries this table is kept for, so reaching them is one click
+    // rather than a menu and a submit.
+    $counts = [ '' => GMCP_Audit::count(), 'refused' => GMCP_Audit::count( [ 'outcome' => 'refused' ] ) ];
+    $views = [];
+    foreach ( [ '' => __( 'All', 'guarded-mcp' ), 'refused' => __( 'Refusals', 'guarded-mcp' ) ] as $key => $label ) {
+      $url = self::page_url( 'logs' );
+      if ( $key !== '' ) {
+        $url = add_query_arg( 'gmcp_outcome', $key, $url );
+      }
+      $views[] = sprintf( '<a href="%s"%s>%s <span class="count">(%s)</span></a>',
+        esc_url( $url ),
+        $outcome === $key ? ' class="current"' : '',
+        esc_html( $label ),
+        esc_html( number_format_i18n( $counts[ $key ] ) ) );
+    }
+    echo '<ul class="subsubsub"><li>' . implode( ' | </li><li>', $views ) . '</li></ul>';
+    ?>
+    <form method="get">
+      <?php // These travel with every filter, search and page link, or submitting the
+      // search box drops the reader onto the first tab of a screen they were not on. ?>
+      <input type="hidden" name="page" value="<?php echo esc_attr( self::PAGE_SLUG ); ?>">
+      <input type="hidden" name="tab" value="logs">
+      <?php if ( $filters['outcome'] !== '' ) : ?>
+        <input type="hidden" name="gmcp_outcome" value="<?php echo esc_attr( $filters['outcome'] ); ?>">
+      <?php endif; ?>
+      <?php $table->search_box( __( 'Search the log', 'guarded-mcp' ), 'gmcp-audit-search' ); ?>
+      <?php $table->display(); ?>
+    </form>
+
     <?php $chain = GMCP_Audit::verify(); ?>
     <p style="margin-top:12px">
       <?php printf(
-        esc_html__( '%1$s entries, %2$s of recorded arguments. Kept for %3$d days, then pruned automatically.', 'guarded-mcp' ),
-        esc_html( number_format_i18n( $total ) ),
+        esc_html__( '%1$s entries, %2$s of recorded arguments and changes. Kept for %3$d days, then pruned automatically.', 'guarded-mcp' ),
+        esc_html( number_format_i18n( $counts[''] ) ),
         esc_html( size_format( GMCP_Audit::bytes() ) ),
         (int) GMCP_Audit::retention_days()
       ); ?>
@@ -1163,6 +1316,10 @@ class GMCP_Settings {
           esc_html__( 'The chain breaks at entry %1$d: %2$s', 'guarded-mcp' ),
           (int) $chain['broken_at'], esc_html( $chain['reason'] )
         ); ?></strong>
+        <?php // The verdict names an id, so it links to it. Before this the reader was
+        // handed a number and no way to look at the entry it named. ?>
+        <a href="<?php echo esc_url( GMCP_Audit_Table::entry_url( (int) $chain['broken_at'] ) ); ?>"><?php
+          esc_html_e( 'Look at that entry', 'guarded-mcp' ); ?></a>
       <?php endif; ?>
     </p>
 
@@ -1181,7 +1338,6 @@ class GMCP_Settings {
     </p>
     <?php
   }
-
   /**
   * Stored timestamps are UTC. wp_date() renders them in the site's timezone, which is
   * what an admin reading this table expects to see.

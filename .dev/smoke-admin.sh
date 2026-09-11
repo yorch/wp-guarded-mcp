@@ -1160,6 +1160,55 @@ call c_fresh '{"jsonrpc":"2.0","id":236,"method":"tools/call","params":{"name":"
 check "and rows written after a clear still verify" \
   "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify();echo $v["ok"]?"intact":"BROKEN at ".$v["broken_at"];' 2>/dev/null | tr -d '\r\n')" "intact"
 
+echo "-- reading the log: filtered counts, one entry, one entry's own verdict --"
+# The screen now pages through the log rather than showing a fixed fifty, which makes
+# these four things load-bearing in a way they were not before. All of it is asserted
+# through wp eval rather than by scraping the rendered page: markup changes, and these
+# are the parts that would go wrong silently if they changed.
+
+# count() took a filter array and ignored it, returning the whole table however the list
+# had been narrowed. Nothing noticed while the screen quoted the total separately. A
+# pager divides one by the other, so a wrong count means pages of rows that do not exist.
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+call rl_ok '{"jsonrpc":"2.0","id":300,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"limit":1}}}'
+call rl_ok2 '{"jsonrpc":"2.0","id":301,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"limit":1}}}'
+call rl_no '{"jsonrpc":"2.0","id":302,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"gmcp_options","value":"x"}}}'
+check "the log holds what the calls just made" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::count();' 2>/dev/null | tr -d '\r\n')" "3"
+check "and counting refusals counts only those" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::count(["outcome"=>"refused"]);' 2>/dev/null | tr -d '\r\n')" "1"
+check "control: counting successes is not the same number" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::count(["outcome"=>"ok"]);' 2>/dev/null | tr -d '\r\n')" "2"
+check "a filtered count agrees with the rows it filtered" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::count(["tool"=>"wp_get_posts"]) === count(GMCP_Audit::query(["tool"=>"wp_get_posts"])) ? "agree" : "DISAGREE";' 2>/dev/null | tr -d '\r\n')" "agree"
+
+# The chain verdict names an id, so an id has to lead somewhere.
+check "one entry can be fetched by its id" \
+  "$(docker compose exec -T cli wp eval '$r = GMCP_Audit::get(1); echo $r ? $r["tool"] : "MISSING";' 2>/dev/null | tr -d '\r\n')" "wp_get_posts"
+check "and an id that is not there says so rather than erroring" \
+  "$(docker compose exec -T cli wp eval 'var_export(GMCP_Audit::get(999999) === null);' 2>/dev/null | tr -d '\r\n')" "true"
+
+# Ordering comes from a query string, and a column name cannot be a bound parameter.
+check "an injected sort column falls back instead of reaching SQL" \
+  "$(docker compose exec -T cli wp eval '$r = GMCP_Audit::query(["orderby"=>"id; DROP TABLE wp_posts","limit"=>1]); echo $r ? "survived" : "BROKEN";' 2>/dev/null | tr -d '\r\n')" "survived"
+check "control: a sort column that is allowed does change the order" \
+  "$(docker compose exec -T cli wp eval '
+     $a = GMCP_Audit::query(["order"=>"asc","limit"=>1])[0]["id"];
+     $d = GMCP_Audit::query(["order"=>"desc","limit"=>1])[0]["id"];
+     echo $a === $d ? "SAME" : "differ";' 2>/dev/null | tr -d '\r\n')" "differ"
+
+# One row's own verdict, which is the question a reader has once the chain names an id.
+check "a good entry verifies on its own" \
+  "$(docker compose exec -T cli wp eval '$v = GMCP_Audit::verify_row(2); echo $v["ok"] && $v["checked"] ? "ok" : "NOT OK";' 2>/dev/null | tr -d '\r\n')" "ok"
+docker compose exec -T cli wp eval 'global $wpdb; $t = GMCP_Audit::table(); $wpdb->query("UPDATE {$t} SET target = \"tampered\" WHERE id = 2");' >/dev/null 2>&1
+check "an edited entry fails on its own" \
+  "$(docker compose exec -T cli wp eval '$v = GMCP_Audit::verify_row(2); echo $v["ok"] ? "STILL OK" : "caught";' 2>/dev/null | tr -d '\r\n')" "caught"
+check "and the entry the chain blames is the one that was edited" \
+  "$(docker compose exec -T cli wp eval '$v = GMCP_Audit::verify("all"); echo (int) $v["broken_at"];' 2>/dev/null | tr -d '\r\n')" "2"
+check "control: its untouched neighbour still verifies" \
+  "$(docker compose exec -T cli wp eval '$v = GMCP_Audit::verify_row(1); echo $v["ok"] ? "ok" : "NOT OK";' 2>/dev/null | tr -d '\r\n')" "ok"
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+
 echo "-- the audit table repairs itself on upgrade --"
 # WordPress does not run the activation hook when a plugin is updated in place, so the
 # old table meets the new code. While it is broken nothing may be lost quietly, and it
