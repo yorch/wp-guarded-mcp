@@ -160,8 +160,14 @@ class GMCP_Settings {
       .gmcp-nowrap { white-space: nowrap; }
       .gmcp-expired td { opacity: .55; }
       .gmcp-detail { color: #787c82; font-size: 12px; }
-      /* Darker than .gmcp-detail on purpose: what a call changed outranks what it said. */
-      .gmcp-change { color: #1d2327; font-size: 12px; }
+      /* More prominent than .gmcp-detail on purpose: what a call changed outranks what
+      it said about itself. Said by inheriting the admin's text colour rather than by
+      naming a dark one, because the old #1d2327 only meant "prominent" on a light page.
+      Rendered dark, it was near-black text on a near-black table and the column could not
+      be read at all. WordPress 7.1's own admin CSS has no dark rules, so this is not core
+      doing it, but a browser forcing dark mode does it, a dark-admin plugin does it, and
+      whatever core eventually ships will do it. Inheriting is right under all of them. */
+      .gmcp-change { color: inherit; font-size: 12px; }
       /* Long enough to wrap on a narrow screen rather than widen the table. */
       .gmcp-hash { font-size: 11px; word-break: break-all; }
       /* A refusal is worth spotting from across the table, not by reading it. */
@@ -683,6 +689,16 @@ class GMCP_Settings {
       <?php endif; ?>
     </div>
     <p class="description"><?php esc_html_e( 'These two act immediately and do not wait for Save changes.', 'guarded-mcp' ); ?></p>
+
+    <?php if ( $token !== '' && apply_filters( 'gmcp_url_token_route', true ) ) : ?>
+      <?php // Said here because a person who sets a token has no other way to find out
+      // that the token is also a URL on their site. It is a deliberate fallback, not a
+      // leak, but "deliberate" is only true of whoever chose it, and nobody chose it. ?>
+      <p class="description gmcp-intro">
+        <strong><?php esc_html_e( 'The token is also a URL.', 'guarded-mcp' ); ?></strong>
+        <?php esc_html_e( 'While a token is set, the server also answers at an address containing it, for hosts that strip the Authorization header before PHP can read it. That address is not advertised anywhere and every administration tool is refused on it, but a URL ends up in server logs, browser history and referrer headers in a way a header does not. Most sites do not need it: the plugin already recovers the header from the two places Apache hides it. If yours connects with the header, switch the fallback off with the gmcp_url_token_route filter.', 'guarded-mcp' ); ?>
+      </p>
+    <?php endif; ?>
 
     <h2 class="title"><?php esc_html_e( 'Named keys', 'guarded-mcp' ); ?></h2>
     <?php $this->render_keys(); ?>
