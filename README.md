@@ -4,6 +4,8 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server for WordPress
 
 It is built on one assumption: the agent will occasionally get it wrong. An agent administering your site also reads your comments, your post bodies and your plugin descriptions, all written by anonymous people, and it has no reliable way to tell an instruction from content. So this hands an agent everything an administrator can do, and puts a guard on each of the operations you would not want done on a misread instruction.
 
+There is a [project page](https://yorch.github.io/wp-guarded-mcp/) if you would rather read the short version.
+
 This is a fork of the MCP layer of [AI Engine](https://wordpress.org/plugins/ai-engine/) 3.7.7 by Jordy Meow, stripped of everything that is not the MCP server. GPLv2 or later, same as the original. See `CREDITS.md` for what was kept and what changed.
 
 ## What it is

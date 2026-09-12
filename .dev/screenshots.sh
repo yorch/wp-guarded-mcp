@@ -52,3 +52,13 @@ docker run --rm \
   --entrypoint node \
   zenika/alpine-chrome:with-puppeteer \
   screenshots.js
+
+# The project page uses two of these. Copied here rather than by hand, so they are
+# regenerated with the rest and cannot quietly fall a redesign behind the way the
+# wordpress.org set did.
+PAGE="$(cd "$HERE/.." && pwd)/docs"
+if [ -d "$PAGE" ]; then
+  cp "$OUT/screenshot-4.png" "$PAGE/log.png"
+  cp "$OUT/screenshot-5.png" "$PAGE/entry.png"
+  echo "  docs/log.png, docs/entry.png"
+fi
