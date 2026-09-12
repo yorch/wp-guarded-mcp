@@ -48,6 +48,10 @@ class GMCP_Core {
     'mcp_tools_elementor' => false,
     // Kirki: customizer framework field discovery, value get/set, CSS cache.
     'mcp_tools_kirki' => false,
+    // Yoast SEO: per-post SEO metadata through the Surfaces API + indexable rebuild.
+    'mcp_tools_yoast' => false,
+    // ACF: custom field values through update_field/get_field with key references.
+    'mcp_tools_acf' => false,
     'mcp_debug_mode' => false,
     // Keep a short history of tool calls, including refused ones, for the settings
     // screen. An agent otherwise operates with no visible record at all.
@@ -696,6 +700,21 @@ class GMCP_Core {
     // when Kirki has been deactivated between the group being switched on and a call.
     if ( $this->get_option( 'mcp_tools_kirki' ) ) {
       new GMCP_Tools_Kirki();
+    }
+
+    // Same reasoning as the optional groups above: without Yoast these tools
+    // fail the moment they try to read through the Surfaces API. The per-call
+    // check in GMCP_Tools_Yoast::handle_call() keeps them honest when Yoast
+    // has been deactivated between the group being switched on and a call.
+    if ( $this->get_option( 'mcp_tools_yoast' ) ) {
+      new GMCP_Tools_Yoast();
+    }
+
+    // Same for ACF: without it, update_field/get_field are undefined and the
+    // tools fatal. The per-call check in GMCP_Tools_Acf::handle_call() is the
+    // runtime honesty check.
+    if ( $this->get_option( 'mcp_tools_acf' ) ) {
+      new GMCP_Tools_Acf();
     }
   }
 

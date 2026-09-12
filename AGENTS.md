@@ -74,7 +74,8 @@ test then reports a code fault that is a seeding fault.
 The suites live in `.dev/`. `smoke.sh` covers transport, auth, content tools, prompts and
 resources. `smoke-admin.sh` covers the administration tools and every guard, and is
 destructive. `smoke-woo.sh` covers the shop tools, `smoke-elementor.sh` covers the Elementor tools,
-and `smoke-kirki.sh` covers the Kirki tools. Run all five before committing. The last three need
+`smoke-kirki.sh` covers the Kirki tools, `smoke-yoast.sh` covers the Yoast SEO tools,
+and `smoke-acf.sh` covers the ACF tools. Run all seven before committing. The last five need
 their plugin installed and say so and exit rather than reporting failures against a site that
 simply does not have it.
 
