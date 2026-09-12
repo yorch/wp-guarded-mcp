@@ -3028,10 +3028,22 @@ class GMCP_Tools_Admin {
     return is_array( $wp_registered_sidebars ) ? $wp_registered_sidebars : [];
   }
 
+  // wp_get_sidebars_widgets() is marked private in core. This reads the same
+  // option with the same post-processing (strip array_version, apply the
+  // sidebars_widgets filter) so the behaviour is identical without calling a
+  // private API that Plugin Check and future core versions may remove.
+  private function get_sidebars_widgets(): array {
+    $assignments = get_option( 'sidebars_widgets', [] );
+    if ( is_array( $assignments ) && isset( $assignments['array_version'] ) ) {
+      unset( $assignments['array_version'] );
+    }
+    return apply_filters( 'sidebars_widgets', $assignments );
+  }
+
   private function list_sidebars( array $r ): array {
     $sidebars = $this->registered_sidebars();
     $renders = $this->widgets_render();
-    $assignments = wp_get_sidebars_widgets();
+    $assignments = $this->get_sidebars_widgets();
 
     $out = [];
     foreach ( $sidebars as $id => $sidebar ) {
@@ -3200,7 +3212,7 @@ class GMCP_Tools_Admin {
     update_option( $option, $stored );
 
     $widget_id = $id_base . '-' . $next;
-    $assignments = wp_get_sidebars_widgets();
+    $assignments = $this->get_sidebars_widgets();
     $list = array_values( (array) ( $assignments[ $sidebar ] ?? [] ) );
     $position = isset( $a['position'] ) ? max( 0, min( count( $list ), (int) $a['position'] ) ) : count( $list );
     array_splice( $list, $position, 0, [ $widget_id ] );
@@ -3225,7 +3237,7 @@ class GMCP_Tools_Admin {
     $id_base = $m[1];
     $number = (int) $m[2];
 
-    $assignments = wp_get_sidebars_widgets();
+    $assignments = $this->get_sidebars_widgets();
     $found = false;
     foreach ( $assignments as $sidebar => $widgets ) {
       if ( !is_array( $widgets ) ) {

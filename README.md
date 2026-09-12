@@ -712,6 +712,37 @@ mount of this repository, and WordPress deletes the old plugin directory before 
 the new one. The delete goes straight through the mount and takes the source tree, `.git`
 included.
 
+### Plugin Check
+
+[WordPress Plugin Check](https://wordpress.org/plugins/plugin-check/) is the static
+analysis tool the WordPress.org review team uses. A GitHub Actions workflow
+(`.github/workflows/plugin-check.yml`) runs it on every push and pull request, so a
+change that would fail directory review is caught before it gets there. Errors fail
+the build; warnings are printed but do not, matching what the review team enforces.
+
+The check excludes `.dev` (the test stack), `.github` (CI workflows), `tmp` (build
+artifacts), and repository-only files (`README.md`, `AGENTS.md`, `CLAUDE.md`,
+`.gitignore`) that the build script strips before publication. The `hidden_files` and
+`github_directory` findings are ignored for the same reason: they fire on `.git`,
+`.gitkeep`, and `.github` which never ship.
+
+To run the same check locally against the `.dev` stack:
+
+```
+COMPOSE_PROJECT_NAME=wt-pcheck GMCP_PORT=8082 docker compose --project-directory .dev -f .dev/docker-compose.yml up -d
+COMPOSE_PROJECT_NAME=wt-pcheck docker compose --project-directory .dev -f .dev/docker-compose.yml exec -T cli wp plugin install plugin-check --activate --allow-root
+COMPOSE_PROJECT_NAME=wt-pcheck docker compose --project-directory .dev -f .dev/docker-compose.yml exec -T cli wp plugin check guarded-mcp \
+  --exclude-directories=.dev,.github,tmp \
+  --exclude-files=.gitignore,AGENTS.md,CLAUDE.md,README.md \
+  --ignore-codes=hidden_files,github_directory \
+  --format=table --allow-root
+```
+
+Plugin Check passing is not the same as WordPress.org approval. The directory review
+covers more than this tool can check, and the tool's warnings include patterns that are
+intentional in this plugin (direct database access for the audit log, third-party hook
+names, `error_log()` for the connector's own diagnostics).
+
 ## Licence
 
 GPLv2 or later. Parts of this plugin derive from prior GPL work; see `CREDITS.md` for the

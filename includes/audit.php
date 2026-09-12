@@ -311,6 +311,7 @@ class GMCP_Audit {
       'detail' => $this->detail( $call, $failed ),
     ];
 
+    // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant, not user input
     $prev = (string) $wpdb->get_var( "SELECT hash FROM " . self::table() . " ORDER BY id DESC LIMIT 1" );
     $row['prev_hash'] = $prev;
     $row['hash'] = self::hash( $row, $prev );
@@ -507,10 +508,12 @@ class GMCP_Audit {
     // Ties broken by id so a page boundary cannot show the same row twice or skip one.
     $order = $by === 'id' ? "id {$dir}" : "{$by} {$dir}, id DESC";
 
+    // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant, $where/$order are built from whitelisted columns
     $sql = 'SELECT * FROM ' . self::table() . ' WHERE ' . $where
       . ' ORDER BY ' . $order . ' LIMIT %d OFFSET %d';
     array_push( $params, $limit, $offset );
 
+    // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $sql is built from a plugin constant table name and whitelisted columns
     return $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A ) ?: [];
   }
 
@@ -568,6 +571,7 @@ class GMCP_Audit {
 
     // Walked by id rather than by OFFSET: an offset makes the database count past every
     // row it already returned, so the last page of a large export costs the most.
+    // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant, $where is built from whitelisted columns
     $sql = 'SELECT * FROM ' . self::table() . ' WHERE ' . $where
       . ' AND id < %d ORDER BY id DESC LIMIT %d';
 
@@ -576,6 +580,7 @@ class GMCP_Audit {
     $before = PHP_INT_MAX;
 
     while ( count( $rows ) < $limit ) {
+      // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $sql is built from a plugin constant table name and whitelisted columns
       $chunk = $wpdb->get_results( $wpdb->prepare( $sql, array_merge(
         $params, [ $before, min( self::EXPORT_CHUNK, $limit - count( $rows ) ) ]
       ) ), ARRAY_A );
@@ -600,16 +605,19 @@ class GMCP_Audit {
   public static function count( array $filters = [] ): int {
     global $wpdb;
     [ $where, $params ] = self::where( $filters );
+    // phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant, $where is built from whitelisted columns
     $sql = 'SELECT COUNT(*) FROM ' . self::table() . ' WHERE ' . $where;
     return (int) ( $params
       ? $wpdb->get_var( $wpdb->prepare( $sql, $params ) )
       : $wpdb->get_var( $sql ) );
+    // phpcs:enable
   }
 
   /** One entry by id, or null. The detail view's whole source. */
   public static function get( int $id ): ?array {
     global $wpdb;
     $row = $wpdb->get_row( $wpdb->prepare(
+      // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant
       'SELECT * FROM ' . self::table() . ' WHERE id = %d', $id
     ), ARRAY_A );
     return $row ?: null;
@@ -677,10 +685,12 @@ class GMCP_Audit {
   */
   public static function bytes(): int {
     global $wpdb;
+    // phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant
     return (int) $wpdb->get_var(
       'SELECT COALESCE(SUM(COALESCE(LENGTH(args), 0) + COALESCE(LENGTH(changes), 0)'
       . ' + COALESCE(LENGTH(detail), 0)), 0) FROM ' . self::table()
     );
+    // phpcs:enable
   }
 
   /**
@@ -822,6 +832,7 @@ class GMCP_Audit {
       'broken_at' => $verdict['broken_at'] === null ? null : (int) $verdict['broken_at'],
       'reason' => (string) $verdict['reason'],
       'ran_at' => gmdate( 'Y-m-d H:i:s' ),
+      // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant
       'high_water' => (int) $wpdb->get_var( 'SELECT MAX(id) FROM ' . self::table() ),
     ], false );
   }
@@ -843,6 +854,7 @@ class GMCP_Audit {
       return null;
     }
     $last['current'] = (int) $last['total'] === self::count()
+      // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant
       && (int) $last['high_water'] === (int) $wpdb->get_var( 'SELECT MAX(id) FROM ' . self::table() );
     return $last;
   }
@@ -892,12 +904,14 @@ class GMCP_Audit {
     global $wpdb;
     $table = self::table();
     return (int) $wpdb->query( $wpdb->prepare(
+      // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a plugin constant
       "DELETE FROM {$table} ORDER BY id ASC LIMIT %d", max( 1, $howMany )
     ) );
   }
 
   public static function clear(): void {
     global $wpdb;
+    // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant; TRUNCATE takes no parameters
     $wpdb->query( 'TRUNCATE TABLE ' . self::table() );
     // TRUNCATE resets the auto-increment, so the next row written takes an id that used
     // to belong to a row signed by the older construction. Leaving the boundary where it
@@ -935,6 +949,7 @@ class GMCP_Audit {
       $forget();
       return;
     }
+    // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant
     if ( (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . self::table() ) > 0 ) {
       $forget();
       return;

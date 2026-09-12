@@ -515,10 +515,14 @@ class GMCP_Settings {
   * JSON blob is neither readable nor sortable; the JSON export is where they belong.
   */
   private static function write_csv( array $rows ): void {
+    // php://output is a stream wrapper, not a filesystem path, so WP_Filesystem does
+    // not apply. fwrite/fclose on it are flagged by Plugin Check all the same because
+    // the sniff cannot trace the handle back to fopen, so echo the BOM directly and
+    // skip fclose (it is a no-op on php://output).
     $out = fopen( 'php://output', 'w' );
     // Excel reads a UTF-8 file as the system code page unless a byte order mark says
     // otherwise, and post titles and comment text arrive in any script.
-    fwrite( $out, "\xEF\xBB\xBF" );
+    echo "\xEF\xBB\xBF";
     self::csv_line( $out, [
       __( 'Entry', 'guarded-mcp' ),
       __( 'When', 'guarded-mcp' ),
@@ -555,7 +559,6 @@ class GMCP_Settings {
         (string) ( $row['hash'] ?? '' ),
       ] );
     }
-    fclose( $out );
   }
 
   /**
@@ -614,19 +617,19 @@ class GMCP_Settings {
     // Named so a file found later says what it is a view of, not just that it is a log.
     echo '  "filters": ' . wp_json_encode( (object) $active ) . ",\n";
     echo '  "entries_exported": ' . count( $rows ) . ",\n";
-    echo '  "entries_matching": ' . $matching . ",\n";
+    echo '  "entries_matching": ' . (int) $matching . ",\n";
     echo '  "complete": ' . ( count( $rows ) >= $matching ? 'true' : 'false' ) . ",\n";
     echo '  "entries": [';
 
-    $separator = "\n";
+    $first = true;
     foreach ( $rows as $row ) {
       $row['id'] = (int) ( $row['id'] ?? 0 );
       $row['actor'] = (int) ( $row['actor'] ?? 0 );
       $row['ms'] = (int) ( $row['ms'] ?? 0 );
       $row['args'] = self::decoded( $row['args'] ?? null );
       $row['changes'] = self::decoded( $row['changes'] ?? null );
-      echo $separator . wp_json_encode( $row, $flags );
-      $separator = ",\n";
+      echo ( $first ? "\n" : ",\n" ) . wp_json_encode( $row, $flags );
+      $first = false;
     }
 
     echo "\n  ]\n}\n";
@@ -1364,6 +1367,7 @@ class GMCP_Settings {
   private function render_activity(): void {
     if ( empty( $this->core->get_option( 'mcp_activity_log' ) ) ) {
       printf(
+        /* translators: %s: link to the Logging page */
         '<p>' . esc_html__( 'The audit log is switched off, so nothing is being recorded. Switch it on on the %s and calls from then on will appear here.', 'guarded-mcp' ) . '</p>',
         '<a href="' . esc_url( self::page_url( 'logging' ) ) . '">' . esc_html__( 'Logging page', 'guarded-mcp' ) . '</a>'
       );
@@ -1398,7 +1402,9 @@ class GMCP_Settings {
     ?>
     <p><a href="<?php echo esc_url( $back ); ?>">&larr; <?php esc_html_e( 'Back to the log', 'guarded-mcp' ); ?></a></p>
 
-    <h3><?php printf( esc_html__( 'Entry #%d', 'guarded-mcp' ), (int) $e['id'] ); ?>
+    <h3><?php printf(
+      /* translators: %d: entry number */
+      esc_html__( 'Entry #%d', 'guarded-mcp' ), (int) $e['id'] ); ?>
       <code><?php echo esc_html( (string) $e['tool'] ); ?></code>
       <?php if ( (string) $e['outcome'] === 'ok' ) : ?>
         <span class="gmcp-ok"><?php esc_html_e( 'Done', 'guarded-mcp' ); ?></span>
@@ -1424,6 +1430,7 @@ class GMCP_Settings {
             <?php echo esc_html( (string) ( $e['client'] ?: $e['auth_method'] ) ); ?>
             <?php if ( (string) $e['actor_name'] !== '' ) : ?>
               <br><span class="gmcp-muted"><?php echo esc_html( sprintf(
+                /* translators: %s: user display name */
                 __( 'ran as %s', 'guarded-mcp' ), $e['actor_name'] ) ); ?></span>
               <?php // Said in full here rather than as a tooltip. The list has to be
               // terse; this page is where somebody came to find out what it means. ?>
@@ -1498,10 +1505,10 @@ class GMCP_Settings {
                   <?php $first = false; ?>
                 <?php endif; ?>
                 <td><code><?php echo esc_html( (string) $field ); ?></code></td>
-                <td><?php echo $this->value_cell( $pair['from'] ?? null,
-                  __( 'not set', 'guarded-mcp' ), __( 'empty', 'guarded-mcp' ) ); ?></td>
-                <td><?php echo $this->value_cell( $pair['to'] ?? null,
-                  __( 'removed', 'guarded-mcp' ), __( 'empty', 'guarded-mcp' ) ); ?>
+                <td><?php echo wp_kses_post( $this->value_cell( $pair['from'] ?? null,
+                  __( 'not set', 'guarded-mcp' ), __( 'empty', 'guarded-mcp' ) ) ); ?></td>
+                <td><?php echo wp_kses_post( $this->value_cell( $pair['to'] ?? null,
+                  __( 'removed', 'guarded-mcp' ), __( 'empty', 'guarded-mcp' ) ) ); ?>
                   <?php if ( isset( $asked[ $field ] ) ) : ?>
                     <br><span class="gmcp-detail"><?php printf(
                       /* translators: %s: the value the call sent, as it was sent. */
@@ -1759,7 +1766,7 @@ class GMCP_Settings {
         esc_html( $label ),
         esc_html( number_format_i18n( $counts[ $key ] ) ) );
     }
-    echo '<ul class="subsubsub"><li>' . implode( ' | </li><li>', $views ) . '</li></ul>';
+    echo '<ul class="subsubsub"><li>' . implode( ' | </li><li>', $views ) . '</li></ul>'; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- each $views entry is built with esc_url/esc_html above
     ?>
     <form method="get">
       <?php // These travel with every filter, search and page link, or submitting the
@@ -1775,6 +1782,7 @@ class GMCP_Settings {
     <?php $chain = GMCP_Audit::verify(); ?>
     <p style="margin-top:12px">
       <?php printf(
+        /* translators: 1: number of entries, 2: size of recorded data, 3: number of days */
         esc_html__( '%1$s entries, %2$s of recorded arguments and changes. Kept for %3$d days, then pruned automatically.', 'guarded-mcp' ),
         esc_html( number_format_i18n( $counts[''] ) ),
         esc_html( size_format( GMCP_Audit::bytes() ) ),
@@ -1824,6 +1832,7 @@ class GMCP_Settings {
       // had been passed by then rather than a count of the log. ?>
       <?php if ( $chain['ok'] && !$chain['complete'] && !empty( $chain['imported'] ) ) : ?>
         <span class="gmcp-muted"><?php printf(
+          /* translators: %s: number of older entries */
           esc_html__( '%s older entries were carried over from before this log was chained and are not covered.', 'guarded-mcp' ),
           esc_html( number_format_i18n( $chain['imported'] ) ) ); ?></span>
       <?php endif; ?>

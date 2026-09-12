@@ -3194,7 +3194,7 @@ class GMCP_Tools_Core {
 
       case 'wp_count_terms':
         $tax = sanitize_key( $a['taxonomy'] );
-        $total = wp_count_terms( $tax, [ 'hide_empty' => false ] );
+        $total = wp_count_terms( [ 'taxonomy' => $tax, 'hide_empty' => false ] );
         if ( is_wp_error( $total ) ) {
           $r = $this->error( $r, $total->get_error_message(), $total->get_error_code() );
         }
@@ -4653,7 +4653,7 @@ class GMCP_Tools_Core {
             // URLs like https://picsum.photos/800/600 have no file extension, so
             // basename() yields a name that media_handle_sideload() rejects. Sniff
             // the real type of the downloaded file and append a proper extension.
-            $name = basename( parse_url( $a['url'], PHP_URL_PATH ) );
+            $name = basename( wp_parse_url( $a['url'], PHP_URL_PATH ) );
             if ( $name === '' || pathinfo( $name, PATHINFO_EXTENSION ) === '' ) {
               $ext = '';
               $check = wp_check_filetype_and_ext( $tmp, $name ?: 'image' );
@@ -4679,7 +4679,7 @@ class GMCP_Tools_Core {
           }
 
           $id = media_handle_sideload( $file, 0, $a['description'] ?? '' );
-          @unlink( $tmp );
+          wp_delete_file( $tmp );
           if ( is_wp_error( $id ) ) {
             throw new Exception( 'Sideload failed (' . $id->get_error_code() . '): ' . $id->get_error_message() );
           }

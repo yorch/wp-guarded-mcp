@@ -81,6 +81,31 @@ mount of the repository, and WordPress deletes the old plugin directory before u
 the new one. The delete goes straight through the mount and takes the source tree, `.git`
 included. To test a built package, extract it to a different directory name instead.
 
+## Plugin Check
+
+[WordPress Plugin Check](https://wordpress.org/plugins/plugin-check/) is the static
+analysis tool the WordPress.org directory review uses. A GitHub Actions workflow runs it
+on every push and pull request (see `.github/workflows/plugin-check.yml`). To run the same
+check locally against this stack:
+
+```
+docker compose exec -T cli wp plugin install plugin-check --activate
+docker compose exec -T cli wp plugin check guarded-mcp \
+  --exclude-directories=.dev,.github,tmp \
+  --exclude-files=.gitignore,AGENTS.md,CLAUDE.md,README.md \
+  --ignore-codes=hidden_files,github_directory \
+  --format=table
+```
+
+The exclusions keep dev-only files out of the report: `.dev` is this test stack, `.github`
+holds CI workflows, `tmp` holds build artifacts, and `README.md`/`AGENTS.md`/`CLAUDE.md`/`.gitignore` are repository-only
+files the build script strips before publication. `hidden_files` and `github_directory`
+are plugin-level findings that fire on `.git`, `.gitkeep`, and `.github` which never ship.
+
+Errors fail; warnings do not. The remaining warnings are mostly intentional: direct
+database access for the audit log, third-party hook names, and `error_log()` for the
+connector's own diagnostics. Plugin Check passing is not the same as WordPress.org approval.
+
 ## Diagnosing a client that cannot auto-configure
 
 When a client reports something like "couldn't determine the server settings", OAuth
