@@ -39,10 +39,17 @@ without it.
 
 **Added.** Work that is not derived from upstream at all: MCP prompts and resources, a
 one-call site briefing, a change journal with a gated undo, named keys with their own
-access level, expiry and tool list, preview mode on the tools whose effect is not visible
-from the call, a WooCommerce group on its own switch, and a tamper-evident audit log in
-its own table with redacted arguments and bounded retention. The catalog is 43 content tools,
-26 more with site administration switched on, and 12 more again with WooCommerce.
+access level, expiry, tool list and owning account, preview mode on the tools whose effect
+is not visible from the call, WooCommerce and Elementor groups each on their own switch,
+backups that can be started and read but never restored, and a tamper-evident audit log in
+its own table with redacted arguments, field-level before and after values, and bounded
+retention. The catalog is 50 content tools, 35 more with site administration switched on,
+and 12 more again with WooCommerce.
+
+Those three numbers are the same ones the access-level table in `README.md` carries, and
+`smoke-admin.sh` checks that table against a running site. They were wrong here before that
+check existed, which is the argument for keeping the count in one place and quoting it
+rather than restating it.
 
 **Renamed.** All classes, hooks, options, transients, database tables and CSS classes now
 use the `GMCP_` / `gmcp_` prefix. Options live in a `gmcp_options` row; the OAuth tables
@@ -60,8 +67,17 @@ were renamed: connected apps need to be approved once more.
 
 **Rewritten.** The logger no longer opens `WP_Filesystem` and writes into
 `wp-content/uploads` on every request; it writes to the PHP error log, and debug-level
-calls are gated. The settings screen is plain PHP instead of a minified JavaScript bundle.
-`get_admin_user()` resolves the lowest-ID administrator rather than assuming user 1.
+calls are gated. The settings screen is plain PHP instead of a minified JavaScript bundle,
+and is now five submenu pages rather than one.
+
+The static credential model inherited from upstream is gone. There is no shared bearer
+token: it was stored in the clear because the screen showed it back, carried no identity so
+the log could not say who acted, could not expire and could not be scoped. A named key
+answers all four and is the only static credential now, and an existing shared token is
+carried over into one on upgrade. The token-in-URL route went with it, because it put the
+credential in the request path where every proxy in front of the site wrote a copy into its
+access log. `get_admin_user()` survives only as the fallback for a key migrated from that
+shared token, which has no owner to act as.
 
 **Fixed.** Bugs found by the smoke suites in `.dev/`, the first three inherited from
 upstream and the rest introduced here:
