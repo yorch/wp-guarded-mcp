@@ -2002,7 +2002,7 @@ MENU_ID=$(docker compose exec -T cli wp eval '
   $b = wp_update_nav_menu_item( $m, 0, [ "menu-item-title" => "Second", "menu-item-url" => "https://example.test/two",
     "menu-item-type" => "custom", "menu-item-status" => "publish" ] );
   echo $m . "|" . $a . "|" . $b;' 2>/dev/null | tr -d '\r\n')
-M_ID=$(echo "$MENU_ID" | cut -d'|' -f1); ITEM_A=$(echo "$MENU_ID" | cut -d'|' -f2); ITEM_B=$(echo "$MENU_ID" | cut -d'|' -f3)
+ITEM_A=$(echo "$MENU_ID" | cut -d'|' -f2)
 ORDER_BEFORE=$(docker compose exec -T cli wp post get "$ITEM_A" --field=menu_order 2>/dev/null | tr -d '\r\n')
 call mi_rename "{\"jsonrpc\":\"2.0\",\"id\":240,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_menu_item\",\"arguments\":{\"item_id\":$ITEM_A,\"title\":\"First Renamed\"}}}"
 check "a menu item can be renamed" "$(verdict mi_rename)" "ok"
