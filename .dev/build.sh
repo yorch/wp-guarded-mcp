@@ -46,9 +46,10 @@ fi
 # the SVN assets/ folder rather than in the plugin. README.md documents the repository
 # and the dev stack; readme.txt is the one a user reads. AGENTS.md and its CLAUDE.md
 # symlink are instructions for people and agents working ON the plugin, and a symlink
-# inside a plugin zip is a portability problem on top of being noise. docs/ is the
-# project page, which is a website rather than part of the plugin, and it carries
-# screenshots that would otherwise be shipped twice.
+# inside a plugin zip is a portability problem on top of being noise. docs/ holds the
+# project page (a website rather than part of the plugin, with screenshots that would
+# otherwise be shipped twice) and the guardrail and audit-log rationale that
+# accompanies README.md.
 ( cd "$STAGE/$SLUG" && rm -rf .dev .wordpress-org .github .gitignore README.md AGENTS.md CLAUDE.md docs )
 # languages/.gitkeep is a git placeholder to keep the empty directory; the directory
 # itself ships so WordPress.org's translation system can populate it.
