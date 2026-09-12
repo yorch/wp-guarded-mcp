@@ -18,9 +18,9 @@ Portions of this plugin are derived from AI Engine 3.7.7, Copyright (C) Jordy Me
 distributed under GPLv2 or later via https://wordpress.org/plugins/ai-engine/. The MCP
 transport, the OAuth module and the WordPress tool catalog originate there.
 
-CREDITS.md in the source repository carries the full attribution and the statement of
-changes that GPLv2 sections 1 and 2(a) require. This notice is repeated here so it
-travels with the code rather than only with the repository.
+Each file derived from upstream carries its own notice stating what it came from and
+that it was changed, as GPLv2 section 2(a) requires. Parsedown (in vendor/) is by
+Emanuil Rusev under the MIT licence; see vendor/Parsedown-LICENSE.txt.
 */
 
 if ( !defined( 'ABSPATH' ) ) {

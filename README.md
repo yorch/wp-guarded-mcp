@@ -6,7 +6,7 @@ It is built on one assumption: the agent will occasionally get it wrong. An agen
 
 There is a [project page](https://yorch.github.io/wp-guarded-mcp/) if you would rather read the short version.
 
-This is a fork of the MCP layer of [AI Engine](https://wordpress.org/plugins/ai-engine/) 3.7.7 by Jordy Meow, stripped of everything that is not the MCP server. GPLv2 or later, same as the original. See `CREDITS.md` for what was kept and what changed.
+This is a fork of the MCP layer of [AI Engine](https://wordpress.org/plugins/ai-engine/) 3.7.7 by Jordy Meow, stripped of everything that is not the MCP server. GPLv2 or later, same as the original.
 
 ## What it is
 
@@ -761,5 +761,4 @@ names, `error_log()` for the connector's own diagnostics).
 
 ## Licence
 
-GPLv2 or later. Parts of this plugin derive from prior GPL work; see `CREDITS.md` for the
-attribution and the statement of changes that licence requires.
+GPLv2 or later. Parts of this plugin derive from prior GPL work.
