@@ -59,6 +59,9 @@ docker compose exec -T cli wp plugin install woocommerce --activate
 
 docker compose exec -T cli wp plugin install elementor --activate
 ./smoke-elementor.sh  # the Elementor tools; needs Elementor
+
+docker compose exec -T cli wp plugin install kirki --activate
+./smoke-kirki.sh      # the Kirki tools; needs Kirki
 ```
 
 `smoke-admin.sh` also expects a theme named `futuretheme` that declares a PHP version this

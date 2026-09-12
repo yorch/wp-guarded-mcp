@@ -1320,6 +1320,60 @@ class GMCP_Tools_Core {
         'accessLevel' => 'admin',
       ],
 
+      /* -------- Theme mods -------- */
+      // The customizer's storage: theme_mods_<stylesheet> is a single option row
+      // holding a serialized array, and wp_update_option does a full-array replace on
+      // it. That is the wrong primitive for changing one customizer value, because the
+      // same row also holds nav_menu_locations, sidebars_widgets, custom_logo and
+      // header_image, and a mistake on any of them is a broken site with no error. These
+      // tools use set_theme_mod / remove_theme_mod, which merge or remove a single key,
+      // and they pass the row through the same option_guard the option tools use so a
+      // site that has protected theme_mods_<stylesheet> is not read around.
+      'wp_get_theme_mod' => [
+        'name' => 'wp_get_theme_mod',
+        'description' => 'Get a single theme modification value for the active theme. Theme mods are the customizer\'s storage: they live in the theme_mods_<stylesheet> option as a serialized array, alongside nav_menu_locations, sidebars_widgets, custom_logo and others. Use this rather than wp_get_option on the row, because a raw option read hands back the whole array and a single value needs extracting. Pass a default to use when the key is not set.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'key' => [ 'type' => 'string', 'description' => 'The theme mod key, e.g. body_background_color or nav_menu_locations.' ],
+            'default' => [ 'description' => 'Value to return when the key is not set. Any type.' ],
+          ],
+          'required' => [ 'key' ],
+        ],
+        'accessLevel' => 'admin',
+      ],
+      'wp_set_theme_mod' => [
+        'name' => 'wp_set_theme_mod',
+        'description' => 'Set a single theme modification value for the active theme. Uses set_theme_mod(), which merges one key into the theme_mods_<stylesheet> array rather than replacing the whole row, so nav_menu_locations, sidebars_widgets and the other keys in that row are left alone. This is the safe primitive for changing a customizer value: wp_update_option on theme_mods_* does a full-array replace and a mistake wipes every other mod. The write is journalled, so wp_undo_change can put it back.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'key' => [ 'type' => 'string', 'description' => 'The theme mod key.' ],
+            'value' => [ 'description' => 'The value to store. Any type; arrays and objects are stored natively.' ],
+          ],
+          'required' => [ 'key', 'value' ],
+        ],
+        'accessLevel' => 'admin',
+      ],
+      'wp_list_theme_mods' => [
+        'name' => 'wp_list_theme_mods',
+        'description' => 'List every theme modification value for the active theme. Returns the full theme_mods_<stylesheet> array, which holds every customizer setting plus nav_menu_locations, sidebars_widgets, custom_logo and header_image. Credential-shaped values are redacted by the same rule the option tools use.',
+        'inputSchema' => [ 'type' => 'object', 'properties' => [] ],
+        'accessLevel' => 'admin',
+      ],
+      'wp_remove_theme_mod' => [
+        'name' => 'wp_remove_theme_mod',
+        'description' => 'Remove a single theme modification value for the active theme, so the customizer falls back to its default for that key. Uses remove_theme_mod(), which removes one key from the theme_mods_<stylesheet> array rather than deleting the row. The removal is journalled as an update (the previous value is kept), so wp_undo_change can put it back.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'key' => [ 'type' => 'string', 'description' => 'The theme mod key to remove.' ],
+          ],
+          'required' => [ 'key' ],
+        ],
+        'accessLevel' => 'admin',
+      ],
+
       /* -------- Caches -------- */
       'wp_flush_cache' => [
         'name' => 'wp_flush_cache',
@@ -2826,6 +2880,105 @@ class GMCP_Tools_Core {
         else {
           $r = $this->error( $r, 'Deleting option "' . $key . '" failed.', -32603 );
         }
+        break;
+
+        /* ===== Theme mods ===== */
+      case 'wp_get_theme_mod':
+        $key = $this->clean_option_key( $a['key'] ?? '' );
+        if ( $key === '' ) {
+          $r = $this->error( $r, 'key required', -32602 );
+          break;
+        }
+        // The row holds every customizer value plus nav_menu_locations and
+        // sidebars_widgets, so it answers to the same guard as any other option. A site
+        // that has protected theme_mods_<stylesheet> is not read around by a tool that
+        // happens to know a different way in.
+        $row = 'theme_mods_' . get_option( 'stylesheet' );
+        $permitted = $this->option_allowed( $row );
+        if ( $permitted !== true ) {
+          $r = $this->error( $r, $permitted, -32600 );
+          break;
+        }
+        $has_default = array_key_exists( 'default', $a );
+        $value = $has_default ? get_theme_mod( $key, $a['default'] ) : get_theme_mod( $key );
+        // A theme mod can hold anything, including a value a theme author put under a
+        // key named api_key. Redact the same way wp_list_theme_mods does, so a single-key
+        // read does not become a way to read a secret the list tool would have blanked.
+        if ( GMCP_Core::field_looks_secret( $key ) ) {
+          $value = '[redacted]';
+        }
+        else {
+          $value = GMCP_Core::redact( $value );
+        }
+        $r = $this->json( $r, $value );
+        break;
+
+      case 'wp_set_theme_mod':
+        $key = $this->clean_option_key( $a['key'] ?? '' );
+        if ( $key === '' ) {
+          $r = $this->error( $r, 'key required', -32602 );
+          break;
+        }
+        $value = $a['value'] ?? null;
+        // set_theme_mod() merges one key into the theme_mods_<stylesheet> array and
+        // calls update_option() under the hood, so the row passes through the same guard
+        // and the same write policy as any other option write. Without the guard, a
+        // site that has protected the row through gmcp_protected_options would be
+        // written around by a tool that happens to know a different way in; without the
+        // policy, a future rule added to option_write_policy() for theme_mods_* would
+        // be bypassed here the day it is added.
+        $row = 'theme_mods_' . get_option( 'stylesheet' );
+        $permitted = $this->option_allowed( $row );
+        if ( $permitted !== true ) {
+          $r = $this->error( $r, $permitted, -32600 );
+          break;
+        }
+        $policy = GMCP_Core::option_write_policy( $row, $value );
+        if ( $policy !== true ) {
+          $r['error'] = [ 'code' => -32600, 'message' => $policy ];
+          break;
+        }
+        set_theme_mod( $key, $value );
+        $this->add_result_text( $r, 'Theme mod "' . $key . '" set for "' . get_option( 'stylesheet' ) . '".' );
+        break;
+
+      case 'wp_list_theme_mods':
+        $row = 'theme_mods_' . get_option( 'stylesheet' );
+        $permitted = $this->option_allowed( $row );
+        if ( $permitted !== true ) {
+          $r = $this->error( $r, $permitted, -32600 );
+          break;
+        }
+        $mods = get_theme_mods();
+        if ( !is_array( $mods ) ) {
+          $mods = [];
+        }
+        // Credential-shaped values are redacted by the same rule the option tools use,
+        // so a theme mod named api_key or similar is not handed to the model in plain
+        // text. redact() walks the value and blanks the leaves the same way it does for
+        // an audit-log argument, keeping the shape so the caller can still see what is
+        // there without seeing what was in it.
+        $mods = GMCP_Core::redact( $mods );
+        $r = $this->json( $r, $mods );
+        break;
+
+      case 'wp_remove_theme_mod':
+        $key = $this->clean_option_key( $a['key'] ?? '' );
+        if ( $key === '' ) {
+          $r = $this->error( $r, 'key required', -32602 );
+          break;
+        }
+        $row = 'theme_mods_' . get_option( 'stylesheet' );
+        $permitted = $this->option_allowed( $row );
+        if ( $permitted !== true ) {
+          $r = $this->error( $r, $permitted, -32600 );
+          break;
+        }
+        // remove_theme_mod() removes one key from the array and writes the row back,
+        // so the previous value is journalled by the change layer the same way an
+        // update is, and wp_undo_change can put it back.
+        remove_theme_mod( $key );
+        $this->add_result_text( $r, 'Theme mod "' . $key . '" removed for "' . get_option( 'stylesheet' ) . '". The customizer will use its default for this key.' );
         break;
 
         /* ===== Caches ===== */
@@ -4653,7 +4806,7 @@ class GMCP_Tools_Core {
   * and a new admin tool is covered the day it is added instead of the day someone
   * notices.
   */
-  private const NON_MUTATING_ADMIN_TOOLS = [ 'wp_get_users', 'wp_get_option' ];
+  private const NON_MUTATING_ADMIN_TOOLS = [ 'wp_get_users', 'wp_get_option', 'wp_get_theme_mod', 'wp_list_theme_mods' ];
 
   // Whether a tool changes site state (so the gmcp_mutate hook should fire).
   private function is_mutating_tool( string $tool ): bool {
