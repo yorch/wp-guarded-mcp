@@ -1174,6 +1174,9 @@ class GMCP_Tools_Elementor {
     }
     $where = implode( ' OR ', array_fill( 0, count( $likes ), 'm.meta_value LIKE %s' ) );
 
+    // phpcs:disable WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- the
+    // placeholder count is dynamic: 1 (meta_key) + count($likes) + 1 (LIMIT) = count($args).
+    // The sniff cannot count the array_fill-generated placeholders in $where.
     $candidates = $wpdb->get_results( $wpdb->prepare(
       "SELECT p.ID, p.post_title, p.post_type, p.post_status, m.meta_value
         FROM {$wpdb->postmeta} m INNER JOIN {$wpdb->posts} p ON p.ID = m.post_id
@@ -1182,6 +1185,7 @@ class GMCP_Tools_Elementor {
         ORDER BY p.ID ASC LIMIT %d",
       array_merge( [ self::DATA_META ], $likes, [ self::SCAN_LIMIT + 1 ] )
     ) );
+    // phpcs:enable WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
     $candidates = is_array( $candidates ) ? $candidates : [];
     $truncated = count( $candidates ) > self::SCAN_LIMIT;
     $candidates = array_slice( $candidates, 0, self::SCAN_LIMIT );
