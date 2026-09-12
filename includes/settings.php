@@ -327,6 +327,7 @@ class GMCP_Settings {
       'mcp_tools_rest' => 'bool',
       'mcp_tools_woo' => 'bool',
       'mcp_tools_elementor' => 'bool',
+      'mcp_tools_kirki' => 'bool',
       'mcp_debug_mode' => 'bool',
       'mcp_activity_log' => 'bool',
       'mcp_audit_days' => 'days',
@@ -1142,6 +1143,7 @@ class GMCP_Settings {
   private function render_tools( array $options ): void {
     $woo = class_exists( 'WooCommerce' );
     $elementor = did_action( 'elementor/loaded' );
+    $kirki = class_exists( 'Kirki' );
 
     // Only the groups actually rendered are declared to the save. A checkbox that was
     // never on screen must keep its stored value rather than read as unticked, which is
@@ -1152,6 +1154,9 @@ class GMCP_Settings {
     }
     if ( $elementor ) {
       $keys[] = 'mcp_tools_elementor';
+    }
+    if ( $kirki ) {
+      $keys[] = 'mcp_tools_kirki';
     }
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'Which groups of tools an agent is offered. A group that is off is not merely hidden: its tools are refused if asked for by name.', 'guarded-mcp' ); ?></p>
@@ -1188,6 +1193,12 @@ class GMCP_Settings {
                   <?php esc_html_e( 'Elementor (theme-builder conditions, regenerate CSS, apply a library template to a page)', 'guarded-mcp' ); ?>
                 </label>
               <?php endif; ?>
+              <?php if ( $kirki ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_kirki" value="1" <?php checked( !empty( $options['mcp_tools_kirki'] ) ); ?>>
+                  <?php esc_html_e( 'Kirki (customizer field discovery, value get/set, Google Fonts cache)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
               <label>
                 <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>
                 <?php esc_html_e( 'Generate tools from this site\'s REST API routes', 'guarded-mcp' ); ?>
@@ -1204,6 +1215,11 @@ class GMCP_Settings {
             <?php if ( $elementor ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The Elementor tools exist because setting a header or footer through the generic tools appears to work and does not: Elementor keeps a cached copy of which template applies where, and writing only the template leaves that cache stale. These write both halves together, and say what the cache holds.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $kirki ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The Kirki tools resolve a field\'s storage model from its registration and write through the right path, so a value written through them lands where Kirki reads it. Writing through the generic option tools instead is a silent success: the value lands in a row nothing reads, and the front end keeps rendering the old one.', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
             <p class="description">

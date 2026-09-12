@@ -67,14 +67,14 @@ An access level belongs to a named key. OAuth callers always act as the administ
 
 | Level | Content only | + administration | + WooCommerce | What it can do |
 |---|---|---|---|---|
-| `admin` | 51 | 86 | 98 | Everything, including deletes, users and options |
+| `admin` | 55 | 90 | 102 | Everything, including deletes, users and options |
 | `readwrite` | 38 | 49 | 58 | Create and update, no destructive tools |
 | `readonly` | 18 | 28 | 32 | Reads only |
 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
-nine had drifted behind the code before anything checked them. Elementor is not counted:
-its tools are a fourth group that comes and goes with a plugin, so folding them in would
-make the table depend on what happens to be installed.
+nine had drifted behind the code before anything checked them. Elementor and Kirki are not
+counted: their tools are fourth and fifth groups that come and go with a plugin, so folding
+them in would make the table depend on what happens to be installed.
 
 A **named key** narrows this further. It carries its own level, an optional expiry date,
 and an optional list of the only tools it may call, so a key handed to a deploy script
@@ -137,6 +137,18 @@ None of this plugin's own rows are readable or writable through the option tools
 - That guard lives in the always-on content tools while the search lives with the Elementor ones, and it calls across rather than keeping a copy. Both halves matter: a guard that disappeared when the optional Elementor group is switched off would not be a guard, since the delete comes from the content tools; and a second copy of the search would be free to disagree with the one doing the reporting, in the direction of waving through a reference the tool can see.
 - The kit is where most of "wire up a theme" lives: the site's global colours, fonts, layout defaults and theme styles. `elementor_set_active_kit` switches it, and does the second half with it. A kit compiles into generated CSS files, so switching the option alone leaves every page rendering the old design while the tool reports the new one, which is the same silent success the conditions tools exist for; the files are cleared here too. The reply names the kit it replaced, because that is the only record of what to switch back to: this is not journalled and there is no undo. Anything that is not a published kit is refused, since Elementor reads the option without checking and an id pointing at an ordinary template leaves the site with no usable global styles at all.
 - Elementor's internals are not a stable contract across versions, so every call into one of its classes is guarded and reports what was missing instead of fataling. A wrong guess fails benignly.
+
+**Kirki**, off by default, and the switch only appears when Kirki is installed: customizer field discovery, value get/set that resolves the field's storage model, and Google Fonts cache clearing. It exists for the same reason the Elementor group does: writing a Kirki value through the generic option tools appears to work and does not.
+
+- Kirki stores each field's value in one of three places, and which one depends on the field's `option_type` and `option_name`: a theme_mod (the default), a single named option row holding a serialized array, or a standalone option row per field. Writing through the wrong one is a silent success: the value lands in a row nothing reads, and the front end keeps rendering the old value. `kirki_set_field_value` resolves the storage from the field's registration and writes through the right path, so the caller does not need to know the model.
+- For `theme_mod` fields it uses `set_theme_mod`, which merges one key into the `theme_mods_<stylesheet>` array rather than replacing the whole row. A full-array replace on that row, which is what `wp_update_option` does, wipes `nav_menu_locations`, `sidebars_widgets`, `custom_logo` and every other mod. The partial update is the safe primitive.
+- For `option` fields with an `option_name` it does a read-merge-write, so a sibling field in the same group survives. A full replace on the grouped option would wipe every other field in it.
+- Every write passes through the same `option_guard` and `option_write_policy` as `wp_update_option`, so a field whose resolved option name is `siteurl` or a credential-shaped key is refused the same way. The guard is attached to the option, not to the tool.
+- Kirki generates its CSS inline and recomputes it on every front-end page load, so a value written through `kirki_set_field_value` takes effect on the next load without an extra step. What can lag is the Google Fonts cache: Kirki downloads font files and caches the remote CSS, and changing a typography field does not invalidate that cache on its own. `kirki_regenerate_css` clears it, and says that a full-page cache is separate and not touched.
+- `kirki_export_config` exports the site's Kirki configuration as JSON, with credential-shaped values redacted. There is no `kirki_import_config`, deliberately: importing rewrites the whole design system from an archive built elsewhere in a single call with no restore tool behind it, which is the same category the Elementor kit import is refused on.
+- Kirki's controls, sections and panels are defined in PHP theme code, not in the database, so the MCP cannot add, remove, or modify them. The tools read what the theme registered and write the stored values; they do not change the registration.
+
+**Theme mods** are the customizer's storage, and four generic tools cover them: `wp_get_theme_mod`, `wp_set_theme_mod`, `wp_list_theme_mods` and `wp_remove_theme_mod`. They are in the core tool group because `theme_mods_<stylesheet>` is ordinary WordPress storage, and any customizer framework — Kirki, Redux, OptionTree, or the core customizer itself — uses it. The critical one is `wp_set_theme_mod`: it uses `set_theme_mod`, which merges one key, where `wp_update_option` on the same row does a full-array replace and a mistake wipes every other mod. The row passes through the same `option_guard` and `option_write_policy` as any other option, and the change journal recognises `theme_mods_*` rows, so `wp_undo_change` can put a write back.
 
 *Several posts in one call.* `wp_create_posts` takes up to twenty and creates them in order,
 stopping at the first failure. The reply names what was created with its new ids, what failed

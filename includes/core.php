@@ -46,6 +46,8 @@ class GMCP_Core {
     'mcp_tools_woo' => false,
     // Elementor: theme-builder conditions, and putting a library template on a page.
     'mcp_tools_elementor' => false,
+    // Kirki: customizer framework field discovery, value get/set, CSS cache.
+    'mcp_tools_kirki' => false,
     'mcp_debug_mode' => false,
     // Keep a short history of tool calls, including refused ones, for the settings
     // screen. An agent otherwise operates with no visible record at all.
@@ -686,6 +688,14 @@ class GMCP_Core {
     // from another. Registering here costs one object on a request that may not use it.
     if ( $this->get_option( 'mcp_tools_elementor' ) ) {
       new GMCP_Tools_Elementor();
+    }
+
+    // Same reasoning as the optional groups above: without Kirki these tools are a
+    // handful of entries in front of a model that fail the moment it tries one. The
+    // per-call check in GMCP_Tools_Kirki::handle_call() is what keeps them honest
+    // when Kirki has been deactivated between the group being switched on and a call.
+    if ( $this->get_option( 'mcp_tools_kirki' ) ) {
+      new GMCP_Tools_Kirki();
     }
   }
 
