@@ -521,8 +521,17 @@ class GMCP_Tools_Admin {
       ],
       'wp_start_backup' => [
         'name' => 'wp_start_backup',
-        'description' => 'Ask the site\'s backup plugin to start a full backup. It starts one; it does not wait for one. A backup takes minutes to hours and this call returns in seconds, so a successful reply means the job was started and NOT that a backup exists. Poll wp_backup_status until it reports a newly completed backup before doing anything you would want the backup for. There is deliberately no tool to restore.',
-        'inputSchema' => [ 'type' => 'object', 'properties' => [] ],
+        'description' => 'Ask the site\'s backup plugin to start a backup, optionally narrowed with scope to full (default), database or files. It starts one; it does not wait for one. A backup takes minutes to hours and this call returns in seconds, so a successful reply means the job was started and NOT that a backup exists. Poll wp_backup_status until it reports a newly completed backup before doing anything you would want the backup for. A scope is asked for, never confirmed: a plugin that cannot express the scope you asked for refuses and names what it can do, rather than running a full backup under the label you gave, and once a backup finishes the contains field in wp_list_backups is the only thing that says what it actually holds. wp_backup_status lists the scopes this site\'s plugin accepts. Where a backup is sent is deliberately not an argument: every adapter uses the destination the site owner already configured, because choosing where a database dump holding every password hash is written is not a decision for this API. There is deliberately no tool to restore.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'scope' => [
+              'type' => 'string',
+              'enum' => [ 'full', 'database', 'files' ],
+              'description' => 'full (default) is the database and the files. database is the database alone. files is the file half, meaning whatever this site already has its backup plugin configured to include, which is not narrowable to uploads or themes alone because the two supported plugins divide files up differently.',
+            ],
+          ],
+        ],
         'accessLevel' => 'write',
       ],
       /* -------- Site health -------- */
@@ -819,7 +828,12 @@ class GMCP_Tools_Admin {
         return $this->json( $r, GMCP_Backup::listing( isset( $a['limit'] ) ? (int) $a['limit'] : 20 ) );
 
       case 'wp_start_backup':
-        $started = GMCP_Backup::start();
+        // Passed through as given, not sanitised to a known value: GMCP_Backup::start()
+        // refuses an unrecognised scope by name, and coercing it here would turn a typo
+        // into a full backup reported as the scope that was asked for. A non-scalar goes
+        // the same way rather than being cast, which would say "Array" and log a warning.
+        $scope = $a['scope'] ?? 'full';
+        $started = GMCP_Backup::start( is_scalar( $scope ) ? (string) $scope : '(not a string)' );
         if ( !$started['ok'] ) {
           return $this->error( $r, $started['message'] );
         }

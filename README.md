@@ -131,8 +131,22 @@ None of this plugin's own rows are readable or writable through the option tools
 - A header or footer is applied by two rows, not one. Elementor keeps a cached registry of which template applies where in an option of its own, separate from each template's conditions meta, and saving in the editor writes both. Writing only the meta leaves the cache stale, and Elementor declines to rebuild it whenever the stored value is already an array: an empty array reads as computed with nothing in it, so a header set up that way is invisible forever and no amount of reloading the front end fixes it. These tools read both halves, say whether they agree, and change them together. Where Elementor Pro's own conditions manager is reachable they ask it to rebuild, since that is the call the editor makes; otherwise they delete the cached option, because an absent value is the state Elementor heals from and an empty array is the one it cannot.
 - The design itself is `_elementor_data`, a JSON string routinely over 100KB. `update_metadata()` unslashes whatever it is handed, so a value that went out through a tool argument and came back would lose every escape in it and return a broken document. Size was never the only problem, and the corruption is silent. `elementor_apply_template` moves it inside PHP so it never leaves the server. It defaults to the shortcode form, which keeps the page linked to the template so later edits to the template propagate rather than freezing a copy, and copies the design only when asked.
 - That link can be asked about. `elementor_template_references` answers what still points at a template, covering both the shortcode written into a page's content and a template embedded inside another page's design, which is how Elementor's own widgets do it. The match is exact rather than textual: the shortcode is parsed and the design decoded, so template 12 is not reported as a reference to template 1. It answers even when Elementor is not active, which is when the answer is worth most, because every referencing page has just started printing its shortcode as literal text. Applying a template now also warns when it is replacing an existing link and when the template is not published, since Elementor renders nothing for a draft and the page shows an empty space.
+- `elementor_kit_report` reads the site's global colours, fonts and layout settings from the active kit, and writes nothing at all. That is what makes it safe to ship against internals that move between Elementor versions: a version change can make the report incomplete, which is a bad afternoon, where a write against a changed shape corrupts a site's global styling. It checks the kit it was given back is the one it asked for, because Elementor substitutes an empty placeholder when the active kit is missing or trashed and that placeholder answers every question with the plugin's built-in defaults, as confidently as a real kit would.
 - Conditions need the theme builder, which is Elementor Pro or PRO Elements. On a site with only the free plugin the rows are still written, nothing reads them, and the tools say so rather than reporting a success the site will never show.
 - Elementor's internals are not a stable contract across versions, so every call into one of its classes is guarded and reports what was missing instead of fataling. A wrong guess fails benignly.
+
+*Several posts in one call.* `wp_create_posts` takes up to twenty and creates them in order,
+stopping at the first failure. The reply names what was created with its new ids, what failed
+and why, and what was never attempted, so a caller can retry the remainder without re-reading
+the whole list. It is a separate tool rather than an argument on `wp_create_post` for a reason
+that is not aesthetic: access is declared per tool and named keys are scoped to tool names, so
+an argument would have handed every key already scoped to the single create the power to write
+twenty posts a call, without anyone deciding that. The cap comes from the journal rather than
+from taste, since it holds forty entries for the whole site and an oversized batch would evict
+everyone else's undo history rather than merely crowding its own. Every guard the single
+create applies is applied per item; a batch is not a way to write content a single call would
+have filtered. It cannot be undone as a unit, because creations are not journalled, and the
+reply says so and points at the ids it returned.
 
 **Orientation.** `wp_site_briefing` answers "what am I looking at" in one call: versions, theme, active plugins, post types with counts, taxonomies, the front page arrangement, the comment queue, users by role and the permalink structure. `wc_store_briefing` does the same for a shop. Both replace the half-dozen queries an agent otherwise makes before any work starts.
 
@@ -195,6 +209,17 @@ Credential-shaped leaves are not stored, judged by the field names inside a valu
 Some values still cannot be snapshotted and keep the older all-or-nothing answer: an object anywhere inside one, because restoring an array copy would put back a different type than was there, and anything nested past the depth limit. Those are recorded as changed and refuse to revert, saying so.
 
 Two limits worth knowing. The check is structural, so a secret held as a bare string under an innocuous option name is still stored; a string that parses as JSON or as a serialized array is unpacked and judged, and blanked whole if it holds one. And it is not retroactive: adding an option to `gmcp_protected_options` refuses future reverts but does not scrub what is already recorded, so clear the journal after protecting something that was previously being written.
+
+*A backup can be narrowed.* `wp_start_backup` takes a scope of full, database or files,
+honoured by the adapters that can express it and refused with a reason by those that cannot,
+because an adapter that silently ignored an unrecognised scope and ran a full backup would
+tell a caller it had a database-only backup when it did not. `files` deliberately means the
+file half of whatever this site's plugin already backs up, rather than a narrower selection
+that would mean uploads on one site and the whole install on another. Destination is not
+offered, and that is a refusal rather than an omission: choosing where a database dump is sent
+is not a decision to hand to something that reads instructions out of a comment queue. The
+reply says the scope was asked for rather than confirming what ran, because neither adapter
+reports back.
 
 **Backups.** `wp_backup_status` reports what is known, `wp_list_backups` says which backups
 exist, and `wp_start_backup` asks the site's backup plugin to start one. Three things shape
