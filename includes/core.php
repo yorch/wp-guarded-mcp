@@ -579,7 +579,20 @@ class GMCP_Core {
     // action fires only when it really did start. It fires during Elementor's own
     // plugins_loaded handler, which runs before this one because plugins load in directory
     // order and "elementor" sorts before "guarded-mcp".
-    if ( $this->get_option( 'mcp_tools_elementor' ) && did_action( 'elementor/loaded' ) ) {
+    // Registered whenever the group is switched on, and NOT gated on Elementor having
+    // loaded. It used to be, which silently defeated the one tool in the group written to
+    // answer with Elementor switched off: elementor_template_references reads only
+    // wp_posts and wp_postmeta, and is the tool a person reaches for at exactly the moment
+    // Elementor is deactivated and every referencing page has started printing its
+    // shortcode as literal text. It carries a carve-out from the per-call Elementor check
+    // for that reason, and a carve-out inside a class that was never constructed cannot
+    // run: the tool was simply absent from the list, and the server answered "Unknown
+    // tool", which reads as "this feature does not exist" rather than "it is gated".
+    //
+    // The per-call check in GMCP_Tools_Elementor::handle_call() is what keeps the rest of
+    // the group honest, and it is the right level for it, because it can tell one tool
+    // from another. Registering here costs one object on a request that may not use it.
+    if ( $this->get_option( 'mcp_tools_elementor' ) ) {
       new GMCP_Tools_Elementor();
     }
   }

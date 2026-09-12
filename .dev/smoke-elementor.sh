@@ -148,5 +148,25 @@ call e_offcall "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params
 check "and calling one anyway is refused" "$(verdict e_offcall)" "error"
 docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_elementor"]=true;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
 
+echo "-- the one tool that must survive Elementor being switched off --"
+# elementor_template_references reads only wp_posts and wp_postmeta, and the moment it is
+# worth most is the moment Elementor is deactivated: every page carrying the shortcode has
+# just started printing it as literal text, and its author needs to know which pages those
+# are. It carried a carve-out from the per-call Elementor check for that reason, and the
+# whole group was gated on Elementor having loaded, so the carve-out sat inside a class
+# that was never constructed. The tool was simply missing, and the server said "Unknown
+# tool", which reads as "no such feature" rather than "gated".
+docker compose exec -T cli wp plugin deactivate elementor >/dev/null 2>&1
+call er_off "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_template_references\",\"arguments\":{\"template_id\":$HDR}}}"
+check "the reference query answers with Elementor switched off" "$(verdict er_off)" "ok"
+# The control, and it is the one that matters: moving the gate outward could have removed
+# it from the whole group. A tool that genuinely needs Elementor must still refuse, and
+# with its own sentence rather than "unknown tool".
+call er_css '{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"elementor_regenerate_css","arguments":{}}}'
+check "and one that needs Elementor still refuses" "$(verdict er_css)" "error"
+check "saying why, not that it does not exist" \
+  "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["content"][0]["text"];print("gated" if "not loaded" in t else t[:40])' er_css)" "gated"
+docker compose exec -T cli wp plugin activate elementor >/dev/null 2>&1
+
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
