@@ -321,6 +321,16 @@ There is no restore tool at any access level. Restoring discards everything sinc
 backup, which is a larger irreversible act than anything else here, and no confirmation
 token makes that safe to hand to something reading instructions out of a comment queue.
 
+There is no kit import either, and it is refused for the same reason rather than because
+it would be hard. Elementor can import a kit from an archive, and doing so rewrites a
+site's design system wholesale: global colours and fonts, theme styles, site settings, and
+whatever content the archive carries. It is one call that changes every page, the archive
+was built somewhere else, and there is no restore tool standing behind it. Switching
+between the kits a site already has is a different thing and `elementor_set_active_kit`
+does it, because those were made here and the previous one is still there to switch back
+to. A site that genuinely wants an import has the Elementor screen for it, where a person
+sees what is about to happen.
+
 **Prompts and resources.** The server offers six ready-made upkeep jobs through MCP prompts, and publishes recent posts, the comment queue and the site briefing as MCP resources a client can attach to a conversation. Every resource is backed by a tool and gated by it, so a resource is never a softer route to data than the tool it mirrors.
 
 Optionally the plugin can also generate tools from the site's own REST API routes. That is off by default because it is a large, generic surface next to the curated tools.

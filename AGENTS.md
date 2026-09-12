@@ -34,6 +34,12 @@ subsystems ask, so the two cannot drift apart.
 **There is no restore tool, at any access level.** Backups can be started and read. That is
 deliberate and not an omission to be helpfully filled in.
 
+**There is no kit import, and no tool that takes an archive.** `elementor_set_active_kit`
+switches between kits the site already has, which is reversible because the previous one is
+still there. Importing one rewrites the whole design system from an archive built elsewhere,
+in a single call, with no restore tool behind it. Same category as the two above: deliberate,
+and not an omission to be helpfully filled in.
+
 **The audit log has no bulk actions and no row deletion in the UI.** Rows hash the row
 before them, so removing one from the middle is exactly what the chain exists to make
 visible. A convenient button for it would be building the attack into the product.
