@@ -139,6 +139,57 @@ check "and it is still valid JSON after the round trip" \
 call e_again "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_apply_template\",\"arguments\":{\"page_id\":$POST,\"template_id\":$SRC,\"mode\":\"copy\"}}}"
 check "applying over an existing design needs overwrite" "$(verdict e_again)" "error"
 
+echo "-- the active kit --"
+# A kit holds the site's global colours, fonts and theme styles, so most of what wiring up
+# a theme means lives in it. Elementor records the active one in a single option, which
+# makes switching look small: it changes every page at once and there is no undo for it.
+#
+# Read first and put back at the end. This is destructive in a way most of this suite is
+# not: leaving the wrong kit active would change how every later check renders.
+KIT_WAS=$(docker compose exec -T cli wp eval 'echo (int) get_option("elementor_active_kit");' 2>/dev/null | tr -d '\r\n')
+check "CONTROL: this site has an active kit to begin with" \
+  "$(docker compose exec -T cli wp eval 'echo get_option("elementor_active_kit") ? "yes" : "no";' 2>/dev/null | tr -d '\r\n')" "yes"
+KIT_NEW=$(docker compose exec -T cli wp eval '$id = wp_insert_post([ "post_title"=>"Suite Kit", "post_type"=>"elementor_library", "post_status"=>"publish" ]); update_post_meta( $id, "_elementor_template_type", "kit" ); echo $id;' 2>/dev/null | tr -d '\r\n')
+call k_set "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_set_active_kit\",\"arguments\":{\"ID\":$KIT_NEW}}}"
+check "switching the active kit succeeds" "$(verdict k_set)" "ok"
+# Asserted against the option, not the reply. A tool reporting a switch and a switch
+# happening are different claims.
+check "and the option really names the new kit" \
+  "$(docker compose exec -T cli wp eval 'echo (int) get_option("elementor_active_kit");' 2>/dev/null | tr -d '\r\n')" "$KIT_NEW"
+# The previous id is the only record of what to go back to, since this is not journalled.
+check "and the reply names the kit it replaced" \
+  "$(py "import json,sys;t=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(t['previous_kit'])" k_set)" "$KIT_WAS"
+# The half that gets forgotten: a kit compiles to generated CSS, and switching the option
+# without clearing it leaves every page rendering the old kit while the tool reports the
+# new one, which is the same silent success the conditions tools exist for.
+check "and it clears the generated CSS rather than leaving the old design rendering" \
+  "$(py "import json,sys;t=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print('cleared' in t['generated_css'])" k_set)" "True"
+check "and says undo cannot reverse it" \
+  "$(py "import json,sys;t=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print('not journalled' in t['note'])" k_set)" "True"
+
+# Elementor reads this option and looks the post up without asking what it is, so an id
+# pointing at the wrong thing leaves the site with no usable global styles and no error.
+KIT_SEC=$(docker compose exec -T cli wp eval '$id = wp_insert_post([ "post_title"=>"Not a kit", "post_type"=>"elementor_library", "post_status"=>"publish" ]); update_post_meta( $id, "_elementor_template_type", "section" ); echo $id;' 2>/dev/null | tr -d '\r\n')
+call k_notkit "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_set_active_kit\",\"arguments\":{\"ID\":$KIT_SEC}}}"
+check "an ordinary template cannot be made the active kit" \
+  "$(py "import json,sys;print('not a kit' in json.load(sys.stdin)['result']['content'][0]['text'])" k_notkit)" "True"
+KIT_DRAFT=$(docker compose exec -T cli wp eval '$id = wp_insert_post([ "post_title"=>"Draft kit", "post_type"=>"elementor_library", "post_status"=>"draft" ]); update_post_meta( $id, "_elementor_template_type", "kit" ); echo $id;' 2>/dev/null | tr -d '\r\n')
+call k_draft "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_set_active_kit\",\"arguments\":{\"ID\":$KIT_DRAFT}}}"
+check "nor can a kit that is not published" \
+  "$(py "import json,sys;print('not published' in json.load(sys.stdin)['result']['content'][0]['text'])" k_draft)" "True"
+# A test for a guard must not depend on the guard: read the option back rather than trust
+# the two refusals above.
+check "and neither refusal changed the active kit" \
+  "$(docker compose exec -T cli wp eval 'echo (int) get_option("elementor_active_kit");' 2>/dev/null | tr -d '\r\n')" "$KIT_NEW"
+call k_again "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_set_active_kit\",\"arguments\":{\"ID\":$KIT_NEW}}}"
+check "setting the kit that is already active says so rather than churning the CSS" \
+  "$(py "import json,sys;print('already the active one' in json.load(sys.stdin)['result']['content'][0]['text'])" k_again)" "True"
+
+docker compose exec -T cli wp eval "update_option( 'elementor_active_kit', $KIT_WAS );" >/dev/null 2>&1
+check "and the site's own kit is back as it was found" \
+  "$(docker compose exec -T cli wp eval 'echo (int) get_option("elementor_active_kit");' 2>/dev/null | tr -d '\r\n')" "$KIT_WAS"
+docker compose exec -T cli wp post delete "$KIT_NEW" "$KIT_SEC" "$KIT_DRAFT" --force >/dev/null 2>&1
+
 echo "-- the group switch --"
 docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_elementor"]=false;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
 call e_off '{"jsonrpc":"2.0","id":8,"method":"tools/list"}'

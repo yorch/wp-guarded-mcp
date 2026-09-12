@@ -169,7 +169,7 @@ class GMCP_Tools_Elementor {
 
   /** Tools here that change the site, and so announce themselves on gmcp_mutate. */
   const MUTATING = [
-    'elementor_set_conditions', 'elementor_regenerate_css', 'elementor_apply_template',
+    'elementor_set_conditions', 'elementor_regenerate_css', 'elementor_set_active_kit', 'elementor_apply_template',
   ];
 
   /** The three tools that read or delete the conditions option, and so pass the option guard. */
@@ -240,6 +240,18 @@ class GMCP_Tools_Elementor {
             'location' => [ 'type' => 'string', 'description' => 'header, footer, single or archive. Only needed when the template type does not say which, in which case the call is refused without it.' ],
           ],
           'required' => [ 'ID', 'conditions' ],
+        ],
+        'accessLevel' => 'admin',
+      ],
+      'elementor_set_active_kit' => [
+        'name' => 'elementor_set_active_kit',
+        'description' => 'Make one Elementor kit the active one. A kit holds the site\'s global colours, fonts, layout defaults and theme-style rules, so most of what "wire up a theme" means lives in it rather than in any page. Elementor records the active one in a single option, which is why this looks small and is not: switching it changes every page at once. Two things come with the switch and both matter. Elementor compiles the kit\'s colours and typography into generated CSS files, so the files are cleared here as well and rebuilt on the next page load; without that the site keeps rendering the old kit\'s design while reporting the new one as active, which is the exact shape of silent failure the conditions tools exist for. And the previous kit is named in the reply, because it is the only record of what to switch back to: this is not journalled and there is no undo for it. Refuses anything that is not a published kit, including an ordinary library template, since Elementor reads the option without checking and an id pointing at the wrong thing leaves the site with no usable global styles at all. List the kits with elementor_list_templates and type "kit".',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'ID' => [ 'type' => 'integer', 'description' => 'The kit to activate. It must be an elementor_library post whose template type is kit.' ],
+          ],
+          'required' => [ 'ID' ],
         ],
         'accessLevel' => 'admin',
       ],
@@ -337,6 +349,7 @@ class GMCP_Tools_Elementor {
       case 'elementor_list_templates': $r = $this->list_templates( $args, $r ); break;
       case 'elementor_get_conditions': $r = $this->get_conditions( $args, $r ); break;
       case 'elementor_set_conditions': $r = $this->set_conditions( $args, $r ); break;
+      case 'elementor_set_active_kit': $r = $this->set_active_kit( $args, $r ); break;
       case 'elementor_regenerate_css': $r = $this->regenerate_css( $args, $r ); break;
       case 'elementor_apply_template': $r = $this->apply_template( $args, $r ); break;
       case 'elementor_template_references': $r = $this->template_references( $args, $r ); break;
@@ -684,6 +697,86 @@ class GMCP_Tools_Elementor {
 
   #region CSS
 
+  /** Elementor's own name for the option holding the active kit, from its Kits Manager. */
+  const ACTIVE_KIT_OPTION = 'elementor_active_kit';
+
+  private function set_active_kit( array $a, array $r ): array {
+    $id = (int) ( $a['ID'] ?? 0 );
+    if ( $id <= 0 ) {
+      return $this->error( $r, 'ID is required and must be the id of a kit.' );
+    }
+    $post = get_post( $id );
+    if ( !$post || $post->post_type !== 'elementor_library' ) {
+      return $this->error( $r, "Post {$id} is not an elementor_library template, so it cannot be a kit." );
+    }
+    // Checked rather than trusted. Elementor reads this option and looks the post up
+    // without asking what it is, so an id pointing at an ordinary template leaves the site
+    // with no usable global styles and no error saying why.
+    $type = (string) get_post_meta( $id, self::TYPE_META, true );
+    if ( $type !== 'kit' ) {
+      return $this->error(
+        $r,
+        "Template {$id} is a \"" . ( $type ?: 'template with no type' ) . "\", not a kit. Only a kit holds the global colours, fonts and theme styles this option points at. List them with elementor_list_templates and type \"kit\"."
+      );
+    }
+    if ( $post->post_status !== 'publish' ) {
+      return $this->error(
+        $r,
+        "Kit {$id} is \"{$post->post_status}\", not published. Elementor reads the active kit through the post, and a kit that is not published gives the site no global styles at all."
+      );
+    }
+
+    $before = (int) get_option( self::ACTIVE_KIT_OPTION );
+    if ( $before === $id ) {
+      return $this->text( $r, "Kit {$id} \"" . get_the_title( $id ) . "\" was already the active one. Nothing changed." );
+    }
+
+    update_option( self::ACTIVE_KIT_OPTION, $id );
+
+    // Asked of the option rather than assumed from the write, for the reason this file
+    // gives everywhere else: a tool reporting a switch and a switch happening are
+    // different claims, and another plugin filtering the option would make them differ.
+    $after = (int) get_option( self::ACTIVE_KIT_OPTION );
+    if ( $after !== $id ) {
+      return $this->error(
+        $r,
+        "The option was written but reads back as {$after} rather than {$id}, so something on this site is filtering it. The active kit has NOT been changed."
+      );
+    }
+
+    // The second half, and the half that gets forgotten. A kit's colours and typography
+    // are compiled into generated CSS files; switching the option without clearing them
+    // leaves every page rendering the old kit while this tool reports the new one.
+    $css = 'not cleared';
+    if ( class_exists( '\Elementor\Plugin' ) ) {
+      $plugin = \Elementor\Plugin::$instance;
+      if ( is_object( $plugin ) && isset( $plugin->files_manager ) && method_exists( $plugin->files_manager, 'clear_cache' ) ) {
+        try {
+          $plugin->files_manager->clear_cache();
+          $css = 'cleared, and will rebuild on the next page load';
+        }
+        catch ( \Throwable $e ) {
+          $css = 'could not be cleared: ' . $e->getMessage();
+        }
+      }
+    }
+
+    return $this->json( $r, [
+      'active_kit' => $id,
+      'title' => get_the_title( $id ),
+      'previous_kit' => $before ?: null,
+      'previous_title' => $before ? get_the_title( $before ) : null,
+      'generated_css' => $css,
+      // The previous id is the only record of what to go back to, so it is said rather
+      // than left to be worked out later.
+      'note' => 'This is not journalled and wp_undo_change cannot reverse it. To switch back, call this again with '
+        . ( $before ? 'ID ' . $before . '.' : 'the kit that was active before, which this site did not have recorded.' )
+        . ( $css === 'cleared, and will rebuild on the next page load'
+            ? ' A full-page cache in front of WordPress is separate and was not touched.'
+            : ' The generated CSS was NOT cleared, so pages may keep rendering the previous kit until it is: call elementor_regenerate_css.' ),
+    ] );
+  }
+
   private function regenerate_css( array $a, array $r ): array {
     if ( !class_exists( '\Elementor\Plugin' ) ) {
       return $this->error( $r, 'The Elementor\\Plugin class is not available, so the generated files cannot be cleared.' );
@@ -802,7 +895,7 @@ class GMCP_Tools_Elementor {
       // through a shortcode stops being pointed at. That is a reference this tool is about to
       // break, and the page it breaks it on is the one in front of us, so it is named rather
       // than left for the caller to discover from a rendering difference.
-      $replaced = $this->matching_other_templates( $page->post_content, $template_id );
+      $replaced = self::matching_other_templates( $page->post_content, $template_id );
       if ( $replaced !== [] ) {
         $notes[] = count( $replaced ) === 1
           ? 'The content being replaced already pointed at template #' . $replaced[0] . ' through a shortcode. That link is gone now; only #' . $template_id . ' is left.'
@@ -914,8 +1007,8 @@ class GMCP_Tools_Elementor {
     // left behind are still in the content and still rendering nothing.
     $template = get_post( $template_id );
 
-    $shortcode = $this->shortcode_references( $template_id, $limit );
-    $data = $this->data_references( $template_id, $limit );
+    $shortcode = self::shortcode_references( $template_id, $limit );
+    $data = self::data_references( $template_id, $limit );
     $rows = array_merge( $shortcode['rows'], $data['rows'] );
 
     $live = 0;
@@ -995,7 +1088,7 @@ class GMCP_Tools_Elementor {
   }
 
   /** Posts whose content holds [elementor-template id="N"], parsed rather than matched. */
-  private function shortcode_references( int $template_id, int $limit ): array {
+  public static function shortcode_references( int $template_id, int $limit ): array {
     global $wpdb;
 
     $like = '%' . $wpdb->esc_like( '[' . self::TEMPLATE_SHORTCODE ) . '%';
@@ -1012,11 +1105,11 @@ class GMCP_Tools_Elementor {
 
     $rows = [];
     foreach ( $candidates as $candidate ) {
-      foreach ( $this->matching_shortcodes( (string) $candidate->post_content, $template_id ) as $found ) {
+      foreach ( self::matching_shortcodes( (string) $candidate->post_content, $template_id ) as $found ) {
         if ( count( $rows ) >= $limit ) {
           return [ 'rows' => $rows, 'candidates' => count( $candidates ), 'truncated' => true ];
         }
-        $rows[] = $this->reference_row( $candidate, 'shortcode', 'Post content holds ' . $found . '.' );
+        $rows[] = self::reference_row( $candidate, 'shortcode', 'Post content holds ' . $found . '.' );
       }
     }
     return [ 'rows' => $rows, 'candidates' => count( $candidates ), 'truncated' => $truncated ];
@@ -1033,7 +1126,7 @@ class GMCP_Tools_Elementor {
   * The lookahead after the name is what stops [elementor-template-something] being read as
   * this shortcode. \b would not: the hyphen is already a word boundary.
   */
-  private function templates_in_shortcodes( string $content ): array {
+  private static function templates_in_shortcodes( string $content ): array {
     if ( strpos( $content, '[' . self::TEMPLATE_SHORTCODE ) === false ) {
       return [];
     }
@@ -1050,26 +1143,26 @@ class GMCP_Tools_Elementor {
       }
       $id = (int) trim( (string) $atts['id'] );
       if ( $id > 0 && !isset( $found[ $id ] ) ) {
-        $found[ $id ] = $this->snippet( $match[0] );
+        $found[ $id ] = self::snippet( $match[0] );
       }
     }
     return $found;
   }
 
   /** The shortcodes in one body that really do name this template. */
-  private function matching_shortcodes( string $content, int $template_id ): array {
-    $found = $this->templates_in_shortcodes( $content );
+  private static function matching_shortcodes( string $content, int $template_id ): array {
+    $found = self::templates_in_shortcodes( $content );
     return isset( $found[ $template_id ] ) ? [ $found[ $template_id ] ] : [];
   }
 
   /** Template ids a body's shortcodes name, other than the one about to replace them. */
-  private function matching_other_templates( string $content, int $except ): array {
-    $ids = array_keys( $this->templates_in_shortcodes( $content ) );
+  private static function matching_other_templates( string $content, int $except ): array {
+    $ids = array_keys( self::templates_in_shortcodes( $content ) );
     return array_values( array_diff( $ids, [ $except ] ) );
   }
 
   /** Posts whose _elementor_data embeds this template through a widget's template_id. */
-  private function data_references( int $template_id, int $limit ): array {
+  public static function data_references( int $template_id, int $limit ): array {
     global $wpdb;
 
     // Quoted and bare forms of each settings key. The bare one is a prefix match and will
@@ -1096,7 +1189,7 @@ class GMCP_Tools_Elementor {
     $rows = [];
     foreach ( $candidates as $candidate ) {
       $raw = (string) $candidate->meta_value;
-      $found = $this->data_widget_hits( $raw, $template_id );
+      $found = self::data_widget_hits( $raw, $template_id );
       $hits = $found['hits'];
 
       // Three different reasons the decode found nothing, and only one of them is a no.
@@ -1114,7 +1207,7 @@ class GMCP_Tools_Elementor {
         if ( !$found['parsed'] ) {
           $hits = [ 'the document could not be parsed, so whether it references this template was not settled either way' ];
         }
-        elseif ( $this->names_id_exactly( $raw, $template_id ) ) {
+        elseif ( self::names_id_exactly( $raw, $template_id ) ) {
           $hits = [ 'the document names this id exactly, but not under a settings key this recognises, so it may be a reference through a widget this does not know' ];
         }
         else {
@@ -1125,7 +1218,7 @@ class GMCP_Tools_Elementor {
         if ( count( $rows ) >= $limit ) {
           return [ 'rows' => $rows, 'candidates' => count( $candidates ), 'truncated' => true ];
         }
-        $rows[] = $this->reference_row( $candidate, 'elementor_data', ucfirst( $hit ) . '.' );
+        $rows[] = self::reference_row( $candidate, 'elementor_data', ucfirst( $hit ) . '.' );
       }
     }
     return [ 'rows' => $rows, 'candidates' => count( $candidates ), 'truncated' => $truncated ];
@@ -1137,13 +1230,13 @@ class GMCP_Tools_Elementor {
   * Whether the document parsed at all travels back with the answer, because an empty list
   * from a document that parsed and an empty list from one that did not are opposite results.
   */
-  private function data_widget_hits( string $json, int $template_id ): array {
+  private static function data_widget_hits( string $json, int $template_id ): array {
     $document = json_decode( $json, true );
     if ( !is_array( $document ) ) {
       return [ 'parsed' => false, 'hits' => [] ];
     }
     $hits = [];
-    $this->walk_for_template( $document, $template_id, $hits );
+    self::walk_for_template( $document, $template_id, $hits );
     return [ 'parsed' => true, 'hits' => array_values( array_unique( $hits ) ) ];
   }
 
@@ -1154,7 +1247,7 @@ class GMCP_Tools_Elementor {
   * which puts no space after a colon, so a bare integer value is always followed by a comma
   * or a closing brace and "template_id":113 cannot be read out of "template_id":1136.
   */
-  private function names_id_exactly( string $json, int $template_id ): bool {
+  private static function names_id_exactly( string $json, int $template_id ): bool {
     foreach ( self::TEMPLATE_ID_SETTINGS as $setting ) {
       foreach ( [ '"' . $template_id . '"', $template_id . ',', $template_id . '}' ] as $value ) {
         if ( strpos( $json, '"' . $setting . '":' . $value ) !== false ) {
@@ -1174,7 +1267,7 @@ class GMCP_Tools_Elementor {
   * heading's text is not a reference, and treating it as one is how this would start
   * refusing safe deletions.
   */
-  private function walk_for_template( array $node, int $template_id, array &$hits ): void {
+  private static function walk_for_template( array $node, int $template_id, array &$hits ): void {
     if ( isset( $node['settings'] ) && is_array( $node['settings'] ) ) {
       $widget = '';
       foreach ( [ 'widgetType', 'elType' ] as $key ) {
@@ -1189,20 +1282,20 @@ class GMCP_Tools_Elementor {
         }
         $value = $node['settings'][ $setting ];
         if ( ( is_string( $value ) || is_int( $value ) ) && (int) $value === $template_id ) {
-          $hits[] = 'the ' . ( $widget === '' ? 'element' : '"' . $this->snippet( $widget ) . '" widget' ) . ' embeds it through its ' . $setting . ' setting';
+          $hits[] = 'the ' . ( $widget === '' ? 'element' : '"' . self::snippet( $widget ) . '" widget' ) . ' embeds it through its ' . $setting . ' setting';
         }
       }
     }
 
     foreach ( $node as $key => $child ) {
       if ( $key !== 'settings' && is_array( $child ) ) {
-        $this->walk_for_template( $child, $template_id, $hits );
+        self::walk_for_template( $child, $template_id, $hits );
       }
     }
   }
 
   /** One referring post, with enough of its state to tell a live page from a waiting one. */
-  private function reference_row( $post, string $via, string $detail ): array {
+  private static function reference_row( $post, string $via, string $detail ): array {
     return [
       'id' => (int) $post->ID,
       'title' => (string) $post->post_title,
@@ -1216,7 +1309,7 @@ class GMCP_Tools_Elementor {
   }
 
   /** Somebody else wrote this text, so it is trimmed before it goes back out in a sentence. */
-  private function snippet( string $text, int $length = 120 ): string {
+  private static function snippet( string $text, int $length = 120 ): string {
     $text = trim( (string) preg_replace( '/\s+/', ' ', $text ) );
     return strlen( $text ) > $length ? substr( $text, 0, $length ) . '...' : $text;
   }

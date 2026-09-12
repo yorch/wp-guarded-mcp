@@ -133,6 +133,9 @@ None of this plugin's own rows are readable or writable through the option tools
 - That link can be asked about. `elementor_template_references` answers what still points at a template, covering both the shortcode written into a page's content and a template embedded inside another page's design, which is how Elementor's own widgets do it. The match is exact rather than textual: the shortcode is parsed and the design decoded, so template 12 is not reported as a reference to template 1. It answers even when Elementor is not active, which is when the answer is worth most, because every referencing page has just started printing its shortcode as literal text. Applying a template now also warns when it is replacing an existing link and when the template is not published, since Elementor renders nothing for a draft and the page shows an empty space.
 - `elementor_kit_report` reads the site's global colours, fonts and layout settings from the active kit, and writes nothing at all. That is what makes it safe to ship against internals that move between Elementor versions: a version change can make the report incomplete, which is a bad afternoon, where a write against a changed shape corrupts a site's global styling. It checks the kit it was given back is the one it asked for, because Elementor substitutes an empty placeholder when the active kit is missing or trashed and that placeholder answers every question with the plugin's built-in defaults, as confidently as a real kit would.
 - Conditions need the theme builder, which is Elementor Pro or PRO Elements. On a site with only the free plugin the rows are still written, nothing reads them, and the tools say so rather than reporting a success the site will never show.
+- Deleting, trashing or unpublishing a template that other posts still render is refused, naming them. `elementor_template_references` answers the same question and refuses nothing, so until this the answer was only as good as a caller's habit of asking first. Both routes a reference takes are covered: the `[elementor-template]` shortcode, and a `template_id` setting inside another page's `_elementor_data`. Trashing counts, which departs from how deletion is treated everywhere else here, because from a referencing page's point of view a trashed template and a deleted one render identically. `despite_references` goes ahead anyway.
+- That guard lives in the always-on content tools while the search lives with the Elementor ones, and it calls across rather than keeping a copy. Both halves matter: a guard that disappeared when the optional Elementor group is switched off would not be a guard, since the delete comes from the content tools; and a second copy of the search would be free to disagree with the one doing the reporting, in the direction of waving through a reference the tool can see.
+- The kit is where most of "wire up a theme" lives: the site's global colours, fonts, layout defaults and theme styles. `elementor_set_active_kit` switches it, and does the second half with it. A kit compiles into generated CSS files, so switching the option alone leaves every page rendering the old design while the tool reports the new one, which is the same silent success the conditions tools exist for; the files are cleared here too. The reply names the kit it replaced, because that is the only record of what to switch back to: this is not journalled and there is no undo. Anything that is not a published kit is refused, since Elementor reads the option without checking and an id pointing at an ordinary template leaves the site with no usable global styles at all.
 - Elementor's internals are not a stable contract across versions, so every call into one of its classes is guarded and reports what was missing instead of fataling. A wrong guess fails benignly.
 
 *Several posts in one call.* `wp_create_posts` takes up to twenty and creates them in order,
@@ -317,6 +320,16 @@ test for this demonstrates by doing exactly that against the unfixed code.
 There is no restore tool at any access level. Restoring discards everything since the
 backup, which is a larger irreversible act than anything else here, and no confirmation
 token makes that safe to hand to something reading instructions out of a comment queue.
+
+There is no kit import either, and it is refused for the same reason rather than because
+it would be hard. Elementor can import a kit from an archive, and doing so rewrites a
+site's design system wholesale: global colours and fonts, theme styles, site settings, and
+whatever content the archive carries. It is one call that changes every page, the archive
+was built somewhere else, and there is no restore tool standing behind it. Switching
+between the kits a site already has is a different thing and `elementor_set_active_kit`
+does it, because those were made here and the previous one is still there to switch back
+to. A site that genuinely wants an import has the Elementor screen for it, where a person
+sees what is about to happen.
 
 **Prompts and resources.** The server offers six ready-made upkeep jobs through MCP prompts, and publishes recent posts, the comment queue and the site briefing as MCP resources a client can attach to a conversation. Every resource is backed by a tool and gated by it, so a resource is never a softer route to data than the tool it mirrors.
 

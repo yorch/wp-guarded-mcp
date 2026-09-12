@@ -38,15 +38,18 @@ rewrite; a short hash does not.
 | the WooCommerce mutation probe | fixed, `test(woo): install the mutation probe instead of assuming a directory`; it silently never installed, so two assertions reported a bug that was not there. Note that main fixed the same directory bug independently, so what this commit still contributes is the control check proving the probe is present |
 | 6, meta journalling and grouping | fixed, `feat(journal): journal post meta, and make one call one unit of undo` |
 
-Still open: 4 (backup scope; the listing half already shipped and the download-URL half
-should stay refused), 7 (batch create), and 10 (kit operations).
+All twelve are now done.
 
-Also open, and narrower than an item: nothing refuses to delete a template that other
-posts still render. `elementor_template_references` answers the question and says in its
-own description that it refuses nothing, so the answer is only as good as the caller's
-habit of asking. A guard belongs in the always-on content tools rather than with the
-Elementor group, because the delete that breaks the page comes from there and a guard that
-disappears when an optional group is switched off is not one.
+| Item | State |
+|---|---|
+| 4, backup scope | done on main, `feat: batch create, backup scope, kit report...`. The download-URL half stays refused, for the reason recorded above |
+| 7, batch create | done on main, same commit |
+| 10, kit operations | the switching half is on this branch, `feat(elementor): switch the active kit, and clear what the switch invalidates`. Main has `elementor_kit_report`, which reads the kit and does not change it. Kit IMPORT is declined and recorded beside the other deliberate omissions: it rewrites a site's design system wholesale from an archive with no restore tool behind it |
+| the template delete guard | on this branch, `feat(elementor): refuse to delete a template that something still renders`. The guard lives in the always-on core and calls the Elementor finder statically, so it does not disappear when that tool group is switched off |
+
+Two of the twelve were answered by refusing rather than building, and both refusals live
+where the other deliberate omissions are rather than here: backup archive download URLs,
+and kit import.
 
 ## A note on doing this twice
 
@@ -59,6 +62,19 @@ and nothing claims an item before starting one, so two readers pick the same nex
 And a branch stacked on another had features added to its base after it forked, so the
 duplication was invisible until the base merged. Claiming an item here before starting it
 costs one commit and would have caught both.
+
+**Claiming was then tried, and did not work.** The last four items were claimed in this
+file and the claim was pushed before any of the work started. Two of the four, batch create
+and backup scope, were built again anyway and landed first. So the claim is necessary and
+is not sufficient: it only helps a session that reads this file after the other one has
+written to it, and two sessions that start within the same hour never see each other's.
+Both implementations of both items passed their suites, and roughly a day of one of them
+was thrown away for the second time.
+
+What would actually work is coordination outside this file, since the race is between
+sessions rather than between commits: one person or process handing out the next item. That
+is a change to how the work is run rather than to what is written down, which is why this
+note stops at describing it.
 
 Everything else below is untouched and still describes what is true today.
 
