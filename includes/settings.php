@@ -1274,7 +1274,7 @@ class GMCP_Settings {
               <?php esc_html_e( 'Remember previous values so changes can be reverted', 'guarded-mcp' ); ?>
             </label>
             <p class="description">
-              <?php esc_html_e( 'Records what a setting or post said before an agent changed it, and lets the change be put back with the wp_undo_change tool. Only writes made through this API are recorded, never your own. Values that look like credentials are never stored.', 'guarded-mcp' ); ?>
+              <?php esc_html_e( 'Records what a setting or post said before an agent changed it, and lets the change be put back with the wp_undo_change tool. Only writes made through this API are recorded, never your own. Fields that look like credentials are blanked and never stored; the rest of the value is kept, and putting it back leaves those fields as they are.', 'guarded-mcp' ); ?>
             </p>
           </td>
         </tr>

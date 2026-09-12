@@ -25,8 +25,8 @@ const SHOTS = [
   { file: 'screenshot-4.png', path: '/wp-admin/admin.php?page=guarded-mcp-logs', heading: 'Audit Log',
     scrollTo: 'The audit log' },
   { file: 'screenshot-5.png', path: '/wp-admin/admin.php?page=guarded-mcp-logs&entry=3', heading: 'Audit Log' },
-  // No scrollTo on the entry: a single record renders its own page with nothing above
-  // it, so the top of the page is already the subject.
+  // No scrollTo on the entry: a single record renders under only the page heading
+  // and its intro, so the top of the page is already the subject.
 ];
 
 // The consent screen is not a settings page, so it is reached the way a client reaches it: register
