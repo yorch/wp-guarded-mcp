@@ -328,6 +328,8 @@ class GMCP_Settings {
       'mcp_tools_woo' => 'bool',
       'mcp_tools_elementor' => 'bool',
       'mcp_tools_kirki' => 'bool',
+      'mcp_tools_yoast' => 'bool',
+      'mcp_tools_acf' => 'bool',
       'mcp_debug_mode' => 'bool',
       'mcp_activity_log' => 'bool',
       'mcp_audit_days' => 'days',
@@ -1147,6 +1149,8 @@ class GMCP_Settings {
     $woo = class_exists( 'WooCommerce' );
     $elementor = did_action( 'elementor/loaded' );
     $kirki = class_exists( 'Kirki' );
+    $yoast = defined( 'WPSEO_VERSION' );
+    $acf = class_exists( 'ACF' );
 
     // Only the groups actually rendered are declared to the save. A checkbox that was
     // never on screen must keep its stored value rather than read as unticked, which is
@@ -1160,6 +1164,12 @@ class GMCP_Settings {
     }
     if ( $kirki ) {
       $keys[] = 'mcp_tools_kirki';
+    }
+    if ( $yoast ) {
+      $keys[] = 'mcp_tools_yoast';
+    }
+    if ( $acf ) {
+      $keys[] = 'mcp_tools_acf';
     }
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'Which groups of tools an agent is offered. A group that is off is not merely hidden: its tools are refused if asked for by name.', 'guarded-mcp' ); ?></p>
@@ -1202,6 +1212,18 @@ class GMCP_Settings {
                   <?php esc_html_e( 'Kirki (customizer field discovery, value get/set, Google Fonts cache)', 'guarded-mcp' ); ?>
                 </label>
               <?php endif; ?>
+              <?php if ( $yoast ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_yoast" value="1" <?php checked( !empty( $options['mcp_tools_yoast'] ) ); ?>>
+                  <?php esc_html_e( 'Yoast SEO (per-post SEO metadata, indexable rebuild)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
+              <?php if ( $acf ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_acf" value="1" <?php checked( !empty( $options['mcp_tools_acf'] ) ); ?>>
+                  <?php esc_html_e( 'ACF (custom field discovery, value get/set through field key references)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
               <label>
                 <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>
                 <?php esc_html_e( 'Generate tools from this site\'s REST API routes', 'guarded-mcp' ); ?>
@@ -1223,6 +1245,16 @@ class GMCP_Settings {
             <?php if ( $kirki ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The Kirki tools resolve a field\'s storage model from its registration and write through the right path, so a value written through them lands where Kirki reads it. Writing through the generic option tools instead is a silent success: the value lands in a row nothing reads, and the front end keeps rendering the old one.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $yoast ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The Yoast tools exist because writing _yoast_wpseo_* post meta through the generic tools appears to work and does not: Yoast reads from the wp_yoast_indexable table on the front end, not from post meta, and a write to post meta alone leaves the indexable stale. These write through Yoast\'s own API and rebuild the indexable, so the front end shows the new value on the next load.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $acf ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The ACF tools exist because writing a custom field through update_post_meta appears to work and does not: ACF needs a hidden field key reference (_fieldname = field_123abc) to return the right type, and without it get_field() returns a bare ID instead of a post object, or null. These write through update_field(), which writes both the value and the key reference.', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
             <p class="description">

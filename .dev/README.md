@@ -62,6 +62,12 @@ docker compose exec -T cli wp plugin install elementor --activate
 
 docker compose exec -T cli wp plugin install kirki --activate
 ./smoke-kirki.sh      # the Kirki tools; needs Kirki
+
+docker compose exec -T cli wp plugin install wordpress-seo --activate
+./smoke-yoast.sh      # the Yoast SEO tools; needs Yoast SEO
+
+docker compose exec -T cli wp plugin install advanced-custom-fields --activate
+./smoke-acf.sh        # the ACF tools; needs ACF (free or PRO)
 ```
 
 `smoke-admin.sh` also expects a theme named `futuretheme` that declares a PHP version this
