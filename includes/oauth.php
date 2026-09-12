@@ -784,7 +784,7 @@ class GMCP_OAuth {
           }
         }
       }
-      elseif ( isset( $_SERVER['PHP_AUTH_USER'] ) && $_SERVER['PHP_AUTH_USER'] === $client->client_id ) {
+      elseif ( isset( $_SERVER['PHP_AUTH_USER'] ) && wp_unslash( $_SERVER['PHP_AUTH_USER'] ) === $client->client_id ) {
         // Apache with mod_php performs HTTP Basic auth itself: it moves the credentials
         // into PHP_AUTH_USER/PHP_AUTH_PW and never exposes the header, so get_header()
         // above finds nothing even though the client sent one. A Bearer header is left
