@@ -46,11 +46,11 @@ without it.
 **Added.** Work that is not derived from upstream at all: MCP prompts and resources, a
 one-call site briefing, a change journal with a gated undo, named keys with their own
 access level, expiry, tool list and owning account, preview mode on the tools whose effect
-is not visible from the call, WooCommerce and Elementor groups each on their own switch,
-backups that can be started and read but never restored, and a tamper-evident audit log in
-its own table with redacted arguments, field-level before and after values, and bounded
-retention. The catalog is 50 content tools, 35 more with site administration switched on,
-and 12 more again with WooCommerce.
+is not visible from the call, WooCommerce, Elementor, Kirki, Yoast SEO and ACF groups each
+on their own switch, backups that can be started and read but never restored, and a
+tamper-evident audit log in its own table with redacted arguments, field-level before and
+after values, and bounded retention. The catalog is 50 content tools, 35 more with site
+administration switched on, and 12 more again with WooCommerce.
 
 Those three numbers are the same ones the access-level table in `README.md` carries, and
 `smoke-admin.sh` checks that table against a running site. They were wrong here before that

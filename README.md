@@ -72,9 +72,9 @@ An access level belongs to a named key. OAuth callers always act as the administ
 | `readonly` | 18 | 28 | 32 | Reads only |
 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
-nine had drifted behind the code before anything checked them. Elementor and Kirki are not
-counted: their tools are fourth and fifth groups that come and go with a plugin, so folding
-them in would make the table depend on what happens to be installed.
+nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO
+and ACF are not counted: their tools are optional groups that come and go with a plugin, so
+folding them in would make the table depend on what happens to be installed.
 
 A **named key** narrows this further. It carries its own level, an optional expiry date,
 and an optional list of the only tools it may call, so a key handed to a deploy script

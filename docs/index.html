@@ -277,6 +277,64 @@ pre code { color: var(--ink); }
 
 <section class="band">
   <div class="shell">
+    <h2>What it can do</h2>
+    <p class="lead">The content and site-data tools are on by default: posts, pages, block
+    content, taxonomies, comments, media, users, post meta, site options, post types and block
+    patterns. Site administration is off by default, and so is each integration below — each
+    appears only when its plugin is installed, and each exists because writing through the
+    generic tools looks like it worked and does not.</p>
+
+    <div class="log">
+      <div class="entry">
+        <p class="head"><code>WooCommerce</code> <span>off by default</span></p>
+        <p>Products, stock, orders, order notes, customers and sales figures, through the
+        WooCommerce CRUD classes rather than posts and meta. No refunds: moving money through
+        a payment gateway is not something a tool call can put back.</p>
+      </div>
+      <div class="entry">
+        <p class="head"><code>Elementor</code> <span>off by default</span></p>
+        <p>Theme-builder conditions written to both the template and Elementor's cached
+        registry, CSS regeneration, and applying a library template without the design passing
+        through a tool argument. No kit import: rewriting a site's whole design system from an
+        archive in one call is not something this can put back.</p>
+      </div>
+      <div class="entry">
+        <p class="head"><code>Kirki</code> <span>off by default</span></p>
+        <p>Customizer field discovery and value get/set that resolves the field's storage model
+        — theme_mod, grouped option or standalone option — so a written value lands in the row
+        the front end actually reads, not a row nothing reads.</p>
+      </div>
+      <div class="entry">
+        <p class="head"><code>Yoast SEO</code> <span>off by default</span></p>
+        <p>Per-post SEO metadata read/write through the Surfaces API, and indexable rebuild.
+        Since Yoast 14.0 the front end reads from a derived table, not from post meta, so
+        writing the post meta directly leaves the indexable stale: the front end renders the
+        old title while the admin shows the new one. These write through Yoast's own API and
+        rebuild the indexable, and refuse computed analysis fields like scores.</p>
+      </div>
+      <div class="entry">
+        <p class="head"><code>Advanced Custom Fields</code> <span>off by default</span></p>
+        <p>Custom field discovery and value get/set through <code>update_field</code> /
+        <code>get_field</code> with field key references. ACF needs a hidden reference
+        (<code>_fieldname = field_123abc</code>) to return the right type; without it a post
+        object comes back as a bare ID, an image as a bare attachment ID, or an options-page
+        field as <code>null</code>. These write through ACF's own API, which writes both the
+        value and the reference, and refuse unregistered fields and arbitrary option
+        prefixes.</p>
+      </div>
+      <div class="entry">
+        <p class="head"><code>Backups</code> <span>if you have a backup plugin</span></p>
+        <p>Start one before a risky change, list what exists, and see when one last completed.
+        Listings never include archive filenames, because on both supported plugins the
+        filename is what keeps the archive from being downloaded by anyone who guesses it.
+        No restore tool, at any access level.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band">
+  <div class="shell">
     <h2>Connecting takes one line</h2>
     <p class="lead">Clients that speak OAuth need only the address. They send you to a WordPress
     login and a consent screen, and only an administrator can approve one. For a command-line
