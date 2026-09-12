@@ -29,20 +29,20 @@ delete_option( 'gmcp_version' );
 // OAuth clients and grants. Dropping these revokes every connected app, which is the
 // point: leaving live tokens behind for a plugin that no longer exists would mean
 // credentials nobody can see or revoke.
-$clients = $wpdb->prefix . 'gmcp_oauth_clients';
-$tokens = $wpdb->prefix . 'gmcp_oauth_tokens';
-$audit = $wpdb->prefix . 'gmcp_audit';
+$gmcp_clients = $wpdb->prefix . 'gmcp_oauth_clients';
+$gmcp_tokens = $wpdb->prefix . 'gmcp_oauth_tokens';
+$gmcp_audit = $wpdb->prefix . 'gmcp_audit';
 // The journal's meta snapshots. This one is content, not bookkeeping: it holds what a
 // page design said before an agent changed it, which is the same reason the journal
 // option above is deleted rather than left to age out.
-$snapshots = $wpdb->prefix . 'gmcp_meta_snapshots';
-$wpdb->query( "DROP TABLE IF EXISTS {$tokens}, {$clients}, {$audit}, {$snapshots}" );
+$gmcp_snapshots = $wpdb->prefix . 'gmcp_meta_snapshots';
+$wpdb->query( "DROP TABLE IF EXISTS {$gmcp_tokens}, {$gmcp_clients}, {$gmcp_audit}, {$gmcp_snapshots}" );
 
 // The prune schedule outlives the plugin files otherwise, and WordPress will keep firing
 // an action nothing listens to until somebody notices.
-$next = wp_next_scheduled( 'gmcp_audit_prune' );
-if ( $next ) {
-  wp_unschedule_event( $next, 'gmcp_audit_prune' );
+$gmcp_next = wp_next_scheduled( 'gmcp_audit_prune' );
+if ( $gmcp_next ) {
+  wp_unschedule_event( $gmcp_next, 'gmcp_audit_prune' );
 }
 
 // Transients: pending authorization codes, consent state, message queue and one-time
