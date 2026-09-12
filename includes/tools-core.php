@@ -1518,11 +1518,12 @@ class GMCP_Tools_Core {
       ],
       'wp_update_post' => [
         'name' => 'wp_update_post',
-        'description' => 'Update post fields and/or meta in ONE call. Pass ID + "fields" object (post_title, post_content, post_status, etc.) and/or "meta_input" object for custom fields. Post fields may also be passed at the top level (e.g. ID + post_title directly). Efficient for WooCommerce products: update title + price + stock together. Note: post_category REPLACES categories; use wp_add_post_terms to append instead. Use schedule_for to easily schedule posts. Set preview to true to be shown which fields would change and how, without writing.',
+        'description' => 'Update post fields and/or meta in ONE call. Pass ID + "fields" object (post_title, post_content, post_status, etc.) and/or "meta_input" object for custom fields. Post fields may also be passed at the top level (e.g. ID + post_title directly). Efficient for WooCommerce products: update title + price + stock together. Note: post_category REPLACES categories; use wp_add_post_terms to append instead. Use schedule_for to easily schedule posts. Taking an Elementor library template out of publish is refused while other posts render it, since that leaves each of them showing nothing; despite_references true goes ahead anyway. Set preview to true to be shown which fields would change and how, without writing.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
             'ID' => [ 'type' => 'integer', 'description' => 'The ID of the post to update.' ],
+            'despite_references' => [ 'type' => 'boolean', 'description' => 'Unpublish an Elementor library template even though other posts render it. Each of them is left showing nothing where the design was.' ],
             'fields' => [
               'type' => 'object',
               'properties' => [
@@ -1551,13 +1552,14 @@ class GMCP_Tools_Core {
       ],
       'wp_delete_post' => [
         'name' => 'wp_delete_post',
-        'description' => 'Delete, trash, or remove a post, page, or any custom post type by ID. Without force the post normally goes to the trash and can be restored, but not always: attachments have no trash in WordPress, and neither does a site with EMPTY_TRASH_DAYS set to 0. In both cases a call without force destroys the post. The reply says which of the two happened, so do not assume it was reversible. With force: true it is always permanently destroyed. Works for posts, pages, products, events, attachments, or any registered CPT. Set preview to true to be told what would be deleted, including anything attached to it, without deleting anything.',
+        'description' => 'Delete, trash, or remove a post, page, or any custom post type by ID. Without force the post normally goes to the trash and can be restored, but not always: attachments have no trash in WordPress, and neither does a site with EMPTY_TRASH_DAYS set to 0. In both cases a call without force destroys the post. The reply says which of the two happened, so do not assume it was reversible. With force: true it is always permanently destroyed. Works for posts, pages, products, events, attachments, or any registered CPT. An Elementor library template that other posts still render is refused, trashing included, because a trashed template renders as nothing on those pages exactly as a deleted one does; the refusal names them and despite_references true goes ahead anyway. Set preview to true to be told what would be deleted, including anything attached to it, without deleting anything.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
             'ID' => [ 'type' => 'integer' ],
             'force' => [ 'type' => 'boolean' ],
             'preview' => [ 'type' => 'boolean', 'description' => 'Describe what would happen and change nothing.' ],
+            'despite_references' => [ 'type' => 'boolean', 'description' => 'Delete an Elementor library template even though other posts render it. Each of them is left showing nothing where the design was.' ],
           ],
           'required' => [ 'ID' ],
         ],
@@ -3710,6 +3712,20 @@ class GMCP_Tools_Core {
           }
         }
 
+        // Taking a referenced template out of publish is the same breakage as deleting it,
+        // reached by a different route. Checked only when the status is actually leaving
+        // publish, so editing a template that is already a draft is not made harder for no
+        // reason, and before anything is written.
+        if ( isset( $c['post_status'] ) && empty( $a['despite_references'] ) ) {
+          if ( get_post_status( $post_id ) === 'publish' && $c['post_status'] !== 'publish' ) {
+            $refs = GMCP_Core::template_reference_guard( $post_id, 'Unpublishing' );
+            if ( $refs !== true ) {
+              $r = $this->error( $r, $refs, -32600 );
+              break;
+            }
+          }
+        }
+
         // Detect trash / untrash transitions and route through wp_trash_post() /
         // wp_untrash_post() so the proper hooks fire (ACF cleanup, search-index purges,
         // SEO plugins, etc.). A bare wp_update_post( ['post_status' => 'trash'] ) just
@@ -3801,6 +3817,17 @@ class GMCP_Tools_Core {
           break;
         }
         $delete_id = intval( $a['ID'] );
+        // Trashing is guarded as well as forcing, which departs from how the rest of this
+        // tool treats the two. Everywhere else the trash is the recoverable half; here it
+        // is not, because a trashed template renders as nothing on every page that
+        // references it, exactly as a deleted one does.
+        if ( empty( $a['despite_references'] ) ) {
+          $refs = GMCP_Core::template_reference_guard( $delete_id, 'Deleting' );
+          if ( $refs !== true ) {
+            $r = $this->error( $r, $refs, -32600 );
+            break;
+          }
+        }
         $del = wp_delete_post( $delete_id, !empty( $a['force'] ) );
         if ( $del ) {
           $this->bust_post_cache( $delete_id, [ 'tool' => 'wp_delete_post' ] );

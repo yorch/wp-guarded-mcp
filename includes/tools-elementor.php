@@ -802,7 +802,7 @@ class GMCP_Tools_Elementor {
       // through a shortcode stops being pointed at. That is a reference this tool is about to
       // break, and the page it breaks it on is the one in front of us, so it is named rather
       // than left for the caller to discover from a rendering difference.
-      $replaced = $this->matching_other_templates( $page->post_content, $template_id );
+      $replaced = self::matching_other_templates( $page->post_content, $template_id );
       if ( $replaced !== [] ) {
         $notes[] = count( $replaced ) === 1
           ? 'The content being replaced already pointed at template #' . $replaced[0] . ' through a shortcode. That link is gone now; only #' . $template_id . ' is left.'
@@ -914,8 +914,8 @@ class GMCP_Tools_Elementor {
     // left behind are still in the content and still rendering nothing.
     $template = get_post( $template_id );
 
-    $shortcode = $this->shortcode_references( $template_id, $limit );
-    $data = $this->data_references( $template_id, $limit );
+    $shortcode = self::shortcode_references( $template_id, $limit );
+    $data = self::data_references( $template_id, $limit );
     $rows = array_merge( $shortcode['rows'], $data['rows'] );
 
     $live = 0;
@@ -995,7 +995,7 @@ class GMCP_Tools_Elementor {
   }
 
   /** Posts whose content holds [elementor-template id="N"], parsed rather than matched. */
-  private function shortcode_references( int $template_id, int $limit ): array {
+  public static function shortcode_references( int $template_id, int $limit ): array {
     global $wpdb;
 
     $like = '%' . $wpdb->esc_like( '[' . self::TEMPLATE_SHORTCODE ) . '%';
@@ -1012,11 +1012,11 @@ class GMCP_Tools_Elementor {
 
     $rows = [];
     foreach ( $candidates as $candidate ) {
-      foreach ( $this->matching_shortcodes( (string) $candidate->post_content, $template_id ) as $found ) {
+      foreach ( self::matching_shortcodes( (string) $candidate->post_content, $template_id ) as $found ) {
         if ( count( $rows ) >= $limit ) {
           return [ 'rows' => $rows, 'candidates' => count( $candidates ), 'truncated' => true ];
         }
-        $rows[] = $this->reference_row( $candidate, 'shortcode', 'Post content holds ' . $found . '.' );
+        $rows[] = self::reference_row( $candidate, 'shortcode', 'Post content holds ' . $found . '.' );
       }
     }
     return [ 'rows' => $rows, 'candidates' => count( $candidates ), 'truncated' => $truncated ];
@@ -1033,7 +1033,7 @@ class GMCP_Tools_Elementor {
   * The lookahead after the name is what stops [elementor-template-something] being read as
   * this shortcode. \b would not: the hyphen is already a word boundary.
   */
-  private function templates_in_shortcodes( string $content ): array {
+  private static function templates_in_shortcodes( string $content ): array {
     if ( strpos( $content, '[' . self::TEMPLATE_SHORTCODE ) === false ) {
       return [];
     }
@@ -1050,26 +1050,26 @@ class GMCP_Tools_Elementor {
       }
       $id = (int) trim( (string) $atts['id'] );
       if ( $id > 0 && !isset( $found[ $id ] ) ) {
-        $found[ $id ] = $this->snippet( $match[0] );
+        $found[ $id ] = self::snippet( $match[0] );
       }
     }
     return $found;
   }
 
   /** The shortcodes in one body that really do name this template. */
-  private function matching_shortcodes( string $content, int $template_id ): array {
-    $found = $this->templates_in_shortcodes( $content );
+  private static function matching_shortcodes( string $content, int $template_id ): array {
+    $found = self::templates_in_shortcodes( $content );
     return isset( $found[ $template_id ] ) ? [ $found[ $template_id ] ] : [];
   }
 
   /** Template ids a body's shortcodes name, other than the one about to replace them. */
-  private function matching_other_templates( string $content, int $except ): array {
-    $ids = array_keys( $this->templates_in_shortcodes( $content ) );
+  private static function matching_other_templates( string $content, int $except ): array {
+    $ids = array_keys( self::templates_in_shortcodes( $content ) );
     return array_values( array_diff( $ids, [ $except ] ) );
   }
 
   /** Posts whose _elementor_data embeds this template through a widget's template_id. */
-  private function data_references( int $template_id, int $limit ): array {
+  public static function data_references( int $template_id, int $limit ): array {
     global $wpdb;
 
     // Quoted and bare forms of each settings key. The bare one is a prefix match and will
@@ -1096,7 +1096,7 @@ class GMCP_Tools_Elementor {
     $rows = [];
     foreach ( $candidates as $candidate ) {
       $raw = (string) $candidate->meta_value;
-      $found = $this->data_widget_hits( $raw, $template_id );
+      $found = self::data_widget_hits( $raw, $template_id );
       $hits = $found['hits'];
 
       // Three different reasons the decode found nothing, and only one of them is a no.
@@ -1114,7 +1114,7 @@ class GMCP_Tools_Elementor {
         if ( !$found['parsed'] ) {
           $hits = [ 'the document could not be parsed, so whether it references this template was not settled either way' ];
         }
-        elseif ( $this->names_id_exactly( $raw, $template_id ) ) {
+        elseif ( self::names_id_exactly( $raw, $template_id ) ) {
           $hits = [ 'the document names this id exactly, but not under a settings key this recognises, so it may be a reference through a widget this does not know' ];
         }
         else {
@@ -1125,7 +1125,7 @@ class GMCP_Tools_Elementor {
         if ( count( $rows ) >= $limit ) {
           return [ 'rows' => $rows, 'candidates' => count( $candidates ), 'truncated' => true ];
         }
-        $rows[] = $this->reference_row( $candidate, 'elementor_data', ucfirst( $hit ) . '.' );
+        $rows[] = self::reference_row( $candidate, 'elementor_data', ucfirst( $hit ) . '.' );
       }
     }
     return [ 'rows' => $rows, 'candidates' => count( $candidates ), 'truncated' => $truncated ];
@@ -1137,13 +1137,13 @@ class GMCP_Tools_Elementor {
   * Whether the document parsed at all travels back with the answer, because an empty list
   * from a document that parsed and an empty list from one that did not are opposite results.
   */
-  private function data_widget_hits( string $json, int $template_id ): array {
+  private static function data_widget_hits( string $json, int $template_id ): array {
     $document = json_decode( $json, true );
     if ( !is_array( $document ) ) {
       return [ 'parsed' => false, 'hits' => [] ];
     }
     $hits = [];
-    $this->walk_for_template( $document, $template_id, $hits );
+    self::walk_for_template( $document, $template_id, $hits );
     return [ 'parsed' => true, 'hits' => array_values( array_unique( $hits ) ) ];
   }
 
@@ -1154,7 +1154,7 @@ class GMCP_Tools_Elementor {
   * which puts no space after a colon, so a bare integer value is always followed by a comma
   * or a closing brace and "template_id":113 cannot be read out of "template_id":1136.
   */
-  private function names_id_exactly( string $json, int $template_id ): bool {
+  private static function names_id_exactly( string $json, int $template_id ): bool {
     foreach ( self::TEMPLATE_ID_SETTINGS as $setting ) {
       foreach ( [ '"' . $template_id . '"', $template_id . ',', $template_id . '}' ] as $value ) {
         if ( strpos( $json, '"' . $setting . '":' . $value ) !== false ) {
@@ -1174,7 +1174,7 @@ class GMCP_Tools_Elementor {
   * heading's text is not a reference, and treating it as one is how this would start
   * refusing safe deletions.
   */
-  private function walk_for_template( array $node, int $template_id, array &$hits ): void {
+  private static function walk_for_template( array $node, int $template_id, array &$hits ): void {
     if ( isset( $node['settings'] ) && is_array( $node['settings'] ) ) {
       $widget = '';
       foreach ( [ 'widgetType', 'elType' ] as $key ) {
@@ -1189,20 +1189,20 @@ class GMCP_Tools_Elementor {
         }
         $value = $node['settings'][ $setting ];
         if ( ( is_string( $value ) || is_int( $value ) ) && (int) $value === $template_id ) {
-          $hits[] = 'the ' . ( $widget === '' ? 'element' : '"' . $this->snippet( $widget ) . '" widget' ) . ' embeds it through its ' . $setting . ' setting';
+          $hits[] = 'the ' . ( $widget === '' ? 'element' : '"' . self::snippet( $widget ) . '" widget' ) . ' embeds it through its ' . $setting . ' setting';
         }
       }
     }
 
     foreach ( $node as $key => $child ) {
       if ( $key !== 'settings' && is_array( $child ) ) {
-        $this->walk_for_template( $child, $template_id, $hits );
+        self::walk_for_template( $child, $template_id, $hits );
       }
     }
   }
 
   /** One referring post, with enough of its state to tell a live page from a waiting one. */
-  private function reference_row( $post, string $via, string $detail ): array {
+  private static function reference_row( $post, string $via, string $detail ): array {
     return [
       'id' => (int) $post->ID,
       'title' => (string) $post->post_title,
@@ -1216,7 +1216,7 @@ class GMCP_Tools_Elementor {
   }
 
   /** Somebody else wrote this text, so it is trimmed before it goes back out in a sentence. */
-  private function snippet( string $text, int $length = 120 ): string {
+  private static function snippet( string $text, int $length = 120 ): string {
     $text = trim( (string) preg_replace( '/\s+/', ' ', $text ) );
     return strlen( $text ) > $length ? substr( $text, 0, $length ) . '...' : $text;
   }

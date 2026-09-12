@@ -385,6 +385,84 @@ class GMCP_Core {
   const REDACTION_MARKER = '[redacted]';
 
   /**
+  * Whether a post is an Elementor library template something still renders, and the
+  * sentence to refuse with.
+  *
+  * Asked before deleting, trashing or unpublishing one. elementor_template_references
+  * already answers what depends on a template and says in its own description that it
+  * refuses nothing, so until now the answer was only as good as a caller's habit of asking
+  * first. A page whose design vanishes shows nothing where it was, with no error on the
+  * page and nothing in any log.
+  *
+  * Trashing counts, and that departs from how deletion is treated everywhere else here.
+  * The trash is normally the recoverable half and is deliberately not gated; from a
+  * referencing page's point of view a trashed template and a deleted one render
+  * identically.
+  *
+  * This lives in core while the search lives in GMCP_Tools_Elementor, and it calls across
+  * rather than keeping its own copy. Two reasons, pulling in opposite directions and both
+  * satisfied. The guard cannot live with the Elementor tools, because that group is
+  * optional and a guard that disappears when it is switched off is not a guard: the delete
+  * that breaks the page comes from the content tools, which are always on. And it must not
+  * reimplement the search, because a second implementation would be free to disagree with
+  * the one doing the reporting, and the direction it would drift is a guard that waves
+  * through a reference the tool can see. So the finder is static and asked directly, which
+  * needs the class autoloaded and not constructed.
+  *
+  * @param string $verb Capitalised, and used as the sentence's subject: Deleting, Unpublishing.
+  * @return true|string True when there is nothing to warn about, otherwise the refusal.
+  */
+  public static function template_reference_guard( int $post_id, string $verb ) {
+    if ( $post_id <= 0 || get_post_type( $post_id ) !== 'elementor_library' ) {
+      return true;
+    }
+    if ( !class_exists( 'GMCP_Tools_Elementor' ) ) {
+      return true;
+    }
+
+    // Both routes a reference takes, because a page can embed a template through the
+    // shortcode or through a widget's template_id inside _elementor_data, and a guard that
+    // knew only one would refuse half the cases and wave the other half through with the
+    // same confidence.
+    $rows = [];
+    foreach ( [ 'shortcode_references', 'data_references' ] as $route ) {
+      $found = GMCP_Tools_Elementor::$route( $post_id, 25 );
+      foreach ( (array) ( $found['rows'] ?? [] ) as $row ) {
+        $rows[] = $row;
+      }
+    }
+    if ( !$rows ) {
+      return true;
+    }
+
+    $names = [];
+    foreach ( array_slice( $rows, 0, 5 ) as $row ) {
+      $names[] = '#' . ( $row['id'] ?? 0 ) . ' "' . ( $row['title'] ?? '' ) . '" (' . ( $row['status'] ?? '' ) . ')';
+    }
+    $more = count( $rows ) > 5 ? ' and ' . ( count( $rows ) - 5 ) . ' more' : '';
+
+    // A draft that references the template is counted and said separately. It breaks when
+    // it is published, which is long after the template is gone and long after anyone
+    // would connect the two, so it is worth refusing over and not worth alarming about in
+    // the same words as a live page.
+    $live = 0;
+    foreach ( $rows as $row ) {
+      if ( !empty( $row['live'] ) ) {
+        $live++;
+      }
+    }
+    $shape = $live === count( $rows )
+      ? count( $rows ) . ' post(s), all of them live,'
+      : $live . ' live post(s) and ' . ( count( $rows ) - $live ) . ' not yet published,';
+
+    return $verb . ' template #' . $post_id . ' would leave ' . $shape
+      . ' rendering nothing where its design is: ' . implode( ', ', $names ) . $more . '. '
+      . 'There is no error on those pages when it happens and nothing in any log. '
+      . 'Point them elsewhere first, ask elementor_template_references for the full picture, '
+      . 'or pass despite_references true to go ahead anyway.';
+  }
+
+  /**
   * A copy of a value safe to keep a record of, or a refusal when it cannot be made one.
   *
   * The middle ground between holds_credential(), which refuses a whole value if any part

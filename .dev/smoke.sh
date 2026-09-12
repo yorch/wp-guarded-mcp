@@ -639,5 +639,71 @@ docker compose exec -T cli wp eval "\$o=get_option('gmcp_options',[]); \$o['mcp_
 check "the REST group is back as it was found" \
   "$(docker compose exec -T cli wp eval 'echo !empty(get_option("gmcp_options",[])["mcp_tools_rest"]) ? "1" : "0";' 2>/dev/null | tr -d '\r\n')" "$REST_WAS"
 
+echo "-- deleting a template something still renders --"
+# elementor_template_references answers what depends on a template and says in its own
+# description that it refuses nothing, so the answer was only as good as a caller's habit
+# of asking first. A page whose design disappears shows nothing where it was, with no error
+# on the page and nothing in any log.
+#
+# Tested HERE, in the suite that never switches the Elementor group on, and that is the
+# point rather than convenience. The group is optional; the delete that breaks the page
+# comes from the content tools, which are always on. A guard that went away with the group
+# would be no guard at all, and this block would pass if it were wired to the group.
+# Switched off for this block and put back at the end, rather than assumed off. It is off
+# by default, but a stack somebody has been working on by hand is not a default stack, and
+# the first version of this control caught exactly that: the group was on, so every check
+# below would have passed while proving nothing about the case they exist for.
+ELEM_WAS=$(docker compose exec -T cli wp eval 'global $gmcp_core; echo $gmcp_core->get_option("mcp_tools_elementor") ? "1" : "0";' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_elementor"]=false;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+check "CONTROL: the Elementor tool group really is off for this block" \
+  "$(docker compose exec -T cli wp eval 'global $gmcp_core; echo $gmcp_core->get_option("mcp_tools_elementor") ? "on" : "off";' 2>/dev/null | tr -d '\r\n')" "off"
+TR_TPL=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Guarded template","post_type"=>"elementor_library","post_status"=>"publish"]);' 2>/dev/null | tr -d '\r\n')
+TR_SC=$(docker compose exec -T cli wp eval "echo wp_insert_post(['post_title'=>'Shortcode page','post_type'=>'page','post_status'=>'publish','post_content'=>'[elementor-template id=\"$TR_TPL\"]']);" 2>/dev/null | tr -d '\r\n')
+call tr_del "{\"jsonrpc\":\"2.0\",\"id\":130,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$TR_TPL}}}"
+check "deleting it is refused, and the refusal names the page" \
+  "$(py "import json,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print('rendering nothing' in t and 'Shortcode page' in t)" tr_del)" "True"
+# A test for a guard must not depend on the guard: read the state back rather than trust
+# the refusal, because a refusal arriving after the delete is the failure being guarded.
+check "and the template is still there" \
+  "$(docker compose exec -T cli wp eval "echo get_post($TR_TPL) ? 'present' : 'gone';" 2>/dev/null | tr -d '\r\n')" "present"
+# Trashing is guarded too, unlike every other content delete here. The trash is normally
+# the recoverable half; from a referencing page's point of view a trashed template and a
+# deleted one render identically.
+check "and trashing is refused as well as forcing" \
+  "$(docker compose exec -T cli wp post get "$TR_TPL" --field=post_status 2>/dev/null | tr -d '\r\n')" "publish"
+call tr_unpub "{\"jsonrpc\":\"2.0\",\"id\":131,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$TR_TPL,\"post_status\":\"draft\"}}}"
+check "unpublishing it is refused too" \
+  "$(py "import json,sys;print('rendering nothing' in json.load(sys.stdin)['result']['content'][0]['text'])" tr_unpub)" "True"
+check "and it is still published" \
+  "$(docker compose exec -T cli wp post get "$TR_TPL" --field=post_status 2>/dev/null | tr -d '\r\n')" "publish"
+
+# The second route a reference takes. Elementor's own template and loop widgets embed one
+# template in another through a template_id setting inside _elementor_data, with no
+# shortcode anywhere. A guard that knew only the shortcode would refuse half the cases and
+# wave the other half through with the same confidence.
+TR_WTPL=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Embedded template","post_type"=>"elementor_library","post_status"=>"publish"]);' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp eval "
+  \$doc = [ [ 'id'=>'s','elType'=>'section','settings'=>[],'elements'=>[ [ 'id'=>'w','elType'=>'widget','widgetType'=>'template','settings'=>[ 'template_id' => '$TR_WTPL' ],'elements'=>[] ] ] ] ];
+  \$p = wp_insert_post([ 'post_title'=>'Embedding page','post_type'=>'page','post_status'=>'publish' ]);
+  update_post_meta( \$p, '_elementor_data', wp_slash( wp_json_encode( \$doc ) ) );" >/dev/null 2>&1
+call tr_wdel "{\"jsonrpc\":\"2.0\",\"id\":132,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$TR_WTPL}}}"
+check "a widget embed with no shortcode is caught too" \
+  "$(py "import json,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print('rendering nothing' in t and 'Embedding page' in t)" tr_wdel)" "True"
+
+# The guard must not be blanket, or it becomes something to route around rather than read.
+TR_FREE=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Unreferenced template","post_type"=>"elementor_library","post_status"=>"publish"]);' 2>/dev/null | tr -d '\r\n')
+call tr_free "{\"jsonrpc\":\"2.0\",\"id\":133,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$TR_FREE,\"force\":true}}}"
+check "CONTROL: an unreferenced template deletes normally" "$(verdict tr_free)" "ok"
+# And an ordinary page is not slowed down or refused by any of this.
+TR_PAGE=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Ordinary page","post_type"=>"page","post_status"=>"publish"]);' 2>/dev/null | tr -d '\r\n')
+call tr_page "{\"jsonrpc\":\"2.0\",\"id\":134,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$TR_PAGE,\"force\":true}}}"
+check "CONTROL: an ordinary post is untouched by the guard" "$(verdict tr_page)" "ok"
+call tr_force "{\"jsonrpc\":\"2.0\",\"id\":135,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$TR_TPL,\"force\":true,\"despite_references\":true}}}"
+check "and the override goes ahead when asked" \
+  "$(docker compose exec -T cli wp eval "echo get_post($TR_TPL) ? 'present' : 'gone';" 2>/dev/null | tr -d '\r\n')" "gone"
+docker compose exec -T cli wp eval "\$o=get_option('gmcp_options',[]);\$o['mcp_tools_elementor']=('$ELEM_WAS'==='1');update_option('gmcp_options',\$o,false);" >/dev/null 2>&1
+check "and the Elementor group is back as it was found" \
+  "$(docker compose exec -T cli wp eval 'global $gmcp_core; echo $gmcp_core->get_option("mcp_tools_elementor") ? "1" : "0";' 2>/dev/null | tr -d '\r\n')" "$ELEM_WAS"
+
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
