@@ -18,9 +18,9 @@ It is built on one assumption: the agent will occasionally get it wrong. So it h
 
 = What makes it different =
 
-Most plugins in this space are AI frameworks that also speak MCP. This one is only the MCP server. No chatbot, no provider API key, no front-end asset, nothing rendered to your visitors. Your agent talks to the model; this plugin is what the agent reaches into.
+Most plugins in this space are AI frameworks that also speak MCP. This one is only the MCP server. No chatbot, no provider API key, no front-end asset. Your agent talks to the model; this plugin is what it reaches into.
 
-The guardrails exist because an agent administering your site also reads your comments, post bodies and plugin descriptions, written by anonymous people. So the guards are placed where a model cannot argue its way past them:
+The guardrails exist because an agent administering your site also reads comments and post bodies written by anonymous people. The guards are placed where a model cannot argue past them:
 
 * Deleting a plugin, theme or menu takes two calls — the first changes nothing and returns a token bound to that target.
 * Installs come from the wordpress.org repository by slug; an arbitrary ZIP URL is refused unless you open a filter.
@@ -35,19 +35,21 @@ The guardrails exist because an agent administering your site also reads your co
 
 Content and site data: posts, pages, block content, taxonomies, comments, media, users, post meta, site options, post types and block patterns.
 
-Site administration (off by default): plugins and themes; navigation menus; widgets; General/Reading/Discussion settings; permalinks; scheduled events; Site Health.
+Site administration (off by default): plugins and themes; menus; widgets; General/Reading/Discussion settings; permalinks; scheduled events; Site Health.
 
 WooCommerce, Elementor, Kirki, Yoast SEO and ACF, each on a switch of its own that appears only when the plugin is installed.
 
 Backups, if you have a compatible backup plugin. There is no restore tool, deliberately.
 
+It also offers ready-made upkeep jobs via MCP prompts, and publishes posts and the comment queue as MCP resources.
+
 = Connecting =
 
-Two ways in: **OAuth** for clients that support it (paste the endpoint URL, no shared secret), and **named keys** for clients that cannot (choose access level, expiry and allowed tools).
+Two ways in: **OAuth** for clients that support it (paste the endpoint URL, no shared secret), and **named keys** for clients that cannot (choose access level and tools).
 
 = Privacy =
 
-No telemetry. It sends nothing about you or your site anywhere.
+No telemetry. Sends nothing about you or your site anywhere.
 
 == Installation ==
 
