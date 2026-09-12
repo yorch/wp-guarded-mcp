@@ -43,7 +43,7 @@ The settings screen shows the endpoint URL. There are two ways in.
 
 **OAuth**, for clients that support it (Claude Desktop, the Claude web connector). Paste the endpoint URL into the client. It discovers the authorization server, sends you to a WordPress login, and shows a consent screen. Nothing to configure, and no shared secret. Only administrators can approve a connection, and the resulting token keeps working only while that account is still an administrator.
 
-**A named key**, for clients that cannot do OAuth, such as a CLI agent. Create one on the Access tab and give it to the client. A key is shown once and stored only as a hash, so keep it wherever the client keeps its configuration:
+**A named key**, for clients that cannot do OAuth, such as a CLI agent. Create one on the Access page and give it to the client. A key is shown once and stored only as a hash, so keep it wherever the client keeps its configuration:
 
 ```json
 {
@@ -292,13 +292,13 @@ Those generated tools return whole REST records, which is more than a model usua
 
 ## The settings screen
 
-At **MCP Server** in the admin menu, in four tabs. It is top level rather than buried
+At **MCP Server** in the admin menu, in five pages. It is top level rather than buried
 under Settings, because it is the first thing anyone needs after activating, and there is
 a Settings link on the plugin's row too.
 
-The tabs are query arguments and each one is an ordinary link, so the screen works with
-JavaScript switched off and a tab can be bookmarked or sent to somebody else. Every form
-returns to the tab it was submitted from.
+Each page is an ordinary link, so every page works with
+JavaScript switched off and a page can be bookmarked or sent to somebody else. Every form
+returns to the page it was submitted from.
 
 ### Connect
 
@@ -329,14 +329,17 @@ key's secret appears once, on creation, and is not recoverable afterwards.
 Which groups of tools an agent is offered, and nothing else. A group that is off is not
 merely hidden: its tools are refused if asked for by name.
 
-### Logs
+### Logging
 
-What the plugin records, and then the record. The audit log's switch and its retention
-window sit directly above the log they fill, which is the arrangement the old single page
-did not have: the two were four hundred lines apart, under a heading about tools. The
-change journal and debug logging are here too, because all three answer the same question.
+What the plugin records. The audit log's switch and its retention window, the change
+journal and debug logging, because all three answer the same question. They live apart
+from the log itself: the switches are set once and the table is visited daily, and the
+table buried below a settings form served neither. When the log is switched off, the
+Audit Log page says so and links back here.
 
-The audit log itself: every tool call, refusals included, with the arguments it was
+### Audit Log
+
+The record itself: every tool call, refusals included, with the arguments it was
 given, what it changed, what made it, what it was aimed at, how long it took and why it
 was turned down. Without it an agent works with no visible record at all: you can see
 that a plugin is gone, but not that your agent removed it, when, or that it tried three

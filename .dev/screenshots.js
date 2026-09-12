@@ -16,19 +16,20 @@ const PASS = process.env.SHOT_PASS || 'admin';
 // that the interesting part of each screen fits without scrolling.
 const VIEWPORT = { width: 1440, height: 900, deviceScaleFactor: 2 };
 
-// `scrollTo` names the heading the capture should start from. Without it the Logs tab
-// captures the three switches above the log and clips the log itself, which is the one
+// `scrollTo` names the heading the capture should start from. Without it the Audit Log
+// page captures the table's filters and clips the rows themselves, which are the one
 // thing on that screen worth showing.
 const SHOTS = [
-  { file: 'screenshot-1.png', path: '/wp-admin/admin.php?page=guarded-mcp-settings' },
-  { file: 'screenshot-3.png', path: '/wp-admin/admin.php?page=guarded-mcp-settings&tab=access' },
-  { file: 'screenshot-4.png', path: '/wp-admin/admin.php?page=guarded-mcp-settings&tab=logs',
+  { file: 'screenshot-1.png', path: '/wp-admin/admin.php?page=guarded-mcp-settings', heading: 'Connection' },
+  { file: 'screenshot-3.png', path: '/wp-admin/admin.php?page=guarded-mcp-access', heading: 'Access' },
+  { file: 'screenshot-4.png', path: '/wp-admin/admin.php?page=guarded-mcp-logs', heading: 'Audit Log',
     scrollTo: 'The audit log' },
-  { file: 'screenshot-5.png', path: '/wp-admin/admin.php?page=guarded-mcp-settings&tab=logs&entry=3',
-    scrollTo: 'The audit log' },
+  { file: 'screenshot-5.png', path: '/wp-admin/admin.php?page=guarded-mcp-logs&entry=3', heading: 'Audit Log' },
+  // No scrollTo on the entry: a single record renders under only the page heading
+  // and its intro, so the top of the page is already the subject.
 ];
 
-// The consent screen is not a tab, so it is reached the way a client reaches it: register
+// The consent screen is not a settings page, so it is reached the way a client reaches it: register
 // a client, then open the authorize URL. Captured here rather than kept as a hand-made
 // file so it ages with the rest of them.
 const CONSENT = { file: 'screenshot-2.png', clientName: 'Claude' };
@@ -58,10 +59,11 @@ const CONSENT = { file: 'screenshot-2.png', clientName: 'Claude' };
   for (const shot of SHOTS) {
     await page.goto(BASE + shot.path, { waitUntil: 'networkidle0' });
     // The screen is identified by its own heading, so a redirect to a permissions
-    // error cannot be captured and shipped as a settings screen.
+    // error cannot be captured and shipped as a settings screen. Each shot names the
+    // heading its page renders, since the five pages no longer share one.
     const heading = await page.$eval('.wrap h1', el => el.textContent.trim()).catch(() => '');
-    if (heading !== 'MCP Server') {
-      throw new Error(`${shot.path} rendered "${heading}", not the MCP Server screen`);
+    if (heading !== shot.heading) {
+      throw new Error(`${shot.path} rendered "${heading}", not the ${shot.heading} screen`);
     }
     if (shot.scrollTo) {
       const found = await page.evaluate(text => {

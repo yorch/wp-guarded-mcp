@@ -178,6 +178,61 @@ reset_state() {
 }
 reset_state
 
+echo "-- admin pages (one submenu page per section, not tabs) --"
+# Placed here on purpose: after reset_state has steadied the fixtures, before any
+# destructive section, and reset_state touches no users, passwords, credentials or
+# tool-group flags, so neither this block nor the admin-switch-on gate above
+# depends on anything below. It mutates nothing itself.
+# Every admin link in the plugin goes through GMCP_Settings::page_url(), so the mapping
+# from section name to page slug is the contract the menu, the redirects and the entry
+# links all share. Assert the page query param it produces, which is host-independent.
+# Pure PHP, no HTTP: what needs a login is covered by hand, and the mapping is what a
+# refactor would silently break (a renamed slug without an updated PAGES entry).
+page_of() { # page_of <section>
+  docker compose exec -T cli wp eval '
+    parse_str( parse_url( GMCP_Settings::page_url( "'"$1"'" ), PHP_URL_QUERY ), $q );
+    echo $q["page"];' 2>/dev/null | tr -d '\r\n'
+}
+# The empty section is the control: the parent slug never moved, so if the probe cannot
+# find even that, the failures below describe the probe rather than the code.
+check "connection page keeps the parent slug" "$(page_of '')" "guarded-mcp-settings"
+check "access section has its own page" "$(page_of access)" "guarded-mcp-access"
+check "tools section has its own page" "$(page_of tools)" "guarded-mcp-tools"
+check "logging section has its own page" "$(page_of logging)" "guarded-mcp-logging"
+check "logs section has its own page" "$(page_of logs)" "guarded-mcp-logs"
+# And each page has its own render callback. The tabbed code rendered all four through
+# one render(), so this fails there and passes here.
+check "each page has its own render callback" \
+  "$(docker compose exec -T cli wp eval 'echo (int) ( method_exists( "GMCP_Settings", "render_connect_page" ) && method_exists( "GMCP_Settings", "render_access_page" ) && method_exists( "GMCP_Settings", "render_tools_page" ) && method_exists( "GMCP_Settings", "render_logging_page" ) && method_exists( "GMCP_Settings", "render_logs_page" ) );' 2>/dev/null | tr -d '\r\n')" "1"
+
+echo "-- admin pages answer over HTTP --"
+# The mapping block proves the URLs; this proves the pages render behind them, with
+# the right heading and the sibling cross-links both ways. It needs a logged-in
+# administrator, which nothing else here needs: admin/admin is the documented
+# dev-stack default (see .dev/README.md and screenshots.js), so a stack with other
+# credentials skips the block instead of failing it. The login cookie gates the
+# block, which is also what separates a broken probe from a real failure: with a
+# cookie but wrong headings, these fail rather than skip.
+JAR=$(mktemp)
+curl -sS -c "$JAR" -b "$JAR" -d 'log=admin&pwd=admin&rememberme=forever&testcookie=1' "$BASE/wp-login.php" -o /dev/null 2>/dev/null
+if grep -q wordpress_logged_in "$JAR"; then
+  page_h1() { # page_h1 <slug>
+    curl -sS -b "$JAR" "$BASE/wp-admin/admin.php?page=$1" 2>/dev/null | grep -o '<h1>[^<]*</h1>' | head -n 1
+  }
+  check "connection page renders" "$(page_h1 guarded-mcp-settings)" "<h1>Connection</h1>"
+  check "access page renders" "$(page_h1 guarded-mcp-access)" "<h1>Access</h1>"
+  check "tools page renders" "$(page_h1 guarded-mcp-tools)" "<h1>Tools</h1>"
+  check "logging page renders" "$(page_h1 guarded-mcp-logging)" "<h1>Logging</h1>"
+  check "audit log renders" "$(page_h1 guarded-mcp-logs)" "<h1>Audit Log</h1>"
+  check "logging page links to the audit log" \
+    "$(curl -sS -b "$JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-logging" 2>/dev/null | grep -q 'page=guarded-mcp-logs' && echo yes || echo no)" "yes"
+  check "audit log links to logging" \
+    "$(curl -sS -b "$JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-logs" 2>/dev/null | grep -q 'page=guarded-mcp-logging' && echo yes || echo no)" "yes"
+else
+  echo "  SKIP  admin login failed; the HTTP block needs the dev-stack admin credential"
+fi
+rm -f "$JAR"
+
 echo "-- credential protection (privilege escalation) --"
 call opt_read '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"gmcp_options"}}}'
 check "own options are unreadable" "$(verdict opt_read)" "error"

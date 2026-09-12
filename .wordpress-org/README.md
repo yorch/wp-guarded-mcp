@@ -25,10 +25,10 @@ zip, which is the convention the common GitHub-to-SVN deploy actions expect.
 | `icon-128x128.png`, `icon-256x256.png` | Raster fallbacks. The directory requires a PNG even when an SVG is supplied, or the icon breaks in older browsers and on Facebook. |
 | `banner.svg` | Source for both banners. |
 | `banner-772x250.png`, `banner-1544x500.png` | Standard and retina banners. Must be PNG or JPG; SVG is not accepted here. |
-| `screenshot-1.png` | The Connect tab. |
+| `screenshot-1.png` | The Connect page. |
 | `screenshot-2.png` | The OAuth consent screen an administrator sees. |
-| `screenshot-3.png` | The Access tab: the bearer token and the named keys. |
-| `screenshot-4.png` | The Logs tab: the audit log, with its filters and its refusals. |
+| `screenshot-3.png` | The Access page: named keys, each with its own access level, tool list and expiry. |
+| `screenshot-4.png` | The Audit Log page: the audit log, with its filters and its refusals. |
 | `screenshot-5.png` | One audit entry in full, with the before and after of each field. |
 
 Screenshot filenames must be lowercase and must match the numbered list in the
