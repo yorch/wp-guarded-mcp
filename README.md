@@ -61,13 +61,18 @@ If your host strips the `Authorization` header before PHP sees it, the plugin al
 
 ## Access levels
 
-The token access level applies to bearer-token callers only. OAuth callers always act as the administrator who approved the connection.
+An access level belongs to a named key. OAuth callers always act as the administrator who approved the connection, at full access.
 
 | Level | Content only | + administration | + WooCommerce | What it can do |
 |---|---|---|---|---|
-| `admin` | 48 | 81 | 93 | Everything, including deletes, users and options |
-| `readwrite` | 36 | 47 | 56 | Create and update, no destructive tools |
-| `readonly` | 17 | 27 | 31 | Reads only |
+| `admin` | 50 | 85 | 97 | Everything, including deletes, users and options |
+| `readwrite` | 37 | 48 | 57 | Create and update, no destructive tools |
+| `readonly` | 18 | 28 | 32 | Reads only |
+
+These nine numbers are checked by `smoke-admin.sh` against a running site, because all
+nine had drifted behind the code before anything checked them. Elementor is not counted:
+its tools are a fourth group that comes and goes with a plugin, so folding them in would
+make the table depend on what happens to be installed.
 
 A **named key** narrows this further. It carries its own level, an optional expiry date,
 and an optional list of the only tools it may call, so a key handed to a deploy script
