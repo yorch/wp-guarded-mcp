@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Guarded MCP">
+  <!-- A shield with a keyhole: delegated access, held under guard. Drawn to stay
+       legible at 128px, so the shapes are heavy and there is no fine detail. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2c4a52"/>
+      <stop offset="1" stop-color="#1b3038"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+
+  <!-- Shield -->
+  <path d="M128 40 L196 66 V126 C196 168 166 199 128 214 C90 199 60 168 60 126 V66 Z"
+        fill="none" stroke="#e8d9a8" stroke-width="13" stroke-linejoin="round"/>
+
+  <!-- Keyhole -->
+  <circle cx="128" cy="118" r="21" fill="#e8d9a8"/>
+  <path d="M118 133 L110 174 H146 L138 133 Z" fill="#e8d9a8"/>
+</svg>
