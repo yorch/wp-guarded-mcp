@@ -67,8 +67,8 @@ An access level belongs to a named key. OAuth callers always act as the administ
 
 | Level | Content only | + administration | + WooCommerce | What it can do |
 |---|---|---|---|---|
-| `admin` | 50 | 85 | 97 | Everything, including deletes, users and options |
-| `readwrite` | 37 | 48 | 57 | Create and update, no destructive tools |
+| `admin` | 51 | 86 | 98 | Everything, including deletes, users and options |
+| `readwrite` | 38 | 49 | 58 | Create and update, no destructive tools |
 | `readonly` | 18 | 28 | 32 | Reads only |
 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
