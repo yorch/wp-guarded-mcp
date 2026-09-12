@@ -866,12 +866,23 @@ kcall m_direct "$K_MIX" '{"jsonrpc":"2.0","id":152,"method":"tools/call","params
 check "a write-level key cannot set default_role directly" "$(verdict m_direct)" "error"
 kcall m_undo "$K_MIX" "{\"jsonrpc\":\"2.0\",\"id\":153,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$M_OPT\"}}}"
 check "nor revert it just because a post tool was in flight" "$(verdict m_undo)" "error"
+# The id has to be real, or the refusal above proves nothing: an empty id is refused with
+# equal enthusiasm by the lookup, and this block sat green through exactly that.
+check "and the id it was refused for actually exists" \
+  "$( [ -n "$M_OPT" ] && echo present || echo EMPTY )" "present"
+check "refused by the gate, not by a missing entry" \
+  "$(refusal m_undo | grep -qi 'no recorded change' && echo "WRONG REASON" || echo gate)" "gate"
 check "default_role was not restored to the more privileged value" \
   "$(docker compose exec -T cli wp option get default_role 2>/dev/null | tr -d '\r\n')" "subscriber"
 # Telling a caller something is reversible and then refusing is its own bug.
 kcall m_list "$K_MIX" '{"jsonrpc":"2.0","id":154,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+# all([]) is True, so the check below would pass over a filter that had stopped matching
+# anything. The count comes first: a selection of zero entries proves nothing about
+# reversibility, and "no such entry" is not "not reversible".
+check "the listing has the entry this is about" \
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(len([x for x in e if 'default_role' in x['what']]) > 0)" m_list)" "True"
 check "the listing already says it is not reversible for this caller" \
-  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(all(not x['reversible'] for x in e if 'default_role' in x['what']))" m_list)" "True"
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);m=[x for x in e if 'default_role' in x['what']];print(bool(m) and all(not x['reversible'] for x in m))" m_list)" "True"
 # The gate must not cost a caller the reverts it is entitled to.
 kcall m_post "$K_MIX" "{\"jsonrpc\":\"2.0\",\"id\":155,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next(x['id'] for x in e if x['what'].startswith('Post')))" m_all)\"}}}"
 check "a write-level key can still revert a post change" "$(verdict m_post)" "ok"
