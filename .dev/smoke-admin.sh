@@ -2305,5 +2305,63 @@ check "passing both id and call is refused" \
   "$(py "import json,sys;print('not both' in json.load(sys.stdin)['result']['content'][0]['text'])" jm_both)" "True"
 docker compose exec -T cli wp post delete "$JM_ID" --force >/dev/null 2>&1
 
+echo "-- uninstall leaves nothing behind --"
+# Last, because it empties the plugin out from under everything above. Run through the
+# real uninstall.php rather than `wp plugin uninstall`, which deletes the plugin directory
+# and here that is a bind mount of the working tree.
+#
+# Asserted as "no gmcp_ row and no gmcp_ table survives" rather than as a list of names,
+# so a table added later without an uninstall line fails this instead of being noticed by
+# somebody reading the file. That is how wp_gmcp_meta_snapshots got left behind: it holds
+# what a page design said before an agent changed it, and an uninstall left the lot.
+docker compose exec -T cli wp eval '
+  $a = get_users( [ "role" => "administrator", "number" => 1, "orderby" => "ID", "order" => "ASC" ] );
+  GMCP_Tokens::create( "uninstall probe", "admin", 0, [], $a ? $a[0]->ID : 0 );
+  GMCP_Journal::install();
+  GMCP_Audit::install();
+  update_option( "gmcp_audit_last_full_verify", [ "at" => time() ], false );' >/dev/null 2>&1
+# The control. Without it, a site that wrote nothing would pass the two checks below by
+# having nothing to leave behind, which is the shape that has produced false passes here
+# before.
+UN_OPTS=$(docker compose exec -T cli wp db query "SELECT COUNT(*) FROM ${TABLE_PREFIX:-wp_}options WHERE option_name LIKE 'gmcp\\_%' AND option_name NOT LIKE 'gmcp\\_smoke\\_%'" --skip-column-names 2>/dev/null | tr -d '\r\n')
+UN_TABS=$(docker compose exec -T cli wp db query "SHOW TABLES LIKE '${TABLE_PREFIX:-wp_}gmcp%'" --skip-column-names 2>/dev/null | tr -d '\r' | grep -c .)
+check "CONTROL: the plugin has rows and tables to leave behind" \
+  "$( [ "${UN_OPTS:-0}" -gt 3 ] && [ "${UN_TABS:-0}" -ge 4 ] && echo present || echo "NOTHING TO TEST ($UN_OPTS opts, $UN_TABS tables)" )" "present"
+# Captured BEFORE the uninstall, which is the whole point: uninstall.php deletes this row
+# along with everything else, so reading it afterwards saves an empty array and restores
+# nothing. The first version of this did exactly that and the restore check below caught it.
+UN_OPTS_SAVE=$(docker compose exec -T cli wp eval 'echo base64_encode( serialize( get_option( "gmcp_options", [] ) ) );' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp eval '
+  define( "WP_UNINSTALL_PLUGIN", "guarded-mcp/guarded-mcp.php" );
+  require WP_PLUGIN_DIR . "/guarded-mcp/uninstall.php";' >/dev/null 2>&1
+# gmcp_smoke_ is this suite's own fixture prefix, not the plugin's, and uninstall.php is
+# right not to touch it. Excluded by prefix rather than by naming the one that exists
+# today, and only fixtures are excluded: a row the PLUGIN writes still fails this, which
+# is the direction that matters. An allow-list of plugin rows would have been written to
+# match today's code and would have missed the snapshot table exactly as uninstall.php did.
+check "no option row survives the uninstall" \
+  "$(docker compose exec -T cli wp db query "SELECT GROUP_CONCAT(option_name) FROM ${TABLE_PREFIX:-wp_}options WHERE option_name LIKE 'gmcp\\_%' AND option_name NOT LIKE 'gmcp\\_smoke\\_%'" --skip-column-names 2>/dev/null | tr -d '\r\n')" "NULL"
+check "and no table survives it" \
+  "$(docker compose exec -T cli wp db query "SHOW TABLES LIKE '${TABLE_PREFIX:-wp_}gmcp%'" --skip-column-names 2>/dev/null | tr -d '\r' | grep -c .)" "0"
+# Put the site back, or the next run of any suite starts against a gutted install and
+# reports a hundred features as broken.
+#
+# Reactivating is not enough. The settings row goes with everything else, so the plugin
+# comes back at its defaults with the admin tool group OFF, and smoke.sh then finds four
+# prompts where it expects six: two of them need admin tools, so they are filtered out of
+# prompts/list for a caller who cannot call them. That reads as two broken prompts and is
+# a wiped setting. The row is captured before the uninstall and written back after.
+docker compose exec -T cli wp plugin deactivate guarded-mcp >/dev/null 2>&1
+docker compose exec -T cli wp plugin activate guarded-mcp >/dev/null 2>&1
+if [ -n "$UN_OPTS_SAVE" ]; then
+  docker compose exec -T cli wp eval '
+    $o = unserialize( base64_decode( "'"$UN_OPTS_SAVE"'" ) );
+    if ( is_array( $o ) && $o ) { update_option( "gmcp_options", $o, false ); }' >/dev/null 2>&1
+fi
+# Said out loud rather than assumed, because a restore that silently did nothing would
+# leave the next suite to report the consequence instead of this one.
+check "the settings survive the uninstall check that wiped them" \
+  "$(docker compose exec -T cli wp eval 'echo !empty( get_option( "gmcp_options", [] )["mcp_tools_admin"] ) ? "restored" : "LOST";' 2>/dev/null | tr -d '\r\n')" "restored"
+
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
