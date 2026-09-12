@@ -92,6 +92,13 @@ the shop suite needs WooCommerce, and the base suite expects post 1 to still be 
 "Hello world!". Confirm by installing the dependency and re-running, never by explaining the
 failure away.
 
+**A suite switches on the tool group it tests, and smoke-admin.sh did not.** `mcp_tools_admin`
+defaults to off, correctly, so on a fresh stack none of the tools that suite names were
+registered and it reported 147 failures describing every guard in the plugin as broken. One
+missing setting, read as a catastrophe, and the second time this shape has appeared after the
+missing credential that produced 226. When a suite fails in the hundreds, suspect its
+preconditions before its subject.
+
 **The suite's own credential is a named key it mints at startup.** So anything that clears
 keys wholesale clears the suite out from under itself: every later request comes back 401,
 and the checks describe features as broken. Use `gmcp_clear_other_keys` rather than deleting

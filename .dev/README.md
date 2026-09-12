@@ -43,7 +43,8 @@ A key acts as the administrator who created it and stops working when that accou
 holding `manage_options`, which is worth remembering on a test site where the suites
 create and delete users.
 
-Run the suites:
+Run the suites, one at a time against a stack. Each switches on the tool group it tests,
+so there is no setting to turn on first; only the plugins below have to be installed.
 
 ```
 ./smoke.sh          # transport, auth, content tools, prompts, resources, previews

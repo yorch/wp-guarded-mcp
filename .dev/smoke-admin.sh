@@ -49,6 +49,23 @@ case "$TOK" in
   gmcp_*) ;;
   *) echo "Could not create an API key for the suite. Is the plugin active?" >&2; exit 1 ;;
 esac
+# The group this suite exists to test, switched on the way smoke-woo.sh and
+# smoke-elementor.sh switch on theirs. mcp_tools_admin defaults to OFF, deliberately: these
+# tools install code and change how a site renders, so they are opt-in. Nothing in the
+# documented setup turned it on, so a first run against a fresh stack found none of the
+# tools it names registered and reported 147 failures describing every guard in the plugin
+# as broken. One missing setting, read as a catastrophe, which is the same shape as the
+# missing credential the key helper above guards against.
+#
+# Asserted rather than assumed, because a write that silently did nothing would put the
+# suite straight back into that state with no clue why.
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_admin"]=true;$o["mcp_tools_core"]=true;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+ADMIN_ON=$(docker compose exec -T cli wp eval 'global $gmcp_core; echo $gmcp_core->get_option("mcp_tools_admin") ? "on" : "off";' 2>/dev/null | tr -d '\r\n')
+if [ "$ADMIN_ON" != "on" ]; then
+  echo "Could not switch the administration tools on, so every check below would fail for that reason alone." >&2
+  exit 1
+fi
+
 OUT=$(mktemp -d)
 pass=0; fail=0
 
