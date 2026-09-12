@@ -169,7 +169,7 @@ class GMCP_Tools_Elementor {
 
   /** Tools here that change the site, and so announce themselves on gmcp_mutate. */
   const MUTATING = [
-    'elementor_set_conditions', 'elementor_regenerate_css', 'elementor_apply_template',
+    'elementor_set_conditions', 'elementor_regenerate_css', 'elementor_set_active_kit', 'elementor_apply_template',
   ];
 
   /** The three tools that read or delete the conditions option, and so pass the option guard. */
@@ -240,6 +240,18 @@ class GMCP_Tools_Elementor {
             'location' => [ 'type' => 'string', 'description' => 'header, footer, single or archive. Only needed when the template type does not say which, in which case the call is refused without it.' ],
           ],
           'required' => [ 'ID', 'conditions' ],
+        ],
+        'accessLevel' => 'admin',
+      ],
+      'elementor_set_active_kit' => [
+        'name' => 'elementor_set_active_kit',
+        'description' => 'Make one Elementor kit the active one. A kit holds the site\'s global colours, fonts, layout defaults and theme-style rules, so most of what "wire up a theme" means lives in it rather than in any page. Elementor records the active one in a single option, which is why this looks small and is not: switching it changes every page at once. Two things come with the switch and both matter. Elementor compiles the kit\'s colours and typography into generated CSS files, so the files are cleared here as well and rebuilt on the next page load; without that the site keeps rendering the old kit\'s design while reporting the new one as active, which is the exact shape of silent failure the conditions tools exist for. And the previous kit is named in the reply, because it is the only record of what to switch back to: this is not journalled and there is no undo for it. Refuses anything that is not a published kit, including an ordinary library template, since Elementor reads the option without checking and an id pointing at the wrong thing leaves the site with no usable global styles at all. List the kits with elementor_list_templates and type "kit".',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'ID' => [ 'type' => 'integer', 'description' => 'The kit to activate. It must be an elementor_library post whose template type is kit.' ],
+          ],
+          'required' => [ 'ID' ],
         ],
         'accessLevel' => 'admin',
       ],
@@ -337,6 +349,7 @@ class GMCP_Tools_Elementor {
       case 'elementor_list_templates': $r = $this->list_templates( $args, $r ); break;
       case 'elementor_get_conditions': $r = $this->get_conditions( $args, $r ); break;
       case 'elementor_set_conditions': $r = $this->set_conditions( $args, $r ); break;
+      case 'elementor_set_active_kit': $r = $this->set_active_kit( $args, $r ); break;
       case 'elementor_regenerate_css': $r = $this->regenerate_css( $args, $r ); break;
       case 'elementor_apply_template': $r = $this->apply_template( $args, $r ); break;
       case 'elementor_template_references': $r = $this->template_references( $args, $r ); break;
@@ -683,6 +696,86 @@ class GMCP_Tools_Elementor {
   #endregion
 
   #region CSS
+
+  /** Elementor's own name for the option holding the active kit, from its Kits Manager. */
+  const ACTIVE_KIT_OPTION = 'elementor_active_kit';
+
+  private function set_active_kit( array $a, array $r ): array {
+    $id = (int) ( $a['ID'] ?? 0 );
+    if ( $id <= 0 ) {
+      return $this->error( $r, 'ID is required and must be the id of a kit.' );
+    }
+    $post = get_post( $id );
+    if ( !$post || $post->post_type !== 'elementor_library' ) {
+      return $this->error( $r, "Post {$id} is not an elementor_library template, so it cannot be a kit." );
+    }
+    // Checked rather than trusted. Elementor reads this option and looks the post up
+    // without asking what it is, so an id pointing at an ordinary template leaves the site
+    // with no usable global styles and no error saying why.
+    $type = (string) get_post_meta( $id, self::TYPE_META, true );
+    if ( $type !== 'kit' ) {
+      return $this->error(
+        $r,
+        "Template {$id} is a \"" . ( $type ?: 'template with no type' ) . "\", not a kit. Only a kit holds the global colours, fonts and theme styles this option points at. List them with elementor_list_templates and type \"kit\"."
+      );
+    }
+    if ( $post->post_status !== 'publish' ) {
+      return $this->error(
+        $r,
+        "Kit {$id} is \"{$post->post_status}\", not published. Elementor reads the active kit through the post, and a kit that is not published gives the site no global styles at all."
+      );
+    }
+
+    $before = (int) get_option( self::ACTIVE_KIT_OPTION );
+    if ( $before === $id ) {
+      return $this->text( $r, "Kit {$id} \"" . get_the_title( $id ) . "\" was already the active one. Nothing changed." );
+    }
+
+    update_option( self::ACTIVE_KIT_OPTION, $id );
+
+    // Asked of the option rather than assumed from the write, for the reason this file
+    // gives everywhere else: a tool reporting a switch and a switch happening are
+    // different claims, and another plugin filtering the option would make them differ.
+    $after = (int) get_option( self::ACTIVE_KIT_OPTION );
+    if ( $after !== $id ) {
+      return $this->error(
+        $r,
+        "The option was written but reads back as {$after} rather than {$id}, so something on this site is filtering it. The active kit has NOT been changed."
+      );
+    }
+
+    // The second half, and the half that gets forgotten. A kit's colours and typography
+    // are compiled into generated CSS files; switching the option without clearing them
+    // leaves every page rendering the old kit while this tool reports the new one.
+    $css = 'not cleared';
+    if ( class_exists( '\Elementor\Plugin' ) ) {
+      $plugin = \Elementor\Plugin::$instance;
+      if ( is_object( $plugin ) && isset( $plugin->files_manager ) && method_exists( $plugin->files_manager, 'clear_cache' ) ) {
+        try {
+          $plugin->files_manager->clear_cache();
+          $css = 'cleared, and will rebuild on the next page load';
+        }
+        catch ( \Throwable $e ) {
+          $css = 'could not be cleared: ' . $e->getMessage();
+        }
+      }
+    }
+
+    return $this->json( $r, [
+      'active_kit' => $id,
+      'title' => get_the_title( $id ),
+      'previous_kit' => $before ?: null,
+      'previous_title' => $before ? get_the_title( $before ) : null,
+      'generated_css' => $css,
+      // The previous id is the only record of what to go back to, so it is said rather
+      // than left to be worked out later.
+      'note' => 'This is not journalled and wp_undo_change cannot reverse it. To switch back, call this again with '
+        . ( $before ? 'ID ' . $before . '.' : 'the kit that was active before, which this site did not have recorded.' )
+        . ( $css === 'cleared, and will rebuild on the next page load'
+            ? ' A full-page cache in front of WordPress is separate and was not touched.'
+            : ' The generated CSS was NOT cleared, so pages may keep rendering the previous kit until it is: call elementor_regenerate_css.' ),
+    ] );
+  }
 
   private function regenerate_css( array $a, array $r ): array {
     if ( !class_exists( '\Elementor\Plugin' ) ) {
