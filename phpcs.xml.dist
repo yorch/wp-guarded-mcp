@@ -18,6 +18,10 @@
       meta snapshots). WordPress has no API for these; direct $wpdb calls are the
       standard approach. Caching is intentionally not applied to token lookups and
       audit writes, which are security-sensitive and must read fresh state.
+
+      CAUTION: these exclusions are global. A future direct query against a core
+      table (wp_posts, wp_options) where a WP API exists would not be flagged.
+      Reviewers should watch for $wpdb calls on core tables in code review.
     -->
     <exclude name="WordPress.DB.DirectDatabaseQuery.DirectQuery"/>
     <exclude name="WordPress.DB.DirectDatabaseQuery.NoCaching"/>
@@ -27,22 +31,32 @@
       Table names cannot be SQL placeholders. They are constructed from $wpdb->prefix
       plus fixed plugin suffixes, never from user input. The InterpolatedNotPrepared
       sniff flags every {$table} even though the value is a trusted identifier.
+
+      CAUTION: this exclusion is global. A future interpolation of user input into
+      SQL would not be flagged. Reviewers should watch for any {$variable} in SQL
+      that is not a known table name.
     -->
     <exclude name="WordPress.DB.PreparedSQL.InterpolatedNotPrepared"/>
 
     <!--
       PluginCheck.Security.DirectDB.UnescapedDBParameter flags the same {$table}
       interpolations as above. The table names are internally generated and not
-      user-controlled.
+      user-controlled. Same caveat applies.
     -->
     <exclude name="PluginCheck.Security.DirectDB.UnescapedDBParameter"/>
 
     <!--
       The plugin uses error_log() for operational logging (OAuth flows, token
-      refresh, SSE streams, tool dispatch). This is gated behind a debug-mode option
-      and logs user IDs, client IDs, and token markers (SHA-256 truncated to 8 chars),
-      never credentials. The audit log's redaction policy (GMCP_Core::redact) is
-      applied to any argument logging.
+      refresh, SSE streams, tool dispatch). Most calls are gated behind a debug-mode
+      option (mcp_debug_mode); GMCP_Logging::warn() and ::error() always write but
+      current callers check $this->logging before invoking them. Logs contain user
+      IDs, client IDs, and token markers (SHA-256 truncated to 8 chars), never
+      credentials. The audit log's redaction policy (GMCP_Core::redact) is applied to
+      argument logging at server.php:604.
+
+      CAUTION: this exclusion is global. A future error_log($token) or
+      error_log($client_secret) would not be flagged. Reviewers should watch for
+      credential-shaped variables in any new error_log call.
     -->
     <exclude name="WordPress.PHP.DevelopmentFunctions.error_log_error_log"/>
 
@@ -56,15 +70,20 @@
     <exclude name="WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound"/>
 
     <!--
-      Dynamic hook names in backup.php ($action) and tools-admin.php ($hook) are
-      cron event names and UpdraftPlus scope actions, resolved from hardcoded
-      switch statements — not user input.
+      Dynamic hook names: backup.php's $action comes from a hardcoded switch
+      statement (updraft_scope_action). tools-admin.php's $hook comes from a
+      cron event name validated via wp_get_scheduled_event(). Neither is user input.
+
+      CAUTION: this exclusion is global. A future do_action($_POST['hook']) would
+      not be flagged. Reviewers should verify dynamic hook names are constrained.
     -->
     <exclude name="WordPress.NamingConventions.PrefixAllGlobals.DynamicHooknameFound"/>
 
     <!--
-      WP_SANDBOX_SCRAPING and DOING_CRON are WordPress core constants the plugin
-      checks, not defines.
+      DOING_CRON: tools-admin.php defines it (line 3393) to make core's update
+      checks run during a cron emulation tool. WP_SANDBOX_SCRAPING is a core
+      constant the plugin checks. Both are non-prefixed because they are core
+      constants, not plugin-defined settings.
     -->
     <exclude name="WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedConstantFound"/>
 
@@ -83,24 +102,33 @@
     <exclude name="WordPress.PHP.DevelopmentFunctions.error_log_set_error_handler"/>
 
     <!--
-      ini_set (server.php) disables output compression and buffering for SSE
-      streaming. Required for Server-Sent Events to flush correctly.
-    -->
-    <exclude name="Squiz.PHP.DiscouragedFunctions.Discouraged"/>
-
-    <!--
       load_plugin_textdomain is unnecessary since WP 4.6 for .org-hosted plugins;
       WordPress auto-loads translations. Removed from core.php but the sniff may
       still fire on residual references.
     -->
     <exclude name="PluginCheck.CodeAnalysis.DiscouragedFunctions.load_plugin_textdomainFound"/>
+  </rule>
 
-    <!--
-      wp_redirect is used in oauth.php for OAuth redirect_uri responses. These are
-      validated against registered client URIs before redirecting. wp_safe_redirect
-      would reject localhost and custom-scheme URIs that local MCP clients require.
-    -->
-    <exclude name="WordPress.Security.SafeRedirect.wp_redirect_wp_redirect"/>
+  <!--
+    ini_set: scoped to server.php, where it disables output compression and
+    buffering for SSE streaming. Required for Server-Sent Events to flush
+    correctly. Scoped rather than globally excluded so that ini_set (or worse,
+    eval/exec/system) elsewhere would still be flagged.
+  -->
+  <rule ref="Squiz.PHP.DiscouragedFunctions.Discouraged">
+    <exclude-pattern>includes/server.php$</exclude-pattern>
+  </rule>
+
+  <!--
+    wp_redirect: scoped to oauth.php, where it handles OAuth redirect_uri
+    responses. These are validated against registered client URIs before
+    redirecting. wp_safe_redirect would reject localhost and custom-scheme URIs
+    that local MCP clients require. Scoped rather than globally excluded so that
+    an open redirect (wp_redirect with user input) elsewhere would still be
+    flagged.
+  -->
+  <rule ref="WordPress.Security.SafeRedirect.wp_redirect_wp_redirect">
+    <exclude-pattern>includes/oauth.php$</exclude-pattern>
   </rule>
 
   <!--
