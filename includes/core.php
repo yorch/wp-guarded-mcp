@@ -328,8 +328,19 @@ class GMCP_Core {
   * same values when it summarises what changed. Two copies would drift, and the direction
   * they drift in is a secret recorded by whichever one was not updated.
   */
-  public static function holds_credential( $value, int $depth = 0 ): bool {
-    if ( $depth > 6 ) {
+  public static function holds_credential( $value, int $depth = 0, int $max_depth = 6 ): bool {
+    // Past the limit the answer is yes, because a limit that gave up and said no would be
+    // a way to hide a secret by burying it. Six is right for the callers feeding something
+    // a person reads, where refusing one unusual value costs a line of a log.
+    //
+    // It is wrong for the reversible snapshot, measurably so. A page-builder design nests
+    // far past six: the meta writer decodes a JSON design into the array the row actually
+    // holds, and thirteen nested containers walk twenty-eight levels that way. So every
+    // design answered yes on the depth rule alone, with no credential-shaped field name
+    // anywhere in it. That refusal protected nothing and declined precisely the values meta
+    // undo exists to restore. @see GMCP_Journal::SNAPSHOT_CREDENTIAL_DEPTH for why raising
+    // it there is safe for a different reason rather than a weaker one.
+    if ( $depth > $max_depth ) {
       return true;
     }
 
@@ -340,11 +351,11 @@ class GMCP_Core {
       }
       if ( function_exists( 'is_serialized' ) && is_serialized( $trimmed ) ) {
         $unpacked = @unserialize( $trimmed, [ 'allowed_classes' => false ] );
-        return $unpacked === false ? false : self::holds_credential( $unpacked, $depth + 1 );
+        return $unpacked === false ? false : self::holds_credential( $unpacked, $depth + 1, $max_depth );
       }
       if ( $trimmed[0] === '{' || $trimmed[0] === '[' ) {
         $decoded = json_decode( $trimmed, true );
-        return is_array( $decoded ) ? self::holds_credential( $decoded, $depth + 1 ) : false;
+        return is_array( $decoded ) ? self::holds_credential( $decoded, $depth + 1, $max_depth ) : false;
       }
       return false;
     }
@@ -360,7 +371,10 @@ class GMCP_Core {
       if ( is_string( $key ) && self::field_looks_secret( $key ) ) {
         return true;
       }
-      if ( self::holds_credential( $inner, $depth + 1 ) ) {
+      // The limit travels with the recursion. Dropping it here would reinstate the
+      // shallow default one level down, which is the whole array branch, so an override
+      // would appear to work on a flat value and quietly fail on a nested one.
+      if ( self::holds_credential( $inner, $depth + 1, $max_depth ) ) {
         return true;
       }
     }

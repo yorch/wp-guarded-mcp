@@ -179,6 +179,15 @@ snapshot that has expired makes its entry report the copy as gone rather than si
 putting back something stale. A value past a megabyte, or one whose key name or contents
 look like a credential, is recorded as changed with no copy kept and says which.
 
+That contents check walks much deeper here than it does for an option. Both ask the same
+function, and it refuses anything below its limit on the grounds that a limit answering
+"no" down there would be a way to hide a secret by burying it. Six levels is right where
+the answer feeds something a person reads. It was wrong here: a page-builder design nests
+far past that, so every design was refused for being deep rather than for holding
+anything, which declined exactly the values meta undo exists to restore. The deeper limit
+is stricter rather than looser, because a secret buried below six levels is now found and
+named instead of being refused indistinguishably from a design with nothing in it.
+
 Reverting is gated twice: on the tool that made the change, and on the operation the revert will perform, derived from the entry's own kind. Both are needed, because the recorded tool is whatever was in flight rather than what wrote the row. A plugin hooked on `save_post` that writes an option produces an option entry attributed to `wp_update_post`, and gating on that name alone let a write-level caller replay an admin-level option write.
 
 Credential-shaped leaves are not stored, judged by the field names inside a value through `gmcp_credential_field_patterns` as well as by the option's own name. The rest of the value is: the shape is kept and only those leaves are blanked, so the change stays reversible and the entry says the restore will be partial. Undo then puts back everything that was recorded and leaves each blanked leaf exactly as it is now, because writing the placeholder over a live credential would destroy the secret the blanking exists to protect. That matters more than it sounds: the patterns match as substrings, so `key` also matches `keywords` and `monkey` and `auth` also matches `author`, and dropping the whole value cost undo to any option merely containing a field so named. Elementor's icon registry, which stores an icon name under `key`, was the case that surfaced it.
