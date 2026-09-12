@@ -48,7 +48,6 @@ register_activation_hook( GMCP_ENTRY, function () {
   require_once( GMCP_PATH . '/includes/oauth.php' );
   require_once( GMCP_PATH . '/includes/audit.php' );
   require_once( GMCP_PATH . '/includes/journal.php' );
-  gmcp_adopt_previous_data();
   GMCP_Audit::install();
   // The journal's meta snapshots. Created here as well as lazily from the journal's own
   // constructor, so a site that has the change journal switched off still has the table
@@ -65,47 +64,3 @@ register_deactivation_hook( GMCP_ENTRY, function () {
   require_once( GMCP_PATH . '/includes/audit.php' );
   GMCP_Audit::unschedule();
 } );
-
-/**
-* Carry settings and OAuth grants across from the plugin's previous name.
-*
-* This shipped once as Reeve, under a reeve_ prefix. Renaming the options and tables
-* would otherwise reset a working install to defaults on upgrade: the bearer token gone,
-* the access level back to admin, the tool groups back off, and every connected app
-* silently disconnected with no way to tell why. That is a bad way to find out a plugin
-* was renamed.
-*
-* Runs once, on activation, and only where the new rows do not already exist, so it
-* cannot overwrite a fresh install that happens to sit beside an old one. The old rows
-* are left alone rather than deleted: if this goes wrong, the previous version can still
-* be reactivated and will find its own data.
-*
-* Delete this once no install of the old name plausibly remains.
-*/
-function gmcp_adopt_previous_data(): void {
-  global $wpdb;
-
-  // 'activity' is deliberately absent. That option is retired in favour of the audit
-  // table, and carrying it across here resurrected it on every activation: the audit
-  // adoption below declines to import once the table has rows, so nothing ever cleared
-  // it again. GMCP_Audit::adopt_activity_option() reads the old name directly instead.
-  foreach ( [ 'options', 'journal', 'tokens', 'oauth_db_version' ] as $name ) {
-    $old = get_option( 'reeve_' . $name, null );
-    if ( $old !== null && get_option( 'gmcp_' . $name, null ) === null ) {
-      // autoload false everywhere except the settings row, matching how each is written.
-      add_option( 'gmcp_' . $name, $old, '', $name === 'options' );
-    }
-  }
-
-  // The OAuth tables carry live grants. Renaming rather than copying keeps the row ids,
-  // which the tokens reference.
-  foreach ( [ 'oauth_clients', 'oauth_tokens' ] as $table ) {
-    $from = $wpdb->prefix . 'reeve_' . $table;
-    $to = $wpdb->prefix . 'gmcp_' . $table;
-    $have_old = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $from ) ) === $from;
-    $have_new = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $to ) ) === $to;
-    if ( $have_old && !$have_new ) {
-      $wpdb->query( "RENAME TABLE `{$from}` TO `{$to}`" );
-    }
-  }
-}

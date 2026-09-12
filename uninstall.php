@@ -22,23 +22,13 @@ delete_option( 'gmcp_audit_hash_boundary' );
 delete_option( 'gmcp_journal' );
 delete_option( 'gmcp_tokens' );
 
-// And anything left under the name this plugin shipped as before. The activation
-// migration copies rather than moves, so an uninstall has to clear both.
-delete_option( 'reeve_options' );
-delete_option( 'reeve_oauth_db_version' );
-delete_option( 'reeve_activity' );
-delete_option( 'reeve_journal' );
-delete_option( 'reeve_tokens' );
-
 // OAuth clients and grants. Dropping these revokes every connected app, which is the
 // point: leaving live tokens behind for a plugin that no longer exists would mean
 // credentials nobody can see or revoke.
 $clients = $wpdb->prefix . 'gmcp_oauth_clients';
 $tokens = $wpdb->prefix . 'gmcp_oauth_tokens';
-$old_clients = $wpdb->prefix . 'reeve_oauth_clients';
-$old_tokens = $wpdb->prefix . 'reeve_oauth_tokens';
 $audit = $wpdb->prefix . 'gmcp_audit';
-$wpdb->query( "DROP TABLE IF EXISTS {$tokens}, {$clients}, {$old_tokens}, {$old_clients}, {$audit}" );
+$wpdb->query( "DROP TABLE IF EXISTS {$tokens}, {$clients}, {$audit}" );
 
 // The prune schedule outlives the plugin files otherwise, and WordPress will keep firing
 // an action nothing listens to until somebody notices.
@@ -52,7 +42,5 @@ if ( $next ) {
 $wpdb->query(
   "DELETE FROM {$wpdb->options}
    WHERE option_name LIKE '_transient_gmcp_%'
-      OR option_name LIKE '_transient_timeout_gmcp_%'
-      OR option_name LIKE '_transient_reeve_%'
-      OR option_name LIKE '_transient_timeout_reeve_%'"
+      OR option_name LIKE '_transient_timeout_gmcp_%'"
 );

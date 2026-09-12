@@ -561,7 +561,7 @@ check "and the old option is gone" \
 docker compose exec -T cli wp plugin deactivate guarded-mcp >/dev/null 2>&1
 docker compose exec -T cli wp plugin activate guarded-mcp >/dev/null 2>&1
 check "and stays gone across a reactivation" \
-  "$(docker compose exec -T cli wp eval 'echo get_option("gmcp_activity",null)===null && get_option("reeve_activity",null)===null ?"gone":"RESURRECTED";' 2>/dev/null | tr -d '\r\n')" "gone"
+  "$(docker compose exec -T cli wp eval 'echo get_option("gmcp_activity",null)===null?"gone":"RESURRECTED";' 2>/dev/null | tr -d '\r\n')" "gone"
 
 echo "-- site briefing --"
 # One call has to answer "what am I looking at", or an agent spends five round trips
