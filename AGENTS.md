@@ -27,9 +27,13 @@ and the change journal's undo. Add a rule there, not in a caller. This exists be
 settings tool once enforced a policy no other writer did, so every refusal it made was
 reachable by naming the same row through a different tool.
 
-**Credential-shaped data never reaches the journal or the audit log.** `user_pass` is
-dropped unconditionally, and `GMCP_Core::field_looks_secret()` is the single answer both
-subsystems ask, so the two cannot drift apart.
+**Credential-shaped data never reaches the journal, the audit log, or the debug
+error_log.** `user_pass` is dropped unconditionally, and
+`GMCP_Core::field_looks_secret()` is the single answer both subsystems ask, so the
+two cannot drift apart. The debug `error_log` at `server.php:604` routes tool
+arguments through `GMCP_Core::redact()` for the same reason: it is a third channel
+the same credential can reach, and a channel with no redaction is a leak waiting
+for the first caller that passes a secret.
 
 **There is no restore tool, at any access level.** Backups can be started and read. That is
 deliberate and not an omission to be helpfully filled in.
