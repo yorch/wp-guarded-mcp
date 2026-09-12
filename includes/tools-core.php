@@ -965,6 +965,151 @@ class GMCP_Tools_Core {
   }
   #endregion
 
+  #region Creating posts
+
+  /**
+  * The most items one wp_create_posts call will accept, and why it is this number.
+  *
+  * Not a guess about what an agent finds convenient. Two bounds already exist downstream
+  * and a batch that walks past either one stops being legible, which is the whole reason
+  * batch writing was held back rather than shipped with the rest.
+  *
+  * GMCP_Changes::MAX_RECORDS is 40 records per call. Past that the audit row stops listing
+  * what happened and starts counting it, so the one row a reviewer opens to see what the
+  * agent did says "and 31 more".
+  *
+  * GMCP_Journal::LIMIT is 40 entries for the WHOLE journal, not per call. This is the
+  * sharper bound and the easier one to miss: a batch that emits more than forty journal
+  * entries does not merely lose its own earliest rows, it evicts everything else already
+  * on the undo list. One convenient call would clear the site's undo history.
+  *
+  * Measured here on the fixture, one wp_create_post costs one audit record for the post
+  * plus one record and one journal entry per meta key. So twenty items carrying a single
+  * meta key each is forty audit records, exactly at the summary cap, and twenty journal
+  * entries, half the journal window, which leaves room for the option rows a page save
+  * triggers underneath: the triage item this came from is a reporter counting nine journal
+  * rows after what they thought was one action.
+  *
+  * Twenty is also comfortably more than the complaint. The reporter made seven
+  * near-identical page calls and eight menu-item calls.
+  */
+  const CREATE_BATCH_MAX = 20;
+
+  /**
+  * One post created, exactly as wp_create_post creates it.
+  *
+  * EXTRACTED RATHER THAN COPIED, which is the only reason "every guard on wp_create_post
+  * applies to every item" is a fact about the code instead of a claim about it. A second
+  * copy of this would drift, and the direction it drifts in is the batch path missing a
+  * filter the single path had already learned to apply. prepare_new_content() is the one
+  * that matters: it routes a bare script tag through store_html(), and its own comment
+  * records that the markup sniff deliberately does not look for <script>, so the branch
+  * that catches one is easy to lose and silent when lost. There is one implementation and
+  * both callers reach it.
+  *
+  * The title check is NOT here. It belongs to the caller because the two callers make it
+  * at different moments: the single tool refuses one call, and the batch refuses the whole
+  * list before it writes anything.
+  *
+  * @param array  $a    One item: post_title, post_content, post_excerpt, post_status,
+  *                     post_type, post_name, meta_input.
+  * @param string $tool Which tool is asking. Cache-bust context only.
+  * @return int|WP_Error The new post ID.
+  */
+  private function create_one_post( array $a, string $tool ) {
+    $ins = [
+      'post_title' => sanitize_text_field( $a['post_title'] ),
+      'post_status' => sanitize_key( $a['post_status'] ?? 'draft' ),
+      'post_type' => sanitize_key( $a['post_type'] ?? 'post' ),
+    ];
+    if ( $a['post_content'] ?? '' ) {
+      $ins['post_content'] = $this->prepare_new_content( $a['post_content'] );
+    }
+    if ( $a['post_excerpt'] ?? '' ) {
+      $ins['post_excerpt'] = $this->clean_html( $a['post_excerpt'] );
+    }
+    if ( $a['post_name'] ?? '' ) {
+      $ins['post_name'] = sanitize_title( $a['post_name'] );
+    }
+
+    // Handle JSON strings for meta_input (some MCP clients send objects as JSON strings)
+    $meta_input = $a['meta_input'] ?? [];
+    if ( is_string( $meta_input ) ) {
+      $meta_input = json_decode( $meta_input, true ) ?? [];
+    }
+    if ( !empty( $meta_input ) && is_array( $meta_input ) ) {
+      $ins['meta_input'] = $meta_input;
+    }
+
+    $new = wp_insert_post( wp_slash( $ins ), true );
+    if ( is_wp_error( $new ) ) {
+      return $new;
+    }
+    if ( empty( $ins['meta_input'] ) && !empty( $meta_input ) && is_array( $meta_input ) ) {
+      foreach ( $meta_input as $k => $v ) {
+        // Pass the value as-is: update_post_meta() serializes arrays itself.
+        // maybe_serialize() here double-serialized nested arrays, so they read
+        // back as a string and consumers (e.g. Noptin) rejected them as legacy.
+        update_post_meta( $new, sanitize_key( $k ), $v );
+      }
+    }
+    $this->bust_post_cache( (int) $new, [ 'tool' => $tool ] );
+    return (int) $new;
+  }
+
+  /**
+  * What a batch can say about undoing itself, which is less than a reader expects.
+  *
+  * MEASURED, NOT ASSUMED, because the opposite is the obvious thing to believe and it is
+  * wrong. A batch runs inside one tool call, so it does inherit the call grouping: every
+  * row it journals carries one call id and one wp_undo_change on that group reverses all
+  * of them. But a CREATION is not a row the journal has. GMCP_Journal::observe_post()
+  * returns early unless the operation is an update, on the reasoning that undo restores
+  * fields and a creation has no previous field to restore, so the journal's vocabulary is
+  * options, post updates and post meta, and nothing in it means "remove this post".
+  *
+  * Checked on a running site rather than read off the source: wp_create_post with no
+  * meta_input leaves the journal empty and wp_list_changes returns []. With two meta keys
+  * it leaves exactly those two rows, sharing one call id, and no row for the post. The
+  * audit log does record the creation, so the two subsystems genuinely differ here.
+  *
+  * So the reply says what is true of this call rather than what is true in general. When
+  * the batch wrote meta there is a real group and it is named; when it did not there is no
+  * group and naming one would be a false yes pointed at the caller. Either way the created
+  * posts come off with wp_delete_post and the reply says so, because a caller who reverts
+  * the group and believes the pages are gone is in a worse position than one who was told
+  * nothing.
+  *
+  * @param bool $wrote_meta Whether any item carried meta_input.
+  */
+  private function batch_undo_note( bool $wrote_meta ): string {
+    $note = 'wp_undo_change cannot remove a created post: the change journal records option'
+      . ' writes, post updates and custom fields, and has no entry for a creation. Delete the'
+      . ' ids above with wp_delete_post instead.';
+    if ( !$wrote_meta ) {
+      return $note . ' This call journalled nothing, so it has no group to revert.';
+    }
+    if ( !class_exists( 'GMCP_Journal' ) || !$this->core->get_option( 'mcp_change_journal' ) ) {
+      return $note . ' The change journal is off on this site, so nothing was recorded.';
+    }
+    $group = '';
+    if ( class_exists( 'GMCP_Changes' ) ) {
+      foreach ( GMCP_Changes::captured() as $record ) {
+        if ( ( $record['call'] ?? '' ) !== '' ) {
+          $group = GMCP_Journal::GROUP_PREFIX . $record['call'];
+          break;
+        }
+      }
+    }
+    $note .= ' The custom fields this call wrote ARE journalled, grouped under this one call';
+    return $group === ''
+      ? $note . '; wp_list_changes shows the group.'
+      : $note . ' as "' . $group . '", and one wp_undo_change on that id removes all of them'
+        . ' while leaving the posts standing.';
+  }
+
+  #endregion
+
   #region Tools Definitions
   private function tools(): array {
     return [
@@ -1327,9 +1472,37 @@ class GMCP_Tools_Core {
         ],
         'accessLevel' => 'write',
       ],
+      'wp_create_posts' => [
+        'name' => 'wp_create_posts',
+        'description' => 'Create up to ' . self::CREATE_BATCH_MAX . ' posts, pages or custom post types in ONE call, instead of that many wp_create_post calls. Pass "items", an ordered array of objects taking exactly the arguments wp_create_post takes (post_title required; post_content, post_excerpt, post_status, post_type, post_name, meta_input optional). Every item goes through the same code path as a single create, so the same HTML filtering, the same status and type defaults and the same meta handling apply to each one; a batch is not a way to write content a single call would have filtered. NOT TRANSACTIONAL, and nothing here is: items run in order and the run STOPS at the first failure, so earlier items are already written and cannot be rolled back. The reply is three lists, what was created with its new id, what failed and why, and what was never attempted, plus retry_from_index so you can resend the remainder without re-reading the list. Obvious mistakes are caught before anything is written: if any item is missing post_title the whole call refuses and creates nothing. Undo is limited and the reply says how: wp_undo_change has no entry for a creation and cannot remove a created post, so use wp_delete_post on the returned ids.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'items' => [
+              'type' => 'array',
+              'description' => 'Ordered list of posts to create. Each entry takes the same arguments as wp_create_post. Maximum ' . self::CREATE_BATCH_MAX . ' entries; a longer list is refused whole and nothing is created.',
+              'items' => [
+                'type' => 'object',
+                'properties' => [
+                  'post_title' => [ 'type' => 'string' ],
+                  'post_content' => [ 'type' => 'string' ],
+                  'post_excerpt' => [ 'type' => 'string' ],
+                  'post_status' => [ 'type' => 'string' ],
+                  'post_type' => [ 'type' => 'string' ],
+                  'post_name' => [ 'type' => 'string' ],
+                  'meta_input' => [ 'type' => 'object', 'description' => 'Associative array of custom fields.' ],
+                ],
+                'required' => [ 'post_title' ],
+              ],
+            ],
+          ],
+          'required' => [ 'items' ],
+        ],
+        'accessLevel' => 'write',
+      ],
       'wp_duplicate_post' => [
         'name' => 'wp_duplicate_post',
-        'description' => 'Duplicate an existing post, page or custom post type, copying its content, excerpt, type, parent, menu order and comment/ping settings. The copy is a DRAFT unless you pass post_status, whatever the source\'s status was: a duplicate going live on a misread instruction is exactly what this plugin exists to prevent, so publishing is always a separate, deliberate call. include_meta (default true) copies every meta key except _edit_lock and _edit_last; the copy happens inside PHP, so an Elementor _elementor_data blob of any size moves without passing through a tool argument. include_terms (default true) copies the term assignments of every taxonomy registered to the post type. Returns the new post ID. The new post is journalled and can be removed with wp_delete_post. The copied meta is journalled too, one entry per key, so an individual field can be put back with wp_undo_change; a value larger than a megabyte is recorded as changed without a copy and says so.',
+        'description' => 'Duplicate an existing post, page or custom post type, copying its content, excerpt, type, parent, menu order and comment/ping settings. The copy is a DRAFT unless you pass post_status, whatever the source\'s status was: a duplicate going live on a misread instruction is exactly what this plugin exists to prevent, so publishing is always a separate, deliberate call. include_meta (default true) copies every meta key except _edit_lock and _edit_last; the copy happens inside PHP, so an Elementor _elementor_data blob of any size moves without passing through a tool argument. include_terms (default true) copies the term assignments of every taxonomy registered to the post type. Returns the new post ID. The new post is NOT journalled, so wp_undo_change will not remove it: the journal records modifications and deliberately not creations, because putting back a creation means deleting something and that is not the same write in reverse. Delete it with wp_delete_post if you need it gone. The copied meta IS journalled, one entry per key, so an individual field can be put back with wp_undo_change; a value larger than a megabyte is recorded as changed without a copy and says so.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -3108,46 +3281,134 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'post_title required', -32602 );
           break;
         }
-        $ins = [
-          'post_title' => sanitize_text_field( $a['post_title'] ),
-          'post_status' => sanitize_key( $a['post_status'] ?? 'draft' ),
-          'post_type' => sanitize_key( $a['post_type'] ?? 'post' ),
-        ];
-        if ( $a['post_content'] ?? '' ) {
-          $ins['post_content'] = $this->prepare_new_content( $a['post_content'] );
-        }
-        if ( $a['post_excerpt'] ?? '' ) {
-          $ins['post_excerpt'] = $this->clean_html( $a['post_excerpt'] );
-        }
-        if ( $a['post_name'] ?? '' ) {
-          $ins['post_name'] = sanitize_title( $a['post_name'] );
-        }
-
-        // Handle JSON strings for meta_input (some MCP clients send objects as JSON strings)
-        $meta_input = $a['meta_input'] ?? [];
-        if ( is_string( $meta_input ) ) {
-          $meta_input = json_decode( $meta_input, true ) ?? [];
-        }
-        if ( !empty( $meta_input ) && is_array( $meta_input ) ) {
-          $ins['meta_input'] = $meta_input;
-        }
-
-        $new = wp_insert_post( wp_slash( $ins ), true );
+        $new = $this->create_one_post( $a, 'wp_create_post' );
         if ( is_wp_error( $new ) ) {
           $r = $this->error( $r, $new->get_error_message(), $new->get_error_code() );
         }
         else {
-          if ( empty( $ins['meta_input'] ) && !empty( $meta_input ) && is_array( $meta_input ) ) {
-            foreach ( $meta_input as $k => $v ) {
-              // Pass the value as-is: update_post_meta() serializes arrays itself.
-              // maybe_serialize() here double-serialized nested arrays, so they read
-              // back as a string and consumers (e.g. Noptin) rejected them as legacy.
-              update_post_meta( $new, sanitize_key( $k ), $v );
-            }
-          }
-          $this->bust_post_cache( (int) $new, [ 'tool' => 'wp_create_post' ] );
           $this->add_result_text( $r, 'Post created ID ' . $new );
         }
+        break;
+
+        /* ===== Posts: create in a batch ===== */
+      case 'wp_create_posts':
+        // Same concession the single create makes for meta_input: some MCP clients send a
+        // structured argument as a JSON string.
+        $items = $a['items'] ?? null;
+        if ( is_string( $items ) ) {
+          $items = json_decode( $items, true );
+        }
+        if ( !is_array( $items ) || !$items ) {
+          $r = $this->error( $r, '"items" must be a non-empty array of post objects, each shaped like a wp_create_post call.', -32602 );
+          break;
+        }
+        // Positions, so every index the reply prints indexes the list the caller sent.
+        $items = array_values( $items );
+
+        // THE CAP, CHECKED BEFORE ANYTHING IS WRITTEN. A cap enforced part way through
+        // would be the batch's own failure mode with none of its reporting: some posts
+        // written, and a refusal that reads as though none were.
+        if ( count( $items ) > self::CREATE_BATCH_MAX ) {
+          $r = $this->error( $r, 'A batch is capped at ' . self::CREATE_BATCH_MAX . ' items and this one has '
+            . count( $items ) . '. Nothing was created. The cap is what keeps a batch legible afterwards: past it the'
+            . ' audit log stops listing the changes and starts counting them, and the change journal holds '
+            . GMCP_Journal::LIMIT . ' entries for the whole site, so one oversized call would push everything else off'
+            . ' the undo list. Send the first ' . self::CREATE_BATCH_MAX . ' and then the rest.', -32602 );
+          break;
+        }
+
+        // VALIDATED UP FRONT, AND ONLY FOR WHAT CAN HONESTLY BE CHECKED WITHOUT WRITING.
+        // Stopping at the first failure still leaves the earlier items written, so the
+        // mistakes worth catching are the ones a hand-built list of fifteen really makes:
+        // an entry that is not an object, and a missing title. Both are certain, both are
+        // free, and catching them here means a typo at item twelve costs nothing instead
+        // of leaving eleven pages behind.
+        //
+        // It deliberately does NOT check post_type or post_status against what is
+        // registered. Those would be guards the single create does not have, and a batch
+        // that refuses what wp_create_post accepts is as much a divergence as one that
+        // accepts what wp_create_post refuses. It is the same rule read the other way.
+        //
+        // So this narrows the window rather than closing it. wp_insert_post can still fail
+        // on the seventh item for a reason nothing here could predict, a database error or
+        // a plugin vetoing the save, which is why the three lists below exist at all.
+        $unfit = [];
+        foreach ( $items as $i => $item ) {
+          if ( !is_array( $item ) ) {
+            $unfit[] = 'item ' . $i . ' is not an object';
+            continue;
+          }
+          if ( empty( $item['post_title'] ) ) {
+            $unfit[] = 'item ' . $i . ' has no post_title';
+          }
+        }
+        if ( $unfit ) {
+          $r = $this->error( $r, 'Nothing was created. ' . count( $unfit ) . ' of ' . count( $items )
+            . ' items would have failed, and they were found before anything was written: '
+            . implode( '; ', $unfit ) . '.', -32602 );
+          break;
+        }
+
+        $batch_created = [];
+        $batch_failed = [];
+        $batch_wrote_meta = false;
+        $batch_stopped = -1;
+        foreach ( $items as $i => $item ) {
+          if ( !empty( $item['meta_input'] ) ) {
+            $batch_wrote_meta = true;
+          }
+          $made = $this->create_one_post( $item, 'wp_create_posts' );
+          if ( is_wp_error( $made ) ) {
+            $batch_failed[] = [
+              'index' => $i,
+              'post_title' => (string) $item['post_title'],
+              'reason' => $made->get_error_message(),
+            ];
+            $batch_stopped = $i;
+            break;
+          }
+          $batch_created[] = [
+            'index' => $i,
+            'ID' => (int) $made,
+            // The STORED title, read raw. The filtering happened on the way in and the
+            // reply should show what the site now holds rather than echo what was asked
+            // for: a caller comparing the two is exactly how a filter that stopped running
+            // would be noticed.
+            'post_title' => (string) get_post_field( 'post_title', (int) $made, 'raw' ),
+          ];
+        }
+
+        // THE UNATTEMPTED HALF IS THE USABLE HALF. A list of what was skipped is only
+        // decorative if the caller still has to work out where to resume, so this names
+        // the slice point: retry_from_index indexes the array they sent, and resending
+        // items from there is the whole remainder and nothing already written.
+        $batch_untried = [];
+        if ( $batch_stopped >= 0 ) {
+          for ( $i = $batch_stopped + 1; $i < count( $items ); $i++ ) {
+            $batch_untried[] = [
+              'index' => $i,
+              'post_title' => (string) ( $items[ $i ]['post_title'] ?? '' ),
+            ];
+          }
+        }
+
+        $batch_summary = 'Created ' . count( $batch_created ) . ' of ' . count( $items ) . '.';
+        if ( $batch_failed ) {
+          $batch_summary .= ' Item ' . $batch_stopped . ' failed, so the run stopped there and '
+            . count( $batch_untried ) . ' later item' . ( count( $batch_untried ) === 1 ? ' was' : 's were' )
+            . ' never attempted. The items before it are already written and nothing here rolls them back.';
+        }
+
+        $this->add_result_text( $r, wp_json_encode( [
+          'summary' => $batch_summary,
+          'created' => $batch_created,
+          // At most one entry, because the run stops at the first failure. A list rather
+          // than a lone object so the caller parses all three the same way.
+          'failed' => $batch_failed,
+          'not_attempted' => $batch_untried,
+          'retry_from_index' => $batch_stopped >= 0 ? $batch_stopped : null,
+          'undo' => $this->batch_undo_note( $batch_wrote_meta ),
+        ], JSON_PRETTY_PRINT ) );
         break;
 
         /* ===== Posts: duplicate ===== */

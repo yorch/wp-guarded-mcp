@@ -77,6 +77,71 @@ class GMCP_Tools_Elementor {
   const SCAN_LIMIT = 500;
 
   /**
+  * Where Elementor records which kit is in force, and what a kit is.
+  *
+  * A kit is an elementor_library post whose template type is "kit"; the option names the one
+  * Elementor reads. The two can disagree, and the disagreement is silent: Elementor's kit
+  * manager substitutes an empty kit whenever the option names a post that is missing, trashed
+  * or not a kit, and an empty kit answers every settings question with Elementor's own
+  * built-in defaults. Nothing in the editor says so. That is why the report checks the id it
+  * gets back against the id it asked for rather than trusting the object.
+  */
+  const KIT_OPTION = 'elementor_active_kit';
+  const KIT_TYPE = 'kit';
+  const KIT_SETTINGS_META = '_elementor_page_settings';
+
+  /**
+  * The kit settings that hold the globals, and which of the two groups each one is.
+  *
+  * System globals are the four Elementor ships and cannot be removed; custom globals are the
+  * ones somebody added. Both are repeaters of rows keyed by _id, and a design refers to a row
+  * by that _id and never by its label.
+  */
+  const GLOBAL_COLOURS = [ 'system_colors' => 'system', 'custom_colors' => 'custom' ];
+  const GLOBAL_FONTS = [ 'system_typography' => 'system', 'custom_typography' => 'custom' ];
+
+  /**
+  * Site-wide kit settings worth naming, and what each one is in plain words.
+  *
+  * A list rather than a dump of everything, because the kit carries eighty-odd keys on a
+  * free install and most of them are one facet of a background control. Every key a caller
+  * has actually changed is reported in full regardless of this list, so a setting missing
+  * from here is still visible; what this list buys is a name for the ones worth reading.
+  *
+  * Keys absent from a given Elementor version are reported as not reported rather than as
+  * unset, because those are different claims and only one of them is true.
+  */
+  const KIT_SETTINGS = [
+    'site_name' => 'Site name, as Elementor\'s own site-identity widgets print it',
+    'site_description' => 'Site description, as Elementor\'s own widgets print it',
+    'site_logo' => 'Site logo Elementor\'s own widgets use',
+    'site_favicon' => 'Favicon Elementor sets',
+    'default_generic_fonts' => 'Fallback family appended after every global font',
+    'container_width' => 'Default content width',
+    'container_padding' => 'Default padding inside a container',
+    'space_between_widgets' => 'Default space between widgets',
+    'default_page_template' => 'Page layout a new page is given',
+    'page_title_selector' => 'CSS selector Elementor hides when a page hides its title',
+    'stretched_section_container' => 'Element a stretched section is stretched to fit',
+    'active_breakpoints' => 'Which responsive breakpoints exist on this site',
+    'body_background_background' => 'Kind of site-wide page background',
+    'body_background_color' => 'Site-wide page background colour',
+    'global_image_lightbox' => 'Whether images open in Elementor\'s lightbox',
+  ];
+
+  /** Documents pulled into memory at once while counting global usage. */
+  const USAGE_PAGE = 25;
+
+  /**
+  * Longest a single setting value is reported inline, in bytes of JSON.
+  *
+  * Anything longer is described rather than printed. A kit can hold custom CSS or an
+  * imported breakpoint set of any size, and a report that quietly becomes 200KB is a report
+  * nobody can afford to ask for twice.
+  */
+  const SETTING_VALUE_LIMIT = 400;
+
+  /**
   * Which theme-builder location each template type belongs to.
   *
   * Elementor registers four locations and more than one template type lands in each: a 404
@@ -213,6 +278,24 @@ class GMCP_Tools_Elementor {
         ],
         'accessLevel' => 'read',
       ],
+      'elementor_kit_report' => [
+        'name' => 'elementor_kit_report',
+        'description' => 'Report Elementor\'s kit: the global colours and fonts the whole site draws from, the site-wide settings the kit holds, and whether the kit Elementor is reading is the one you think it is. Changes nothing, at all, by design: a kit write against an internal shape that moved between Elementor versions corrupts a site\'s global styling everywhere at once, which is not a risk worth an agent taking, so there is no kit write tool here and this is not an omission to be filled in. Reports which kit is active with its ID and title, every global with its label, its value and the globals/... reference a design uses to point at it, and any other kit in the library, since a site with two kits where the inactive one is the edited one is the usual reason a global change appears to do nothing. With include_usage it also counts which designs refer to each global, which is what separates a colour that is safe to change from one that is on every button. Settings whose shape it does not recognise are reported as stored rather than dropped. Works on the free Elementor plugin: the kit is part of Elementor itself and not of the theme builder, unlike this file\'s conditions tools.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'include_usage' => [
+              'type' => 'boolean',
+              'description' => 'Count which designs refer to each global. Default false, because it reads every Elementor document on the site that uses any global at all, and those documents are routinely over 100KB each. Ask for it when you are about to change or remove a global, not to look around.',
+            ],
+            'limit' => [
+              'type' => 'integer',
+              'description' => 'Most referring posts listed per global when include_usage is set. Default 20, maximum 100. Counts are not capped by this; only the listed rows are.',
+            ],
+          ],
+        ],
+        'accessLevel' => 'read',
+      ],
     ];
   }
 
@@ -240,6 +323,16 @@ class GMCP_Tools_Elementor {
       }
     }
 
+    // And the kit report reads elementor_active_kit, which is an option like any other and
+    // answers to the same guard for the same reason: a site that has protected that name is
+    // not read around by a tool that happens to know a different way in.
+    if ( $tool === 'elementor_kit_report' ) {
+      $allowed = GMCP_Core::option_guard( self::KIT_OPTION );
+      if ( $allowed !== true ) {
+        return $this->error( $r, $allowed );
+      }
+    }
+
     switch ( $tool ) {
       case 'elementor_list_templates': $r = $this->list_templates( $args, $r ); break;
       case 'elementor_get_conditions': $r = $this->get_conditions( $args, $r ); break;
@@ -247,6 +340,7 @@ class GMCP_Tools_Elementor {
       case 'elementor_regenerate_css': $r = $this->regenerate_css( $args, $r ); break;
       case 'elementor_apply_template': $r = $this->apply_template( $args, $r ); break;
       case 'elementor_template_references': $r = $this->template_references( $args, $r ); break;
+      case 'elementor_kit_report': $r = $this->kit_report( $args, $r ); break;
       default:
         $r['error'] = [ 'code' => -32601, 'message' => 'Unknown tool' ];
         return $r;
@@ -1128,4 +1222,506 @@ class GMCP_Tools_Elementor {
   }
 
   #endregion
+
+  #region Kit
+
+  /**
+  * What Elementor's kit says the site's globals and site-wide settings are.
+  *
+  * Two sources, because neither alone tells the truth.
+  *
+  * Elementor's own kit document is authoritative for what is in force: it merges the kit's
+  * saved settings over its controls' defaults, so on a site nobody has touched it still
+  * reports the four system colours the editor shows, which the stored meta does not contain
+  * at all. Reading only the meta would report a fresh site as having no globals.
+  *
+  * The stored meta is authoritative for what somebody chose. A value in the merged view may
+  * be a default nobody has ever seen, and "this colour is Elementor's #6EC1E4 because nobody
+  * changed it" and "this colour is #6EC1E4 because somebody picked it" are different facts
+  * when the question is whether changing it is safe.
+  *
+  * Between them there is still a gap, and it is named in the report rather than papered over.
+  * Elementor does not register the same controls on every request. Measured on Elementor
+  * 4.2.4 against one site: 403 kit controls through the REST endpoint this tool answers on,
+  * 146 through WP-CLI, with container_width and space_between_widgets among the ones the
+  * smaller set lacks. A saved value still comes through either way, because the merge puts
+  * it there, but a setting nobody has changed and whose control is not registered is absent
+  * from the merge entirely and its shipped default cannot be read at all. The report says
+  * "not reported" for those rather than "not set": the first is true and the second would be
+  * a false negative about a setting that is live on the front end.
+  */
+  private function kit_report( array $a, array $r ): array {
+    $option = get_option( self::KIT_OPTION, null );
+    $active_id = is_scalar( $option ) ? (int) $option : 0;
+    $post = $active_id > 0 ? get_post( $active_id ) : null;
+    $kits = $this->kit_posts();
+    $state = $this->kit_state( $option, $post, $kits );
+
+    $live = $this->kit_settings_from_elementor( $active_id );
+    $saved = get_post_meta( $active_id > 0 ? $active_id : 0, self::KIT_SETTINGS_META, true );
+    $saved = is_array( $saved ) ? $saved : [];
+
+    $colours = [];
+    foreach ( self::GLOBAL_COLOURS as $key => $group ) {
+      $colours = array_merge( $colours, $this->global_rows( $live['settings'], $saved, $key, $group, 'colors' ) );
+    }
+    $fonts = [];
+    foreach ( self::GLOBAL_FONTS as $key => $group ) {
+      $fonts = array_merge( $fonts, $this->global_rows( $live['settings'], $saved, $key, $group, 'typography' ) );
+    }
+
+    $usage = null;
+    if ( !empty( $a['include_usage'] ) ) {
+      $limit = max( 1, min( 100, isset( $a['limit'] ) ? (int) $a['limit'] : 20 ) );
+      $usage = $this->globals_usage( array_merge( $colours, $fonts ), $limit );
+      $colours = $this->attach_usage( $colours, $usage );
+      $fonts = $this->attach_usage( $fonts, $usage );
+    }
+
+    return $this->json( $r, [
+      'kit' => [
+        'option' => self::KIT_OPTION,
+        'active_id' => $active_id > 0 ? $active_id : null,
+        'title' => $post ? $post->post_title : null,
+        'status' => $post ? $post->post_status : null,
+        'template_type' => $post ? (string) get_post_meta( $post->ID, self::TYPE_META, true ) : null,
+        'state' => $state['state'],
+        'meaning' => $state['meaning'],
+      ],
+      'read_through_elementor' => $live['available'],
+      'read_note' => $live['reason'],
+      'theme_builder_note' => 'The kit is part of Elementor itself, not of the theme builder, so everything below is live on a site with only the free plugin. That is the opposite of this file\'s conditions tools, which store their values happily and are read by nothing without Elementor Pro or PRO Elements. Pro adds kit settings of its own, and on a site without it those are absent below rather than reported as empty.'
+          . ( $this->theme_builder_present() ? ' The theme builder is present on this site.' : ' The theme builder is not present on this site.' ),
+      'globals' => [
+        'colors' => $colours,
+        'fonts' => $fonts,
+      ],
+      'settings' => $this->setting_rows( $live['settings'], $saved ),
+      'saved_on_the_kit' => $this->saved_rows( $saved ),
+      'saved_note' => $saved === []
+        ? 'The kit has no stored settings at all, so every value above is a default Elementor ships rather than a choice anybody made here.'
+        : 'Every key the kit has explicitly stored, reported as stored whether or not anything here recognises its shape. The four globals keys are left out because they are reported in full above.',
+      'other_kits' => $this->other_kit_rows( $kits, $active_id ),
+      'usage' => $usage === null ? null : [
+        'documents_examined' => $usage['documents_examined'],
+        'truncated' => $usage['truncated'],
+        'method' => 'Every post holding an ' . self::DATA_META . ' row that mentions a global at all, matched on the reference string inside the stored document rather than by decoding it. Decoding is what elementor_template_references does and is what makes that tool exact; here the documents are routinely over 100KB each and there is one pass over all of them, so the exactness traded away is this: a design that merely quotes a reference string in its own text counts as using it. The closing quote in the needle is what stops a global named "brand" being counted for every use of "brand-dark".',
+        'not_searched' => [
+          'Post revisions and auto-drafts.',
+          'Anything outside ' . self::DATA_META . ', so a global used by a theme, a plugin or a template stored in an option is not counted.',
+          'Other sites in a multisite network.',
+        ],
+      ],
+      'summary' => $this->kit_summary( $state, $colours, $fonts, $usage ),
+    ] );
+  }
+
+  /**
+  * Every post that is a kit, active or not, trash included.
+  *
+  * Queried by the template-type meta rather than asked of Elementor, because Elementor's kit
+  * manager will not hand back a trashed kit and a trashed kit is exactly the one worth
+  * seeing: it is still named by the option, and a site in that state renders from Elementor's
+  * built-in defaults while the library still shows the kit somebody was editing.
+  *
+  * post_status has to be spelled out. WP_Query's "any" is not any: it excludes trash.
+  */
+  private function kit_posts(): array {
+    return $this->templates( [
+      'post_status' => [ 'publish', 'private', 'draft', 'pending', 'future', 'trash' ],
+      'posts_per_page' => 50,
+      'meta_key' => self::TYPE_META,
+      'meta_value' => self::KIT_TYPE,
+    ] );
+  }
+
+  /** Which of the six states the site is in, and what it means for what renders. */
+  private function kit_state( $option, $post, array $kits ): array {
+    if ( $option === null || $option === '' || (int) $option <= 0 ) {
+      return $kits === []
+        ? [
+          'state' => 'no kit',
+          'meaning' => 'Elementor has not created a kit on this site yet, and there are no global colours or fonts to report. It creates one when the site settings are first opened in the editor. This is not an error and nothing is broken; the site simply renders with the defaults Elementor ships.',
+        ]
+        : [
+          'state' => 'no active kit',
+          'meaning' => 'There ' . ( count( $kits ) === 1 ? 'is a kit' : 'are at least ' . count( $kits ) . ' kits' ) . ' in the library but the ' . self::KIT_OPTION . ' option names none of them, so Elementor is reading none of them. Whatever is stored on those kits has no effect until one is made active.',
+        ];
+    }
+    if ( !$post ) {
+      return [
+        'state' => 'active kit missing',
+        'meaning' => 'The ' . self::KIT_OPTION . ' option names post #' . (int) $option . ', which does not exist on this site. Elementor substitutes an empty kit without saying so, which means every global is silently its built-in default right now, whatever the site settings panel last showed.',
+      ];
+    }
+    if ( $post->post_status === 'trash' ) {
+      return [
+        'state' => 'active kit trashed',
+        'meaning' => 'The active kit, post #' . $post->ID . ', is in the trash. Elementor refuses a trashed kit and substitutes an empty one without saying so, so every global is its built-in default right now even though the kit and its settings are still there.',
+      ];
+    }
+    if ( $post->post_type !== 'elementor_library' || (string) get_post_meta( $post->ID, self::TYPE_META, true ) !== self::KIT_TYPE ) {
+      return [
+        'state' => 'active kit is not a kit',
+        'meaning' => 'The ' . self::KIT_OPTION . ' option names post #' . $post->ID . ', which is a ' . $post->post_type . ' and not a kit. Elementor substitutes an empty kit, so every global is its built-in default right now.',
+      ];
+    }
+    return [
+      'state' => 'active',
+      'meaning' => 'Post #' . $post->ID . ' is the kit Elementor reads, and the globals below are what the site is drawing from.',
+    ];
+  }
+
+  /**
+  * Elementor's merged view of the kit, or a sentence saying why there is not one.
+  *
+  * Every step is guarded and every failure names what was missing, because a version that
+  * moves any of this should cost the caller a report rather than the request. The identity
+  * check at the end is the one that matters: the kit manager answers a bad id with an empty
+  * kit rather than with nothing, and an empty kit reports Elementor's built-in defaults as
+  * confidently as a real one. Returning those as the site's globals would be the false yes.
+  */
+  private function kit_settings_from_elementor( int $kit_id ): array {
+    $absent = function ( string $reason ) {
+      return [ 'available' => false, 'reason' => $reason, 'settings' => [], 'controls' => 0 ];
+    };
+
+    if ( $kit_id <= 0 ) {
+      return $absent( 'There is no active kit to read, so the globals below come from the kit\'s stored settings alone and every default Elementor would have supplied is missing from them.' );
+    }
+    if ( !class_exists( '\Elementor\Plugin' ) || !isset( \Elementor\Plugin::$instance ) || !isset( \Elementor\Plugin::$instance->kits_manager ) ) {
+      return $absent( 'Elementor\'s kit manager is not available in this version, so nothing here could ask Elementor what the kit holds. The globals below come from the kit\'s stored settings alone, which contain only what somebody changed.' );
+    }
+
+    $manager = \Elementor\Plugin::$instance->kits_manager;
+    if ( !method_exists( $manager, 'get_kit' ) ) {
+      return $absent( 'Elementor\'s kit manager has no get_kit method in this version, so nothing here could ask it for the kit. The globals below come from the kit\'s stored settings alone.' );
+    }
+
+    try {
+      $kit = $manager->get_kit( $kit_id );
+    }
+    catch ( \Throwable $e ) {
+      return $absent( 'Elementor threw reading the kit: ' . $this->snippet( $e->getMessage() ) . '. The globals below come from the kit\'s stored settings alone.' );
+    }
+
+    if ( !is_object( $kit ) || !method_exists( $kit, 'get_settings' ) || !method_exists( $kit, 'get_main_id' ) ) {
+      return $absent( 'Elementor answered with something that is not a kit document, so nothing here could read its settings. The globals below come from the kit\'s stored settings alone.' );
+    }
+    if ( (int) $kit->get_main_id() !== $kit_id ) {
+      return $absent( 'Elementor answered with its empty placeholder kit rather than with post #' . $kit_id . ', which is what it does when the active kit is missing, trashed or not a kit. Its settings would be Elementor\'s built-in defaults and not this site\'s, so they are not reported as though they were. The globals below come from the kit\'s stored settings alone.' );
+    }
+
+    try {
+      $settings = $kit->get_settings();
+      $controls = method_exists( $kit, 'get_controls' ) ? $kit->get_controls() : [];
+    }
+    catch ( \Throwable $e ) {
+      return $absent( 'Elementor threw reading the kit\'s settings: ' . $this->snippet( $e->getMessage() ) . '. The globals below come from the kit\'s stored settings alone.' );
+    }
+
+    return [
+      'available' => true,
+      'reason' => 'Read from Elementor\'s own kit document, which merges what the kit has stored over the defaults of the controls it registers. ' . ( is_array( $controls ) ? count( $controls ) : 0 ) . ' controls were registered on this request. Elementor does not register the same set every time, so a setting reported below as not reported is one this request could not see, which is not the same as one the site does not have.',
+      'settings' => is_array( $settings ) ? $settings : [],
+      'controls' => is_array( $controls ) ? count( $controls ) : 0,
+    ];
+  }
+
+  /**
+  * One group of globals, as rows a caller can act on.
+  *
+  * The _id is the half that matters and the label is the half that is read: a design points
+  * at globals/colors?id=primary and never at "Primary", so renaming a global in the editor
+  * changes nothing about what refers to it and deleting one leaves every reference dangling
+  * under the old id. The reference string travels with every row for that reason.
+  *
+  * saved_on_the_kit is a property of the whole group rather than of the row, and says so:
+  * Elementor stores the repeater whole, so either the kit holds this group's values or it
+  * holds none of them and every row in it is a default.
+  */
+  private function global_rows( array $settings, array $saved, string $key, string $group, string $kind ): array {
+    if ( !isset( $settings[ $key ] ) && isset( $saved[ $key ] ) ) {
+      $settings[ $key ] = $saved[ $key ];
+    }
+    if ( !isset( $settings[ $key ] ) || !is_array( $settings[ $key ] ) ) {
+      return [];
+    }
+
+    $stored = array_key_exists( $key, $saved );
+    $rows = [];
+    foreach ( $settings[ $key ] as $index => $entry ) {
+      // A row this does not recognise is reported as stored. Dropping it would report a
+      // global that exists and is referenced as one that does not, and the caller would
+      // then be told a colour was free to remove.
+      if ( !is_array( $entry ) || !isset( $entry['_id'] ) || !is_scalar( $entry['_id'] ) ) {
+        $rows[] = [
+          'id' => null,
+          'label' => null,
+          'group' => $group,
+          'setting' => $key,
+          'reference' => null,
+          'unrecognised' => 'Entry ' . (int) $index . ' of ' . $key . ' is not a row with an _id, so nothing here can name it or say what refers to it. It is reported as stored.',
+          'stored' => $this->setting_value( $entry ),
+        ];
+        continue;
+      }
+
+      $id = (string) $entry['_id'];
+      $row = [
+        'id' => $id,
+        'label' => isset( $entry['title'] ) && is_scalar( $entry['title'] ) ? (string) $entry['title'] : '',
+        'group' => $group,
+        'setting' => $key,
+        'reference' => 'globals/' . $kind . '?id=' . $id,
+        'saved_on_the_kit' => $stored,
+      ];
+      if ( $kind === 'colors' ) {
+        $row['value'] = isset( $entry['color'] ) && is_scalar( $entry['color'] ) ? (string) $entry['color'] : null;
+      }
+      else {
+        $row['font_family'] = isset( $entry['typography_font_family'] ) && is_scalar( $entry['typography_font_family'] ) ? (string) $entry['typography_font_family'] : null;
+      }
+
+      // Whatever else the row carries, minus the keys holding nothing. A font row holds every
+      // typography control whether or not it was set, and the set differs between versions;
+      // a colour row is not meant to hold anything else, and if it does that is worth seeing
+      // rather than hiding. The empty ones are counted rather than dropped quietly, because a
+      // count is what tells the caller that what they cannot see is empty and not missing.
+      $rest = $entry;
+      unset( $rest['_id'], $rest['title'], $rest[ $kind === 'colors' ? 'color' : 'typography_font_family' ] );
+      $held = array_filter( $rest, function ( $value ) { return $this->holds_anything( $value ); } );
+      $row['other_keys'] = $held === [] ? null : $this->setting_value( $held );
+      $row['other_keys_empty'] = count( $rest ) - count( $held );
+      $rows[] = $row;
+    }
+    return $rows;
+  }
+
+  /** The named site-wide settings, each saying which of the two sources knew about it. */
+  private function setting_rows( array $settings, array $saved ): array {
+    $rows = [];
+    foreach ( self::KIT_SETTINGS as $key => $label ) {
+      $from_elementor = array_key_exists( $key, $settings );
+      $from_kit = array_key_exists( $key, $saved );
+      $rows[] = [
+        'key' => $key,
+        'label' => $label,
+        'reported' => $from_elementor || $from_kit,
+        'value' => $from_elementor ? $this->setting_value( $settings[ $key ] ) : ( $from_kit ? $this->setting_value( $saved[ $key ] ) : null ),
+        'saved_on_the_kit' => $from_kit,
+        'note' => ( $from_elementor || $from_kit )
+          ? null
+          : 'Not reported, which is not the same as not set. Neither Elementor nor the kit\'s stored settings offered this key on this request: either this version has no such setting, or it has one whose control it does not register outside its editor and which nobody here has changed. Either way whatever it ships is still in force on the front end and this cannot see it.',
+      ];
+    }
+    return $rows;
+  }
+
+  /** Every key the kit has actually stored, minus the globals, which are reported properly. */
+  private function saved_rows( array $saved ): array {
+    $rows = [];
+    foreach ( $saved as $key => $value ) {
+      if ( isset( self::GLOBAL_COLOURS[ $key ] ) || isset( self::GLOBAL_FONTS[ $key ] ) ) {
+        continue;
+      }
+      $rows[ (string) $key ] = $this->setting_value( $value );
+    }
+    return $rows;
+  }
+
+  /** The other kits in the library, which is where "I changed it and nothing happened" lives. */
+  private function other_kit_rows( array $kits, int $active_id ): array {
+    $rows = [];
+    foreach ( $kits as $kit ) {
+      if ( (int) $kit->ID === $active_id ) {
+        continue;
+      }
+      $rows[] = [
+        'id' => (int) $kit->ID,
+        'title' => (string) $kit->post_title,
+        'status' => (string) $kit->post_status,
+        'note' => 'Not the active kit. Editing it changes nothing on the front end until ' . self::KIT_OPTION . ' names it.',
+      ];
+    }
+    return $rows;
+  }
+
+  /**
+  * How many designs refer to each global, and which.
+  *
+  * The prefilter is "globals" with no slash after it, and that is not a typo. Elementor
+  * stores its documents with json_encode's default escaping, so the stored text reads
+  * globals\/colors?id=primary and a LIKE for "globals/" matches nothing at all on any site.
+  * That failure is silent and looks exactly like a site where no global is used anywhere,
+  * which is the answer that would tell a caller every global was safe to delete.
+  *
+  * One pass over the documents rather than one query per global, and the documents are read
+  * a page at a time and dropped, because they are routinely over 100KB and a site with a few
+  * hundred pages would otherwise be asked to hold all of them in memory at once.
+  */
+  private function globals_usage( array $rows, int $limit ): array {
+    global $wpdb;
+
+    $needles = [];
+    foreach ( $rows as $row ) {
+      if ( empty( $row['reference'] ) ) {
+        continue;
+      }
+      // A needle is the reference between delimiters, and an id carrying one of those
+      // delimiters cannot be looked for that way. Such a row is left out of the scan rather
+      // than searched for with a needle that cannot match, because the nothing that came
+      // back would be indistinguishable from a global nobody uses, and the caller would be
+      // told it was safe to delete. Elementor generates its ids, so this is a hand-edited
+      // kit or an import, which is the case least worth guessing about.
+      if ( strpbrk( (string) ( $row['id'] ?? '' ), "\"\\" ) !== false ) {
+        continue;
+      }
+      $needles[ $row['reference'] ] = substr( (string) $row['reference'], strlen( 'globals' ) ) . '"';
+    }
+    $found = [];
+    foreach ( array_keys( $needles ) as $reference ) {
+      $found[ $reference ] = [ 'count' => 0, 'posts' => [] ];
+    }
+    if ( $needles === [] ) {
+      return [ 'documents_examined' => 0, 'truncated' => false, 'by_reference' => $found ];
+    }
+
+    $like = '%' . $wpdb->esc_like( 'globals' ) . '%';
+    $examined = 0;
+    $offset = 0;
+    while ( $examined < self::SCAN_LIMIT ) {
+      $batch = $wpdb->get_results( $wpdb->prepare(
+        "SELECT p.ID, p.post_title, p.post_type, p.post_status, m.meta_value
+          FROM {$wpdb->postmeta} m INNER JOIN {$wpdb->posts} p ON p.ID = m.post_id
+          WHERE m.meta_key = %s AND m.meta_value LIKE %s
+            AND p.post_type != 'revision' AND p.post_status != 'auto-draft'
+          ORDER BY p.ID ASC LIMIT %d OFFSET %d",
+        self::DATA_META,
+        $like,
+        self::USAGE_PAGE,
+        $offset
+      ) );
+      if ( !is_array( $batch ) || $batch === [] ) {
+        break;
+      }
+      foreach ( $batch as $document ) {
+        $json = (string) $document->meta_value;
+        foreach ( $needles as $reference => $needle ) {
+          if ( strpos( $json, $needle ) === false ) {
+            continue;
+          }
+          $found[ $reference ]['count']++;
+          if ( count( $found[ $reference ]['posts'] ) < $limit ) {
+            $found[ $reference ]['posts'][] = $this->reference_row( $document, 'elementor_data', 'Its design refers to ' . $reference . '.' );
+          }
+        }
+        $examined++;
+      }
+      if ( count( $batch ) < self::USAGE_PAGE ) {
+        break;
+      }
+      $offset += self::USAGE_PAGE;
+    }
+
+    return [
+      'documents_examined' => $examined,
+      'truncated' => $examined >= self::SCAN_LIMIT,
+      'by_reference' => $found,
+    ];
+  }
+
+  /** Put the counts back on the rows they belong to. */
+  private function attach_usage( array $rows, array $usage ): array {
+    foreach ( $rows as $index => $row ) {
+      $reference = $row['reference'] ?? null;
+      if ( $reference === null ) {
+        continue;
+      }
+      if ( !isset( $usage['by_reference'][ $reference ] ) ) {
+        $rows[ $index ]['used_by_count'] = null;
+        $rows[ $index ]['used_by_note'] = 'Not counted. This global\'s id contains a quote or a backslash, which cannot be looked for inside a stored design, and a count of zero from a search that could not have succeeded would read as nobody using it.';
+        continue;
+      }
+      $rows[ $index ]['used_by_count'] = $usage['by_reference'][ $reference ]['count'];
+      $rows[ $index ]['used_by'] = $usage['by_reference'][ $reference ]['posts'];
+    }
+    return $rows;
+  }
+
+  /**
+  * Whether a stored value holds anything somebody chose.
+  *
+  * unit, sizes and isLinked are scaffolding: Elementor writes them on every slider and every
+  * dimension control whether or not the control was set, so a font nobody has styled still
+  * carries a line height of "px" with no number behind it. They do not count towards a value
+  * on their own, which is the one piece of Elementor's shapes this assumes, and it is assumed
+  * here rather than scattered so that a version that changes it has one place to be fixed.
+  */
+  private function holds_anything( $value ): bool {
+    if ( is_array( $value ) ) {
+      foreach ( $value as $key => $item ) {
+        if ( in_array( $key, [ 'unit', 'sizes', 'isLinked' ], true ) ) {
+          continue;
+        }
+        if ( $this->holds_anything( $item ) ) {
+          return true;
+        }
+      }
+      return false;
+    }
+    return $value !== '' && $value !== null && $value !== false;
+  }
+
+  /** A value small enough to print, or a sentence saying what was there instead. */
+  private function setting_value( $value ) {
+    $encoded = wp_json_encode( $value );
+    if ( !is_string( $encoded ) ) {
+      return [ 'not_reported' => 'This value could not be encoded as JSON, so its shape is not reported. It is stored on the kit and nothing here has changed it.' ];
+    }
+    if ( strlen( $encoded ) <= self::SETTING_VALUE_LIMIT ) {
+      return $value;
+    }
+    return [ 'not_reported' => 'A ' . gettype( $value ) . ' of ' . strlen( $encoded ) . ' bytes of JSON, too large to print here. It is stored on the kit and nothing here has changed it.' ];
+  }
+
+  /** The one sentence a caller reads before the rest of it. */
+  private function kit_summary( array $state, array $colours, array $fonts, ?array $usage ): string {
+    if ( $state['state'] !== 'active' ) {
+      return $state['meaning'];
+    }
+
+    $summary = count( $colours ) . ' global colour' . ( count( $colours ) === 1 ? '' : 's' )
+      . ' and ' . count( $fonts ) . ' global font' . ( count( $fonts ) === 1 ? '' : 's' ) . '.';
+
+    if ( $usage === null ) {
+      return $summary . ' Whether anything on the site actually uses them was not asked: pass include_usage to find out before changing or removing one.';
+    }
+
+    // Named by reference rather than by id, because the ids are not unique across the two
+    // kinds: a site has a colour called primary and a font called primary, and a list of bare
+    // ids saying five things are unused reads as one thing listed five times.
+    $unused = [];
+    foreach ( array_merge( $colours, $fonts ) as $row ) {
+      if ( isset( $row['used_by_count'] ) && $row['used_by_count'] === 0 && !empty( $row['reference'] ) ) {
+        $unused[] = (string) $row['reference'];
+      }
+    }
+    $read = (int) $usage['documents_examined'];
+    $summary .= ' ' . $read . ( $read === 1 ? ' design was' : ' designs were' ) . ' read for references.';
+    if ( $usage['truncated'] ) {
+      return $summary . ' More than ' . self::SCAN_LIMIT . ' designs use globals, so the counts below are "at least these" and nothing can be called unused on this answer.';
+    }
+    if ( $unused === [] ) {
+      return $summary . ' Every global is referred to by at least one of them.';
+    }
+    $shown = array_slice( $unused, 0, 12 );
+    $more = count( $unused ) - count( $shown );
+    return $summary . ' Referred to by none of them: ' . implode( ', ', $shown )
+      . ( $more > 0 ? ' and ' . $more . ' more, all listed above with a count of zero' : '' )
+      . '. Nothing outside those designs was searched, so that is "unused by any Elementor design on this site", not "unused".';
+  }
+
+  #endregion
+
 }

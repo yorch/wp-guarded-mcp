@@ -44,8 +44,36 @@ if ( !defined( 'ABSPATH' ) ) {
 * the backup, which is a larger irreversible act than anything else this plugin can do,
 * and no confirmation token makes that safe to hand to something reading instructions out
 * of a comment queue.
+*
+* Destination is deliberately absent too. Every adapter here sends a backup wherever the
+* site owner already configured it to go, and nothing in this file chooses otherwise.
+* Deciding where a database dump holding every password hash on the site is written is a
+* site owner's decision, not one to hand to something reading instructions out of a comment
+* queue, and it sits beside the missing restore tool and the withheld archive filenames as
+* a declined request rather than a gap somebody forgot to fill.
+*
+* SCOPE IS ASKED FOR, NEVER CONFIRMED. start() takes full, database or files, and an
+* adapter that cannot express one refuses by name rather than quietly running a full backup
+* under the label it was given. That refusal is the whole point of the scopes list below: a
+* silent widening would tell a caller it has a database-only backup when it has something
+* else, which is the same false yes this file is otherwise arranged against. What no adapter
+* can do is confirm afterwards, because a backup outlives the request that started it. The
+* only honest confirmation is the contains field wp_list_backups reports once the job
+* finishes, and the wording here says so instead of implying more.
 */
 class GMCP_Backup {
+
+  /**
+  * The scopes a caller may ask for.
+  *
+  * Three, not more. UpdraftPlus can narrow a files backup to individual entities through
+  * restrict_files_to_override, and Backuply cannot; a scope meaning "uploads" on one site
+  * and "the whole install" on another is a name that lies, so the narrower selection is not
+  * offered at all and "files" means the file half of whatever this site's plugin already
+  * backs up. A site that has excluded its uploads directory from backups gets a files
+  * backup without uploads, exactly as it already gets a full backup without them.
+  */
+  public const SCOPES = [ 'full', 'database', 'files' ];
 
   /**
   * The adapters, newest-first in preference order.
@@ -62,6 +90,12 @@ class GMCP_Backup {
   * A list entry describes a backup without naming it on disk. See list_entry() for why
   * the filename is the one field deliberately missing, and sanitise_entry() for why an
   * adapter registered through this filter is not taken at its word about that.
+  *
+  * A scopes slot lists which of SCOPES the start slot honours. Its absence means full only,
+  * which is the fail-closed reading: an adapter written before scope existed, or registered
+  * through this filter by somebody who never saw this comment, receives no scope it did not
+  * ask for, and a caller wanting one is refused by name. The alternative default would hand
+  * an unknown adapter a scope it ignores and then report that scope back as done.
   */
   public static function providers(): array {
     return apply_filters( 'gmcp_backup_providers', [
@@ -74,11 +108,26 @@ class GMCP_Backup {
           // this plugin has been caught before by wp-admin-only code paths.
           return class_exists( 'UpdraftPlus_Backup_History' ) && has_action( 'updraft_backupnow_backup_all' );
         },
+        'scopes' => [ 'full', 'database', 'files' ],
         'start' => function ( array $args ) {
+          $action = self::updraft_scope_action( (string) ( $args['scope'] ?? 'full' ) );
+
+          // installed() proves updraft_backupnow_backup_all is wired; the other two are
+          // registered on the line beside it and would have to be removed deliberately.
+          // Checked anyway, because the failure if one ever goes is do_action() on a hook
+          // nothing listens to, which does nothing at all and returns exactly what a
+          // started backup returns.
+          if ( !has_action( $action ) ) {
+            return [
+              'ok' => false,
+              'message' => sprintf( 'UpdraftPlus is active but nothing is listening on %s, which is the hook it uses for this scope, so no backup was started. Its own Backup Now screen still works.', $action ),
+            ];
+          }
+
           // nocloud 0 means "also send it to whatever remote storage the site configured".
           // Leaving that to the site's own settings is the right default: a backup that
           // only exists on the same disk as the site is not much of a backup.
-          do_action( 'updraft_backupnow_backup_all', [ 'nocloud' => 0 ] );
+          do_action( $action, [ 'nocloud' => 0 ] );
           return [ 'ok' => true, 'handle' => (string) get_site_option( 'updraft_last_backup_job_nonce', '' ) ];
         },
         'state' => function () {
@@ -160,7 +209,8 @@ class GMCP_Backup {
             && function_exists( 'backuply_backup_execute' )
             && function_exists( 'backuply_get_backups_info' );
         },
-        'start' => function ( array $args ) { return self::backuply_start(); },
+        'scopes' => [ 'full', 'database', 'files' ],
+        'start' => function ( array $args ) { return self::backuply_start( (string) ( $args['scope'] ?? 'full' ) ); },
         'state' => function () { return self::backuply_state(); },
         'list' => function () { return self::backuply_list(); },
       ],
@@ -227,6 +277,14 @@ class GMCP_Backup {
       'can_start' => is_callable( $provider['start'] ?? null ),
       'can_tell' => is_callable( $provider['state'] ?? null ),
     ];
+
+    // Published so a caller can read what it may ask for rather than discovering it by
+    // being refused. Absent, not empty, when nothing can be started: an empty list beside
+    // can_start false would read as a second way of saying the same thing, and this file's
+    // rule is that an empty array never stands in for "cannot tell".
+    if ( $out['can_start'] ) {
+      $out['scopes'] = self::provider_scopes( $provider );
+    }
 
     if ( !$out['can_tell'] ) {
       $out['summary'] = $provider['name'] . ' is active. This plugin cannot read its state or start it. '
@@ -490,6 +548,34 @@ class GMCP_Backup {
   }
 
   /**
+  * The UpdraftPlus action for one scope.
+  *
+  * UpdraftPlus expresses scope as three separate actions rather than as an argument, and
+  * the names are a trap: updraft_backupnow_backup_database is the database, and
+  * updraft_backupnow_backup - the one that reads like the general case - is FILES ONLY.
+  * It is wired to UpdraftPlus::backupnow_files(), which calls boot_backup(1, 0). The
+  * mapping here is the same one admin.php makes from its own Backup Now tick boxes, so a
+  * scope asked for through this tool reaches exactly the code path the plugin's own button
+  * reaches. All three are registered side by side in UpdraftPlus::__construct(), outside
+  * any is_admin() guard, which is what makes them reachable on a REST request at all.
+  *
+  * Each of the three passes ints to boot_backup() rather than bools, and boot_backup only
+  * consults the site's file and database schedules when it is handed a bool. So a scope
+  * asked for here cannot be quietly widened back to both halves by a site whose two
+  * schedules happen to match, which is the one way UpdraftPlus does rewrite these.
+  */
+  private static function updraft_scope_action( string $scope ): string {
+    switch ( $scope ) {
+      case 'database':
+        return 'updraft_backupnow_backup_database';
+      case 'files':
+        return 'updraft_backupnow_backup';
+      default:
+        return 'updraft_backupnow_backup_all';
+    }
+  }
+
+  /**
   * Where an UpdraftPlus backup went.
   *
   * An empty service list means it was only ever written next to the site, which is worth
@@ -522,11 +608,50 @@ class GMCP_Backup {
   }
 
   /**
+  * Which of SCOPES an adapter can actually be asked for.
+  *
+  * An adapter with no scopes slot can be asked for a full backup and nothing else. See
+  * providers() for why that, rather than "assume it copes", is the safe default. Unknown
+  * values in the slot are dropped instead of trusted: providers() is a public filter, and
+  * a scope this file cannot name is one start() would have no way to describe in a reply.
+  */
+  private static function provider_scopes( array $provider ): array {
+    $declared = array_map( 'strval', (array) ( $provider['scopes'] ?? [] ) );
+    $scopes = array_values( array_intersect( self::SCOPES, $declared ) );
+    return $scopes ?: [ 'full' ];
+  }
+
+  /** A scope named the way a sentence needs it. */
+  private static function scope_phrase( string $scope ): string {
+    switch ( $scope ) {
+      case 'database':
+        return 'a database-only backup';
+      case 'files':
+        return 'a files-only backup';
+      default:
+        return 'a full backup';
+    }
+  }
+
+  /**
   * Start one. Never reports completion, because it cannot know.
+  *
+  * The refusal order matters. A provider this plugin cannot start at all keeps giving the
+  * answer it already gave, whatever scope was asked for: BackWPup's caller wants to hear
+  * that BackWPup cannot be driven from here, not a sentence about scopes that would be
+  * beside the point. Only a provider that could have started something gets refused for
+  * the scope.
   *
   * @return array{ok:bool,message:string}
   */
-  public static function start(): array {
+  public static function start( string $scope = 'full' ): array {
+    // An unrecognised scope is refused rather than rounded to full. Rounding would be safe
+    // in the sense that it backs up more, and unsafe in the sense that matters here: the
+    // caller would be told its typo ran, and the next call would repeat it.
+    if ( !in_array( $scope, self::SCOPES, true ) ) {
+      return [ 'ok' => false, 'message' => sprintf( '"%s" is not a backup scope. Ask for one of: %s. Nothing was started.', $scope, implode( ', ', self::SCOPES ) ) ];
+    }
+
     $provider = self::detect();
     if ( !$provider ) {
       return [ 'ok' => false, 'message' => 'No backup plugin this one can drive is active. Install UpdraftPlus or Backuply, or register an adapter through the gmcp_backup_providers filter.' ];
@@ -535,8 +660,27 @@ class GMCP_Backup {
       return [ 'ok' => false, 'message' => $provider['name'] . ' is active but cannot be started from here. ' . ( $provider['why_not'] ?? '' ) ];
     }
 
+    $scopes = self::provider_scopes( $provider );
+    if ( !in_array( $scope, $scopes, true ) ) {
+      return [
+        'ok' => false,
+        // Says what did NOT happen as well as what did. An agent reading only "cannot be
+        // asked for a database-only backup" has to infer whether it now has a full backup
+        // it did not ask for, and the inference it would draw is the dangerous one.
+        'message' => sprintf(
+          '%s can start a backup but cannot be asked for %s from here, so nothing was started. Nothing was widened to make up for it: no backup of any scope is now running because of this call. %s, or narrow the backup from %s\'s own screen.',
+          self::provider_name( $provider ),
+          self::scope_phrase( $scope ),
+          count( $scopes ) === 1
+            ? sprintf( 'The only scope it accepts is %s, so ask for that', $scopes[0] )
+            : sprintf( 'The scopes it accepts are %s, so ask for one of those', implode( ', ', $scopes ) ),
+          self::provider_name( $provider )
+        ),
+      ];
+    }
+
     $before = is_callable( $provider['state'] ?? null ) ? call_user_func( $provider['state'] ) : null;
-    $result = call_user_func( $provider['start'], [] );
+    $result = call_user_func( $provider['start'], [ 'scope' => $scope ] );
     if ( empty( $result['ok'] ) ) {
       // An adapter that knows why gets to say so. "Refused" on its own tells an agent
       // nothing it can act on, and the two real reasons want opposite responses: wait,
@@ -545,10 +689,38 @@ class GMCP_Backup {
       return [ 'ok' => false, 'message' => $why !== '' ? $why : $provider['name'] . ' refused to start a backup.' ];
     }
 
+    // provider_name() rather than the name field, for the reason listing() gives: an
+    // adapter registered through the filter without one produced a sentence beginning on
+    // a bare space.
     $message = sprintf(
-      'Asked %s to start a full backup. It runs in the background and is almost certainly not finished yet, so do not treat this as a backup having been taken. Call wp_backup_status to see when one completes.',
-      $provider['name']
+      'Asked %s to start %s. It runs in the background and is almost certainly not finished yet, so do not treat this as a backup having been taken.',
+      self::provider_name( $provider ),
+      self::scope_phrase( $scope )
     );
+
+    // The scope was asked for, not confirmed, and the difference is worth a sentence. A
+    // backup outlives the request that started it, so nothing readable here says what the
+    // job ended up containing; both adapters hand the scope over and are told nothing
+    // back. wp_list_backups reads what each finished backup records about itself, which
+    // makes its contains field the first honest answer and the reason to point at it.
+    //
+    // "once the job has finished", never "once the backup completes". The admin suite
+    // greps this reply for "backup complete" and requires zero matches, because a reply
+    // carrying that phrase is one an agent can skim into a false yes. The pre-existing
+    // last sentence dodges it the same way, saying "when one completes".
+    $message .= sprintf(
+      ' That is the scope %s was asked for. Nothing here can confirm what it ends up making: read the contains field in wp_list_backups once the job has finished.',
+      self::provider_name( $provider )
+    );
+    // Said for full as well as for files, because both carry the file half and both inherit
+    // the site's own exclusions. A site that has taken uploads out of its backup settings
+    // gets a backup without uploads under either name, and reading "files" as "everything
+    // on disk" is the assumption this sentence exists to head off.
+    if ( $scope !== 'database' ) {
+      $message .= ' The file half covers whatever this site already has its backup plugin configured to include, so anything excluded there is excluded here too.';
+    }
+    $message .= ' Call wp_backup_status to see when one completes.';
+
     if ( $before && $before['last_completed'] ) {
       $message .= sprintf( ' The most recent completed backup before this was %s ago.', human_time_diff( $before['last_completed'], time() ) );
     }
@@ -598,7 +770,7 @@ class GMCP_Backup {
   * die(), on the failure paths as much as the success ones, so calling it here would take
   * this tool's own reply with it and the caller would see a dropped connection.
   */
-  private static function backuply_start(): array {
+  private static function backuply_start( string $scope ): array {
     if ( self::backuply_running() ) {
       return [
         'ok' => false,
@@ -606,17 +778,26 @@ class GMCP_Backup {
       ];
     }
 
-    // Both halves, whatever the site's saved defaults say. wp_start_backup offers a full
-    // backup, and a site whose Backuply screen is left on database-only would otherwise
-    // hand back a partial one under that name, which is exactly the false yes this file
-    // is arranged against. Where it goes is a different question, and one the site owner
-    // has already answered in Backuply: an empty location is Backuply's own local folder.
+    // The halves the CALLER asked for, never the site's saved defaults. A site whose
+    // Backuply screen is left on database-only would otherwise hand back a partial backup
+    // under whatever name this tool reported, which is exactly the false yes this file is
+    // arranged against. Where it goes is a different question, and one the site owner has
+    // already answered in Backuply: an empty location is Backuply's own local folder.
+    //
+    // Backuply expresses scope as two independent flags on the job record it leaves for
+    // the cron runner, and backup_ins.php gates the database dump and the file archive on
+    // !empty() of one each. So an unwanted half is OMITTED rather than set to a zero,
+    // matching what the Create Backup button leaves behind: that form is serialized with
+    // jQuery's serializeArray(), which drops an unticked checkbox entirely, and its own
+    // handler refuses when neither is present.
     $settings = (array) get_option( 'backuply_settings', [] );
-    $job = [
-      'backup_dir' => '1',
-      'backup_db' => '1',
-      'backup_location' => (string) ( $settings['backup_location'] ?? '' ),
-    ];
+    $job = [ 'backup_location' => (string) ( $settings['backup_location'] ?? '' ) ];
+    if ( $scope !== 'files' ) {
+      $job['backup_db'] = '1';
+    }
+    if ( $scope !== 'database' ) {
+      $job['backup_dir'] = '1';
+    }
 
     backuply_create_log_file();
     update_option( 'backuply_backup_stopped', false, false );

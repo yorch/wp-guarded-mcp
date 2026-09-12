@@ -82,6 +82,25 @@ class GMCP_Journal {
   /** The whole snapshot table stays under this. */
   const SNAP_MAX_BYTES = 16777216;
   const SNAP_RETENTION_DAYS = 14;
+  /**
+  * How deep the credential check walks before it refuses a meta value on depth alone.
+  *
+  * holds_credential() defaults to six, which is right for the audit log and the option
+  * summaries, where a value that deep is unusual and refusing to record one costs a line
+  * a person reads. It is wrong here and measurably so. A page-builder design nests far
+  * past six, and further than its JSON suggests: prepare_meta_value() decodes the design
+  * into the array the row actually holds, and thirteen nested containers walk twenty-eight
+  * levels that way. So every design was refused on the depth rule with nothing
+  * credential-shaped anywhere in it, and the refusal declined precisely the values this
+  * feature exists to restore.
+  *
+  * Raising it is safe for a different reason rather than a weaker one. A snapshot is a
+  * second copy of bytes already sitting unencrypted in wp_postmeta, it is written back
+  * verbatim, and it is never rendered. What the deeper limit does NOT do is relax the
+  * check: a secret buried below six levels is now found and refused, where before it was
+  * refused only by the blanket depth rule that refused everything else with it.
+  */
+  const SNAPSHOT_CREDENTIAL_DEPTH = 64;
 
   public function __construct() {
     add_action( 'gmcp_change', [ $this, 'observe' ], 10, 1 );
@@ -282,7 +301,9 @@ class GMCP_Journal {
   * The value goes in the snapshot table and the entry keeps only a pointer, for the
   * reason SNAP_MAX_VALUE gives. Nothing credential-shaped goes in either: the same test
   * the option side uses is asked here, so the two subsystems cannot disagree about what
-  * counts as a secret.
+  * counts as a secret. It is asked to walk further, for the reason
+  * SNAPSHOT_CREDENTIAL_DEPTH sets out, which makes this path stricter than the option
+  * side rather than more permissive.
   */
   private function observe_meta( array $change ): void {
     $post_id = (int) ( $change['id'] ?? 0 );
@@ -310,11 +331,14 @@ class GMCP_Journal {
     ];
 
     // A key whose NAME looks like a credential, or a value that holds one, is recorded as
-    // changed and its previous value is not kept. Same answer as the option side, asked of
-    // the same functions, so the journal cannot protect a secret in an option and copy the
-    // same secret out of a meta row.
+    // changed and its previous value is not kept. Same functions as the option side, so the
+    // journal cannot protect a secret in an option and copy the same secret out of a meta
+    // row. The one difference is how far the value is walked, and it is a difference in
+    // reach rather than in what counts: this path finds a credential the option side gives
+    // up before reaching. @see SNAPSHOT_CREDENTIAL_DEPTH.
     $previous = $change['previous'] ?? null;
-    if ( GMCP_Core::field_looks_secret( $meta_key ) || GMCP_Core::holds_credential( $previous ) ) {
+    if ( GMCP_Core::field_looks_secret( $meta_key )
+      || GMCP_Core::holds_credential( $previous, 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
       $entry['redacted'] = true;
       $this->record( $entry );
       return;
