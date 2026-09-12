@@ -42,23 +42,29 @@ else
   git archive HEAD | ( cd "$STAGE/$SLUG" && tar -xf - )
 fi
 
-# Build-time only. .wordpress-org holds the directory listing assets, which belong in the
-# SVN assets/ folder rather than in the plugin. README.md documents the repository and
-# the dev stack; readme.txt is the one a user reads. AGENTS.md and its CLAUDE.md symlink
-# are instructions for people and agents working ON the plugin, and a symlink inside a
-# plugin zip is a portability problem on top of being noise. docs/ is the project page,
-# which is a website rather than part of the plugin, and it carries screenshots that
-# would otherwise be shipped twice.
-( cd "$STAGE/$SLUG" && rm -rf .dev .wordpress-org .github .gitignore README.md AGENTS.md CLAUDE.md docs )
+# Build-time only. .wordpress-org holds the directory listing assets, which belong in
+# the SVN assets/ folder rather than in the plugin. README.md documents the repository
+# and the dev stack; readme.txt is the one a user reads. AGENTS.md and its CLAUDE.md
+# symlink are instructions for people and agents working ON the plugin, and a symlink
+# inside a plugin zip is a portability problem on top of being noise. docs/ is the
+# project page, which is a website rather than part of the plugin, and it carries
+# screenshots that would otherwise be shipped twice. CREDITS.md carries the GPLv2
+# attribution but WordPress.org flags it as an unexpected markdown file, so it stays
+# in the repository and the attribution in the plugin header and per-file notices
+# ships instead.
+( cd "$STAGE/$SLUG" && rm -rf .dev .wordpress-org .github .gitignore README.md AGENTS.md CLAUDE.md CREDITS.md docs )
+# languages/.gitkeep is a git placeholder to keep the empty directory; the directory
+# itself ships so WordPress.org's translation system can populate it.
+rm -f "$STAGE/$SLUG/languages/.gitkeep"
 
-# CREDITS.md ships. It is the only file carrying the upstream copyright notice and the
-# statement of changes that GPLv2 sections 1 and 2(a) require, and every zip built before
-# this script existed left it out, which meant distributing a derivative work with the
-# attribution stripped.
+# CREDITS.md no longer ships (WordPress.org flags it as an unexpected markdown file),
+# but it still has to exist in the repository and name the upstream author. The checks
+# run against the source tree, not the staged package, because the file is stripped
+# before this point.
 for required in "$SLUG.php" readme.txt LICENSE CREDITS.md uninstall.php; do
-  [ -f "$STAGE/$SLUG/$required" ] || { echo "missing from the package: $required" >&2; exit 1; }
+  [ -f "$required" ] || { echo "missing from the source tree: $required" >&2; exit 1; }
 done
-grep -qi "jordy meow" "$STAGE/$SLUG/CREDITS.md" || { echo "CREDITS.md no longer names the upstream author" >&2; exit 1; }
+grep -qi "jordy meow" CREDITS.md || { echo "CREDITS.md no longer names the upstream author" >&2; exit 1; }
 
 # GPLv2 2(a) asks the modified FILES to carry the notice, not a companion document, so
 # each file derived from upstream states what it came from and that it was changed. A

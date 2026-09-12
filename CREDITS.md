@@ -6,6 +6,10 @@ It carries the full attribution and the statement of changes. It is not the only
 upstream work is named: the plugin header repeats the notice so it travels with the code,
 `README.md` says what this is a fork of, and each derived file names the file it came from.
 
+This file does not ship in the plugin zip. WordPress.org flags it as an unexpected
+markdown file, so the build script strips it and the attribution in the plugin header and
+per-file notices ships instead. The checks below still run against the source tree.
+
 `.dev/build.sh` refuses to build a package whose `CREDITS.md` has lost the upstream author,
 or where any of the four derived files has lost its own notice. It does not yet check the
 plugin header, which is the copy GPLv2 2(a) most directly asks for.
