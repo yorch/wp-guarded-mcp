@@ -179,6 +179,10 @@ reset_state() {
 reset_state
 
 echo "-- admin pages (one submenu page per section, not tabs) --"
+# Placed here on purpose: after reset_state has steadied the fixtures, before any
+# destructive section, and reset_state touches no users, passwords, credentials or
+# tool-group flags, so neither this block nor the admin-switch-on gate above
+# depends on anything below. It mutates nothing itself.
 # Every admin link in the plugin goes through GMCP_Settings::page_url(), so the mapping
 # from section name to page slug is the contract the menu, the redirects and the entry
 # links all share. Assert the page query param it produces, which is host-independent.
