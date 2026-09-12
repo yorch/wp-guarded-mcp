@@ -90,7 +90,7 @@ class GMCP_OAuth {
    * route registration.
    */
   public function handle_host_root_wellknown() {
-    $uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '';
+    $uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_unslash( $_SERVER['REQUEST_URI'] ) : '';
     $path = strtok( $uri, '?' );
     if ( $path === false || strpos( $path, '/.well-known/' ) !== 0 ) {
       return;
@@ -791,7 +791,7 @@ class GMCP_OAuth {
         // alone, which is exactly why MCP tool calls keep working on these hosts while
         // every single token refresh is rejected as invalid_client: the connection dies
         // once the access token ages out and never comes back.
-        $provided_secret = (string) ( $_SERVER['PHP_AUTH_PW'] ?? '' );
+        $provided_secret = isset( $_SERVER['PHP_AUTH_PW'] ) ? (string) wp_unslash( $_SERVER['PHP_AUTH_PW'] ) : '';
       }
     }
     else {
