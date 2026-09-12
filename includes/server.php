@@ -14,14 +14,16 @@
 *
 * Current Implementation:
 * - Single Streamable HTTP endpoint (/mcp/v1/http), used by Claude, Claude Code and ChatGPT
-* - Authentication via OAuth (see oauth.php) or a static bearer token
+* - Authentication via OAuth (see oauth.php) or a named key presented as a bearer token
 * - Properly handles agent cancellation signals (notifications/cancelled) to free workers immediately
 * - Caps how long an idle stream holds a PHP worker (see Connection Management below)
 * - Sends heartbeat signals to detect dead connections quickly
 *
-* The legacy SSE transport (/mcp/v1/sse plus /messages, driven by a bundled mcp.js Node
-* relay) was removed in 3.6, once the MCP spec retired it. Streamable HTTP still answers
-* with text/event-stream framing, which is why the SSE handling below is still needed.
+* The separate SSE transport (/mcp/v1/sse plus /messages, driven by a bundled mcp.js Node
+* relay) was dropped upstream in AI Engine 3.6 once the MCP spec retired it, so this fork
+* never carried it. Streamable HTTP still answers with text/event-stream framing, which is
+* why the SSE handling below is still needed. The version is upstream's, not this
+* plugin's, and saying "removed in 3.6" read as though this plugin had once shipped it.
 *
 * Connection Management:
 * - Agents send notifications/cancelled when done, triggering immediate stream closure

@@ -19,9 +19,14 @@ if ( !defined( 'ABSPATH' ) ) {
  * Protected Resource Metadata (RFC 9728), and Token Revocation (RFC 7009),
  * matching the MCP authorization specification.
  *
- * This module is additive: the legacy static bearer token continues to work
- * for developer tooling. OAuth is the consumer-facing path used by clients
- * like Claude Desktop that drive the user through a browser authorize flow.
+ * One of the two ways in. The other is a named key, minted on the settings screen and
+ * presented as a bearer token; OAuth is the consumer-facing path used by clients like
+ * Claude Desktop that drive the user through a browser authorize flow.
+ *
+ * There is no static token beside either of them any more. This said there was, and had
+ * said so since the shared token was retired: a reader following it would look for a
+ * setting that is gone, and the sentence described the plaintext credential whose removal
+ * was the point of retiring it.
  */
 class GMCP_OAuth {
   public const DB_VERSION = '1.0.0';

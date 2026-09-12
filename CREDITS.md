@@ -2,7 +2,13 @@
 
 This file exists to satisfy GPLv2 sections 1 and 2(a), which require the upstream
 copyright notice to be preserved and modified work to carry a statement of what changed.
-It is the only place in this project that names the upstream work.
+It carries the full attribution and the statement of changes. It is not the only place the
+upstream work is named: the plugin header repeats the notice so it travels with the code,
+`README.md` says what this is a fork of, and each derived file names the file it came from.
+
+`.dev/build.sh` refuses to build a package whose `CREDITS.md` has lost the upstream author,
+or where any of the four derived files has lost its own notice. It does not yet check the
+plugin header, which is the copy GPLv2 2(a) most directly asks for.
 
 ## Upstream
 
@@ -55,11 +61,6 @@ rather than restating it.
 use the `GMCP_` / `gmcp_` prefix. Options live in a `gmcp_options` row; the OAuth tables
 are `{prefix}gmcp_oauth_clients` and `{prefix}gmcp_oauth_tokens`. MCP resource URIs use
 the `gmcp://` scheme.
-
-The plugin was briefly named Reeve during development. An install of that name is carried
-across on activation: settings, activity, journal, keys and the OAuth tables all move to
-the new prefix, so a connected app stays connected. That migration is in `includes/init.php`
-and can be deleted once no install of the old name plausibly remains.
 
 The REST namespace is deliberately unchanged at `mcp/v1`, so a client already pointed at
 `/wp-json/mcp/v1/http` keeps working. OAuth grants do not carry over, because the tables
