@@ -157,7 +157,7 @@ class GMCP_Server {
     // preflight from claude.ai (and similar web connectors) was rejecting the
     // actual POST and the client reported "Couldn't reach the MCP server".
     add_filter( 'rest_allowed_cors_headers', function ( $headers ) {
-      $uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '';
+      $uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_unslash( $_SERVER['REQUEST_URI'] ) : '';
       if ( strpos( $uri, '/' . $this->namespace . '/' ) === false ) {
         return $headers;
       }
@@ -246,7 +246,7 @@ class GMCP_Server {
       return $hdr;
     }
     if ( !empty( $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ) ) {
-      return $_SERVER['REDIRECT_HTTP_AUTHORIZATION'];
+      return wp_unslash( $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] );
     }
     if ( function_exists( 'apache_request_headers' ) ) {
       foreach ( (array) apache_request_headers() as $name => $value ) {
@@ -575,7 +575,7 @@ class GMCP_Server {
 
           // Debug logging for tools/list
           if ( $this->logging ) {
-            $user_agent = isset( $_SERVER['HTTP_USER_AGENT'] ) ? $_SERVER['HTTP_USER_AGENT'] : 'unknown';
+            $user_agent = isset( $_SERVER['HTTP_USER_AGENT'] ) ? sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) ) : 'unknown';
             error_log( '[Guarded MCP Direct] 📋 tools/list requested by: ' . $user_agent );
             error_log( '[Guarded MCP Direct] 📊 Returning ' . count( $tools ) . ' tools' );
             if ( count( $tools ) > 0 ) {
@@ -601,7 +601,7 @@ class GMCP_Server {
 
           if ( $this->logging ) {
             error_log( '[Guarded MCP Direct] 🔧 tools/call - Tool: ' . $tool );
-            error_log( '[Guarded MCP Direct] 🔧 tools/call - Arguments: ' . wp_json_encode( $arguments ) );
+            error_log( '[Guarded MCP Direct] 🔧 tools/call - Arguments: ' . wp_json_encode( GMCP_Core::redact( $arguments ) ) );
           }
 
           try {
