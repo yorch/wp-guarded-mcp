@@ -49,8 +49,9 @@ fi
 # inside a plugin zip is a portability problem on top of being noise. docs/ holds the
 # project page (a website rather than part of the plugin, with screenshots that would
 # otherwise be shipped twice) and the guardrail and audit-log rationale that
-# accompanies README.md.
-( cd "$STAGE/$SLUG" && rm -rf .dev .wordpress-org .github .gitignore README.md AGENTS.md CLAUDE.md docs )
+# accompanies README.md. phpcs.xml.dist is a local development tool config; wordpress.org
+# Plugin Check rejects it as an "application file."
+( cd "$STAGE/$SLUG" && rm -rf .dev .wordpress-org .github .gitignore README.md AGENTS.md CLAUDE.md docs phpcs.xml.dist )
 # languages/.gitkeep is a git placeholder to keep the empty directory; the directory
 # itself ships so WordPress.org's translation system can populate it.
 rm -f "$STAGE/$SLUG/languages/.gitkeep"
