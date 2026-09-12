@@ -203,8 +203,9 @@ Writes `tmp/guarded-mcp-<version>.zip`, built from the current commit rather tha
 the directory, so an untracked scratch file cannot end up inside a plugin somebody
 installs. It refuses to run with uncommitted changes; `./build.sh --dirty` overrides that
 and marks the filename. Every PHP file in the package is parsed before the zip is
-written, and the build fails if `CREDITS.md` is missing or no longer names the upstream
-author, because that file carries the attribution GPLv2 requires.
+written, and the build fails if any of the four files derived from AI Engine has lost
+its upstream notice, because that per-file attribution is what GPLv2 section 2(a)
+requires.
 
 Never install the result over the bind-mounted plugin directory of this stack. See the
 warning above.

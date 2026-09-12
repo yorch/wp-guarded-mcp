@@ -4,7 +4,7 @@
  * Derived from AI Engine 3.7.7 (labs/mcp.php), Copyright (C) Jordy Meow,
  * GPLv2 or later. Modified 2026 by Jorge Barnaby: renamed throughout, prompts and resources added, named keys, an audit
  * hook and per-tool access gating.
- * See CREDITS.md for the full statement of changes.
+ * See the plugin header in guarded-mcp.php for the full attribution.
  */
 
 /**

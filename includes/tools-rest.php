@@ -3,7 +3,7 @@
 /*
  * Derived from AI Engine 3.7.7 (labs/mcp-rest.php), Copyright (C) Jordy Meow,
  * GPLv2 or later. Modified 2026 by Jorge Barnaby: renamed throughout.
- * See CREDITS.md for the full statement of changes.
+ * See the plugin header in guarded-mcp.php for the full attribution.
  */
 
 class GMCP_Tools_Rest {

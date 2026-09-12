@@ -4,7 +4,7 @@
  * Derived from AI Engine 3.7.7 (labs/mcp-oauth.php), Copyright (C) Jordy Meow,
  * GPLv2 or later. Modified 2026 by Jorge Barnaby: renamed throughout, host-root discovery documents, an administrator
  * check at authorize time and again per request.
- * See CREDITS.md for the full statement of changes.
+ * See the plugin header in guarded-mcp.php for the full attribution.
  */
 
 if ( !defined( 'ABSPATH' ) ) {
