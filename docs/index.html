@@ -279,10 +279,10 @@ pre code { color: var(--ink); }
   <div class="shell">
     <h2>What it can do</h2>
     <p class="lead">The content and site-data tools are on by default: posts, pages, block
-    content, taxonomies, comments, media, users, post meta, site options, post types and block
-    patterns. Site administration is off by default, and so is each integration below — each
-    appears only when its plugin is installed, and each exists because writing through the
-    generic tools looks like it worked and does not.</p>
+    content, taxonomies, comments, media, users, post meta, site options, post types, block
+    patterns and theme mods. Site administration is off by default, and so is each
+    integration below — each appears only when its plugin is installed, and each exists
+    because writing through the generic tools looks like it worked and does not.</p>
 
     <div class="log">
       <div class="entry">
@@ -295,14 +295,20 @@ pre code { color: var(--ink); }
         <p class="head"><code>Elementor</code> <span>off by default</span></p>
         <p>Theme-builder conditions written to both the template and Elementor's cached
         registry, CSS regeneration, and applying a library template without the design passing
-        through a tool argument. No kit import: rewriting a site's whole design system from an
-        archive in one call is not something this can put back.</p>
+        through a tool argument. Reading the active kit's global colours, fonts and settings,
+        and switching between the kits the site already has — clearing the generated CSS with
+        it, since switching the option alone leaves every page rendering the old design. No
+        kit import: rewriting a site's whole design system from an archive in one call is not
+        something this can put back.</p>
       </div>
       <div class="entry">
         <p class="head"><code>Kirki</code> <span>off by default</span></p>
         <p>Customizer field discovery and value get/set that resolves the field's storage model
         — theme_mod, grouped option or standalone option — so a written value lands in the row
-        the front end actually reads, not a row nothing reads.</p>
+        the front end actually reads, not a row nothing reads. Google Fonts cache clearing,
+        since changing a typography field does not invalidate the cached CSS on its own, and
+        config export with credential-shaped values redacted. No import, for the same reason
+        as the Elementor kit import.</p>
       </div>
       <div class="entry">
         <p class="head"><code>Yoast SEO</code> <span>off by default</span></p>
