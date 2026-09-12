@@ -1,0 +1,122 @@
+<?xml version="1.0"?>
+<ruleset name="Guarded MCP">
+  <description>Coding standards for the Guarded MCP plugin. The exclusions below are
+  each intentional and documented; they suppress categories that are structural false
+  positives for this codebase, not individual warnings.</description>
+
+  <file>.</file>
+  <exclude-pattern>vendor/</exclude-pattern>
+  <exclude-pattern>node_modules/</exclude-pattern>
+  <exclude-pattern>.dev/</exclude-pattern>
+
+  <config name="minimum_supported_wp_version" value="6.0"/>
+  <config name="testVersion" value="8.1-"/>
+
+  <rule ref="WordPress">
+    <!--
+      The plugin manages four custom tables (OAuth tokens, OAuth clients, audit log,
+      meta snapshots). WordPress has no API for these; direct $wpdb calls are the
+      standard approach. Caching is intentionally not applied to token lookups and
+      audit writes, which are security-sensitive and must read fresh state.
+    -->
+    <exclude name="WordPress.DB.DirectDatabaseQuery.DirectQuery"/>
+    <exclude name="WordPress.DB.DirectDatabaseQuery.NoCaching"/>
+    <exclude name="WordPress.DB.DirectDatabaseQuery.SchemaChange"/>
+
+    <!--
+      Table names cannot be SQL placeholders. They are constructed from $wpdb->prefix
+      plus fixed plugin suffixes, never from user input. The InterpolatedNotPrepared
+      sniff flags every {$table} even though the value is a trusted identifier.
+    -->
+    <exclude name="WordPress.DB.PreparedSQL.InterpolatedNotPrepared"/>
+
+    <!--
+      PluginCheck.Security.DirectDB.UnescapedDBParameter flags the same {$table}
+      interpolations as above. The table names are internally generated and not
+      user-controlled.
+    -->
+    <exclude name="PluginCheck.Security.DirectDB.UnescapedDBParameter"/>
+
+    <!--
+      The plugin uses error_log() for operational logging (OAuth flows, token
+      refresh, SSE streams, tool dispatch). This is gated behind a debug-mode option
+      and logs user IDs, client IDs, and token markers (SHA-256 truncated to 8 chars),
+      never credentials. The audit log's redaction policy (GMCP_Core::redact) is
+      applied to any argument logging.
+    -->
+    <exclude name="WordPress.PHP.DevelopmentFunctions.error_log_error_log"/>
+
+    <!--
+      The plugin fires third-party and core hook names: litespeed_purge_url,
+      litespeed_purge_post, litespeed_purge_all, wp_create_nav_menu,
+      sidebars_widgets. These are consumed by LiteSpeed Cache and WordPress core;
+      prefixing them would break the integration. The sniff is meant for hooks a
+      plugin *defines*, not hooks it *invokes*.
+    -->
+    <exclude name="WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound"/>
+
+    <!--
+      Dynamic hook names in backup.php ($action) and tools-admin.php ($hook) are
+      cron event names and UpdraftPlus scope actions, resolved from hardcoded
+      switch statements — not user input.
+    -->
+    <exclude name="WordPress.NamingConventions.PrefixAllGlobals.DynamicHooknameFound"/>
+
+    <!--
+      WP_SANDBOX_SCRAPING and DOING_CRON are WordPress core constants the plugin
+      checks, not defines.
+    -->
+    <exclude name="WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedConstantFound"/>
+
+    <!--
+      Global variables in uninstall.php are in global scope during the uninstall
+      bootstrap. They are now prefixed with $gmcp_ but the sniff still fires in the
+      uninstall context.
+    -->
+    <exclude name="WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedVariableFound"/>
+
+    <!--
+      set_error_handler (tools-core.php) suppresses warnings during PCRE pattern
+      compilation testing and is immediately restored. Required because preg_match
+      emits a warning rather than throwing on bad patterns.
+    -->
+    <exclude name="WordPress.PHP.DevelopmentFunctions.error_log_set_error_handler"/>
+
+    <!--
+      ini_set (server.php) disables output compression and buffering for SSE
+      streaming. Required for Server-Sent Events to flush correctly.
+    -->
+    <exclude name="Squiz.PHP.DiscouragedFunctions.Discouraged"/>
+
+    <!--
+      load_plugin_textdomain is unnecessary since WP 4.6 for .org-hosted plugins;
+      WordPress auto-loads translations. Removed from core.php but the sniff may
+      still fire on residual references.
+    -->
+    <exclude name="PluginCheck.CodeAnalysis.DiscouragedFunctions.load_plugin_textdomainFound"/>
+
+    <!--
+      wp_redirect is used in oauth.php for OAuth redirect_uri responses. These are
+      validated against registered client URIs before redirecting. wp_safe_redirect
+      would reject localhost and custom-scheme URIs that local MCP clients require.
+    -->
+    <exclude name="WordPress.Security.SafeRedirect.wp_redirect_wp_redirect"/>
+  </rule>
+
+  <!--
+    Nonce verification: Plugin Check cannot trace the call graph. Every POST handler
+    in settings.php is dispatched from maybe_handle_post(), which gates on
+    check_admin_referer() before any handler runs. The Missing/Recommended warnings
+    on individual handlers are false positives. We keep the rule enabled so genuinely
+    unguarded form handling is still caught, but the existing warnings are expected.
+  -->
+  <rule ref="WordPress.Security.NonceVerification"/>
+
+  <!--
+    Input sanitization: keep enabled. The $_SERVER reads are now unslashed, and
+    $_POST['gmcp_fields'] is split and re-sanitized downstream. The residual
+    InputNotSanitized warning on gmcp_fields is a known limitation of the sniff (it
+    flags the access point, not the downstream sanitize_key on each element).
+  -->
+  <rule ref="WordPress.Security.ValidatedSanitizedInput"/>
+</ruleset>
