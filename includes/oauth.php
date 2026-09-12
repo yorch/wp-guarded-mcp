@@ -1071,7 +1071,7 @@ class GMCP_OAuth {
     echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">';
     echo '<meta name="viewport" content="width=device-width, initial-scale=1">';
     echo '<title>' . esc_html( sprintf( 'Authorize %s', $client_name ) ) . '</title>';
-    echo $this->consent_styles();
+    echo wp_kses( $this->consent_styles(), [ 'style' => [] ] );
     echo '</head><body><main class="gmcp-oauth-card">';
 
     echo '<h1>Authorize this app</h1>';
@@ -1103,7 +1103,7 @@ class GMCP_OAuth {
     header( 'Content-Type: text/html; charset=utf-8' );
     echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">';
     echo '<title>Authorization error</title>';
-    echo $this->consent_styles();
+    echo wp_kses( $this->consent_styles(), [ 'style' => [] ] );
     echo '</head><body><main class="gmcp-oauth-card">';
     echo '<h1>Authorization error</h1>';
     echo '<p class="gmcp-oauth-note">' . esc_html( $message ) . '</p>';

@@ -380,6 +380,7 @@ class GMCP_Journal {
   private static function snapshot_for( string $entry_id ) {
     global $wpdb;
     $row = $wpdb->get_row( $wpdb->prepare(
+      // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name is a plugin constant
       "SELECT meta_value FROM " . self::snapshot_table() . " WHERE entry_id = %s ORDER BY id DESC LIMIT 1",
       $entry_id
     ) );
@@ -389,6 +390,7 @@ class GMCP_Journal {
   private static function snapshot_exists( string $entry_id ): bool {
     global $wpdb;
     return (int) $wpdb->get_var( $wpdb->prepare(
+      // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name is a plugin constant
       "SELECT COUNT(*) FROM " . self::snapshot_table() . " WHERE entry_id = %s",
       $entry_id
     ) ) > 0;

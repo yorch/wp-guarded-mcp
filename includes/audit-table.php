@@ -486,7 +486,7 @@ class GMCP_Audit_Table extends WP_List_Table {
               /* translators: %d: an audit log entry number. */
               __( 'What entry %d changed:', 'guarded-mcp' ), (int) $item['id'] ) ) ),
       esc_html( $short ),
-      $this->expander( $item, $why, $short, $records ) );
+      wp_kses_post( $this->expander( $item, $why, $short, $records ) ) );
   }
 
   /**

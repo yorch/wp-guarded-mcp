@@ -396,7 +396,7 @@ class GMCP_Server {
   * moment this plugin or a filter on it grows one.
   */
   private static function is_content_block_list( $content ): bool {
-    if ( !is_array( $content ) || $content === [] || !array_is_list( $content ) ) {
+    if ( !is_array( $content ) || $content === [] || array_keys( $content ) !== range( 0, count( $content ) - 1 ) ) {
       return false;
     }
     foreach ( $content as $block ) {

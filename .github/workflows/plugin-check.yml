@@ -1,0 +1,99 @@
+name: Plugin Check
+
+# Runs the WordPress.org Plugin Check against the plugin on every push and pull
+# request, so a change that would fail review is caught before it reaches the
+# directory.
+#
+# Plugin Check is a WP-CLI command that needs WordPress loaded to run, and
+# WordPress needs a database to boot, even though the checks themselves are
+# static analysis and never query it. The workflow brings up a throwaway
+# MariaDB container as a service, boots WordPress against it, installs Plugin
+# Check, and runs the check.
+#
+# Errors fail the build. Warnings are printed but do not, matching what the
+# WordPress.org review team enforces: errors block, warnings advise.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  plugin-check:
+    runs-on: ubuntu-latest
+
+    services:
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: wp
+          MARIADB_USER: wp
+          MARIADB_PASSWORD: wp
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-retries=20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Plugin Check
+        run: |
+          # Use the wordpress:cli-php8.2 image, which bundles WP-CLI. Run as
+          # root so we can write to /tmp. The default 128 MB PHP memory limit
+          # is not enough for WP-CLI's zip extractor during `wp core
+          # download`, so a wrapper passes `-d memory_limit=512M` to PHP
+          # directly (WP_CLI_PHP_ARGS does not reach the phar's shebang).
+          docker run --rm \
+            --user root \
+            --network host \
+            -v "$PWD:/workspace/guarded-mcp" \
+            --entrypoint bash \
+            wordpress:cli-php8.2 -c '
+              set -e
+
+              # Wrapper that runs WP-CLI with enough memory for core download.
+              printf "#!/bin/bash\nexec php -d memory_limit=512M /usr/local/bin/wp \"\$@\"\n" > /usr/local/bin/wp-mem
+              chmod +x /usr/local/bin/wp-mem
+
+              # Download WordPress core to a throwaway directory.
+              mkdir -p /tmp/wp && cd /tmp/wp
+              wp-mem core download --force --allow-root
+
+              # Point it at the MariaDB service container.
+              wp-mem config create \
+                --dbname=wp --dbuser=wp --dbpass=wp --dbhost=127.0.0.1 \
+                --force --skip-check --allow-root
+
+              # Install WordPress so Plugin Check can boot.
+              wp-mem core install \
+                --url=http://localhost \
+                --title="Plugin Check" \
+                --admin_user=admin --admin_password=admin \
+                --admin_email=check@local.test \
+                --skip-email --allow-root
+
+              # Install Plugin Check from the repository.
+              wp-mem plugin install plugin-check --activate --allow-root
+
+              # Symlink the plugin under its required slug so WordPress
+              # derives the right identity from the folder name.
+              ln -s /workspace/guarded-mcp /tmp/wp/wp-content/plugins/guarded-mcp
+
+              # Run the check. The exclude flags keep dev-only files out of the
+              # report: .dev holds the test stack, .github holds CI workflows,
+              # tmp holds build artifacts, .gitignore and the agent docs are not
+              # shipped, and hidden_files and github_directory are plugin-level
+              # findings that fire on files the build script strips before
+              # publication.
+              wp-mem plugin check guarded-mcp \
+                --exclude-directories=.dev,.github,tmp \
+                --exclude-files=.gitignore,AGENTS.md,CLAUDE.md,README.md \
+                --ignore-codes=hidden_files,github_directory \
+                --format=table \
+                --allow-root
+            '

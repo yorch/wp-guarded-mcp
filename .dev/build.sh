@@ -49,7 +49,7 @@ fi
 # plugin zip is a portability problem on top of being noise. docs/ is the project page,
 # which is a website rather than part of the plugin, and it carries screenshots that
 # would otherwise be shipped twice.
-( cd "$STAGE/$SLUG" && rm -rf .dev .wordpress-org .gitignore README.md AGENTS.md CLAUDE.md docs )
+( cd "$STAGE/$SLUG" && rm -rf .dev .wordpress-org .github .gitignore README.md AGENTS.md CLAUDE.md docs )
 
 # CREDITS.md ships. It is the only file carrying the upstream copyright notice and the
 # statement of changes that GPLv2 sections 1 and 2(a) require, and every zip built before
