@@ -2030,6 +2030,29 @@ check "and the log does not record a move that never happened" \
 call mi_self "{\"jsonrpc\":\"2.0\",\"id\":241,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_menu_item\",\"arguments\":{\"item_id\":$ITEM_A,\"parent_id\":$ITEM_A}}}"
 check "an item cannot be its own parent" "$(verdict mi_self)" "error"
 
+# A post_type item stores an empty post_title and inherits the title from the page it
+# points at. The update reply used to report that raw empty string, while wp_get_menu_items
+# reported the resolved title — so an agent comparing the two could conclude the update
+# erased the title and "restore" it, which freezes the item and stops it following the
+# page. The reply now reports the resolved title and url, matching wp_get_menu_items.
+INHERIT_MENU=$(echo "$MENU_ID" | cut -d'|' -f1)
+INHERIT_PAGE=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Inherited Title Probe","post_type"=>"page","post_status"=>"publish"]);' 2>/dev/null | tr -d '\r\n')
+INHERIT_ITEM=$(docker compose exec -T cli wp eval '
+  echo wp_update_nav_menu_item( '"$INHERIT_MENU"', 0, ["menu-item-object-id" => '"$INHERIT_PAGE"', "menu-item-object" => "page", "menu-item-type" => "post_type", "menu-item-status" => "publish"] );' 2>/dev/null | tr -d '\r\n')
+call mi_inherit "{\"jsonrpc\":\"2.0\",\"id\":244,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_menu_item\",\"arguments\":{\"item_id\":$INHERIT_ITEM,\"position\":0}}}"
+check "an inheriting item reports the resolved title, not the empty stored one" \
+  "$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(t["title"])' mi_inherit)" "Inherited Title Probe"
+# CONTROL: the stored post_title is still empty, so inheritance is preserved. Writing the
+# resolved title back would freeze the item, which is the failure this fix prevents an
+# agent from triggering.
+check "CONTROL: the stored title is still empty (inheritance preserved)" \
+  "$(docker compose exec -T cli wp eval 'echo get_post_field("post_title", '"$INHERIT_ITEM"');' 2>/dev/null | tr -d '\r\n')" ""
+# A post_type item stores _menu_item_url empty and takes its link from the page. The reply
+# should report the resolved permalink, not the empty string, matching wp_get_menu_items.
+check "and the resolved url is the page permalink, not the empty stored one" \
+  "$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print("EMPTY" if t["url"]=="" else "resolved")' mi_inherit)" "resolved"
+docker compose exec -T cli wp post delete "$INHERIT_PAGE" --force >/dev/null 2>&1
+
 echo "-- menu slugs and the audit --"
 # WordPress appends a numbered suffix when a derived slug is taken, and the slug is what an
 # Elementor Nav Menu widget stores. Creating "main-menu-2" silently leaves that widget
