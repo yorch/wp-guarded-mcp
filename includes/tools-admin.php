@@ -607,7 +607,7 @@ class GMCP_Tools_Admin {
       ],
       'wp_update_menu_item' => [
         'name' => 'wp_update_menu_item',
-        'description' => 'Change one menu item in place: its title, its URL, which item it sits under, its position, or whether it opens in a new tab. Only the fields passed change. Everything else is read and written back as it was, because WordPress\'s own updater blanks every field an update omits, which leaves the item sitting in the menu with no link and no error. Refuses to move an item under itself, under one of its own descendants, or under an item in another menu: each of those breaks the menu silently. A post_type or taxonomy item takes its link from the thing it points at, so setting url on one is refused rather than stored and ignored. position is the stored order counting from 0, the same number wp_get_menu_items reports.',
+        'description' => 'Change one menu item in place: its title, its URL, which item it sits under, its position, or whether it opens in a new tab. Only the fields passed change. Everything else is read and written back as it was, because WordPress\'s own updater blanks every field an update omits, which leaves the item sitting in the menu with no link and no error. Refuses to move an item under itself, under one of its own descendants, or under an item in another menu: each of those breaks the menu silently. A post_type or taxonomy item takes its link from the thing it points at, so setting url on one is refused rather than stored and ignored. position is the stored order counting from 0, the same number wp_get_menu_items reports. The reply reports the resolved title and url — the same values wp_get_menu_items reports — so a post_type item that inherits its title shows the title of the page it points at, not the empty string WordPress stores. Do not write that resolved title back: it freezes the item and it stops following the page.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -2593,13 +2593,29 @@ class GMCP_Tools_Admin {
       $stored = (int) get_post_field( 'menu_order', $item_id );
     }
 
+    /*
+    * Report the resolved title and url, not the raw stored values.
+    *
+    * A post_type or taxonomy item stores an empty post_title and _menu_item_url when it
+    * inherits them from the object it points at. WordPress's wp_setup_nav_menu_item()
+    * resolves both at read time — the same function wp_get_menu_items uses through
+    * wp_get_nav_menu_items() — so reporting the raw stored values here made the update
+    * reply say title:"" and url:"" while the lister said title:"About Us" and
+    * url:"https://…/about-us/". An agent comparing the two could conclude the update
+    * erased the title and "restore" it by writing the resolved title back, which freezes
+    * the item: it stops following the page it points at. That is exactly the failure
+    * menu_item_fields() exists to prevent on the write path, and the response was
+    * undermining it from the read path.
+    */
+    $resolved = wp_setup_nav_menu_item( get_post( $item_id ) );
+
     return $this->json( $r, [
       'item_id' => $item_id,
       'menu_id' => $menu_id,
       'menu' => $menu_name,
       'changed' => $changed,
-      'title' => get_post_field( 'post_title', $item_id ),
-      'url' => (string) get_post_meta( $item_id, '_menu_item_url', true ),
+      'title' => $resolved->title,
+      'url' => $resolved->url,
       'parent_id' => (int) get_post_meta( $item_id, '_menu_item_menu_item_parent', true ),
       'position' => $stored,
     ] );
