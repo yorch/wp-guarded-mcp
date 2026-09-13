@@ -575,14 +575,24 @@ print('blocks' if isinstance(c, list) and c and all(
     isinstance(b, dict) and 'type' in b and 'text' in b for b in c) else 'malformed')
 " "$1"; }
 SH_PAGE=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Shape probe","post_type"=>"page","post_status"=>"draft"]);' 2>/dev/null | tr -d '\r\n')
+SH_POST=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Shape probe post","post_type"=>"post","post_status"=>"draft"]);' 2>/dev/null | tr -d '\r\n')
 SH_MEDIA=$(docker compose exec -T cli wp eval 'echo wp_insert_attachment(["post_title"=>"Shape media","post_mime_type"=>"image/gif","post_status"=>"inherit"], false, 0);' 2>/dev/null | tr -d '\r\n')
 call sh_create '{"jsonrpc":"2.0","id":93,"method":"tools/call","params":{"name":"create_pages","arguments":{"title":"Shape created","status":"draft"}}}'
 call sh_get    "{\"jsonrpc\":\"2.0\",\"id\":94,\"method\":\"tools/call\",\"params\":{\"name\":\"get_pages\",\"arguments\":{\"id\":$SH_PAGE}}}"
 call sh_update "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\",\"params\":{\"name\":\"update_pages\",\"arguments\":{\"id\":$SH_PAGE,\"title\":\"Shape renamed\"}}}"
 call sh_delete "{\"jsonrpc\":\"2.0\",\"id\":96,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_pages\",\"arguments\":{\"id\":$SH_PAGE}}}"
 call sh_media  "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\",\"params\":{\"name\":\"get_media\",\"arguments\":{\"id\":$SH_MEDIA}}}"
+# The posts variants of the same four tools. The fix is in a shared function, so the pages
+# tests cover the class, but the triage doc named eight affected tools and only four were
+# tested. A post's content field has the same shape as a page's, yet proving it directly is
+# cheaper than relying on the inference forever.
+call sh_pcreate '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"create_posts","arguments":{"title":"Shape post created","status":"draft"}}}'
+call sh_pget    "{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"tools/call\",\"params\":{\"name\":\"get_posts\",\"arguments\":{\"id\":$SH_POST}}}"
+call sh_pupdate "{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"tools/call\",\"params\":{\"name\":\"update_posts\",\"arguments\":{\"id\":$SH_POST,\"title\":\"Shape post renamed\"}}}"
+call sh_pdelete "{\"jsonrpc\":\"2.0\",\"id\":102,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_posts\",\"arguments\":{\"id\":$SH_POST}}}"
 for t in create get update delete; do
   check "${t}_pages answers with a block list" "$(shape sh_$t)" "blocks"
+  check "${t}_posts answers with a block list" "$(shape sh_p$t)" "blocks"
 done
 # Media never had the defect, because an attachment has no content field for the key test
 # to trip over. Kept as a control: it is the shape the others should always have had, and
