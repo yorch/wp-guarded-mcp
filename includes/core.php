@@ -52,6 +52,10 @@ class GMCP_Core {
     'mcp_tools_yoast' => false,
     // ACF: custom field values through update_field/get_field with key references.
     'mcp_tools_acf' => false,
+    // Gravity Forms: form schema, submissions, notes. Submissions are personal data
+    // written by members of the public, so the entry tools are admin and an entry edit
+    // takes the same two-step as a deletion.
+    'mcp_tools_gravityforms' => false,
     'mcp_debug_mode' => false,
     // Keep a short history of tool calls, including refused ones, for the settings
     // screen. An agent otherwise operates with no visible record at all.
@@ -714,6 +718,76 @@ class GMCP_Core {
     if ( $this->get_option( 'mcp_tools_acf' ) ) {
       new GMCP_Tools_Acf();
     }
+
+    // And Gravity Forms: every tool goes through GFAPI, and its tables are not wp_posts,
+    // so there is nothing a generic tool could do instead. The per-call check in
+    // GMCP_Tools_Gravityforms::handle_call() is the runtime honesty check.
+    if ( $this->get_option( 'mcp_tools_gravityforms' ) ) {
+      new GMCP_Tools_Gravityforms();
+    }
+  }
+
+  /**
+  * Two-step confirmation for irreversible operations, using a token the server mints.
+  *
+  * The obvious designs do not work. A `confirm: true` flag is free to send and carries
+  * no evidence of intent. Echoing back the target's own name is better, since it proves
+  * the caller knew which target it named, but it is still information the caller already
+  * has in the same call, so it is satisfied on the first attempt. Both stop a typo.
+  * Neither stops the thing that actually matters here: this agent reads comments, post
+  * bodies and form entries that anonymous people wrote, so "delete plugin X" can arrive as
+  * an instruction smuggled into content, and a single injected tool call should not be
+  * able to complete an irreversible operation.
+  *
+  * A server-minted token fixes exactly that. The first call changes nothing and returns a
+  * random token; only a second call carrying it proceeds. An injected instruction cannot
+  * predict the token, so it cannot complete in one shot, and the refusal message with its
+  * preview passes through the transcript where a person can see what was about to happen.
+  * It raises the bar to two calls; it does not defeat an agent that is fully under an
+  * attacker's control, and no description here should claim that it does.
+  *
+  * The token is keyed to the tool AND the normalized target, so a token minted to delete
+  * one plugin cannot be replayed to delete another. It is single use and expires in two
+  * minutes.
+  *
+  * This lives here rather than in the admin tool class because the optional groups each
+  * delete something irreversible, and a copy in each file would drift in exactly the way
+  * this repo keeps paying for: the TTL, the single-use delete, or the target binding
+  * updated in one place and not the others.
+  *
+  * @param string $tool    The tool name, part of the token key.
+  * @param mixed  $target  The resolved thing being acted on, part of the token key.
+  * @param array  $args    The call's arguments; `confirm` is read from here.
+  * @param string $summary What is about to happen, for the human reading the transcript.
+  *
+  * @return true|string True to proceed, otherwise the message to return.
+  */
+  public static function confirm_gate( string $tool, $target, array $args, string $summary ) {
+    // Keyed on the RESOLVED target, not on the raw arguments. A caller may name a
+    // plugin as "akismet" or "akismet/akismet.php"; both resolve to the same file, so
+    // both must share one token, and the token has to be bound to what will actually
+    // be deleted rather than to how it happened to be spelled.
+    $key = 'gmcp_confirm_' . hash( 'sha256', $tool . '|' . (string) $target );
+
+    $given = isset( $args['confirm'] ) ? (string) $args['confirm'] : '';
+    $expected = get_transient( $key );
+
+    if ( $given !== '' && is_string( $expected ) && hash_equals( $expected, $given ) ) {
+      delete_transient( $key ); // Single use: a replay has to be confirmed again.
+      return true;
+    }
+
+    $token = bin2hex( random_bytes( 8 ) );
+    set_transient( $key, $token, 2 * MINUTE_IN_SECONDS );
+
+    // The backup situation belongs in the summary rather than in a gate. Whoever reads
+    // this is about to approve something irreversible, and "the last backup finished
+    // eight days ago" is the fact that most changes their answer. Gating on it instead
+    // would have to fail open on any provider this plugin cannot read, and a control that
+    // silently passes is worse than an absent one, because it gets counted.
+    $backup = class_exists( 'GMCP_Backup' ) ? GMCP_Backup::confirmation_line() : '';
+
+    return $summary . $backup . " Nothing has been changed. To go ahead, call this tool again within two minutes with the same arguments plus confirm set to \"{$token}\".";
   }
 
   #region Options

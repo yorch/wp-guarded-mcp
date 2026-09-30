@@ -68,6 +68,9 @@ docker compose exec -T cli wp plugin install wordpress-seo --activate
 
 docker compose exec -T cli wp plugin install advanced-custom-fields --activate
 ./smoke-acf.sh        # the ACF tools; needs ACF (free or PRO)
+
+docker compose exec -T cli wp plugin activate gravityforms
+./smoke-gravityforms.sh  # the Gravity Forms tools; needs Gravity Forms
 ```
 
 `smoke-admin.sh` also expects a theme named `futuretheme` that declares a PHP version this

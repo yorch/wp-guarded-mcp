@@ -330,6 +330,7 @@ class GMCP_Settings {
       'mcp_tools_kirki' => 'bool',
       'mcp_tools_yoast' => 'bool',
       'mcp_tools_acf' => 'bool',
+      'mcp_tools_gravityforms' => 'bool',
       'mcp_debug_mode' => 'bool',
       'mcp_activity_log' => 'bool',
       'mcp_audit_days' => 'days',
@@ -1151,6 +1152,11 @@ class GMCP_Settings {
     $kirki = class_exists( 'Kirki' );
     $yoast = defined( 'WPSEO_VERSION' );
     $acf = class_exists( 'ACF' );
+    // Gravity Forms defines GFCommon/GFForms and GFAPI as classes once its bootstrap
+    // reaches common.php and includes/api.php, a few lines apart. GFPlugin's autoloader
+    // can resolve a class name on a copy that later bailed out, so two classes plus the
+    // method the tools call is the same signal the group's own per-call check uses.
+    $gf = class_exists( 'GFCommon' ) && class_exists( 'GFAPI' ) && method_exists( 'GFAPI', 'get_entries' );
 
     // Only the groups actually rendered are declared to the save. A checkbox that was
     // never on screen must keep its stored value rather than read as unticked, which is
@@ -1170,6 +1176,9 @@ class GMCP_Settings {
     }
     if ( $acf ) {
       $keys[] = 'mcp_tools_acf';
+    }
+    if ( $gf ) {
+      $keys[] = 'mcp_tools_gravityforms';
     }
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'Which groups of tools an agent is offered. A group that is off is not merely hidden: its tools are refused if asked for by name.', 'guarded-mcp' ); ?></p>
@@ -1224,6 +1233,12 @@ class GMCP_Settings {
                   <?php esc_html_e( 'ACF (custom field discovery, value get/set through field key references)', 'guarded-mcp' ); ?>
                 </label>
               <?php endif; ?>
+              <?php if ( $gf ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_gravityforms" value="1" <?php checked( !empty( $options['mcp_tools_gravityforms'] ) ); ?>>
+                  <?php esc_html_e( 'Gravity Forms (form schema, submissions, entry notes and status)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
               <label>
                 <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>
                 <?php esc_html_e( 'Generate tools from this site\'s REST API routes', 'guarded-mcp' ); ?>
@@ -1255,6 +1270,11 @@ class GMCP_Settings {
             <?php if ( $acf ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The ACF tools exist because writing a custom field through update_post_meta appears to work and does not: ACF needs a hidden field key reference (_fieldname = field_123abc) to return the right type, and without it get_field() returns a bare ID instead of a post object, or null. These write through update_field(), which writes both the value and the key reference.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $gf ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The Gravity Forms tools exist because submissions live in Gravity Forms\' own tables, not in posts, meta or options, so no other tool here can reach them. A submission is personal data a member of the public wrote, so the tools that return or change one are admin-level, a password field is never returned or written, and overwriting an answer takes the same two-step confirmation as a deletion because the previous value cannot be recovered. Deleting a submission is permanent; there is no restore tool.', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
             <p class="description">

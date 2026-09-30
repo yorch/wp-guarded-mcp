@@ -400,6 +400,65 @@ field through `update_post_meta` appears to work and does not.
 - ACF's internals move between versions, so every call into one is guarded and
   reports what was missing rather than fataling.
 
+## Gravity Forms
+
+This group exists because the generic tools cannot reach the data at all. A form's
+schema is a serialized array in `wp_gf_form_meta`; submissions live in `wp_gf_entry`
+with their answers in `wp_gf_entry_meta` keyed by input id; notes live in
+`wp_gf_entry_notes`. None of `wp_get_posts`, `wp_get_post_meta` or the option tools
+touches any of it, so unlike the Yoast or Kirki groups there is no silent success to
+fix — there is simply no other way in.
+
+What shapes the design is that a submission is the one record on a WordPress site
+that a member of the public wrote, that no administrator typed, and that a business
+may be obliged to keep.
+
+- **The bar is set by the effect, not by the tool's name.** `gf_update_entry_field`
+  overwrites an answer in place. The previous value is not recorded anywhere, the
+  change journal does not read Gravity Forms' tables so `wp_undo_change` cannot put
+  it back, and this plugin has no restore tool by design. That is the same
+  irreversible loss as deleting the entry, so it takes the same server-minted
+  two-step: the first call changes nothing and returns a token, the second writes.
+  Attaching the two-step only to tools whose names contain "delete" would leave the
+  more injectable operation — "correct this value for me", arriving in the text the
+  agent was asked to read — as a single call.
+- **A token is bound to the entry, the input and the new value**, so one minted to
+  change an answer on entry A cannot be replayed against entry B, and a token for one
+  value cannot be used to write a different one. Writing the value an answer already
+  holds is a no-op and needs no token, because nothing is destroyed.
+- **Only plain answer fields are writable.** The field's type is checked against the
+  form the entry belongs to before anything is written. A password field is refused
+  because Gravity Forms hands its value back in plain text through this API, so
+  writing or returning one is a credential leak into the model and the audit log; an
+  upload, a signature, an opt-in/consent field, a repeater, and anything a plugin
+  added are refused because changing them changes something the site relies on.
+  Writing an entry field also re-runs the form's add-on hooks, so a call is not the
+  isolated data edit its name suggests, and the description says so.
+- **A password field is never returned on read either**, and the tracking fields (IP,
+  user agent, source URL) are omitted unless asked for.
+- **Gravity Forms fails open on a filter it does not understand, so the tools fail
+  closed.** An unrecognised query operator is silently treated as "match everything"
+  (measured), and a date it cannot parse matches every entry rather than none.
+  `gf_list_entries` therefore validates the operator against a list, the filtered
+  input id against the form, and the date by parsing it and requiring it to
+  round-trip — a shape check alone lets `2024-02-30` through, which Gravity Forms
+  rolls over rather than rejecting. Each is refused rather than passed on.
+- **A value this group refuses to return is not readable through the query filters
+  either.** Gravity Forms' own "any field" search compares the term against every
+  meta value, including a password field's, and with the total in the reply that is a
+  boolean oracle: a caller can test a guess one character at a time. A field filter on
+  the same input is the same oracle with one branch. So `search` is rebuilt as a
+  match-any over the form's readable answer fields (which is also what makes it a real
+  substring search, since Gravity Forms' default is an exact match), `search` requires
+  a form id for that reason, and a field filter on a password or credit-card field is
+  refused.
+- **Deletion is honest about what it does not do.** It removes the entry row, its
+  answers and its notes; it does not necessarily remove files the entry uploaded or
+  data an add-on stored in another table. There is no restore tool.
+- **Access levels follow WooCommerce's reasoning.** A form definition is
+  configuration, so reading it is `read`; anything that returns or changes a
+  submission is `admin`, because a submission is somebody's personal data.
+
 ## Theme mods
 
 Theme mods are the customizer's storage, and four generic tools cover them:

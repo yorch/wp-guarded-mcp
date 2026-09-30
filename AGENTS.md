@@ -79,7 +79,8 @@ The suites live in `.dev/`. `smoke.sh` covers transport, auth, content tools, pr
 resources. `smoke-admin.sh` covers the administration tools and every guard, and is
 destructive. `smoke-woo.sh` covers the shop tools, `smoke-elementor.sh` covers the Elementor tools,
 `smoke-kirki.sh` covers the Kirki tools, `smoke-yoast.sh` covers the Yoast SEO tools,
-and `smoke-acf.sh` covers the ACF tools. Run all seven before committing. The last five need
+`smoke-acf.sh` covers the ACF tools, and `smoke-gravityforms.sh` covers the Gravity Forms tools.
+Run all eight before committing. The last six need
 their plugin installed and say so and exit rather than reporting failures against a site that
 simply does not have it.
 

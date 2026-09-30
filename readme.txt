@@ -37,7 +37,7 @@ Content and site data: posts, pages, block content, taxonomies, comments, media,
 
 Site administration (off by default): plugins and themes; menus; widgets; General/Reading/Discussion settings; permalinks; scheduled events; Site Health.
 
-WooCommerce, Elementor, Kirki, Yoast SEO and ACF, each on a switch of its own that appears only when the plugin is installed.
+WooCommerce, Elementor, Kirki, Yoast SEO, ACF and Gravity Forms, each on a switch of its own that appears only when the plugin is installed.
 
 Backups, if you have a compatible backup plugin. There is no restore tool, deliberately.
 
@@ -151,6 +151,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * Generic theme mod tools in the core group: wp_get_theme_mod, wp_set_theme_mod, wp_list_theme_mods and wp_remove_theme_mod. The critical one is wp_set_theme_mod, which uses set_theme_mod to merge one key rather than replacing the whole theme_mods array, so nav_menu_locations and the other mods survive.
 * Yoast SEO tools on their own switch: per-post SEO metadata read/write through the Surfaces API, and indexable rebuild. Writing _yoast_wpseo_* post meta through the generic post-meta tool is a silent success because Yoast reads from the wp_yoast_indexable table on the front end, not from post meta; these write through Yoast's own API and rebuild the indexable. Computed analysis fields are refused.
 * Advanced Custom Fields tools on their own switch: custom field discovery, value get/set through update_field and get_field with field key references. Writing a custom field through update_post_meta is a silent success because ACF needs a hidden field key reference to return the right type; these write through update_field, which writes both the value and the reference. Unregistered fields are refused, and the post_id is restricted to known forms.
+* Gravity Forms tools on their own switch: the form list and one form's field schema, an entry-count briefing, and — at admin level, because a submission is personal data a member of the public wrote — searching and reading submissions, changing an entry's status or flags, overwriting one answer, deleting an entry, and adding or listing entry notes. Overwriting an answer and deleting an entry each take a server-minted two-step, because the previous value cannot be recovered afterwards and there is no restore tool. A password-type field is never returned or written, and an upload, opt-in, repeater or plugin-added field is refused rather than overwritten. Deleting an entry removes the submission, its answers and its notes; it does not reach files the entry uploaded or data an add-on stored elsewhere.
 
 == Upgrade Notice ==
 

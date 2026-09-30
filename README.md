@@ -72,9 +72,9 @@ An access level belongs to a named key. OAuth callers always act as the administ
 | `readonly` | 18 | 28 | 32 | Reads only |
 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
-nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO
-and ACF are not counted: their tools are optional groups that come and go with a plugin, so
-folding them in would make the table depend on what happens to be installed.
+nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO,
+ACF and Gravity Forms are not counted: their tools are optional groups that come and go with
+a plugin, so folding them in would make the table depend on what happens to be installed.
 
 A **named key** narrows this further. It carries its own level, an optional expiry date,
 and an optional list of the only tools it may call, so a key handed to a deploy script
@@ -122,6 +122,18 @@ per-post SEO metadata read/write through the Surfaces API, and indexable rebuild
 **Advanced Custom Fields**, off by default, and the switch only appears when ACF is
 installed: custom field discovery, value get/set through `update_field`/`get_field` with
 field key references.
+
+**Gravity Forms**, off by default, and the switch only appears when Gravity Forms is
+installed: the form list and one form's field schema, a briefing of entry counts, and — at
+`admin` because a submission is personal data a member of the public wrote — searching and
+reading submissions, changing an entry's status or read/starred flags, overwriting one
+answer, deleting an entry, and adding or listing entry notes. A submission edit and a
+deletion each take the same server-minted two-step, because overwriting an answer destroys
+the only copy and there is no restore tool. A password-type field is never returned or
+writable, and a field whose type is not a plain answer (an upload, an opt-in, a repeater,
+anything a plugin added) is refused rather than overwritten. Deleting an entry removes the
+submission, its answers and its notes; it does not reach files the entry uploaded or data an
+add-on stored elsewhere.
 
 **REST API tools**, off by default: tools generated from the site's own REST API routes.
 Generated once and cached for a day; the cache is thrown away on the first request after
@@ -297,12 +309,13 @@ docker run --rm -v "$PWD":/app -w /app php:8.1-cli sh -c 'for f in includes/*.ph
 ```
 
 A throwaway WordPress for testing lives in `.dev/` (see that directory's README). It carries
-seven suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
+eight suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
 previews; `smoke-admin.sh` for the administration tools, the change journal, named keys and
 every guard around them, which rebuilds `.htaccess` partway through and is the destructive
 one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor tools;
-`smoke-kirki.sh` for the Kirki tools; `smoke-yoast.sh` for the Yoast SEO tools; and
-`smoke-acf.sh` for the ACF tools. The last five need their plugin installed.
+`smoke-kirki.sh` for the Kirki tools; `smoke-yoast.sh` for the Yoast SEO tools;
+`smoke-acf.sh` for the ACF tools; and `smoke-gravityforms.sh` for the Gravity Forms tools.
+The last six need their plugin installed.
 
 Never run `wp plugin install --force` against that stack. Its plugin directory is a bind
 mount of this repository, and WordPress deletes the old plugin directory before unpacking

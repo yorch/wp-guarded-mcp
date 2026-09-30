@@ -68,54 +68,16 @@ class GMCP_Tools_Admin {
   }
 
   /**
-  * Two-step confirmation for irreversible operations, using a token the server mints.
+  * Two-step confirmation, shared with every other group that deletes something
+  * irreversible. @see GMCP_Core::confirm_gate() for the reasoning and the token rules.
   *
-  * The obvious designs do not work. A `confirm: true` flag is free to send and carries
-  * no evidence of intent. Echoing back the target's own name is better, since it proves
-  * the caller knew which target it named, but it is still information the caller already
-  * has in the same call, so it is satisfied on the first attempt. Both stop a typo.
-  * Neither stops the thing that actually matters here: this agent reads comments and post
-  * content that anonymous people wrote, so "delete plugin X" can arrive as an instruction
-  * smuggled into content, and a single injected tool call should not be able to complete
-  * a deletion.
-  *
-  * A server-minted token fixes exactly that. The first call changes nothing and returns a
-  * random token; only a second call carrying it proceeds. An injected instruction cannot
-  * predict the token, so it cannot complete in one shot, and the refusal message with its
-  * preview passes through the transcript where a person can see what was about to happen.
-  *
-  * The token is keyed to the tool AND the normalized arguments, so a token minted to
-  * delete one plugin cannot be replayed to delete another. It is single use and expires
-  * in two minutes.
+  * Kept as a thin delegator so the many call sites in this file read as before; the
+  * implementation moved to the core so a second copy cannot drift from this one.
   *
   * @return true|string True to proceed, otherwise the message to return.
   */
   private function confirmed( string $tool, $target, array $a, string $summary ) {
-    // Keyed on the RESOLVED target, not on the raw arguments. A caller may name a
-    // plugin as "akismet" or "akismet/akismet.php"; both resolve to the same file, so
-    // both must share one token, and the token has to be bound to what will actually
-    // be deleted rather than to how it happened to be spelled.
-    $key = 'gmcp_confirm_' . hash( 'sha256', $tool . '|' . (string) $target );
-
-    $given = isset( $a['confirm'] ) ? (string) $a['confirm'] : '';
-    $expected = get_transient( $key );
-
-    if ( $given !== '' && is_string( $expected ) && hash_equals( $expected, $given ) ) {
-      delete_transient( $key ); // Single use: a replay has to be confirmed again.
-      return true;
-    }
-
-    $token = bin2hex( random_bytes( 8 ) );
-    set_transient( $key, $token, 2 * MINUTE_IN_SECONDS );
-
-    // The backup situation belongs in the summary rather than in a gate. Whoever reads
-    // this is about to approve something irreversible, and "the last backup finished
-    // eight days ago" is the fact that most changes their answer. Gating on it instead
-    // would have to fail open on any provider this plugin cannot read, and a control that
-    // silently passes is worse than an absent one, because it gets counted.
-    $backup = class_exists( 'GMCP_Backup' ) ? GMCP_Backup::confirmation_line() : '';
-
-    return $summary . $backup . " Nothing has been changed. To go ahead, call this tool again within two minutes with the same arguments plus confirm set to \"{$token}\".";
+    return GMCP_Core::confirm_gate( $tool, $target, $a, $summary );
   }
 
   /**

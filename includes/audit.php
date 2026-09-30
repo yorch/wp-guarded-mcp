@@ -198,14 +198,20 @@ class GMCP_Audit {
   * because the source of a copy is not what the call changed. Both still appear in the
   * arguments, which the deep search reads.
   *
+  * entry_id and form_id are the Gravity Forms group's identifiers. entry_id is ahead of
+  * form_id and of the generic id because a call that names an entry is aimed at that
+  * entry; naming only the form (gf_list_entries, gf_set_form_active) falls through to
+  * form_id. Without both, every row those tools wrote recorded an empty target, which is
+  * the one column an operator filters on.
+  *
   * scope is last because it names a mode rather than a thing. It is reached only for a
   * wp_flush_cache that named no post, where "object" or "transients" is the whole of what
   * the call was aimed at; anything more specific outranks it.
   */
   private function target( array $args ): string {
     foreach ( [ 'plugin', 'stylesheet', 'hook', 'ID', 'post_id', 'item_id', 'widget_id',
-      'menu', 'key', 'sidebar', 'user_id', 'comment_ID', 'term_id', 'to_id', 'page_id',
-      'id', 'slug', 'name', 'post_title', 'scope' ] as $key ) {
+      'menu', 'key', 'sidebar', 'user_id', 'comment_ID', 'entry_id', 'term_id', 'form_id',
+      'to_id', 'page_id', 'id', 'slug', 'name', 'post_title', 'scope' ] as $key ) {
       if ( isset( $args[ $key ] ) && is_scalar( $args[ $key ] ) ) {
         $value = (string) $args[ $key ];
         if ( $value !== '' ) {

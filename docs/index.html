@@ -329,6 +329,17 @@ pre code { color: var(--ink); }
         prefixes.</p>
       </div>
       <div class="entry">
+        <p class="head"><code>Gravity Forms</code> <span>off by default</span></p>
+        <p>Form schema, a submission-count briefing, and — at admin, because a submission is
+        personal data a member of the public wrote — searching and reading submissions,
+        changing an entry's status or flags, overwriting one answer, deleting an entry, and
+        entry notes. Submissions live in Gravity Forms' own tables, so no other tool here can
+        reach them. Overwriting an answer and deleting an entry each take a two-step
+        confirmation, because the old value cannot be recovered and there is no restore tool.
+        Password fields are never returned or written, and uploads, opt-ins, repeaters and
+        plugin-added fields are refused rather than overwritten.</p>
+      </div>
+      <div class="entry">
         <p class="head"><code>Backups</code> <span>if you have a backup plugin</span></p>
         <p>Start one before a risky change, list what exists, and see when one last completed.
         Listings never include archive filenames, because on both supported plugins the
