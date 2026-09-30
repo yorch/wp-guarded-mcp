@@ -135,6 +135,19 @@ It also inventories Custom Code snippets (title, location, priority, size and a 
 never returns or writes their code: Pro echoes a snippet unescaped into every page, so
 writing one is an arbitrary persistent script injection with no restore behind it.
 
+**WooCommerce Subscriptions**, off by default, and the switch only appears when it is
+installed: the subscription list and one subscription's state, a recurring-revenue
+briefing, and moving a subscription between the states a shop owner manages. It is
+deliberately missing the three tools that look most useful. There is no tool that charges
+a customer, no tool that changes the next payment date — WooCommerce Subscriptions accepts a
+date in the past, which charges on the next queue run, and an empty value stops the
+subscription renewing for good — and no immediate cancellation, because cancelled is
+terminal and ends the customer's agreement at the gateway on gateways that manage billing.
+The status tool offers only active ↔ on-hold and active ↔ pending-cancel, refuses
+reactivating a subscription that has an unpaid renewal (it would restore service and cancel
+the retry without collecting the debt), and reports every address it emailed. The reads
+never return a customer's email, address, line-item names or payment method.
+
 **Gravity Forms**, off by default, and the switch only appears when Gravity Forms is
 installed: the form list and one form's field schema, a briefing of entry counts, and — at
 `admin` because a submission is personal data a member of the public wrote — searching and
@@ -334,14 +347,15 @@ docker run --rm -v "$PWD":/app -w /app php:8.1-cli sh -c 'for f in includes/*.ph
 ```
 
 A throwaway WordPress for testing lives in `.dev/` (see that directory's README). It carries
-eleven suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
+twelve suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
 previews; `smoke-admin.sh` for the administration tools, the change journal, named keys and
 every guard around them, which rebuilds `.htaccess` partway through and is the destructive
 one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor tools;
 `smoke-kirki.sh` for the Kirki tools; `smoke-yoast.sh` for the Yoast SEO tools;
 `smoke-acf.sh` for the ACF tools; `smoke-gravityforms.sh` for the Gravity Forms tools; and
-`smoke-learndash.sh` for the LearnDash tools; and `smoke-elementor-pro.sh` for the Elementor
-Pro tools. The last eight need their plugin installed.
+`smoke-learndash.sh` for the LearnDash tools; `smoke-elementor-pro.sh` for the Elementor Pro
+tools; and `smoke-woo-subscriptions.sh` for the Subscriptions tools. The last nine need
+their plugin installed.
 
 Never run `wp plugin install --force` against that stack. Its plugin directory is a bind
 mount of this repository, and WordPress deletes the old plugin directory before unpacking

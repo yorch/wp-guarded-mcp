@@ -77,6 +77,9 @@ docker compose exec -T cli wp plugin activate sfwd-lms
 
 docker compose exec -T cli wp plugin activate elementor-pro
 ./smoke-elementor-pro.sh  # the Elementor Pro tools; needs Elementor Pro (and Elementor)
+
+docker compose exec -T cli wp plugin activate woocommerce-subscriptions
+./smoke-woo-subscriptions.sh  # the Subscriptions tools; needs WooCommerce Subscriptions
 ```
 
 `smoke-admin.sh` also expects a theme named `futuretheme` that declares a PHP version this

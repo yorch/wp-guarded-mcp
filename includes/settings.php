@@ -326,6 +326,7 @@ class GMCP_Settings {
       'mcp_tools_admin' => 'bool',
       'mcp_tools_rest' => 'bool',
       'mcp_tools_woo' => 'bool',
+      'mcp_tools_woo_subscriptions' => 'bool',
       'mcp_tools_elementor' => 'bool',
       'mcp_tools_elementor_pro' => 'bool',
       'mcp_tools_kirki' => 'bool',
@@ -1167,6 +1168,10 @@ class GMCP_Settings {
     // steps class and its enrolment function; requiring all three is the same signal the
     // group's own per-call check uses.
     $ld = defined( 'LEARNDASH_VERSION' ) && class_exists( 'LDLMS_Factory_Post' ) && function_exists( 'ld_update_course_access' );
+    // Subscriptions has no version constant in 7.7.0, so presence is the classes plus a
+    // function a tool here calls. WC_Subscription alone is not enough: a gateway bundling
+    // the subscriptions core library provides it without WooCommerce Subscriptions.
+    $wcs = class_exists( 'WC_Subscriptions' ) && class_exists( 'WC_Subscription' ) && function_exists( 'wcs_get_subscription' );
 
     // Only the groups actually rendered are declared to the save. A checkbox that was
     // never on screen must keep its stored value rather than read as unticked, which is
@@ -1174,6 +1179,9 @@ class GMCP_Settings {
     $keys = [ 'mcp_tools_core', 'mcp_tools_admin', 'mcp_tools_rest' ];
     if ( $woo ) {
       $keys[] = 'mcp_tools_woo';
+    }
+    if ( $wcs ) {
+      $keys[] = 'mcp_tools_woo_subscriptions';
     }
     if ( $elementor ) {
       $keys[] = 'mcp_tools_elementor';
@@ -1226,6 +1234,12 @@ class GMCP_Settings {
                 <label>
                   <input type="checkbox" name="mcp_tools_woo" value="1" <?php checked( !empty( $options['mcp_tools_woo'] ) ); ?>>
                   <?php esc_html_e( 'WooCommerce (products, stock, orders, customers, sales figures)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
+              <?php if ( $wcs ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_woo_subscriptions" value="1" <?php checked( !empty( $options['mcp_tools_woo_subscriptions'] ) ); ?>>
+                  <?php esc_html_e( 'WooCommerce Subscriptions (recurring revenue, subscription state, the safe status changes)', 'guarded-mcp' ); ?>
                 </label>
               <?php endif; ?>
               <?php if ( $elementor ) : ?>
@@ -1281,6 +1295,11 @@ class GMCP_Settings {
             <?php if ( $woo ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The WooCommerce tools are separate because the risk is a different shape: they read customer names, email addresses and delivery addresses and hand them to a model. Refunds are deliberately not included, and any action that emails a customer says so in its own description.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $wcs ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The WooCommerce Subscriptions tools read recurring revenue and move a subscription between the states a shop owner manages, and they are deliberately missing the things that look most useful. There is no tool that charges a customer, no tool that changes the next payment date (WooCommerce Subscriptions accepts a date in the past, which charges on the next queue run, and an empty value stops the renewal for good), and no immediate cancellation, because cancelled is terminal and cancels at the gateway on gateways that manage billing. The reads return counts and state, never a customer\'s email, address, line-item names or payment method.', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
             <?php if ( $elementor ) : ?>

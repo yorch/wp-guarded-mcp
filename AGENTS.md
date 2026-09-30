@@ -122,8 +122,9 @@ resources. `smoke-admin.sh` covers the administration tools and every guard, and
 destructive. `smoke-woo.sh` covers the shop tools, `smoke-elementor.sh` covers the Elementor tools,
 `smoke-kirki.sh` covers the Kirki tools, `smoke-yoast.sh` covers the Yoast SEO tools,
 `smoke-acf.sh` covers the ACF tools, `smoke-gravityforms.sh` covers the Gravity Forms tools,
-`smoke-learndash.sh` covers the LearnDash tools, and `smoke-elementor-pro.sh` covers the
-Elementor Pro tools. Run all eleven before committing. The last eight need
+`smoke-learndash.sh` covers the LearnDash tools, `smoke-elementor-pro.sh` covers the
+Elementor Pro tools, and `smoke-woo-subscriptions.sh` covers the Subscriptions tools. Run all
+twelve before committing. The last nine need
 their plugin installed and say so and exit rather than reporting failures against a site that
 simply does not have it.
 

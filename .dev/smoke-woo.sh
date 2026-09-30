@@ -348,12 +348,16 @@ SUBPHP
   # 'pending' while the reply claimed 'completed'.
   check "and the stored status is unchanged" \
     "$(docker compose exec -T cli wp eval "echo wc_get_order($SUB_ID)->get_status();" 2>/dev/null | tr -d '\r\n')" "active"
-  call sub_note "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_add_order_note\",\"arguments\":{\"id\":$SUB_ID,\"note\":\"should not land\"}}}"
-  check "adding an order note to a subscription is refused too" "$(verdict sub_note)" "error"
-  # Asserting the specific text rather than a note count: creating the fixture writes notes
-  # of its own, so a count would be measuring the fixture.
-  NOTE_HITS=$(wpc db query "SELECT COUNT(*) FROM $(wpc db prefix)comments WHERE comment_post_ID=$SUB_ID AND comment_content LIKE '%should not land%'" --skip-column-names)
-  check "and the note text was never written" "$NOTE_HITS" "0"
+  # Notes ARE allowed on a subscription: a note changes no state, so the type guard, which
+  # exists for writes that have an effect this plugin cannot see, does not apply. This is the
+  # control opposite the status check above.
+  call sub_note "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_add_order_note\",\"arguments\":{\"id\":$SUB_ID,\"note\":\"annotation on a subscription\"}}}"
+  check "annotating a subscription is allowed, since a note changes no state" "$(verdict sub_note)" "ok"
+  NOTE_HITS=$(wpc db query "SELECT COUNT(*) FROM $(wpc db prefix)comments WHERE comment_post_ID=$SUB_ID AND comment_content LIKE '%annotation on a subscription%'" --skip-column-names)
+  check "and the note really landed" "$NOTE_HITS" "1"
+  # And the status is still untouched by it.
+  check "and the note did not disturb the status" \
+    "$(docker compose exec -T cli wp eval "echo wc_get_order($SUB_ID)->get_status();" 2>/dev/null | tr -d '\r\n')" "active"
   # The control for the guard: a real order still works, so the refusal is about the type
   # and not about the tool having stopped working.
   call sub_control "{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_order_status\",\"arguments\":{\"id\":$O_ID,\"status\":\"processing\"}}}"

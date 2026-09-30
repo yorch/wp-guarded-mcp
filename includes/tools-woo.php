@@ -690,6 +690,11 @@ class GMCP_Tools_Woo {
   * resolution happens in every method below that starts with wc_get_order(). A guard on one
   * caller is a guard the next caller does not have.
   *
+  * wc_get_order() is used directly by the read tools (get_order, list_orders), deliberately:
+  * reading an order's own data is a legitimate admin operation, and the subscription's own
+  * fields are part of what an order query returns. It is the writes that have an effect this
+  * plugin cannot see, so it is the writes that are refused.
+  *
   * @return \WC_Order|null
   */
   private function order_or_null( int $id ): ?\WC_Order {
@@ -841,8 +846,12 @@ class GMCP_Tools_Woo {
 
   private function add_order_note( array $a, array $r ): array {
     $id = (int) ( $a['id'] ?? 0 );
-    $order = $this->order_or_null( $id );
-    if ( !$order ) {
+    // Notes are allowed on a subscription, unlike a status change. A note changes no state:
+    // it does not reschedule a payment, reactivate anything at the gateway or alter a date,
+    // and annotating a subscription is a real thing to want. The type guard is about writes
+    // that have an effect this plugin cannot see, and a note is not one of them.
+    $order = $id > 0 ? wc_get_order( $id ) : null;
+    if ( !$order instanceof \WC_Order ) {
       return $this->not_an_order( $id, $r );
     }
     $note = sanitize_textarea_field( (string) ( $a['note'] ?? '' ) );

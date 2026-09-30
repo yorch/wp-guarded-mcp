@@ -44,6 +44,10 @@ class GMCP_Core {
     // large, noisy surface next to the curated tools.
     'mcp_tools_rest' => false,
     'mcp_tools_woo' => false,
+    // WooCommerce Subscriptions: reading recurring revenue, and the few status changes that
+    // are safe to make. Its own switch rather than part of the shop group, so a site that
+    // already runs the shop tools is not handed billing control by an update.
+    'mcp_tools_woo_subscriptions' => false,
     // Elementor: theme-builder conditions, and putting a library template on a page.
     'mcp_tools_elementor' => false,
     // Elementor Pro: its own switch, because the free group is switched on sites running
@@ -723,6 +727,14 @@ class GMCP_Core {
     // a dozen entries in front of a model that fail the moment it tries one.
     if ( $this->get_option( 'mcp_tools_woo' ) && class_exists( 'WooCommerce' ) ) {
       new GMCP_Tools_Woo();
+    }
+
+    // Subscriptions on their own switch, and NOT gated on the shop group: a site can run the
+    // subscriptions group without the shop tools, and the two answer different questions.
+    // Registered whenever its own switch is on; the per-call check in its handle_call() is
+    // what refuses when WooCommerce Subscriptions has been deactivated since.
+    if ( $this->get_option( 'mcp_tools_woo_subscriptions' ) ) {
+      new GMCP_Tools_Woo_Subscriptions();
     }
 
     // Same reasoning as WooCommerce above: without the page builder these tools are a dozen

@@ -37,7 +37,7 @@ Content and site data: posts, pages, block content, taxonomies, comments, media,
 
 Site administration (off by default): plugins and themes; menus; widgets; General/Reading/Discussion settings; permalinks; scheduled events; Site Health.
 
-WooCommerce, Elementor, Elementor Pro, Kirki, Yoast SEO, ACF, Gravity Forms and LearnDash, each on a switch of its own that appears only when the plugin is installed.
+WooCommerce, WooCommerce Subscriptions, Elementor, Elementor Pro, Kirki, Yoast SEO, ACF, Gravity Forms and LearnDash, each on a switch of its own that appears only when the plugin is installed.
 
 Backups, if you have a compatible backup plugin. There is no restore tool, deliberately.
 
@@ -155,6 +155,8 @@ It has not been tested on multisite. The code has network-aware branches, but un
 
 * LearnDash tools on their own switch: the course list and one course's structure (lessons, each with its topics and quizzes), a counts-only briefing, and — at admin level, because they carry student data — who holds access to a course and how, one user's reachable courses, one user's progress, and one quiz's questions. They distinguish "enrolled" from "can view the course": an open course, or one whose join setting is empty (the default), is viewable by anyone with nobody enrolled, and LearnDash's own has-access check is true for those users and for administrators before it ever looks at an enrolment. Enrolling and unenrolling act on the direct enrolment only and report separately whether the user can also reach the course another way, because that decides whether removing the enrolment does anything. Unenrolling takes the same two-step as a deletion and refuses when the access comes from a LearnDash Group. Quiz answer keys are never returned; question text and points are. Progress covers lessons and topics only, as LearnDash's own percentage does.
 * Elementor Pro tools on their own switch, deliberately few of them: whether Pro is really loaded and which of its modules can be called (checked per module by class AND method, not by a version string), how many form submissions exist, and an inventory of Custom Code snippets. Popups, loop templates and mega menus are library templates with theme-builder conditions, which the existing Elementor tools already report, so there is no second implementation of that comparison to drift from the first. Submissions are counted and never returned, and the count checks that Pro's submission tables exist first, because Pro creates them on the first submission and its own query layer answers "none" while they are missing. Snippets are listed by title, location, priority, size and hash; the code body is never read or written, because Pro echoes a snippet unescaped into every page.
+
+* WooCommerce Subscriptions tools on their own switch: the subscription list and one subscription's state, a recurring-revenue briefing, and moving a subscription between active, on-hold and pending-cancel. Deliberately absent: anything that charges a customer, anything that changes the next payment date (the date is validated for ordering only, so a past date charges on the next queue run and an empty one stops the renewal for good), and immediate cancellation (terminal, and ends the agreement at the gateway). Reactivating a subscription with an unpaid renewal is refused, and the reply names every address it emailed. The reads never return a customer's email, address, line-item names or payment method.
 
 == Upgrade Notice ==
 

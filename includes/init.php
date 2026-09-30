@@ -19,6 +19,7 @@ spl_autoload_register( function ( $class ) {
     'GMCP_Tools_Core' => '/includes/tools-core.php',
     'GMCP_Tools_Rest' => '/includes/tools-rest.php',
     'GMCP_Tools_Woo' => '/includes/tools-woo.php',
+    'GMCP_Tools_Woo_Subscriptions' => '/includes/tools-woo-subscriptions.php',
     'GMCP_Tools_Elementor' => '/includes/tools-elementor.php',
     'GMCP_Tools_Kirki' => '/includes/tools-kirki.php',
     'GMCP_Tools_Elementor_Pro' => '/includes/tools-elementor-pro.php',

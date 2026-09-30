@@ -562,6 +562,76 @@ a model tries one. Registration is not gated on Pro being loaded, for the reason
 Elementor group's own carve-out documents: the status tool exists to answer "why is Pro not
 working", and a gate inside a class that is never constructed cannot run.
 
+## WooCommerce Subscriptions
+
+A subscription is a `WC_Order` subclass, and that single fact is what this slice is
+arranged around. It means the shop's own order tools resolve one — which is why the first
+commit in this slice is a fix to shipped code rather than a new tool — and it means a
+subscription's parent order and its renewal orders are ordinary `shop_order` rows that
+WooCommerce Subscriptions also reacts to.
+
+**The writes that were already reachable.** `wc_get_order()` returned a `WC_Subscription`
+for a subscription id, and `WC_Abstract_Order::set_status()` silently rewrites any status
+that is not valid for a subscription to `pending`, so `wc_update_order_status(sub,
+"completed")` stored `pending` and replied "moved from active to completed". Measured:
+before `wc-active`, reply claimed completed, after `wc-pending`. Cancelling a *parent order*
+moved its subscription from active to pending-cancel. Both were reachable with a `write`
+level key, on shops that never switch this group on. The guards are
+`GMCP_Tools_Woo::order_or_null()` (type), `update_order_status()`'s subscription-link check,
+and `GMCP_Core::commerce_post_guard()`, which the generic post and meta writers ask — the
+same "a policy belongs to the object" rule as `option_guard()`.
+
+**What is deliberately absent, and why each one.**
+
+- **No tool charges a customer.** A renewal charge moves money through a gateway, and
+  nothing this plugin has can put it back. Same category as the excluded refunds.
+- **No tool changes the next payment date.** This is the one that looks harmless.
+  WooCommerce Subscriptions validates a date change for ORDERING only — after the start and
+  trial end, before the end — and never for whether it is in the future. A past date is
+  accepted, the payment job is rescheduled to it, and the next queue run charges. An empty
+  value deletes the date instead, which stops the subscription renewing ever again. One
+  argument, two ways to hurt a shop.
+- **No immediate cancellation.** `cancelled` is terminal: `can_be_updated_to('active')` has
+  no path out of it, so the customer would have to check out again, and on a gateway that
+  manages its own billing the agreement ends there irreversibly. `pending-cancel` is the
+  state for "the customer asked to stop", and `on-hold` is for "stop charging now".
+- **No creation or resubscription.** Both create a billing agreement the customer did not
+  enter.
+
+**The one write, and its guards.** `wcs_set_subscription_status` offers exactly
+`active ↔ on-hold` and `active ↔ pending-cancel`. The allow-list is narrower than
+`can_be_updated_to()` on purpose: that function runs filters, so a third-party plugin can
+widen it, and it accepts aliases — `completed` maps onto the active branch, which would run
+the reactivation code and then store `pending`. Two of the four transitions are also refused
+for a particular subscription: reactivating one with an unpaid **renewal** order, because it
+restores service and cancels the retry without collecting the debt; and reactivating a
+pending-cancel one whose original end date was not recorded, because a fixed-term
+subscription would come back with no end. The unpaid-renewal test reads renewals rather than
+`needs_payment()`, which is also true for a subscription whose parent order is merely
+pending — the normal state after a fixture is created, and not a debt.
+
+Whether going `pending-cancel` can be undone from this plugin is **computed**, not assumed:
+on a gateway that schedules its own payments the agreement can end there, and WooCommerce
+Subscriptions will then refuse to reactivate. The confirmation token is bound to the
+outcome (`id:from>to` plus the values a reactivation recalculates), not only to the
+subscription, so a token minted for one of the four changes cannot complete another.
+
+Verification is against stored state read fresh, never the return value:
+`update_status()` returns true or throws, a hook failure inside the transition is caught by
+WooCommerce Subscriptions and written as a note while the call still returns true, and the
+reply reports those notes and every address emailed.
+
+**PII.** The reads return counts and state only. A subscription carries the customer's
+billing email and address, line-item names an admin can edit, notes with decline text, and
+payment-method meta with gateway customer ids; all of it lives on the same object and the
+WooCommerce order tool already returns it at admin level. read-level tools do not, so a
+shop's recurring revenue can be read without moving personal data through the model.
+
+**What the suite cannot test.** The fixture renews manually, because that is how a
+subscription is built without a payment gateway, and a manual subscription reports every
+gateway feature as supported. So the gateway-dependent branches are unreachable here, and
+the suite says so rather than implying coverage it does not have.
+
 ## Theme mods
 
 Theme mods are the customizer's storage, and four generic tools cover them:
