@@ -219,7 +219,41 @@ class GMCP_Core {
         : 'The default role has to be the name of a role.';
     }
 
+    // An audit log this plugin does not own is still not writable through it. The rule is
+    // about the LOG rather than about WP Activity Log, so a site that switches to another
+    // logging plugin is covered by adding its prefix to the list rather than by finding
+    // every caller.
+    //
+    // Measured on WP Activity Log 5.6.7: wsal_disabled-alerts is the list of events the log
+    // does not record, and replacing it silences whatever the writer chooses — 2001 is
+    // "published a post", so one write stops the record of content changes and a second
+    // call confirms the silence. wsal_delete-data arms dropping the whole table on
+    // uninstall, wsal_pruning-date shortens the retention window to a day, and
+    // wsal_excluded-users stops recording named accounts. Each is one call, none is
+    // reversible from here, and all four are exactly the settings an agent would change if
+    // it wanted its own activity to stop being written down.
+    //
+    // This is the same shape as the option policies above it and lives in the same place for
+    // the same reason: the settings tool, the generic option tool and the journal's undo all
+    // write options, and a rule enforced in one of them is a rule two of them do not have.
+    foreach ( self::audit_log_option_prefixes() as $prefix ) {
+      if ( strpos( $key, $prefix ) === 0 ) {
+        return 'This option configures an activity log that records what happens on this site. Changing it can stop events being recorded, shorten how long they are kept, or arm deleting the log on uninstall, and none of that can be undone from here. A log an agent can switch off is not a log. Change it on the plugin\'s own settings screen.';
+      }
+    }
+
     return true;
+  }
+
+  /**
+  * Option prefixes belonging to a third-party activity log.
+  *
+  * Filterable, because the point is the category rather than one plugin: a site running a
+  * different logger adds its prefix through gmcp_audit_log_prefixes and gets the same
+  * protection without this list being edited.
+  */
+  public static function audit_log_option_prefixes(): array {
+    return (array) apply_filters( 'gmcp_audit_log_prefixes', [ 'wsal_' ] );
   }
 
   /**
