@@ -3573,6 +3573,11 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'No post with ID ' . intval( $a['ID'] ?? 0 ) . '.', -32602 );
           break;
         }
+        $commerce = GMCP_Core::commerce_post_guard( $src->ID, 'Duplicating' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
         $dup = [
           'post_title' => ( $a['post_title'] ?? '' ) !== '' ? sanitize_text_field( $a['post_title'] ) : $src->post_title,
           // A copy is a draft unless the caller says otherwise, and the source's own
@@ -3769,6 +3774,11 @@ class GMCP_Tools_Core {
           break;
         }
         $post_id = intval( $a['ID'] );
+        $commerce = GMCP_Core::commerce_post_guard( $post_id, 'Updating' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
         $c = [ 'ID' => $post_id ];
 
         // Handle JSON strings (some MCP clients send objects as JSON strings)
@@ -3970,6 +3980,11 @@ class GMCP_Tools_Core {
           break;
         }
         $delete_id = intval( $a['ID'] );
+        $commerce = GMCP_Core::commerce_post_guard( $delete_id, 'Deleting' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
         // Trashing is guarded as well as forcing, which departs from how the rest of this
         // tool treats the two. Everywhere else the trash is the recoverable half; here it
         // is not, because a trashed template renders as nothing on every page that
@@ -4092,6 +4107,11 @@ class GMCP_Tools_Core {
           break;
         }
         $pid = intval( $a['ID'] );
+        $commerce = GMCP_Core::commerce_post_guard( $pid, 'Setting meta on' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
 
         // Handle JSON strings for meta (some MCP clients send objects as JSON strings)
         $meta = $a['meta'] ?? null;
@@ -4161,6 +4181,11 @@ class GMCP_Tools_Core {
           break;
         }
         $pid = intval( $a['ID'] );
+        $commerce = GMCP_Core::commerce_post_guard( $pid, 'Deleting meta from' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
         $key = (string) $a['key'];
         $del_why = $this->meta_key_allowed( $key );
         if ( $del_why !== true ) {

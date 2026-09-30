@@ -430,6 +430,53 @@ class GMCP_Core {
   * @param string $verb Capitalised, and used as the sentence's subject: Deleting, Unpublishing.
   * @return true|string True when there is nothing to warn about, otherwise the refusal.
   */
+  /**
+  * Post types owned by a commerce plugin, which the generic post and meta tools must not
+  * write.
+  *
+  * An order and a subscription are posts when WooCommerce's high-performance order storage
+  * is off, which is the default and what most shops run. That makes them reachable by
+  * wp_update_post, wp_update_post_meta and wp_duplicate_post, none of which know anything
+  * about them. The harm is not theoretical: a subscription carries its billing period,
+  * its next payment date and whether it renews manually in ordinary meta rows, and its
+  * status in post_status. A generic write changes what the next renewal charges and when,
+  * without rescheduling the payment job and without telling the gateway, so the site and
+  * the gateway disagree and neither says so. Its status is the post's status, so a generic
+  * write of wc-active is an activation that skipped every rule the subscription plugin
+  * has.
+  *
+  * This lives here, as a policy about the OBJECT rather than about one tool, because more
+  * than one tool has to agree about it — the same reasoning as option_guard(). The
+  * alternative, a check inside each write tool, is how the settings tool once enforced a
+  * policy no other writer did.
+  *
+  * Only writes are refused. Reading an order's meta is a legitimate admin operation and the
+  * agent's own WooCommerce tools do it deliberately; it is the write that has an effect
+  * this plugin cannot see or undo.
+  *
+  * @return true|string True when the write is allowed, otherwise the refusal.
+  */
+  public static function commerce_post_guard( int $post_id, string $verb = 'Changing' ) {
+    if ( $post_id <= 0 ) {
+      return true;
+    }
+    $types = (array) apply_filters( 'gmcp_commerce_post_types', [
+      'shop_order', 'shop_subscription', 'shop_order_refund', 'shop_order_placehold',
+    ] );
+    $type = get_post_type( $post_id );
+    if ( !$type || !in_array( $type, $types, true ) ) {
+      return true;
+    }
+
+    // Owned by WooCommerce rather than by WordPress, and the difference matters: the
+    // refusal explains why rather than only saying no.
+    $owner = 'WooCommerce';
+    return $verb . ' a ' . $type . ' through the generic post tools is refused because ' . $owner . ' owns it. '
+      . 'Its status, its dates and its billing settings are stored in the same rows a post uses, so a generic write changes them without rescheduling anything or telling the payment gateway. '
+      . 'It is also not recorded by the change journal, so it could not be put back. '
+      . 'Use the WooCommerce tools, which go through WooCommerce, or edit it in wp-admin.';
+  }
+
   public static function template_reference_guard( int $post_id, string $verb ) {
     if ( $post_id <= 0 || get_post_type( $post_id ) !== 'elementor_library' ) {
       return true;

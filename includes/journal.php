@@ -581,6 +581,9 @@ class GMCP_Journal {
       if ( !get_post( (int) $entry['ID'] ) ) {
         return 'The post no longer exists.';
       }
+      if ( !GMCP_Changes::undoable_post( (int) $entry['ID'] ) ) {
+        return 'It belongs to a ' . self::post_type_label( (int) $entry['ID'] ) . ', whose writes this journal does not record or revert. Putting a subscription back with a plain post write leaves the site and the payment gateway disagreeing.';
+      }
       if ( !empty( $entry['redacted'] ) ) {
         return 'The previous value looked like it held a credential, so it was never stored.';
       }
@@ -600,6 +603,9 @@ class GMCP_Journal {
       if ( !get_post( (int) $entry['ID'] ) ) {
         return 'The post no longer exists.';
       }
+      if ( !GMCP_Changes::undoable_post( (int) $entry['ID'] ) ) {
+        return 'It belongs to a ' . self::post_type_label( (int) $entry['ID'] ) . ', whose writes this journal does not record or revert. Putting a subscription back with a plain post write leaves the site and the payment gateway disagreeing.';
+      }
       foreach ( (array) ( $entry['previous'] ?? [] ) as $value ) {
         if ( !self::too_large( $value ) ) {
           return true;
@@ -608,6 +614,12 @@ class GMCP_Journal {
       return 'Every previous value was too large to keep.';
     }
     return 'Unknown change type.';
+  }
+
+  /** The post type of an entry's target, for naming it in a refusal. */
+  private static function post_type_label( int $post_id ): string {
+    $post = get_post( $post_id );
+    return $post ? $post->post_type : 'post type';
   }
 
   /**

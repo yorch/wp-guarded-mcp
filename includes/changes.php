@@ -361,9 +361,47 @@ class GMCP_Changes {
     return mb_substr( $title, 0, 80 );
   }
 
+  /**
+  * Posts the journal refuses to record, and therefore refuses to undo.
+  *
+  * A subscription is a post when HPOS is off, and its status is that post's post_status
+  * while its dates are meta rows on the same post. Recording it would offer a
+  * wp_undo_change that puts wc-cancelled back to wc-active with wp_update_post(), which
+  * reschedules no payment job and reactivates nothing at the gateway — so the site and the
+  * gateway disagree and neither one says so. WC_Subscription::update_status() is the only
+  * thing that keeps the two in step, and it is not what an undo would call.
+  *
+  * The same entry point covers meta, so the cache rows a subscription writes while being
+  * READ are not journalled either. A cold read of related orders writes
+  * _subscription_*_order_ids_cache, which produced journal entries for a tool that changed
+  * nothing a caller asked for.
+  *
+  * Refusing here rather than at undo time is the point: an entry that is never written
+  * cannot be offered as an undo, and the two cannot drift apart.
+  */
+  const UNRECORDED_POST_TYPES = [ 'shop_subscription' ];
+
   /** Revisions are posts, and saving one fires these hooks. So does the empty auto-draft. */
   private function skip_post( WP_Post $post ): bool {
+    if ( in_array( $post->post_type, self::UNRECORDED_POST_TYPES, true ) ) {
+      return true;
+    }
     return $post->post_type === 'revision' || $post->post_status === 'auto-draft';
+  }
+
+  /**
+  * Whether an undo may act on this post, asked separately from whether it was recorded.
+  *
+  * Recording and undoing are two decisions and a refusal has to be both: a row that somehow
+  * exists for a type this file will not touch must not become a live undo just because the
+  * recording side was fixed. @see skip_post() for why subscriptions are on the list.
+  */
+  public static function undoable_post( int $post_id ): bool {
+    $post = get_post( $post_id );
+    if ( !$post ) {
+      return false;
+    }
+    return !in_array( $post->post_type, self::UNRECORDED_POST_TYPES, true );
   }
 
   public function post_changed( $post_id, $after, $before ): void {
@@ -425,6 +463,11 @@ class GMCP_Changes {
       '_pingme', '_encloseme',
       '_elementor_css', '_elementor_page_assets', '_elementor_controls_usage',
       '_elementor_inspector_data', '_elementor_element_cache',
+      // Cache rows a plugin writes while it is being READ. Reading a subscription's related
+      // orders populates these on a cold cache, so a read-only tool produced journal entries
+      // for a change nobody asked for.
+      '_subscription_renewal_order_ids_cache', '_subscription_resubscribe_order_ids_cache',
+      '_subscription_switch_order_ids_cache',
     ] );
   }
 

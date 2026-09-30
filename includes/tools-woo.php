@@ -674,10 +674,87 @@ class GMCP_Tools_Woo {
     ] );
   }
 
+  /**
+  * Fetch an order for these tools, refusing anything that is not an ordinary order.
+  *
+  * wc_get_order() resolves a subscription id too, because WC_Subscription extends WC_Order,
+  * and every tool in this group then treats one as an order. That is not a naming problem:
+  * a subscription's set_status() silently rewrites a status that is not valid for a
+  * subscription to 'pending', so wc_update_order_status on a subscription moved it from
+  * active to pending while the reply said "moved from active to completed". It also skipped
+  * everything WC_Subscription::update_status() does — the date bookkeeping and the payment
+  * schedule — while still firing the transition hooks, so a gateway that cancels on them
+  * cancelled at the gateway while the site and the gateway then disagreed.
+  *
+  * The refusal lives here rather than in the one tool that was reported, because the same
+  * resolution happens in every method below that starts with wc_get_order(). A guard on one
+  * caller is a guard the next caller does not have.
+  *
+  * @return \WC_Order|null
+  */
+  private function order_or_null( int $id ): ?\WC_Order {
+    if ( $id <= 0 ) {
+      return null;
+    }
+    $order = wc_get_order( $id );
+    if ( !$order instanceof \WC_Order ) {
+      return null;
+    }
+    return $order->get_type() === 'shop_order' ? $order : null;
+  }
+
+  /** The sentence a refusal gives when the id resolves to something that is not an order. */
+  private function not_an_order( int $id, array $r ): array {
+    $thing = wc_get_order( $id );
+    if ( $thing instanceof \WC_Order ) {
+      return $this->error( $r, '#' . $id . ' is a ' . $thing->get_type() . ', not an order, so this tool will not touch it. These tools act on ordinary orders only. A subscription has its own rules for which status changes are allowed and its own date bookkeeping, and writing it as though it were an order silently records a status that was not set' . ( class_exists( 'WC_Subscription' ) ? '; use the subscriptions tools instead.' : '.' ) );
+    }
+    return $this->error( $r, 'No order with id ' . $id . '.' );
+  }
+
+  /**
+  * The subscription ids an order is bound to, or an empty array.
+  *
+  * Empty when WooCommerce Subscriptions is not loaded rather than assumed: this group runs
+  * on shops that have never installed it.
+  *
+  * @return string[]
+  */
+  private function subscription_links( int $order_id ): array {
+    if ( !function_exists( 'wcs_order_contains_subscription' ) || !function_exists( 'wcs_get_subscriptions_for_order' ) ) {
+      return [];
+    }
+    if ( !wcs_order_contains_subscription( $order_id, [ 'parent', 'renewal', 'switch', 'resubscribe' ] ) ) {
+      return [];
+    }
+    $ids = [];
+    foreach ( (array) wcs_get_subscriptions_for_order( $order_id, [ 'order_type' => 'any' ] ) as $subscription ) {
+      if ( $subscription instanceof \WC_Subscription ) {
+        $ids[] = '#' . $subscription->get_id();
+      }
+    }
+    return $ids;
+  }
+
   private function update_order_status( array $a, array $r ): array {
-    $order = wc_get_order( (int) ( $a['id'] ?? 0 ) );
+    $id = (int) ( $a['id'] ?? 0 );
+    $order = $this->order_or_null( $id );
     if ( !$order ) {
-      return $this->error( $r, 'No order with id ' . (int) ( $a['id'] ?? 0 ) . '.' );
+      return $this->not_an_order( $id, $r );
+    }
+    // An order that belongs to a subscription is not a plain order either, and the type
+    // check above cannot see that: a parent order and a renewal order are both ordinary
+    // shop_order rows. WooCommerce Subscriptions reacts to their status, so
+    // wc_update_order_status on one is a subscription write wearing an order's clothes.
+    // Measured on 7.7.0: cancelling a parent order moved its subscription from active to
+    // pending-cancel, which is the terminal-ish transition this plugin deliberately refuses
+    // to make directly; marking a failed renewal completed reactivates the subscription
+    // without any money moving; marking one failed puts it on hold. Refused here rather
+    // than allowed-with-a-warning, because the caller's intent is about the order and the
+    // effect lands on the subscription.
+    $linked = $this->subscription_links( $id );
+    if ( $linked ) {
+      return $this->error( $r, 'Order #' . $id . ' belongs to subscription ' . implode( ', ', $linked ) . ', and changing its status changes that subscription too, through rules that are not about the order. Nothing was changed. Use the subscriptions tools for the subscription, or change this order in wp-admin if the knock-on effect is what you want.' );
     }
     $status = $this->bare_status( sanitize_key( $a['status'] ?? '' ) );
     $valid = array_map( [ $this, 'bare_status' ], array_keys( wc_get_order_statuses() ) );
@@ -763,9 +840,10 @@ class GMCP_Tools_Woo {
   }
 
   private function add_order_note( array $a, array $r ): array {
-    $order = wc_get_order( (int) ( $a['id'] ?? 0 ) );
+    $id = (int) ( $a['id'] ?? 0 );
+    $order = $this->order_or_null( $id );
     if ( !$order ) {
-      return $this->error( $r, 'No order with id ' . (int) ( $a['id'] ?? 0 ) . '.' );
+      return $this->not_an_order( $id, $r );
     }
     $note = sanitize_textarea_field( (string) ( $a['note'] ?? '' ) );
     if ( $note === '' ) {

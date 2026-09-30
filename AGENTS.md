@@ -15,6 +15,24 @@ GitHub zip unpacks to. The plugin derives its identity from the folder through
 mid-call compares against that. Rename the folder and the self-protection stops matching,
 silently.
 
+**An order is not always a plain order.** `wc_get_order()` resolves a subscription id too,
+because `WC_Subscription` extends `WC_Order`, and an order that *belongs* to a subscription
+(the parent, a renewal, a switch) is an ordinary `shop_order` row. Both reach subscription
+state: `wc_update_order_status` on a subscription made `set_status('completed')` silently
+write `pending` while the reply said "completed", and cancelling a parent order moved its
+subscription from active to pending-cancel. So `GMCP_Tools_Woo::order_or_null()` refuses
+anything that is not `shop_order`, and `update_order_status()` separately refuses orders
+that carry a subscription link. Both are reachable at `write` level, on shops that never
+switch the subscriptions group on.
+
+**A policy about a post type belongs to the post type, not to the tool that writes it.**
+`GMCP_Core::commerce_post_guard()` is asked by every generic post and meta write
+(`wp_update_post`, `wp_update_post_meta`, `wp_delete_post_meta`, `wp_duplicate_post`,
+`wp_delete_post`), because an order and a subscription are `wp_posts` rows with the
+ordering storage off, and their billing period, next payment date and status live in those
+same rows. One write tool enforcing it and the next not is the same defect as the settings
+tool that once enforced an option policy no other writer did.
+
 **Never run `wp plugin install --force`, `wp plugin update` or `wp plugin delete` against
 the `.dev` stack.** Its plugin directory is a bind mount of this repository, and WordPress
 deletes the old directory before unpacking the new one. The delete goes through the mount

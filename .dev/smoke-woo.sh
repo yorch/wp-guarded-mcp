@@ -287,6 +287,88 @@ check "but a read does not" "$(fired wc_list_products)" "silent"
 docker compose exec -T wp sh -c 'rm -f /var/www/html/wp-content/mu-plugins/mutate-probe.php' >/dev/null 2>&1
 docker compose exec -T cli wp option delete probe_mutate >/dev/null 2>&1
 
+echo "-- a subscription is not an order, and the order tools refuse it --"
+# wc_get_order() resolves a subscription id, because WC_Subscription extends WC_Order, so
+# every tool that starts with wc_get_order() treated one as an order. set_status() then
+# silently rewrites a status that is not valid for a subscription to 'pending', so
+# wc_update_order_status said "moved from active to completed" while the stored status
+# became pending: a reported status that was never set. It also skipped the date bookkeeping
+# and the payment schedule WC_Subscription::update_status() performs, while still firing the
+# transition hooks a gateway cancels on. Reachable at write level, on sites that never turn
+# the subscriptions group on.
+#
+# Skipped, with the reason, when WooCommerce Subscriptions is absent: the fixture needs its
+# writer, and a suite that invented one would be testing its own invention.
+if docker compose exec -T cli wp plugin is-active woocommerce-subscriptions >/dev/null 2>&1; then
+  SUBFIX=$(mktemp)
+  cat > "$SUBFIX" <<'SUBPHP'
+<?php
+if ( ! class_exists( 'WC_Subscriptions' ) ) { echo 0; return; }
+foreach ( get_posts( [ 'post_type' => 'shop_subscription', 'post_status' => 'any', 'numberposts' => -1, 'fields' => 'ids' ] ) as $pid ) {
+  $o = wc_get_order( $pid );
+  if ( $o && strpos( (string) $o->get_billing_email(), 'wcs-guard-' ) === 0 ) { $o->delete( true ); }
+}
+$parent = wc_create_order();
+$parent->set_billing_email( 'wcs-guard-parent@example.test' );
+$parent->save();
+// wcs_create_subscription() refuses without a customer_id, so the fixture supplies one.
+$uid = (int) get_user_by( 'login', 'gmcp_wcs_guard' )->ID;
+if ( ! $uid ) {
+  $uid = wp_insert_user( [ 'user_login' => 'gmcp_wcs_guard', 'user_pass' => wp_generate_password(), 'user_email' => 'wcs-guard-cust@example.test', 'role' => 'customer' ] );
+  if ( is_wp_error( $uid ) ) { echo 0; return; }
+}
+$parent->set_customer_id( $uid );
+$parent->save();
+$sub = wcs_create_subscription( [
+  'order_id' => $parent->get_id(), 'customer_id' => $uid,
+  'billing_period' => 'month', 'billing_interval' => 1,
+  'start_date' => gmdate( 'Y-m-d H:i:s', time() - DAY_IN_SECONDS ), 'status' => 'active',
+] );
+if ( is_wp_error( $sub ) ) { echo 0; return; }
+$sub->set_billing_email( 'wcs-guard-' . $sub->get_id() . '@example.test' );
+$sub->update_dates( [ 'next_payment' => gmdate( 'Y-m-d H:i:s', time() + 30 * DAY_IN_SECONDS ) ] );
+$sub->set_requires_manual_renewal( true );
+$sub->save();
+echo $sub->get_id();
+SUBPHP
+  docker compose cp "$SUBFIX" cli:/var/www/html/gmcp-wcs-fix.php >/dev/null 2>&1
+  docker compose exec -T -u 0 cli chmod 644 /var/www/html/gmcp-wcs-fix.php >/dev/null 2>&1
+  SUB_ID=$(docker compose exec -T cli wp eval-file /var/www/html/gmcp-wcs-fix.php 2>/dev/null | tr -d '\r\n')
+  docker compose exec -T -u 0 cli rm -f /var/www/html/gmcp-wcs-fix.php >/dev/null 2>&1
+  rm -f "$SUBFIX"
+  check "CONTROL: the subscription fixture exists and is active" \
+    "$(docker compose exec -T cli wp eval "echo wc_get_order($SUB_ID)->get_status();" 2>/dev/null | tr -d '\r\n')" "active"
+  check "CONTROL: and wc_get_order() really resolves it as a subscription" \
+    "$(docker compose exec -T cli wp eval "echo wc_get_order($SUB_ID)->get_type();" 2>/dev/null | tr -d '\r\n')" "shop_subscription"
+  call sub_status "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_order_status\",\"arguments\":{\"id\":$SUB_ID,\"status\":\"completed\"}}}"
+  check "moving a subscription through the order tool is refused" "$(verdict sub_status)" "error"
+  check "and the refusal says what it is, rather than that it is missing" \
+    "$(body sub_status | grep -c 'shop_subscription')" "1"
+  # The assertion that matters: the stored status is untouched. Before the guard this read
+  # 'pending' while the reply claimed 'completed'.
+  check "and the stored status is unchanged" \
+    "$(docker compose exec -T cli wp eval "echo wc_get_order($SUB_ID)->get_status();" 2>/dev/null | tr -d '\r\n')" "active"
+  call sub_note "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_add_order_note\",\"arguments\":{\"id\":$SUB_ID,\"note\":\"should not land\"}}}"
+  check "adding an order note to a subscription is refused too" "$(verdict sub_note)" "error"
+  # Asserting the specific text rather than a note count: creating the fixture writes notes
+  # of its own, so a count would be measuring the fixture.
+  NOTE_HITS=$(wpc db query "SELECT COUNT(*) FROM $(wpc db prefix)comments WHERE comment_post_ID=$SUB_ID AND comment_content LIKE '%should not land%'" --skip-column-names)
+  check "and the note text was never written" "$NOTE_HITS" "0"
+  # The control for the guard: a real order still works, so the refusal is about the type
+  # and not about the tool having stopped working.
+  call sub_control "{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_order_status\",\"arguments\":{\"id\":$O_ID,\"status\":\"processing\"}}}"
+  check "CONTROL: a real order still moves" "$(verdict sub_control)" "ok"
+  check "CONTROL: and it really moved" \
+    "$(docker compose exec -T cli wp eval "echo wc_get_order($O_ID)->get_status();" 2>/dev/null | tr -d '\r\n')" "processing"
+  docker compose exec -T cli wp eval "
+    foreach ( get_posts( [ 'post_type' => 'shop_subscription', 'post_status' => 'any', 'numberposts' => -1, 'fields' => 'ids' ] ) as \$pid ) {
+      \$o = wc_get_order( \$pid );
+      if ( \$o && strpos( (string) \$o->get_billing_email(), 'wcs-guard-' ) === 0 ) { \$o->delete( true ); }
+    }" >/dev/null 2>&1
+else
+  echo "  SKIP  subscription guard checks: WooCommerce Subscriptions is not active"
+fi
+
 echo "-- the switch really is a switch --"
 docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_woo"]=false;update_option("gmcp_options",$o);' >/dev/null 2>&1
 call w_off '{"jsonrpc":"2.0","id":16,"method":"tools/list"}'
