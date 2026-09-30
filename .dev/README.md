@@ -71,6 +71,9 @@ docker compose exec -T cli wp plugin install advanced-custom-fields --activate
 
 docker compose exec -T cli wp plugin activate gravityforms
 ./smoke-gravityforms.sh  # the Gravity Forms tools; needs Gravity Forms
+
+docker compose exec -T cli wp plugin activate sfwd-lms
+./smoke-learndash.sh  # the LearnDash tools; needs LearnDash
 ```
 
 `smoke-admin.sh` also expects a theme named `futuretheme` that declares a PHP version this

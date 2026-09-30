@@ -56,6 +56,10 @@ class GMCP_Core {
     // written by members of the public, so the entry tools are admin and an entry edit
     // takes the same two-step as a deletion.
     'mcp_tools_gravityforms' => false,
+    // LearnDash: course structure, enrolment and progress. Enrolment is user meta and the
+    // student tools are admin; removing an enrolment takes the same two-step as a deletion
+    // because re-enrolling does not restore the same enrolment date.
+    'mcp_tools_learndash' => false,
     'mcp_debug_mode' => false,
     // Keep a short history of tool calls, including refused ones, for the settings
     // screen. An agent otherwise operates with no visible record at all.
@@ -724,6 +728,13 @@ class GMCP_Core {
     // GMCP_Tools_Gravityforms::handle_call() is the runtime honesty check.
     if ( $this->get_option( 'mcp_tools_gravityforms' ) ) {
       new GMCP_Tools_Gravityforms();
+    }
+
+    // And LearnDash: courses are CPTs but enrolment is user meta and progress is LearnDash's
+    // own shape, so the generic tools cannot answer either question honestly. The per-call
+    // check in GMCP_Tools_Learndash::handle_call() is the runtime honesty check.
+    if ( $this->get_option( 'mcp_tools_learndash' ) ) {
+      new GMCP_Tools_Learndash();
     }
   }
 

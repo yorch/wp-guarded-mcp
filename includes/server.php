@@ -135,6 +135,15 @@ class GMCP_Server {
   }
 
   public function rest_api_init() {
+    // Discard anything another plugin printed before our JSON. A REST response is a body
+    // that a client parses, and a plugin that echoes a notice, a warning or a deprecation
+    // during REST puts text in front of the `{`, so the client's parser fails on a response
+    // that is otherwise correct. Measured with LearnDash 4.10.3: it emits "Deprecated:
+    // Creation of dynamic property ..." while registering its REST controllers, which
+    // corrupted the OAuth discovery documents and the MCP endpoint itself. Sending JSON
+    // with a stray prefix is a broken response whichever plugin caused it, so this is
+    // handled here rather than per-integration.
+    add_filter( 'rest_pre_serve_request', [ $this, 'discard_stray_output' ], 0, 4 );
     // No shared token to load any more. A key carries its own level, so mcp_role has
     // nothing left to say and the default stands until a key replaces it.
 
@@ -202,6 +211,34 @@ class GMCP_Server {
       'permission_callback' => '__return_true',
       'show_in_index' => false,
     ] );
+  }
+
+  /**
+   * Discard output printed by any plugin before ours during a REST request.
+   *
+   * A REST body is parsed by the client, so text in front of the `{` is a malformed
+   * response. Measured with LearnDash 4.10.3: registering its REST controllers emits
+   * "Deprecated: Creation of dynamic property ...", which prepended itself to the OAuth
+   * discovery documents and to this endpoint's own replies, so a client saw invalid JSON
+   * from an endpoint that was answering correctly. This is not LearnDash-specific — any
+   * plugin printing a notice during REST does the same — so the fix belongs at the
+   * boundary rather than inside each integration.
+   *
+   * The text is logged rather than swallowed, because it is a symptom worth keeping: it
+   * is either a third-party notice or a mistake of our own. Only output produced BEFORE
+   * this point is discarded; the response body is written after this filter runs.
+   */
+  public function discard_stray_output( $served, $result, $request, $server ) {
+    $stray = ob_get_clean();
+    if ( is_string( $stray ) && trim( $stray ) !== '' ) {
+      if ( $this->logging ) {
+        error_log( '[Guarded MCP] Discarded stray output before the REST body: ' . mb_substr( trim( $stray ), 0, 500 ) );
+      }
+      // A fresh buffer, so anything printed later in the request is discarded too rather
+      // than appended to the body about to be sent.
+      ob_start();
+    }
+    return $served;
   }
   #endregion
 

@@ -340,6 +340,16 @@ pre code { color: var(--ink); }
         plugin-added fields are refused rather than overwritten.</p>
       </div>
       <div class="entry">
+        <p class="head"><code>LearnDash</code> <span>off by default</span></p>
+        <p>Course structure, a counts-only briefing, and — at admin, because it is student data
+        — who holds access to a course and how, one user's reachable courses and progress, and
+        one quiz's questions. It separates "enrolled" from "can view the course": an open
+        course, or one whose join setting is empty, is viewable by anyone with nobody
+        enrolled. Enrolling and unenrolling touch the direct enrolment only and say what else
+        grants access; unenrolling takes a two-step and refuses when the access is a group.
+        Quiz answer keys are never returned.</p>
+      </div>
+      <div class="entry">
         <p class="head"><code>Backups</code> <span>if you have a backup plugin</span></p>
         <p>Start one before a risky change, list what exists, and see when one last completed.
         Listings never include archive filenames, because on both supported plugins the

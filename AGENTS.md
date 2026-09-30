@@ -65,6 +65,21 @@ run from a subdirectory against a path that did not exist, an `echo` that ate an
 **A check that passes first time on something fiddly deserves suspicion.** So does a result
 that is surprising in the safe direction.
 
+**A seed can agree with the bug.** `smoke-learndash.sh` seeded a question's points under
+`points`, which is the form field's name; LearnDash stores them under `question_points`, so
+the tool reading `points` returned 0 on a real site and the suite, having seeded the same
+wrong key, agreed with it. A fixture written from the same reading of the code as the code
+under test proves nothing. Seed through the plugin's own writer where it has one, and where
+it does not, take the key from the plugin's own read path rather than from the field name
+in its form.
+
+**A read tool can mutate.** LearnDash's `ld_course_access_expired()` is named like a
+predicate and is not one: on a lapsed enrolment it deletes the enrolment row and, on a
+course configured to, the user's course progress. Calling it from `access_state()` meant
+every read tool — reachable with a readonly key — could delete the very data it was asked
+to report, with nothing announced and no undo. Before calling a third-party function from a
+read path, read its body. A name that starts with `is_`/`has_`/`*_expired` is not a promise.
+
 **Prove the container serves the tree you mean** before trusting anything it reports. Grep
 inside it for a marker only your branch has. `docker inspect` is the authority on what a
 running container mounts; the compose file only describes what a new one would.
@@ -79,8 +94,9 @@ The suites live in `.dev/`. `smoke.sh` covers transport, auth, content tools, pr
 resources. `smoke-admin.sh` covers the administration tools and every guard, and is
 destructive. `smoke-woo.sh` covers the shop tools, `smoke-elementor.sh` covers the Elementor tools,
 `smoke-kirki.sh` covers the Kirki tools, `smoke-yoast.sh` covers the Yoast SEO tools,
-`smoke-acf.sh` covers the ACF tools, and `smoke-gravityforms.sh` covers the Gravity Forms tools.
-Run all eight before committing. The last six need
+`smoke-acf.sh` covers the ACF tools, `smoke-gravityforms.sh` covers the Gravity Forms tools,
+and `smoke-learndash.sh` covers the LearnDash tools. Run all nine before committing. The last
+seven need
 their plugin installed and say so and exit rather than reporting failures against a site that
 simply does not have it.
 
@@ -103,7 +119,11 @@ recorded boundary.
 **Some failures are environmental.** The admin suite needs UpdraftPlus and Backuply present,
 the shop suite needs WooCommerce, and the base suite expects post 1 to still be called
 "Hello world!". Confirm by installing the dependency and re-running, never by explaining the
-failure away.
+failure away. One suite also has to survive a plugin it does not name: `smoke-admin.sh`
+asserts a rendered page contains a string once, and an SEO plugin's OpenGraph meta tag
+repeats the post's own text, so a plain occurrence count returned 2 and failed while the
+body it was checking was present and correct. It counts inside the content element now,
+because the assertion is about the body, not about the page.
 
 **A suite switches on the tool group it tests, and smoke-admin.sh did not.** `mcp_tools_admin`
 defaults to off, correctly, so on a fresh stack none of the tools that suite names were

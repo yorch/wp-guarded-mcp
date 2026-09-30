@@ -459,6 +459,65 @@ may be obliged to keep.
   configuration, so reading it is `read`; anything that returns or changes a
   submission is `admin`, because a submission is somebody's personal data.
 
+## LearnDash
+
+A course's structure is a tree LearnDash keeps in course meta and its enrolment is a
+per-user meta row, so the generic tools reach neither with any confidence. As with the
+Gravity Forms group there is no silent success to fix, only a surface that does not
+exist yet.
+
+Two of LearnDash's own names mean something narrower than they read, and most of this
+group's design is about not confusing them.
+
+- **"Has access" is not "is enrolled".** `sfwd_lms_has_access()` answers whether a user
+  can VIEW a course. It returns true for an open course, for a paynow course with no
+  price, whenever the course's join setting is empty (the default, so it is true for
+  most courses), for anyone who can auto-enrol such as an administrator, and for a group
+  member — all before it looks at the user's own enrolment. Measured on 4.10.3: after
+  the direct enrolment was removed, it still returned true. So no tool here uses it as
+  an enrolment oracle. `access_state()` reads the enrolment from the user meta that
+  records it and reports the other reasons separately.
+- **"Enrolled" is not "reachable".** `learndash_user_get_enrolled_courses()` returns
+  open courses as well as enrolled ones, and returns every course for an administrator.
+  The tool that uses it is called `ld_list_user_courses` and its rows carry the reasons,
+  so "reachable" is not read as "enrolled".
+
+What follows:
+
+- **`ld_update_course_access()`'s return value is not the evidence.** It returns false
+  both for "already enrolled" and for bad input, so a caller that maps it to
+  success/failure reports the opposite of the truth in one of the two cases. Every write
+  here is verified by re-reading the enrolment meta, and the reply distinguishes
+  "granted" from "already enrolled" and, separately, from "could already reach it".
+- **Unenrolling two-steps and refuses off the direct path.** Removing an enrolment
+  deletes the direct row but leaves group access, a purchase entitlement and open-course
+  access intact, so deleting it and reporting "access removed" would be false. The tool
+  refuses when the access is a group membership and names the group. It also states that
+  the enrolment-date record survives the removal (LearnDash keeps it for reporting) and
+  that re-enrolling writes a new date, so it is not a faithful undo — which is why it
+  takes the two-step rather than being treated as reversible.
+- **Answer keys are never returned.** A question's correct answers, feedback and hints
+  live in LearnDash's pro-quiz tables rather than on the question post; only the
+  question text, its type and its points are returned.
+- **Progress is lessons and topics.** LearnDash's own course-progress total excludes
+  quizzes, so its percentage is described as what it is rather than as course
+  completion.
+- **A read tool must not mutate, and one nearly did.** LearnDash's
+  `ld_course_access_expired()` is named like a predicate and is not one: when access has
+  lapsed it writes an expired marker, **deletes the enrolment row**, fires an action and,
+  on a course configured to do so, deletes the user's course progress. The first version
+  of this group called it from `access_state()`, which every read tool uses, so
+  `ld_get_user_progress` — reachable with a readonly key — could delete the very progress
+  it was asked to report, announcing nothing and leaving nothing to undo. Expiry is now
+  recomputed from the same stored meta without writing, and the smoke suite builds an
+  EXPIRED enrolment before reading, because on a live one the function returns early and
+  the defect would not show.
+- **A group's date window is reported, not collapsed into the guard.** A group whose
+  start date has not arrived, or whose end date has passed, still lists its members but
+  no longer grants them access under LearnDash's own check. The group guard reads the
+  membership list the listing uses, so the two cannot disagree; the live-window flag is
+  reported separately.
+
 ## Theme mods
 
 Theme mods are the customizer's storage, and four generic tools cover them:

@@ -515,7 +515,19 @@ call xa '{"jsonrpc":"2.0","id":90,"method":"tools/call","params":{"name":"wp_cre
 curl -sS "$BASE/probe-a/" -o "$OUT/pa.html"
 check "script in post content is not executable" \
   "$(python3 "$(dirname "$0")/check_xss.py" xss-a < "$OUT/pa.html")" "safe"
-check "legitimate body survives" "$(grep -c 'legit-a' "$OUT/pa.html")" "1"
+# Counted inside the post's own content element, not across the whole page: an SEO
+# plugin's og:description meta tag repeats the post text, so a raw `grep -c legit-a` on the
+# page returns 2 on a site with one installed, and the check fails while the body it is
+# asserting is present and correct. python3 reads the element across its newlines, which a
+# greedy grep does not.
+check "legitimate body survives" \
+  "$(python3 - "$OUT/pa.html" <<'PYEOF'
+import re, sys
+html = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+m = re.search(r'<div[^>]*class="[^"]*entry-content[^"]*"[^>]*>(.*?)</div>', html, re.S)
+print((m.group(1) if m else html).count("legit-a"))
+PYEOF
+)" "1"
 
 # Content with no recognised HTML took the markdown branch, and Parsedown runs without
 # safe mode, so a bare script tag bypassed sanitising entirely.

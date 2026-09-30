@@ -377,6 +377,32 @@ curl -sS "$BASE/.well-known/oauth-authorization-server" -o "$OUT/asm"
 check "OAuth server metadata at host root" "$(py 'import json,sys;print("ok" if "token_endpoint" in json.load(sys.stdin) else "err")' asm)" "ok"
 check "PKCE S256 advertised" "$(py 'import json,sys;print("S256" in json.load(sys.stdin).get("code_challenge_methods_supported",[]))' asm)" "True"
 
+echo "-- a stray notice from another plugin cannot corrupt the body --"
+# A REST body is parsed by the client, so text in front of the `{` is a malformed response.
+# Measured with LearnDash 4.10.3, which prints "Deprecated: Creation of dynamic property ..."
+# while registering its REST controllers: the OAuth discovery documents came back as notice
+# text followed by valid JSON, and a client saw invalid JSON from an endpoint that was
+# answering correctly. rest_pre_serve_request discards whatever was printed before the body.
+# The mu-plugin below prints on every REST request, so this reproduces the shape without
+# depending on which plugins are installed.
+docker exec -u 0 "${COMPOSE_PROJECT_NAME:-wptest}-wp-1" mkdir -p /var/www/html/wp-content/mu-plugins
+docker compose exec -T wp sh -c 'cat > /var/www/html/wp-content/mu-plugins/noise-probe.php <<"PHPEOF"
+<?php
+add_action( "rest_api_init", function () { echo "NOISE_BEFORE_BODY "; }, 1 );
+PHPEOF'
+check "CONTROL: the noise probe is installed and loaded" \
+  "$(docker compose exec -T cli wp eval 'echo has_action("rest_api_init") ? "hooked" : "not hooked";' 2>/dev/null | tr -d '\r\n' | awk '{print $NF}')" "hooked"
+curl -sS "$BASE/wp-json/mcp/v1/.well-known/oauth-protected-resource" -o "$OUT/prm_noisy"
+check "a body survives a plugin printing during REST" \
+  "$(py 'import json,sys;d=json.load(sys.stdin);print("authorization_servers" in d)' prm_noisy)" "True"
+check "and the stray text is gone from the body" \
+  "$(grep -c 'NOISE_BEFORE_BODY' "$OUT/prm_noisy")" "0"
+# The control for the check above: without proving the probe really prints, "the text is
+# gone" would also pass on a probe that was never installed.
+check "CONTROL: the probe really does print" \
+  "$(docker compose exec -T cli wp eval 'do_action("rest_api_init"); echo "|end";' 2>/dev/null | tr -d '\r\n' | grep -c 'NOISE_BEFORE_BODY')" "1"
+docker compose exec -T wp sh -c 'rm -f /var/www/html/wp-content/mu-plugins/noise-probe.php' >/dev/null 2>&1
+
 echo "-- copying a design between posts --"
 # A value too large or too escaped to survive a tool argument. update_metadata() unslashes
 # what it is handed, so a JSON payload that went out to the caller and came back would lose

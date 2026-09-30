@@ -73,8 +73,9 @@ An access level belongs to a named key. OAuth callers always act as the administ
 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
 nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO,
-ACF and Gravity Forms are not counted: their tools are optional groups that come and go with
-a plugin, so folding them in would make the table depend on what happens to be installed.
+ACF, Gravity Forms and LearnDash are not counted: their tools are optional groups that come
+and go with a plugin, so folding them in would make the table depend on what happens to be
+installed.
 
 A **named key** narrows this further. It carries its own level, an optional expiry date,
 and an optional list of the only tools it may call, so a key handed to a deploy script
@@ -134,6 +135,19 @@ writable, and a field whose type is not a plain answer (an upload, an opt-in, a 
 anything a plugin added) is refused rather than overwritten. Deleting an entry removes the
 submission, its answers and its notes; it does not reach files the entry uploaded or data an
 add-on stored elsewhere.
+
+**LearnDash**, off by default, and the switch only appears when LearnDash is installed:
+the course list and one course's structure (lessons, each with its topics and quizzes),
+a counts-only briefing, and — at `admin` because they carry student data — who holds
+access to a course and how, one user's reachable courses, one user's progress in a
+course, and one quiz's questions. Enrolling and unenrolling act on the **direct**
+enrolment only, and both report separately whether the user can also reach the course
+for another reason (an open course, a LearnDash Group, or an administrator's automatic
+access), because those reasons decide whether removing an enrolment actually does
+anything. Unenrolling takes the same server-minted two-step as a deletion and refuses
+when the access comes from a Group. Quiz **answer keys** are never returned; a question's
+text and points are. Progress is lessons and topics only, as LearnDash's own percentage
+is.
 
 **REST API tools**, off by default: tools generated from the site's own REST API routes.
 Generated once and cached for a day; the cache is thrown away on the first request after
@@ -309,13 +323,13 @@ docker run --rm -v "$PWD":/app -w /app php:8.1-cli sh -c 'for f in includes/*.ph
 ```
 
 A throwaway WordPress for testing lives in `.dev/` (see that directory's README). It carries
-eight suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
+nine suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
 previews; `smoke-admin.sh` for the administration tools, the change journal, named keys and
 every guard around them, which rebuilds `.htaccess` partway through and is the destructive
 one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor tools;
 `smoke-kirki.sh` for the Kirki tools; `smoke-yoast.sh` for the Yoast SEO tools;
-`smoke-acf.sh` for the ACF tools; and `smoke-gravityforms.sh` for the Gravity Forms tools.
-The last six need their plugin installed.
+`smoke-acf.sh` for the ACF tools; `smoke-gravityforms.sh` for the Gravity Forms tools; and
+`smoke-learndash.sh` for the LearnDash tools. The last seven need their plugin installed.
 
 Never run `wp plugin install --force` against that stack. Its plugin directory is a bind
 mount of this repository, and WordPress deletes the old plugin directory before unpacking
