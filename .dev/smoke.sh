@@ -251,6 +251,13 @@ check "a group that matched nothing expands to nothing" \
 docker compose exec -T cli wp post delete "$LB_ID" --force >/dev/null 2>&1
 
 echo "-- prompts --"
+# The listing is filtered to prompts whose backing tools the caller can actually reach, so
+# two of the six (update_review, site_health_brief) come from the administration group. This
+# block used to run against whatever the stack happened to have, so it passed only where
+# smoke-admin.sh had already run and left that group on. .dev/README.md promises each suite
+# switches on the group it tests, and this is that switch.
+ADMIN_WAS=$(docker compose exec -T cli wp eval 'echo !empty(get_option("gmcp_options",[])["mcp_tools_admin"]) ? "1" : "0";' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_admin"]=true;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
 call plist '{"jsonrpc":"2.0","id":30,"method":"prompts/list"}'
 check "prompts are listed" \
   "$(py 'import json,sys;p=json.load(sys.stdin)["result"]["prompts"];print(len(p)>=6 and all("name" in x and "description" in x for x in p))' plist)" "True"
@@ -300,6 +307,9 @@ call punknown '{"jsonrpc":"2.0","id":49,"method":"prompts/get","params":{"name":
 # holding an old listing can then say which tools it needs rather than guessing.
 check "an unknown prompt says so in those words" \
   "$(py 'import json,sys;print("Unknown prompt" in json.load(sys.stdin)["error"]["message"])' punknown)" "True"
+docker compose exec -T cli wp eval "\$o=get_option('gmcp_options',[]);\$o['mcp_tools_admin']=('$ADMIN_WAS'==='1');update_option('gmcp_options',\$o,false);" >/dev/null 2>&1
+check "the administration group is back as it was found" \
+  "$(docker compose exec -T cli wp eval 'echo !empty(get_option("gmcp_options",[])["mcp_tools_admin"]) ? "1" : "0";' 2>/dev/null | tr -d '\r\n')" "$ADMIN_WAS"
 
 echo "-- resources --"
 # A resource is the one path where a person, not a model, chooses what enters the
