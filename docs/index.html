@@ -350,6 +350,17 @@ pre code { color: var(--ink); }
         Quiz answer keys are never returned.</p>
       </div>
       <div class="entry">
+        <p class="head"><code>Elementor Pro</code> <span>off by default</span></p>
+        <p>A deliberately small group: popups, loop templates and mega menus are library
+        templates with theme-builder conditions that the Elementor tools already report, so
+        this answers only what those cannot — whether Pro is really loaded and which modules
+        can be called, how many form submissions exist, and an inventory of Custom Code
+        snippets. Submissions are counted, never returned, and the count checks that Pro's
+        submission tables exist first, because Pro creates them on the first submission and
+        answers "none" while they are missing. Snippet bodies are never read or written: Pro
+        echoes a snippet unescaped into every page.</p>
+      </div>
+      <div class="entry">
         <p class="head"><code>Backups</code> <span>if you have a backup plugin</span></p>
         <p>Start one before a risky change, list what exists, and see when one last completed.
         Listings never include archive filenames, because on both supported plugins the

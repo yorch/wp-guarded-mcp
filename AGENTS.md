@@ -80,6 +80,15 @@ every read tool — reachable with a readonly key — could delete the very data
 to report, with nothing announced and no undo. Before calling a third-party function from a
 read path, read its body. A name that starts with `is_`/`has_`/`*_expired` is not a promise.
 
+**A plugin's own API can answer "none" for "not installed".** Elementor Pro creates its form
+submission tables on the first submission, and until then its own query layer returns an
+empty page with a total of 0 — measured, not inferred. A tool built on that number reports a
+confident "no submissions" on every site that has never received one, and on every site where
+the module is off. Before reporting a zero from a third-party reader, check that the thing it
+reads from exists: `SHOW TABLES LIKE` for a table, the class and method for a module
+constant, the directory for a file. The distinction the reply must make is between "there are
+none" and "there is nothing to count", and only the check can tell them apart.
+
 **Prove the container serves the tree you mean** before trusting anything it reports. Grep
 inside it for a marker only your branch has. `docker inspect` is the authority on what a
 running container mounts; the compose file only describes what a new one would.
@@ -95,8 +104,8 @@ resources. `smoke-admin.sh` covers the administration tools and every guard, and
 destructive. `smoke-woo.sh` covers the shop tools, `smoke-elementor.sh` covers the Elementor tools,
 `smoke-kirki.sh` covers the Kirki tools, `smoke-yoast.sh` covers the Yoast SEO tools,
 `smoke-acf.sh` covers the ACF tools, `smoke-gravityforms.sh` covers the Gravity Forms tools,
-and `smoke-learndash.sh` covers the LearnDash tools. Run all nine before committing. The last
-seven need
+`smoke-learndash.sh` covers the LearnDash tools, and `smoke-elementor-pro.sh` covers the
+Elementor Pro tools. Run all eleven before committing. The last eight need
 their plugin installed and say so and exit rather than reporting failures against a site that
 simply does not have it.
 

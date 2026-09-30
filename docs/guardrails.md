@@ -518,6 +518,50 @@ What follows:
   membership list the listing uses, so the two cannot disagree; the live-window flag is
   reported separately.
 
+## Elementor Pro
+
+The smallest group in the plugin, and most of the work was deciding what not to ship.
+Elementor Pro adds popups, loop templates, mega menus, display conditions, custom code,
+forms and a role manager, and almost none of it becomes a tool here.
+
+**What is here.** `elementor_pro_status` answers "is Pro really loaded, and which modules
+can be called", per module by class **and** method rather than from a version string,
+because Pro is licensable, can be present with a module switched off, and registers an
+autoloader before it decides whether to boot. `elementor_forms_briefing` counts form
+submissions.
+
+**Why popups and loop templates are not a second tool.** They are `elementor_library`
+posts with theme-builder conditions, so `elementor_list_templates` and
+`elementor_get_conditions` already report them, together with the cache agreement that is
+the point of those tools. A parallel implementation would be free to disagree with the one
+already doing the reporting, and the disagreement would be invisible.
+
+**Why submissions are counted and not returned.** Elementor Pro creates its submissions
+tables on demand, on the first submission. Until then its own query layer returns an empty
+page with a total of 0 — measured on 4.1.2 — so "no submissions" and "the feature has never
+run" are indistinguishable from the numbers alone. A row reader would therefore report a
+confident zero on every site that has never received one. On top of that, a submission is a
+visitor's personal data, and a reply containing one is copied into the audit log's `detail`
+column, which outlives the reply the model saw. The briefing checks whether the tables
+exist before it counts, and says which of the two answers it is giving.
+
+**Why there is no Custom Code tool, read or write.** A snippet's body is stored in post
+meta and echoed **unescaped** into the page on every request for every visitor
+(`Document::print_content()`). A write tool is therefore arbitrary persistent script
+injection across the whole site, with no restore tool and no journal coverage behind it,
+and a read tool for the same field is the reconnaissance step for it. The status tool
+inventories snippets — title, status, location, priority, size and a SHA-256 of the body —
+which is what an operator needs to find the one misbehaving, and never the code. Whether a
+snippet renders at all also depends on the theme: Pro prints a location by calling
+`elementor_theme_do_location()`, which a block theme such as Twenty Twenty-Five does not
+do, so a snippet can be stored, enabled and bound and still not appear.
+
+**Its own switch.** Pro tools are not part of the Elementor group. That group is switched
+on sites running free Elementor, so Pro entries there would be entries that fail the moment
+a model tries one. Registration is not gated on Pro being loaded, for the reason the
+Elementor group's own carve-out documents: the status tool exists to answer "why is Pro not
+working", and a gate inside a class that is never constructed cannot run.
+
 ## Theme mods
 
 Theme mods are the customizer's storage, and four generic tools cover them:

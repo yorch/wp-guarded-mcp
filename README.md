@@ -73,9 +73,9 @@ An access level belongs to a named key. OAuth callers always act as the administ
 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
 nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO,
-ACF, Gravity Forms and LearnDash are not counted: their tools are optional groups that come
-and go with a plugin, so folding them in would make the table depend on what happens to be
-installed.
+ACF, Gravity Forms, LearnDash and Elementor Pro are not counted: their tools are optional
+groups that come and go with a plugin, so folding them in would make the table depend on what
+happens to be installed.
 
 A **named key** narrows this further. It carries its own level, an optional expiry date,
 and an optional list of the only tools it may call, so a key handed to a deploy script
@@ -123,6 +123,17 @@ per-post SEO metadata read/write through the Surfaces API, and indexable rebuild
 **Advanced Custom Fields**, off by default, and the switch only appears when ACF is
 installed: custom field discovery, value get/set through `update_field`/`get_field` with
 field key references.
+
+**Elementor Pro**, off by default, and the switch only appears when Elementor Pro is
+installed — a deliberately small group, because popups, loop templates and mega menus are
+library templates with theme-builder conditions that the Elementor tools above already
+report. It answers what those cannot: whether Pro is really loaded and which of its modules
+can be called, and how many form submissions exist. It counts submissions and never returns
+one, and it checks that Pro's submission tables exist before counting, because Pro creates
+them on the first submission and its own query layer answers "none" while they are missing.
+It also inventories Custom Code snippets (title, location, priority, size and a hash) and
+never returns or writes their code: Pro echoes a snippet unescaped into every page, so
+writing one is an arbitrary persistent script injection with no restore behind it.
 
 **Gravity Forms**, off by default, and the switch only appears when Gravity Forms is
 installed: the form list and one form's field schema, a briefing of entry counts, and — at
@@ -323,13 +334,14 @@ docker run --rm -v "$PWD":/app -w /app php:8.1-cli sh -c 'for f in includes/*.ph
 ```
 
 A throwaway WordPress for testing lives in `.dev/` (see that directory's README). It carries
-nine suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
+eleven suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
 previews; `smoke-admin.sh` for the administration tools, the change journal, named keys and
 every guard around them, which rebuilds `.htaccess` partway through and is the destructive
 one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor tools;
 `smoke-kirki.sh` for the Kirki tools; `smoke-yoast.sh` for the Yoast SEO tools;
 `smoke-acf.sh` for the ACF tools; `smoke-gravityforms.sh` for the Gravity Forms tools; and
-`smoke-learndash.sh` for the LearnDash tools. The last seven need their plugin installed.
+`smoke-learndash.sh` for the LearnDash tools; and `smoke-elementor-pro.sh` for the Elementor
+Pro tools. The last eight need their plugin installed.
 
 Never run `wp plugin install --force` against that stack. Its plugin directory is a bind
 mount of this repository, and WordPress deletes the old plugin directory before unpacking

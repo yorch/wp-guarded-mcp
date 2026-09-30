@@ -94,9 +94,13 @@ check "an empty cache is named as an empty cache" \
 check "and the disagreement is reported" \
   "$(py 'import json,sys;j=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print("disagree" in j["summary"])' e_diag)" "True"
 # Nothing reads conditions without the theme builder. Reporting success here would send a
-# reader looking at their theme for a fault that is a missing plugin.
-check "and the absent theme builder is not glossed over" \
-  "$(py 'import json,sys;j=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(j["theme_builder_present"])' e_diag)" "False"
+# reader looking at their theme for a fault that is a missing plugin. The theme builder ships
+# with Elementor Pro, so this asserts what the tool REPORTS against whether Pro is actually
+# installed, rather than hardcoding one installation state: the suite used to demand "absent"
+# and failed the moment Pro was present, which is a precondition, not a defect.
+PRO_PRESENT=$(docker compose exec -T cli wp eval 'echo class_exists("\ElementorPro\Modules\ThemeBuilder\Module") ? "1" : "0";' 2>/dev/null | tr -d '\r\n')
+check "and the theme builder's presence is reported honestly" \
+  "$(py 'import json,sys;j=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(j["theme_builder_present"])' e_diag)" "$([ "$PRO_PRESENT" = "1" ] && echo True || echo False)"
 
 call e_set "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_set_conditions\",\"arguments\":{\"ID\":$HDR,\"conditions\":[\"include/singular/page\"]}}}"
 check "setting conditions succeeds" "$(verdict e_set)" "ok"

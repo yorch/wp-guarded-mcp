@@ -327,6 +327,7 @@ class GMCP_Settings {
       'mcp_tools_rest' => 'bool',
       'mcp_tools_woo' => 'bool',
       'mcp_tools_elementor' => 'bool',
+      'mcp_tools_elementor_pro' => 'bool',
       'mcp_tools_kirki' => 'bool',
       'mcp_tools_yoast' => 'bool',
       'mcp_tools_acf' => 'bool',
@@ -1150,6 +1151,10 @@ class GMCP_Settings {
   private function render_tools( array $options ): void {
     $woo = class_exists( 'WooCommerce' );
     $elementor = did_action( 'elementor/loaded' );
+    // Pro is a separate plugin with its own version constant, and it registers an
+    // autoloader before deciding whether to boot, so presence is the constant plus the
+    // class plus the method a tool would call.
+    $elementor_pro = defined( 'ELEMENTOR_PRO_VERSION' ) && class_exists( '\ElementorPro\Modules\ThemeBuilder\Module' ) && method_exists( '\ElementorPro\Modules\ThemeBuilder\Module', 'instance' );
     $kirki = class_exists( 'Kirki' );
     $yoast = defined( 'WPSEO_VERSION' );
     $acf = class_exists( 'ACF' );
@@ -1172,6 +1177,12 @@ class GMCP_Settings {
     }
     if ( $elementor ) {
       $keys[] = 'mcp_tools_elementor';
+    }
+    // Gated on Pro being present, so saving the Tools form on a free-Elementor site cannot
+    // switch the Pro group off — the checkbox would not be on screen, and an unticked box
+    // that was never rendered reads as unticked.
+    if ( $elementor_pro ) {
+      $keys[] = 'mcp_tools_elementor_pro';
     }
     if ( $kirki ) {
       $keys[] = 'mcp_tools_kirki';
@@ -1223,6 +1234,12 @@ class GMCP_Settings {
                   <?php esc_html_e( 'Elementor (theme-builder conditions, regenerate CSS, apply a library template to a page)', 'guarded-mcp' ); ?>
                 </label>
               <?php endif; ?>
+              <?php if ( $elementor_pro ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_elementor_pro" value="1" <?php checked( !empty( $options['mcp_tools_elementor_pro'] ) ); ?>>
+                  <?php esc_html_e( 'Elementor Pro (module status, form submission counts, custom-code inventory)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
               <?php if ( $kirki ) : ?>
                 <label>
                   <input type="checkbox" name="mcp_tools_kirki" value="1" <?php checked( !empty( $options['mcp_tools_kirki'] ) ); ?>>
@@ -1269,6 +1286,11 @@ class GMCP_Settings {
             <?php if ( $elementor ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The Elementor tools exist because setting a header or footer through the generic tools appears to work and does not: Elementor keeps a cached copy of which template applies where, and writing only the template leaves that cache stale. These write both halves together, and say what the cache holds.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $elementor_pro ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The Elementor Pro group is deliberately small: popups, loop templates and mega menus are library templates with theme-builder conditions, which the Elementor tools above already report, so a second implementation of that comparison would be free to disagree with the first. These tools answer what the others cannot: whether Pro is really loaded and which of its modules can be called, and how many form submissions exist. They count submissions and never return one — that is a visitor\'s personal data, and a reply containing it is copied into the audit log for its retention window. There is no tool here that reads or writes Custom Code: Pro echoes a snippet unescaped into every page, so writing one is an arbitrary persistent script injection with no restore behind it.', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
             <?php if ( $kirki ) : ?>

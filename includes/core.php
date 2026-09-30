@@ -46,6 +46,10 @@ class GMCP_Core {
     'mcp_tools_woo' => false,
     // Elementor: theme-builder conditions, and putting a library template on a page.
     'mcp_tools_elementor' => false,
+    // Elementor Pro: its own switch, because the free group is switched on sites running
+    // free Elementor and Pro tools there would be entries that fail when tried. The status
+    // tool is registered regardless of Pro being loaded, so it can answer with Pro off.
+    'mcp_tools_elementor_pro' => false,
     // Kirki: customizer framework field discovery, value get/set, CSS cache.
     'mcp_tools_kirki' => false,
     // Yoast SEO: per-post SEO metadata through the Surfaces API + indexable rebuild.
@@ -698,6 +702,15 @@ class GMCP_Core {
     // from another. Registering here costs one object on a request that may not use it.
     if ( $this->get_option( 'mcp_tools_elementor' ) ) {
       new GMCP_Tools_Elementor();
+    }
+
+    // Elementor Pro, on its own switch. Registered whenever that switch is on and NOT gated
+    // on Pro having loaded, for the same reason the Elementor group above is not: the status
+    // tool exists to answer "why is Pro not working", and a gate inside a class that is
+    // never constructed cannot run. The per-call check in its handle_call() keeps the rest
+    // of the group honest, and refuses Pro-dependent tools rather than the status tool.
+    if ( $this->get_option( 'mcp_tools_elementor_pro' ) ) {
+      new GMCP_Tools_Elementor_Pro();
     }
 
     // Same reasoning as the optional groups above: without Kirki these tools are a

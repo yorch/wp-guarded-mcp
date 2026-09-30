@@ -21,6 +21,7 @@ spl_autoload_register( function ( $class ) {
     'GMCP_Tools_Woo' => '/includes/tools-woo.php',
     'GMCP_Tools_Elementor' => '/includes/tools-elementor.php',
     'GMCP_Tools_Kirki' => '/includes/tools-kirki.php',
+    'GMCP_Tools_Elementor_Pro' => '/includes/tools-elementor-pro.php',
     'GMCP_Tools_Yoast' => '/includes/tools-yoast.php',
     'GMCP_Tools_Acf' => '/includes/tools-acf.php',
     'GMCP_Tools_Gravityforms' => '/includes/tools-gravityforms.php',

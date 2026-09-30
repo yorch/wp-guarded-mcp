@@ -74,6 +74,9 @@ docker compose exec -T cli wp plugin activate gravityforms
 
 docker compose exec -T cli wp plugin activate sfwd-lms
 ./smoke-learndash.sh  # the LearnDash tools; needs LearnDash
+
+docker compose exec -T cli wp plugin activate elementor-pro
+./smoke-elementor-pro.sh  # the Elementor Pro tools; needs Elementor Pro (and Elementor)
 ```
 
 `smoke-admin.sh` also expects a theme named `futuretheme` that declares a PHP version this
