@@ -179,6 +179,45 @@ class GMCP_Core {
         return "The option \"{$key}\" looks like it holds a credential, so it is not readable or writable through the API. A site can allow specific keys with the gmcp_protected_option_patterns filter.";
       }
     }
+
+    // Payment gateways, by namespace, and for the same reason the backup rows above get
+    // their own rule: the NAME gives nothing away. Measured on a site with PayPal
+    // configured, woocommerce_paypal_settings was allowed by every pattern above while its
+    // value held api_password, api_signature, sandbox_api_password and
+    // sandbox_api_signature. A gateway's row is the row that can move money, and the write
+    // side matters as much as the read: rewriting api_password is how a payment goes to
+    // somebody else's account.
+    //
+    // Listed by prefix because these names change between WooCommerce releases and a
+    // gateway added later would otherwise be unprotected until somebody noticed, which is
+    // the mistake this guard has already made twice.
+    $gateway_prefixes = apply_filters( 'gmcp_gateway_option_prefixes', [
+      'woocommerce_paypal', 'woocommerce_stripe', 'woocommerce_square', 'woocommerce_braintree',
+      'woocommerce_authorize', 'woocommerce_eway', 'woocommerce_payfast', 'woocommerce_paystack',
+      'woocommerce_razorpay', 'woocommerce_mollie', 'woocommerce_klarna', 'woocommerce_amazon_payments',
+    ], $key );
+    foreach ( (array) $gateway_prefixes as $prefix ) {
+      if ( $prefix !== '' && strpos( $needle, strtolower( (string) $prefix ) ) !== false ) {
+        // Says what to do instead, because a refusal an agent cannot act on is one it
+        // works around by guessing another row.
+        return "The option \"{$key}\" holds payment gateway credentials: an API password, a signature, a secret key or a webhook secret. Those rows are not readable or writable through the API, because reading one hands over the ability to move money and writing one redirects it. Configure the gateway on its own settings screen. A site can extend this list with the gmcp_gateway_option_prefixes filter.";
+      }
+    }
+
+    // Mail transport, same shape and same reason: the row is named after the plugin, not
+    // after the credential inside it. mailserver_pass is WordPress core's own row,
+    // registered for the mail server password, and the rest are the popular SMTP plugins.
+    $mailer_prefixes = apply_filters( 'gmcp_mailer_option_prefixes', [
+      'mailserver', 'wp_mail_smtp', 'wpmailsmtp', 'wp-smtp', 'smtp_', 'postman', 'post_smtp',
+      'sendgrid', 'mailgun', 'postmark', 'mailjet', 'elasticemail', 'sparkpost',
+      'mailpress', 'wp-mail-smtp', 'smtp-mailer', 'easy_wp_smtp', 'fluentmail',
+    ], $key );
+    foreach ( (array) $mailer_prefixes as $prefix ) {
+      if ( $prefix !== '' && strpos( $needle, strtolower( (string) $prefix ) ) !== false ) {
+        return "The option \"{$key}\" belongs to a mail transport plugin and holds the credentials that authenticate this site's outgoing mail. Changing them silently breaks password resets and order emails, and reading them hands over an account that can send mail as this domain. Configure mail on the plugin's own screen. A site can extend this list with the gmcp_mailer_option_prefixes filter.";
+      }
+    }
+
     return true;
   }
 

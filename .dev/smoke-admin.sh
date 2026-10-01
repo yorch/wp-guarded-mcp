@@ -245,6 +245,36 @@ check "credential-shaped keys refused" "$(verdict opt_cred)" "error"
 call opt_ok '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"blogname"}}}'
 check "ordinary options still readable" "$(verdict opt_ok)" "ok"
 
+# A gateway or mailer row carries credentials its NAME does not mention, which is the same
+# shape as the backup-plugin rows option_guard already protects by prefix. Measured before
+# the fix: woocommerce_paypal_settings passed every pattern while its value held
+# api_password, api_signature, sandbox_api_password and sandbox_api_signature, and the
+# credential patterns only match names like "api_key", never "paypal".
+echo "-- payment and mail rows, whose names say nothing about the credentials inside --"
+# The fixture writes a row under a real gateway name so the control can prove the value is
+# there to be protected, rather than the check passing because the row does not exist.
+docker compose exec -T cli wp eval 'update_option("woocommerce_paypal_settings",["api_username"=>"u","api_password"=>"PAYPALMUSTNOTAPPEAR","api_signature"=>"sig","testmode"=>"yes"]);' >/dev/null 2>&1
+check "CONTROL: the gateway row really holds an API password" \
+  "$(docker compose exec -T cli wp eval 'echo strpos((string)json_encode(get_option("woocommerce_paypal_settings")),"PAYPALMUSTNOTAPPEAR")!==false?"holds":"EMPTY";' 2>/dev/null | tr -d '\r\n')" "holds"
+call gw_read '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"woocommerce_paypal_settings"}}}'
+check "the gateway row cannot be read" "$(verdict gw_read)" "error"
+call gw_write '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"woocommerce_paypal_settings","value":{"api_password":"ATTACKER"}}}}'
+check "and cannot be rewritten" "$(verdict gw_write)" "error"
+# The control that matters most here: the stored value must be untouched after the refusal,
+# or the tool refused in the reply and wrote anyway.
+check "and the stored API password is unchanged" \
+  "$(docker compose exec -T cli wp eval 'echo strpos((string)json_encode(get_option("woocommerce_paypal_settings")),"ATTACKER")===false?"unchanged":"OVERWRITTEN";' 2>/dev/null | tr -d '\r\n')" "unchanged"
+docker compose exec -T cli wp option delete woocommerce_paypal_settings >/dev/null 2>&1
+call mail_read '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"mailserver_pass"}}}'
+check "the core mail-server password row cannot be read" "$(verdict mail_read)" "error"
+# CONTROLS, so this cannot be a rule that refuses everything payment- or mail-adjacent:
+# the gateway ORDER is a harmless list of which gateways show first, and a settings row
+# belonging to another plugin that merely has "paypal" in its name holds no credentials.
+call gw_order '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"woocommerce_gateway_order"}}}'
+check "CONTROL: the harmless gateway-order row is still readable" "$(verdict gw_order)" "ok"
+call ld_pay '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"learndash_settings_paypal"}}}'
+check "CONTROL: an unrelated row with a gateway word in its name is readable" "$(verdict ld_pay)" "ok"
+
 echo "-- the identifier the plugin tools need --"
 call plist '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"wp_list_plugins","arguments":{}}}'
 check "wp_list_plugins returns the plugin file" \
