@@ -264,6 +264,68 @@ check "active theme unchanged" \
 call t_active '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"wp_delete_theme","arguments":{"stylesheet":"twentytwentyfive"}}}'
 check "deleting the active theme refused" "$(verdict t_active)" "error"
 
+echo "-- a theme name cannot be a path (the traversal that deleted this plugin) --"
+# WP_Theme::exists() is true for 'theme_no_stylesheet', which is what any directory that
+# is not a theme produces, so '../..' and '../plugins/guarded-mcp' both "exist" as themes.
+# delete_theme() then deletes themes_dir . $stylesheet with no validation of its own, so
+# two confirmed calls would take this plugin, the activity log, or ABSPATH (wp-config.php
+# with it). Measured before the fix: wp_get_theme('../plugins/guarded-mcp')->exists() was
+# true and validate_file() returned 1 while the tool called delete_theme anyway.
+for tpath in '../plugins/guarded-mcp' '../..' '../../..' '/etc' 'guarded-mcp/../..'; do
+  TID=$(echo "$tpath" | tr -c 'a-zA-Z0-9' '_')
+  call "t_path_$TID" "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_theme\",\"arguments\":{\"stylesheet\":\"$tpath\"}}}"
+  check "wp_delete_theme refuses the path '${tpath}'" "$(verdict "t_path_$TID")" "error"
+done
+call t_path_act '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"wp_activate_theme","arguments":{"stylesheet":"../plugins/guarded-mcp"}}}'
+check "wp_activate_theme refuses the same path" "$(verdict t_path_act)" "error"
+call t_path_upd '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"wp_update_theme","arguments":{"stylesheet":"../plugins/guarded-mcp"}}}'
+check "wp_update_theme refuses the same path" "$(verdict t_path_upd)" "error"
+
+# The checks above prove the OUTCOME and nothing about which check produced it. This guard
+# has two independent halves — a path-shape check and an allowlist against wp_get_themes() —
+# and a mutation removing either one leaves the other refusing the same paths, so all five
+# assertions above stay green with half the guard gone. Verified: removing the allowlist
+# entirely still passed every one of them. So each half is exercised directly here, where
+# the other half is out of the way, and each has a control that must pass.
+t_guard() { # t_guard <stylesheet>  -> the refusal message, or "allowed"
+  # No tail/truncation: an earlier version used `tail -c 90`, which cut the phrase the
+  # checks grep for and made every one of them fail on correct code.
+  docker compose exec -T cli wp eval "\$m = new ReflectionMethod('GMCP_Tools_Admin', 'known_theme'); \$m->setAccessible(true);
+    \$o = new GMCP_Tools_Admin(null);
+    \$r = \$m->invoke(\$o, '$1'); echo \$r === true ? 'allowed' : \$r;" 2>/dev/null | tr -d '\r' | grep -E 'is not a theme name|No installed theme|^allowed$' | tail -1
+}
+# Half one: the path shape. Asserted on the REASON, not on the refusal, because both halves
+# refuse a traversal and an assertion that only checks "refused" cannot tell which one fired.
+# Verified: with the path-shape check removed the traversal still returns the ALLOWLIST's
+# message, so a bare "refused" check stayed green through that mutation.
+check "the path-shape half refuses a traversal segment, on the shape" \
+  "$(t_guard '../plugins/guarded-mcp' | grep -c 'is not a theme name')" "1"
+check "and refuses an absolute path, on the shape" \
+  "$(t_guard '/etc' | grep -c 'is not a theme name')" "1"
+check "and refuses a name with a slash in it, on the shape" \
+  "$(t_guard 'guarded-mcp/../..' | grep -c 'is not a theme name')" "1"
+# Half two: the allowlist. A well-formed name with no traversal passes half one, so its
+# refusal can only come from the allowlist — and it must NOT be the path-shape message.
+check "the allowlist refuses a well-formed name that is not installed" \
+  "$(t_guard 'no-such-theme' | grep -c 'No installed theme')" "1"
+check "and that refusal is NOT the path-shape one" \
+  "$(t_guard 'no-such-theme' | grep -c 'is not a theme name')" "0"
+check "and the plugin directory's own name is refused by the allowlist" \
+  "$(t_guard 'guarded-mcp' | grep -c 'No installed theme')" "1"
+# CONTROL: both halves together must still ADMIT a real theme, or a guard that refused
+# everything would pass every check above.
+check "CONTROL: a genuinely installed theme is admitted" "$(t_guard 'futuretheme')" "allowed"
+check "CONTROL: the active theme is admitted" "$(t_guard "$(docker compose exec -T cli wp theme list --status=active --field=name 2>/dev/null | tr -d '\r\n')")" "allowed"
+
+# And the outcome the traversal would have destroyed. Checked by file existence rather than
+# by a count, because counting lines of a newline-stripped list counts lines, not names —
+# which is how an earlier version of this very check reported the plugin as missing while it
+# was present and active.
+check "CONTROL: this plugin's own file is still on disk" \
+  "$(docker compose exec -T cli sh -c 'test -f /var/www/html/wp-content/plugins/guarded-mcp/includes/tools-admin.php && echo yes' 2>/dev/null | tr -d '\r\n')" "yes"
+check "CONTROL: wp-config.php is still on disk" \
+  "$(docker compose exec -T cli sh -c 'test -f /var/www/html/wp-config.php && echo yes' 2>/dev/null | tr -d '\r\n')" "yes"
+
 echo "-- self-protection --"
 call self_off '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"wp_deactivate_plugin","arguments":{"plugin":"guarded-mcp"}}}'
 check "cannot deactivate itself" "$(verdict self_off)" "error"

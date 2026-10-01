@@ -92,6 +92,44 @@ class GMCP_Tools_Admin {
   }
 
   /**
+  * Whether a stylesheet names an INSTALLED theme, and nothing else.
+  *
+  * `wp_get_theme( $stylesheet )->exists()` is not this question, and the difference is a
+  * path traversal. WP_Theme::exists() is true when the only error is 'theme_no_stylesheet',
+  * which is what any directory that is not a theme produces — so `../..` "exists" as a
+  * theme, and so does `../plugins/guarded-mcp`. delete_theme() then runs
+  * `$wp_filesystem->delete( $themes_dir . $stylesheet, true )` with no validation of its
+  * own, so two confirmed calls would delete this plugin, the activity log, or ABSPATH with
+  * wp-config.php in it. Measured on the dev stack:
+  *
+  *   wp_get_theme('../plugins/guarded-mcp')->exists()  true   (err theme_no_stylesheet)
+  *   validate_file('../plugins/guarded-mcp')           1      (invalid: '..' segment)
+  *
+  * The authoritative answer is the key set of wp_get_themes(), which is built from a scan
+  * of the themes directory. A path is never one of those keys. Asking that question is
+  * stronger than any string check and needs no list of things to look for, which is the
+  * same reason the WP Activity Log metadata filter is an allowlist.
+  *
+  * @return true|string True when the stylesheet is an installed theme, otherwise the message.
+  */
+  private function known_theme( string $stylesheet ) {
+    if ( $stylesheet === '' ) {
+      return 'A theme stylesheet is required.';
+    }
+    // Belt and braces before the allowlist: a traversal segment or an absolute path is
+    // never a stylesheet, and refusing it here keeps the refusal message specific rather
+    // than "no installed theme has that name".
+    if ( validate_file( $stylesheet ) !== 0 || strpos( $stylesheet, '/' ) !== false ) {
+      return '"' . $stylesheet . '" is not a theme name. Pass the stylesheet of an installed theme, as wp_list_themes reports it, without any path separators.';
+    }
+    $installed = wp_get_themes();
+    if ( !isset( $installed[ $stylesheet ] ) ) {
+      return "No installed theme has the stylesheet \"{$stylesheet}\". Use wp_list_themes to see what is available.";
+    }
+    return true;
+  }
+
+  /**
   * Capability check.
   *
   * Worth doing even though a bearer-token request already runs as an administrator.
@@ -1274,6 +1312,10 @@ class GMCP_Tools_Admin {
   * @return true|string
   */
   private function switch_to_theme( string $stylesheet ) {
+    $known = $this->known_theme( $stylesheet );
+    if ( $known !== true ) {
+      return $known;
+    }
     $theme = wp_get_theme( $stylesheet );
     if ( !$theme->exists() ) {
       return "No installed theme has the stylesheet \"{$stylesheet}\". Use wp_list_themes to see what is available.";
@@ -1313,6 +1355,10 @@ class GMCP_Tools_Admin {
     $this->load_upgrader();
 
     $stylesheet = trim( (string) $a['stylesheet'] );
+    $known = $this->known_theme( $stylesheet );
+    if ( $known !== true ) {
+      return $this->error( $r, $known );
+    }
     $theme = wp_get_theme( $stylesheet );
     if ( !$theme->exists() ) {
       return $this->error( $r, "No installed theme has the stylesheet \"{$stylesheet}\"." );
@@ -1352,6 +1398,10 @@ class GMCP_Tools_Admin {
     $this->load_upgrader();
 
     $stylesheet = trim( (string) $a['stylesheet'] );
+    $known = $this->known_theme( $stylesheet );
+    if ( $known !== true ) {
+      return $this->error( $r, $known );
+    }
     if ( !wp_get_theme( $stylesheet )->exists() ) {
       return $this->error( $r, "No installed theme has the stylesheet \"{$stylesheet}\"." );
     }
