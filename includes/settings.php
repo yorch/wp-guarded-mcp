@@ -389,14 +389,26 @@ class GMCP_Settings {
     }
     elseif ( $action === 'prune_audit' ) {
       $gone = GMCP_Audit::prune();
-      $total = array_sum( $gone );
-      $this->notice = $total
-        ? sprintf(
-            /* translators: 1: number removed for age, 2: for the row cap, 3: for the size cap. */
-            __( 'Pruned %1$d entries past the retention window, %2$d over the entry limit and %3$d over the size limit.', 'guarded-mcp' ),
-            $gone['age'], $gone['rows'], $gone['bytes']
-          )
-        : __( 'Nothing needed pruning.', 'guarded-mcp' );
+      if ( !empty( $gone['stopped'] ) ) {
+        // The bound was reached inside the retention window, so nothing was deleted and
+        // recording has stopped. Saying "nothing needed pruning" here would be the wrong
+        // reassurance about a log that has stopped growing.
+        $this->notice = sprintf(
+          /* translators: 1: the bound that was reached, 2: the number of entries. */
+          __( 'Pruned %1$d entries past the retention window. The log is at its %2$s limit and has stopped recording new entries, so nothing recent was deleted to make room. Raise the limit or lower the retention to start recording again.', 'guarded-mcp' ),
+          $gone['age'],
+          $gone['stopped'] === 'bytes' ? __( 'size', 'guarded-mcp' ) : __( 'entry-count', 'guarded-mcp' )
+        );
+      }
+      else {
+        $this->notice = $gone['age']
+          ? sprintf(
+              /* translators: %d: number of entries removed for age. */
+              __( 'Pruned %d entries past the retention window.', 'guarded-mcp' ),
+              $gone['age']
+            )
+          : __( 'Nothing needed pruning.', 'guarded-mcp' );
+      }
     }
     elseif ( $action === 'export_csv' || $action === 'export_json' ) {
       // Sends a file and exits, so it never reaches the redirect below. Capability and

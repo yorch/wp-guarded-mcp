@@ -1163,6 +1163,50 @@ check "and keeps everything inside it" \
 check "a prune is scheduled" \
   "$(docker compose exec -T cli wp eval 'echo wp_next_scheduled("gmcp_audit_prune") ? "yes" : "no";' 2>/dev/null | tr -d '\r\n')" "yes"
 
+# THE BOUNDS MUST NOT DELETE RECENT ENTRIES, and this is the test for the path that did.
+# The row and byte bounds used to delete from the oldest end whatever those rows' age, so
+# any key could exceed a bound with recorded calls (a refused call is recorded, and
+# mcp_ping is reachable from a key scoped to it) and make the next cron prune erase real
+# history. Measured before the fix: 52 rows crossing the byte bound became 0 rows, and
+# verify() still reported the chain intact because a loss at the oldest end is invisible to
+# a walk that starts at the boundary. README says nothing exposed through MCP can prune or
+# clear the log; this was the path that made that untrue.
+# Filled by hand rather than by 52 MB of real calls, because the state is what is under
+# test: the bound is crossed and the prune must not act on it. The rows are dated NOW, so
+# every one of them is inside the retention window and none is old enough to remove.
+flood_audit() { docker compose exec -T cli wp eval 'global $wpdb; $t = GMCP_Audit::table(); GMCP_Audit::clear(); delete_option( GMCP_Audit::STOPPED_OPTION );
+  for ( $i = 0; $i < 52; $i++ ) { $wpdb->query( $wpdb->prepare( "INSERT INTO {$t} (ts, tool, outcome, args, hash, prev_hash) VALUES (UTC_TIMESTAMP(), %s, \"ok\", %s, \"\", \"\")", "pad{$i}", str_repeat( "x", 1000000 ) ) ); }
+  echo GMCP_Audit::count();' 2>/dev/null | tr -d '\r\n'; }
+check "CONTROL: the fixture crosses the byte bound" "$(flood_audit)" "52"
+check "CONTROL: and the log really is over its bound" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::over_bound() ? "over" : "under";' 2>/dev/null | tr -d '\r\n')" "over"
+check "a prune at the byte bound deletes NOTHING" \
+  "$(docker compose exec -T cli wp eval 'GMCP_Audit::prune(); echo GMCP_Audit::count();' 2>/dev/null | tr -d '\r\n')" "52"
+check "and says which bound stopped it" \
+  "$(docker compose exec -T cli wp eval '$s = GMCP_Audit::stopped(); echo $s ? $s["bound"] : "none";' 2>/dev/null | tr -d '\r\n')" "bytes"
+# The other half: at a bound, recording must refuse rather than add a row whose arrival
+# would evict the ones already there.
+check "recording refuses while at the bound" \
+  "$(docker compose exec -T cli wp eval '$b = GMCP_Audit::count(); $a = new GMCP_Audit(); $a->record(["tool"=>"while_stopped","status"=>"success","args"=>[],"user_id"=>1]); echo GMCP_Audit::count() === $b ? "refused" : "RECORDED";' 2>/dev/null | tr -d '\r\n')" "refused"
+# CONTROL: the age bound is the one that is supposed to delete, and it still does. Without
+# this, a prune that did nothing at all would pass every check above.
+check "CONTROL: the age bound still deletes what is past retention" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb; $t = GMCP_Audit::table(); GMCP_Audit::clear(); delete_option( GMCP_Audit::STOPPED_OPTION );
+    $a = new GMCP_Audit(); $a->record(["tool"=>"fresh","status"=>"success","args"=>[],"user_id"=>1]);
+    $wpdb->query( "INSERT INTO {$t} (ts, tool, outcome, hash, prev_hash) VALUES (\"2000-01-01 00:00:00\", \"ancient\", \"ok\", \"\", \"\")" );
+    $r = GMCP_Audit::prune(); echo $r["age"] === 1 && GMCP_Audit::count() === 1 ? "aged" : "WRONG age=" . $r["age"] . " rows=" . GMCP_Audit::count();' 2>/dev/null | tr -d '\r\n')" "aged"
+# And once back under the bound it records again, so a site cannot be left permanently
+# silent by one flood.
+check "CONTROL: it records again once back under the bound" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb; $t = GMCP_Audit::table(); GMCP_Audit::clear(); delete_option( GMCP_Audit::STOPPED_OPTION );
+    for ( $i = 0; $i < 52; $i++ ) { $wpdb->query( $wpdb->prepare( "INSERT INTO {$t} (ts, tool, outcome, args, hash, prev_hash) VALUES (UTC_TIMESTAMP(), %s, \"ok\", %s, \"\", \"\")", "pad{$i}", str_repeat( "x", 1000000 ) ) ); }
+    GMCP_Audit::prune();
+    $wpdb->query( "UPDATE {$t} SET args = NULL" );
+    GMCP_Audit::prune();
+    $b = GMCP_Audit::count(); $a = new GMCP_Audit(); $a->record(["tool"=>"recovered","status"=>"success","args"=>[],"user_id"=>1]);
+    echo GMCP_Audit::count() > $b ? "recording" : "STILL SILENT";' 2>/dev/null | tr -d '\r\n')" "recording"
+docker compose exec -T cli wp eval 'GMCP_Audit::clear(); delete_option(GMCP_Audit::STOPPED_OPTION);' >/dev/null 2>&1
+
 # An agent that can prune its own audit trail is not being audited.
 call au_tools '{"jsonrpc":"2.0","id":214,"method":"tools/list"}'
 check "the only audit tool is the read one" \
