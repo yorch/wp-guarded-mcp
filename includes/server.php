@@ -365,6 +365,13 @@ class GMCP_Server {
         $this->auth_method = 'bearer';
         $this->auth_client_id = 'key:' . $key['id'];
         $this->auth_client_name = $key['label'];
+        // Published so a tool can tell how the caller is authorised. A tool at read level
+        // may legitimately return less to a read key than to an admin one, and before this
+        // there was no way for it to know which it was answering, short of reaching into a
+        // private property or guessing from the tool's own declared level.
+        add_filter( 'gmcp_caller_access_level', function () {
+          return $this->mcp_role;
+        } );
         GMCP_Tokens::touch( $key['id'] );
         if ( $this->logging ) {
           error_log( '[Guarded MCP] 🔐 Key auth OK: ' . $key['label'] );

@@ -68,6 +68,11 @@ class GMCP_Core {
     // student tools are admin; removing an enrolment takes the same two-step as a deletion
     // because re-enrolling does not restore the same enrolment date.
     'mcp_tools_learndash' => false,
+    // WP Activity Log: read a third-party security log. Its own switch, defaulting off, so
+    // a site is not handed a reader for a log it may not have agreed to keep. Read-only:
+    // there is no write tool here and the option writer that could reach the log's own
+    // settings refuses them (see option_write_policy()).
+    'mcp_tools_wp_activity_log' => false,
     'mcp_debug_mode' => false,
     // Keep a short history of tool calls, including refused ones, for the settings
     // screen. An agent otherwise operates with no visible record at all.
@@ -841,6 +846,15 @@ class GMCP_Core {
     // check in GMCP_Tools_Learndash::handle_call() is the runtime honesty check.
     if ( $this->get_option( 'mcp_tools_learndash' ) ) {
       new GMCP_Tools_Learndash();
+    }
+
+    // And WP Activity Log: a third-party security log, read from the outside. Switched on
+    // separately because it is a reader for a log the site may not have agreed to keep, and
+    // registered unconditionally within its own switch so the briefing can answer "the log
+    // is not loaded" — which is a different answer from "the log is empty" and is the one
+    // an operator needs when the log has stopped recording.
+    if ( $this->get_option( 'mcp_tools_wp_activity_log' ) ) {
+      new GMCP_Tools_Wsal();
     }
   }
 

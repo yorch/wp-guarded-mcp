@@ -2125,6 +2125,12 @@ tc_groups() { # tc_groups <admin 0|1> <woo 0|1>
     $o["mcp_tools_woo"]   = '"$2"' ? true : false;
     update_option( "gmcp_options", $o, false );' >/dev/null 2>&1
 }
+# Optional groups are excluded by tool-name prefix, because the table counts only the groups
+# that are always present. Every optional group belongs in the list below: leave one out and
+# the count moves with whatever happens to be installed, which is the drift the table exists
+# to catch. Current prefixes: elementor_ (free and Pro), kirki_, yoast_, acf_, wsal_, gf_
+# (Gravity Forms), ld_ (LearnDash). WooCommerce Subscriptions is wcs_ and is deliberately not
+# listed, because this block never switches that group on.
 tc_count() { # tc_count <secret>
   curl -sS -X POST "$URL" -H "Authorization: Bearer $1" \
     -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
@@ -2135,7 +2141,7 @@ try:
     t = json.load(sys.stdin)['result']['tools']
 except Exception:
     print('unreadable'); raise SystemExit
-print(len([x for x in t if not x['name'].startswith('elementor_') and not x['name'].startswith('kirki_') and not x['name'].startswith('yoast_') and not x['name'].startswith('acf_')]))"
+print(len([x for x in t if not x['name'].startswith('elementor_') and not x['name'].startswith('kirki_') and not x['name'].startswith('yoast_') and not x['name'].startswith('acf_') and not x['name'].startswith('wsal_') and not x['name'].startswith('gf_') and not x['name'].startswith('ld_')]))"
 }
 # The expected numbers come from the table itself, so the check fails whichever side moved.
 tc_doc() { # tc_doc <level> <column index, 1-3>

@@ -137,13 +137,16 @@ echo "-- the fixture exists, and the probe discriminates --"
 check "CONTROL: the subscription exists and is active" \
   "$(wpc eval "echo wcs_get_subscription($SUB)->get_status();")" "active"
 check "CONTROL: it really carries the customer's billing email" \
-  "$(dbq "SELECT COUNT(*) FROM $(wpc db prefix)postmeta WHERE post_id=$SUB AND meta_key='_billing_email' AND meta_value LIKE 'wcs-suite-$TAG%'")" "1"
-# The discriminating half, and the point of the pair: the same query the absence checks use
+  "$(wpc eval "\$s = wcs_get_subscription($SUB); echo \$s ? \$s->get_billing_email() : 'NO_SUB';")" "wcs-suite-$TAG@example.test"
+# The discriminating half, and the point of the pair: the same probe the absence checks use
 # finds this suite's email when it is there, so "not in the reply" later is an absence and
-# not a probe that never worked. Scoped to this run's tag rather than counting every
-# subscription, because a fixture left by an earlier run is not a tool defect.
+# not a probe that never worked. Read through WooCommerce's own API rather than from
+# postmeta, because with HPOS on — which is the default on a fresh store — billing data
+# lives in wc_orders and wc_order_addresses and there is no postmeta row to find. Scoped to
+# this run's tag rather than counting every subscription, because a fixture left by an
+# earlier run is not a tool defect.
 check "CONTROL: the same probe finds this run's email, so a later absence means absent" \
-  "$(dbq "SELECT COUNT(*) FROM $(wpc db prefix)postmeta WHERE meta_key='_billing_email' AND meta_value LIKE 'wcs-suite-$TAG%'")" "1"
+  "$(wpc eval "\$s = wcs_get_subscription($SUB); echo \$s ? \$s->get_billing_email() : 'NO_SUB';" | grep -c "^wcs-suite-$TAG@example.test\$")" "1"
 
 echo "-- the tools are offered --"
 call wcs_list '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'

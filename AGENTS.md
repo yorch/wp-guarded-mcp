@@ -45,6 +45,15 @@ and the change journal's undo. Add a rule there, not in a caller. This exists be
 settings tool once enforced a policy no other writer did, so every refusal it made was
 reachable by naming the same row through a different tool.
 
+**An audit log this plugin does not own is still not writable through it.**
+`option_write_policy()` refuses options whose name begins with a prefix in
+`audit_log_option_prefixes()` — `wsal_` for WP Activity Log, extendable through
+`gmcp_audit_log_prefixes` for any other logger. Those rows are ordinary options, so every
+generic writer can reach them: one admin-level `wp_update_option` on `wsal_disabled-alerts`
+stops chosen events being recorded, and `wsal_delete-data` arms dropping the log on
+uninstall. A log an agent can switch off is not a log, and an agent that can switch it off
+and then read it back can confirm its own silence.
+
 **Credential-shaped data never reaches the journal, the audit log, or the debug
 error_log.** `user_pass` is dropped unconditionally, and
 `GMCP_Core::field_looks_secret()` is the single answer both subsystems ask, so the
@@ -123,8 +132,9 @@ destructive. `smoke-woo.sh` covers the shop tools, `smoke-elementor.sh` covers t
 `smoke-kirki.sh` covers the Kirki tools, `smoke-yoast.sh` covers the Yoast SEO tools,
 `smoke-acf.sh` covers the ACF tools, `smoke-gravityforms.sh` covers the Gravity Forms tools,
 `smoke-learndash.sh` covers the LearnDash tools, `smoke-elementor-pro.sh` covers the
-Elementor Pro tools, and `smoke-woo-subscriptions.sh` covers the Subscriptions tools. Run all
-twelve before committing. The last nine need
+Elementor Pro tools, `smoke-woo-subscriptions.sh` covers the Subscriptions tools, and
+`smoke-wsal.sh` covers the WP Activity Log tools. Run all
+fourteen before committing. The last eleven need
 their plugin installed and say so and exit rather than reporting failures against a site that
 simply does not have it.
 
@@ -153,12 +163,29 @@ repeats the post's own text, so a plain occurrence count returned 2 and failed w
 body it was checking was present and correct. It counts inside the content element now,
 because the assertion is about the body, not about the page.
 
+**A fixture cleaned up with `wp_delete_post` leaves something behind under HPOS.**
+WooCommerce's High-Performance Order Storage keeps an order as a row in `wc_orders` with no
+`wp_posts` row at all, and it is on by default on a fresh store. So a suite that clears its
+own orders with `get_posts( ['post_type' => 'shop_order'] )` finds nothing, and deleting by a
+HPOS order id writes to the posts table. The cleanup silently does nothing — measured: 12
+orders before it ran and 12 after — and because the shop suites assert exact counts, each run
+hands the next one a failure that describes a tool defect which does not exist. Delete orders
+through WooCommerce's own API (`wc_get_order( $id )->delete( true )`) and, where a suite
+asserts counts, run it twice in a row: a leftover-fixture bug only appears on the second run.
+
 **A suite switches on the tool group it tests, and smoke-admin.sh did not.** `mcp_tools_admin`
 defaults to off, correctly, so on a fresh stack none of the tools that suite names were
 registered and it reported 147 failures describing every guard in the plugin as broken. One
 missing setting, read as a catastrophe, and the second time this shape has appeared after the
 missing credential that produced 226. When a suite fails in the hundreds, suspect its
 preconditions before its subject.
+
+**A count table checked against reality only stays checked if its filter is exhaustive.** The
+access-level table in `README.md` counts only the groups that are always present, and
+`smoke-admin.sh` excludes the optional ones by tool-name prefix. Adding a group without adding
+its prefix moves every number in the table, which reads as a numbering mistake rather than as
+new tools. The prefixes are not guessable from the group names — LearnDash's tools are `ld_`,
+Gravity Forms' are `gf_` — so take them from the group's own file rather than from its name.
 
 **The suite's own credential is a named key it mints at startup.** So anything that clears
 keys wholesale clears the suite out from under itself: every later request comes back 401,

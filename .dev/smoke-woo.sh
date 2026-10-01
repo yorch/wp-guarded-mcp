@@ -78,10 +78,17 @@ if ! docker compose exec -T cli wp plugin is-active woocommerce >/dev/null 2>&1;
 fi
 docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_woo"]=true;update_option("gmcp_options",$o);' >/dev/null 2>&1
 
-# Leave nothing behind from a previous run.
+# Leave nothing behind from a previous run. Orders are deleted through WooCommerce's own
+# API rather than with wp_delete_post: with HPOS on — which is the default on a fresh store —
+# an order is a row in wc_orders with no wp_posts row at all, so deleting by post id removes
+# nothing and every run leaves its fixtures behind. The counts in this file are exact, so
+# leftovers from run N make run N+1 report a tool defect that is not one.
 docker compose exec -T cli wp eval '
+  foreach ( wc_get_orders( [ "limit" => -1, "return" => "ids", "status" => array_keys( wc_get_order_statuses() ) ] ) as $id ) {
+    $o = wc_get_order( $id );
+    if ( $o ) { $o->delete( true ); }
+  }
   foreach ( get_posts( [ "post_type" => [ "product", "shop_order" ], "post_status" => "any", "numberposts" => -1 ] ) as $p ) { wp_delete_post( $p->ID, true ); }
-  foreach ( wc_get_orders( [ "limit" => -1, "return" => "ids", "status" => array_keys( wc_get_order_statuses() ) ] ) as $id ) { wp_delete_post( $id, true ); }
 ' >/dev/null 2>&1
 
 echo "-- the tools only exist when the shop does --"

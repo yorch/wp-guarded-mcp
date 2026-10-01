@@ -334,6 +334,7 @@ class GMCP_Settings {
       'mcp_tools_acf' => 'bool',
       'mcp_tools_gravityforms' => 'bool',
       'mcp_tools_learndash' => 'bool',
+      'mcp_tools_wp_activity_log' => 'bool',
       'mcp_debug_mode' => 'bool',
       'mcp_activity_log' => 'bool',
       'mcp_audit_days' => 'days',
@@ -1168,6 +1169,9 @@ class GMCP_Settings {
     // steps class and its enrolment function; requiring all three is the same signal the
     // group's own per-call check uses.
     $ld = defined( 'LEARNDASH_VERSION' ) && class_exists( 'LDLMS_Factory_Post' ) && function_exists( 'ld_update_course_access' );
+    // WP Activity Log: the version constant plus the class and method the message renderer
+    // calls, which is the same per-call signal the group itself uses.
+    $wsal = defined( 'WSAL_VERSION' ) && class_exists( '\WSAL\Controllers\Alert' ) && method_exists( '\WSAL\Controllers\Alert', 'get_original_alert_message' );
     // Subscriptions has no version constant in 7.7.0, so presence is the classes plus a
     // function a tool here calls. WC_Subscription alone is not enough: a gateway bundling
     // the subscriptions core library provides it without WooCommerce Subscriptions.
@@ -1206,6 +1210,9 @@ class GMCP_Settings {
     }
     if ( $ld ) {
       $keys[] = 'mcp_tools_learndash';
+    }
+    if ( $wsal ) {
+      $keys[] = 'mcp_tools_wp_activity_log';
     }
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'Which groups of tools an agent is offered. A group that is off is not merely hidden: its tools are refused if asked for by name.', 'guarded-mcp' ); ?></p>
@@ -1282,6 +1289,12 @@ class GMCP_Settings {
                 <label>
                   <input type="checkbox" name="mcp_tools_learndash" value="1" <?php checked( !empty( $options['mcp_tools_learndash'] ) ); ?>>
                   <?php esc_html_e( 'LearnDash (course structure, enrolment, progress, quiz questions)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
+              <?php if ( $wsal ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_wp_activity_log" value="1" <?php checked( !empty( $options['mcp_tools_wp_activity_log'] ) ); ?>>
+                  <?php esc_html_e( 'WP Activity Log (read the site\'s security log: event counts, and the events themselves at admin level)', 'guarded-mcp' ); ?>
                 </label>
               <?php endif; ?>
               <label>

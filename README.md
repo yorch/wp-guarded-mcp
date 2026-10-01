@@ -73,8 +73,9 @@ An access level belongs to a named key. OAuth callers always act as the administ
 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
 nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO,
-ACF, Gravity Forms, LearnDash and Elementor Pro are not counted: their tools are optional
-groups that come and go with a plugin, so folding them in would make the table depend on what
+ACF, Gravity Forms, LearnDash, Elementor Pro and WP Activity Log are not counted: their tools
+are optional groups that come and go with a plugin, so folding them in would make the table
+depend on what
 happens to be installed.
 
 A **named key** narrows this further. It carries its own level, an optional expiry date,
@@ -172,6 +173,40 @@ anything. Unenrolling takes the same server-minted two-step as a deletion and re
 when the access comes from a Group. Quiz **answer keys** are never returned; a question's
 text and points are. Progress is lessons and topics only, as LearnDash's own percentage
 is.
+
+**WP Activity Log**, off by default, and the switch only appears when that plugin is
+installed. This group **reads** a third-party security log; there is no write tool here and
+there will not be one, because a writer is a way to reduce what the log holds, and this
+plugin already ships an option writer that could reach the log's own settings — which is why
+the option policy refuses that family first (see the commit that added
+`audit_log_option_prefixes`). Three tools: a **counts-only briefing** at `read`, which
+reports events by severity, object, event type and security family over at most 90 days; and
+`wsal_list_events` and `wsal_get_event` at `admin`, matching this plugin's own log reader,
+because an event row names a person.
+
+What the tools refuse to return matters more than what they do. The metadata an event carries
+is filtered by an **allowlist** — only names that describe the site — because a denylist
+version turned out to be a credential-disclosure defect rather than an incomplete list: a
+user-meta write stores the field's name in one key and both its values in others, with
+nothing in any name to give it away, so the denylist returned a user's API token in
+plaintext. The names of what was withheld are listed so an absence is visible. A value stored
+as a serialised object is never read, only marked, since casting one still exposes every
+property it holds. Filesystem paths are returned relative to the content directory. The
+failure-login alerts do not return their message at all, because it is built from what someone
+typed at the login form and that field regularly holds a mistyped password.
+
+Each reply carries a `log_state` block, which is what separates "nothing happened" from
+"nothing is being recorded" — the same false-zero trap Gravity Forms and Elementor Pro have.
+It reports whether the plugin is loaded, whether the tables exist, whether storage is
+external, how many events the log holds and how recent the newest is, and how many alert
+types are switched off. A read-level key gets a recency bucket rather than an exact time.
+
+**No search, no IP list, no user ranking, and no alert catalogue.** Searching would have to
+LIKE across the metadata table, which is an oracle for exactly the values the tools withhold;
+an IP list is a behavioural record of an identifiable person and this group takes no action a
+list could feed; a per-user activity ranking is profiling, and also wrong, because REST
+actions are recorded against whichever user the bearer key borrows. Each is a deliberate
+absence, not an omission to be helpfully filled in.
 
 **REST API tools**, off by default: tools generated from the site's own REST API routes.
 Generated once and cached for a day; the cache is thrown away on the first request after
@@ -352,10 +387,10 @@ previews; `smoke-admin.sh` for the administration tools, the change journal, nam
 every guard around them, which rebuilds `.htaccess` partway through and is the destructive
 one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor tools;
 `smoke-kirki.sh` for the Kirki tools; `smoke-yoast.sh` for the Yoast SEO tools;
-`smoke-acf.sh` for the ACF tools; `smoke-gravityforms.sh` for the Gravity Forms tools; and
+`smoke-acf.sh` for the ACF tools; `smoke-gravityforms.sh` for the Gravity Forms tools;
 `smoke-learndash.sh` for the LearnDash tools; `smoke-elementor-pro.sh` for the Elementor Pro
-tools; and `smoke-woo-subscriptions.sh` for the Subscriptions tools. The last nine need
-their plugin installed.
+tools; `smoke-woo-subscriptions.sh` for the Subscriptions tools; and `smoke-wsal.sh` for the
+WP Activity Log tools. The last ten need their plugin installed.
 
 Never run `wp plugin install --force` against that stack. Its plugin directory is a bind
 mount of this repository, and WordPress deletes the old plugin directory before unpacking
