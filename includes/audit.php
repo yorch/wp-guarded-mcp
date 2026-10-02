@@ -63,6 +63,15 @@ class GMCP_Audit {
   /** The last row written under the old hash construction. @see hash_boundary(). */
   const BOUNDARY_OPTION = 'gmcp_audit_hash_boundary';
 
+  /**
+  * Set when a hard bound has been reached and the log has stopped recording.
+  *
+  * Distinguishes "this call was never made" from "this call happened and could not be
+  * written down", which is the same distinction the rest of this file draws for a failed
+  * query. An operator reading an audit log with a gap in it needs to know which one it is.
+  */
+  const STOPPED_OPTION = 'gmcp_audit_stopped';
+
   /** Per-entry cap on the recorded arguments, before the row is written. */
   const MAX_ARGS = 64000;
 
@@ -289,6 +298,12 @@ class GMCP_Audit {
     }
     global $wpdb;
 
+    // At a hard bound, refuse to write rather than write into a log that will have its
+    // recent rows deleted to make room. The row this would have added is lost either way;
+    // what the refusal protects is the rows already there. @see prune().
+    if ( self::over_bound() ) {
+      return;
+    }
     $args = is_array( $call['args'] ?? null ) ? $call['args'] : [];
     $failed = ( ( $call['status'] ?? '' ) !== 'success' )
       || !empty( $call['result']['result']['isError'] );
@@ -876,43 +891,100 @@ class GMCP_Audit {
   }
 
   /**
-  * Apply all three bounds, oldest first.
+  * Apply the bounds, oldest first.
   *
-  * @return array{age:int,rows:int,bytes:int} how many were removed by each bound
+  * AGE is the only bound that deletes rows, and it deletes exactly the rows the retention
+  * setting says are past keeping. The row and byte bounds exist to stop the table growing
+  * without limit, but they must never be the thing that removes a recent, genuine entry.
+  *
+  * They could, until this was fixed: both bounds called drop_oldest(), so exceeding either
+  * deleted the oldest rows whatever their age. Any key can add rows — a refused call is
+  * recorded, and mcp_ping is reachable from a key scoped to it — and every recorded call
+  * keeps up to MAX_ARGS of arguments, so roughly eight hundred padded calls push the table
+  * over MAX_BYTES. The next cron run then deleted real history from the old end, and
+  * verify() still reported the chain intact because a loss at the oldest end is invisible
+  * to a walk that starts at the boundary. README says nothing exposed through MCP can prune
+  * or clear the log; this is the path that made that untrue.
+  *
+  * So the row and byte bounds no longer delete anything. When one is reached the log stops
+  * recording and says so, through the stopped() state the settings screen and the read
+  * tools can report. That trades a bounded loss of detail at the NEW end for an unbounded
+  * loss of evidence at the old one, which is the right way round: the newest entries are
+  * the ones an operator is looking at, but the oldest retained entries are the ones the
+  * retention promise is about.
+  *
+  * @return array{age:int,stopped:string} rows removed by age, and why recording stopped
   */
   public static function prune(): array {
     global $wpdb;
     $table = self::table();
-    $removed = [ 'age' => 0, 'rows' => 0, 'bytes' => 0 ];
+    $removed = [ 'age' => 0, 'stopped' => '' ];
 
     $cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::retention_days() * DAY_IN_SECONDS ) );
     $removed['age'] = (int) $wpdb->query(
       $wpdb->prepare( "DELETE FROM {$table} WHERE ts < %s", $cutoff )
     );
 
-    $count = self::count();
-    if ( $count > self::MAX_ROWS ) {
-      $removed['rows'] = self::drop_oldest( $count - self::MAX_ROWS );
+    // Still over a bound after the retention delete: the site is recording more than the
+    // bounds allow inside the retention window. Stop writing rather than delete recent
+    // rows, and leave a marker so an operator can see why their newer calls are missing.
+    if ( self::over_bound() ) {
+      $removed['stopped'] = self::over_bound_reason();
+      update_option( self::STOPPED_OPTION, [ 'at' => time(), 'why' => $removed['stopped'] ], false );
+      return $removed;
     }
 
-    // Bytes last, because dropping by age or count may already have solved it, and this
-    // is the bound most likely to remove something recent.
-    $guard = 0;
-    while ( self::bytes() > self::MAX_BYTES && self::count() > 1 && $guard < 200 ) {
-      $removed['bytes'] += self::drop_oldest( max( 100, (int) ( self::count() * 0.05 ) ) );
-      $guard++;
+    // Recording works again once the site is back under its bounds — the retention delete
+    // above, or an operator raising the limit. Clearing the marker here rather than on the
+    // next successful write keeps the reason attached to the condition that caused it.
+    if ( get_option( self::STOPPED_OPTION, null ) !== null ) {
+      delete_option( self::STOPPED_OPTION );
     }
 
     return $removed;
   }
 
-  private static function drop_oldest( int $howMany ): int {
-    global $wpdb;
-    $table = self::table();
-    return (int) $wpdb->query( $wpdb->prepare(
-      // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is a plugin constant
-      "DELETE FROM {$table} ORDER BY id ASC LIMIT %d", max( 1, $howMany )
-    ) );
+  /**
+  * Whether the log is at or past a hard bound, and which one.
+  *
+  * Counted rather than estimated: the bounds are enforced against these two numbers, and
+  * asking the database is the only way to know the answer the prune will act on.
+  */
+  public static function over_bound(): bool {
+    return self::over_bound_reason() !== '';
+  }
+
+  private static function over_bound_reason(): string {
+    if ( self::count() >= self::MAX_ROWS ) {
+      return 'rows';
+    }
+    if ( self::bytes() >= self::MAX_BYTES ) {
+      return 'bytes';
+    }
+    return '';
+  }
+
+  /**
+  * Why recording is currently stopped, or null.
+  *
+  * Read by the settings screen and by any tool that reports on the log, so a missing recent
+  * entry can be told apart from one that never happened. Shaped as a small array rather
+  * than a bool because when it stopped and at which bound both matter to whoever has to
+  * decide whether to raise the limit or lower the retention.
+  */
+  public static function stopped(): ?array {
+    $state = get_option( self::STOPPED_OPTION, null );
+    if ( !is_array( $state ) || empty( $state['at'] ) ) {
+      return null;
+    }
+    return [
+      'since' => gmdate( 'c', (int) $state['at'] ),
+      'bound' => (string) ( $state['why'] ?? '' ),
+      'rows' => self::count(),
+      'max_rows' => self::MAX_ROWS,
+      'bytes' => self::bytes(),
+      'max_bytes' => self::MAX_BYTES,
+    ];
   }
 
   public static function clear(): void {

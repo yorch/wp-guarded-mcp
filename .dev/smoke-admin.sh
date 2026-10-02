@@ -245,6 +245,36 @@ check "credential-shaped keys refused" "$(verdict opt_cred)" "error"
 call opt_ok '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"blogname"}}}'
 check "ordinary options still readable" "$(verdict opt_ok)" "ok"
 
+# A gateway or mailer row carries credentials its NAME does not mention, which is the same
+# shape as the backup-plugin rows option_guard already protects by prefix. Measured before
+# the fix: woocommerce_paypal_settings passed every pattern while its value held
+# api_password, api_signature, sandbox_api_password and sandbox_api_signature, and the
+# credential patterns only match names like "api_key", never "paypal".
+echo "-- payment and mail rows, whose names say nothing about the credentials inside --"
+# The fixture writes a row under a real gateway name so the control can prove the value is
+# there to be protected, rather than the check passing because the row does not exist.
+docker compose exec -T cli wp eval 'update_option("woocommerce_paypal_settings",["api_username"=>"u","api_password"=>"PAYPALMUSTNOTAPPEAR","api_signature"=>"sig","testmode"=>"yes"]);' >/dev/null 2>&1
+check "CONTROL: the gateway row really holds an API password" \
+  "$(docker compose exec -T cli wp eval 'echo strpos((string)json_encode(get_option("woocommerce_paypal_settings")),"PAYPALMUSTNOTAPPEAR")!==false?"holds":"EMPTY";' 2>/dev/null | tr -d '\r\n')" "holds"
+call gw_read '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"woocommerce_paypal_settings"}}}'
+check "the gateway row cannot be read" "$(verdict gw_read)" "error"
+call gw_write '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"woocommerce_paypal_settings","value":{"api_password":"ATTACKER"}}}}'
+check "and cannot be rewritten" "$(verdict gw_write)" "error"
+# The control that matters most here: the stored value must be untouched after the refusal,
+# or the tool refused in the reply and wrote anyway.
+check "and the stored API password is unchanged" \
+  "$(docker compose exec -T cli wp eval 'echo strpos((string)json_encode(get_option("woocommerce_paypal_settings")),"ATTACKER")===false?"unchanged":"OVERWRITTEN";' 2>/dev/null | tr -d '\r\n')" "unchanged"
+docker compose exec -T cli wp option delete woocommerce_paypal_settings >/dev/null 2>&1
+call mail_read '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"mailserver_pass"}}}'
+check "the core mail-server password row cannot be read" "$(verdict mail_read)" "error"
+# CONTROLS, so this cannot be a rule that refuses everything payment- or mail-adjacent:
+# the gateway ORDER is a harmless list of which gateways show first, and a settings row
+# belonging to another plugin that merely has "paypal" in its name holds no credentials.
+call gw_order '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"woocommerce_gateway_order"}}}'
+check "CONTROL: the harmless gateway-order row is still readable" "$(verdict gw_order)" "ok"
+call ld_pay '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"learndash_settings_paypal"}}}'
+check "CONTROL: an unrelated row with a gateway word in its name is readable" "$(verdict ld_pay)" "ok"
+
 echo "-- the identifier the plugin tools need --"
 call plist '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"wp_list_plugins","arguments":{}}}'
 check "wp_list_plugins returns the plugin file" \
@@ -263,6 +293,68 @@ check "active theme unchanged" \
   "$(docker compose exec -T cli wp theme list --status=active --field=name 2>/dev/null | tr -d '\r\n')" "twentytwentyfive"
 call t_active '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"wp_delete_theme","arguments":{"stylesheet":"twentytwentyfive"}}}'
 check "deleting the active theme refused" "$(verdict t_active)" "error"
+
+echo "-- a theme name cannot be a path (the traversal that deleted this plugin) --"
+# WP_Theme::exists() is true for 'theme_no_stylesheet', which is what any directory that
+# is not a theme produces, so '../..' and '../plugins/guarded-mcp' both "exist" as themes.
+# delete_theme() then deletes themes_dir . $stylesheet with no validation of its own, so
+# two confirmed calls would take this plugin, the activity log, or ABSPATH (wp-config.php
+# with it). Measured before the fix: wp_get_theme('../plugins/guarded-mcp')->exists() was
+# true and validate_file() returned 1 while the tool called delete_theme anyway.
+for tpath in '../plugins/guarded-mcp' '../..' '../../..' '/etc' 'guarded-mcp/../..'; do
+  TID=$(echo "$tpath" | tr -c 'a-zA-Z0-9' '_')
+  call "t_path_$TID" "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_theme\",\"arguments\":{\"stylesheet\":\"$tpath\"}}}"
+  check "wp_delete_theme refuses the path '${tpath}'" "$(verdict "t_path_$TID")" "error"
+done
+call t_path_act '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"wp_activate_theme","arguments":{"stylesheet":"../plugins/guarded-mcp"}}}'
+check "wp_activate_theme refuses the same path" "$(verdict t_path_act)" "error"
+call t_path_upd '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"wp_update_theme","arguments":{"stylesheet":"../plugins/guarded-mcp"}}}'
+check "wp_update_theme refuses the same path" "$(verdict t_path_upd)" "error"
+
+# The checks above prove the OUTCOME and nothing about which check produced it. This guard
+# has two independent halves — a path-shape check and an allowlist against wp_get_themes() —
+# and a mutation removing either one leaves the other refusing the same paths, so all five
+# assertions above stay green with half the guard gone. Verified: removing the allowlist
+# entirely still passed every one of them. So each half is exercised directly here, where
+# the other half is out of the way, and each has a control that must pass.
+t_guard() { # t_guard <stylesheet>  -> the refusal message, or "allowed"
+  # No tail/truncation: an earlier version used `tail -c 90`, which cut the phrase the
+  # checks grep for and made every one of them fail on correct code.
+  docker compose exec -T cli wp eval "\$m = new ReflectionMethod('GMCP_Tools_Admin', 'known_theme'); \$m->setAccessible(true);
+    \$o = new GMCP_Tools_Admin(null);
+    \$r = \$m->invoke(\$o, '$1'); echo \$r === true ? 'allowed' : \$r;" 2>/dev/null | tr -d '\r' | grep -E 'is not a theme name|No installed theme|^allowed$' | tail -1
+}
+# Half one: the path shape. Asserted on the REASON, not on the refusal, because both halves
+# refuse a traversal and an assertion that only checks "refused" cannot tell which one fired.
+# Verified: with the path-shape check removed the traversal still returns the ALLOWLIST's
+# message, so a bare "refused" check stayed green through that mutation.
+check "the path-shape half refuses a traversal segment, on the shape" \
+  "$(t_guard '../plugins/guarded-mcp' | grep -c 'is not a theme name')" "1"
+check "and refuses an absolute path, on the shape" \
+  "$(t_guard '/etc' | grep -c 'is not a theme name')" "1"
+check "and refuses a name with a slash in it, on the shape" \
+  "$(t_guard 'guarded-mcp/../..' | grep -c 'is not a theme name')" "1"
+# Half two: the allowlist. A well-formed name with no traversal passes half one, so its
+# refusal can only come from the allowlist — and it must NOT be the path-shape message.
+check "the allowlist refuses a well-formed name that is not installed" \
+  "$(t_guard 'no-such-theme' | grep -c 'No installed theme')" "1"
+check "and that refusal is NOT the path-shape one" \
+  "$(t_guard 'no-such-theme' | grep -c 'is not a theme name')" "0"
+check "and the plugin directory's own name is refused by the allowlist" \
+  "$(t_guard 'guarded-mcp' | grep -c 'No installed theme')" "1"
+# CONTROL: both halves together must still ADMIT a real theme, or a guard that refused
+# everything would pass every check above.
+check "CONTROL: a genuinely installed theme is admitted" "$(t_guard 'futuretheme')" "allowed"
+check "CONTROL: the active theme is admitted" "$(t_guard "$(docker compose exec -T cli wp theme list --status=active --field=name 2>/dev/null | tr -d '\r\n')")" "allowed"
+
+# And the outcome the traversal would have destroyed. Checked by file existence rather than
+# by a count, because counting lines of a newline-stripped list counts lines, not names —
+# which is how an earlier version of this very check reported the plugin as missing while it
+# was present and active.
+check "CONTROL: this plugin's own file is still on disk" \
+  "$(docker compose exec -T cli sh -c 'test -f /var/www/html/wp-content/plugins/guarded-mcp/includes/tools-admin.php && echo yes' 2>/dev/null | tr -d '\r\n')" "yes"
+check "CONTROL: wp-config.php is still on disk" \
+  "$(docker compose exec -T cli sh -c 'test -f /var/www/html/wp-config.php && echo yes' 2>/dev/null | tr -d '\r\n')" "yes"
 
 echo "-- self-protection --"
 call self_off '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"wp_deactivate_plugin","arguments":{"plugin":"guarded-mcp"}}}'
@@ -1100,6 +1192,50 @@ check "and keeps everything inside it" \
   "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::count() > 0 ? "kept" : "OVERPRUNED";' 2>/dev/null | tr -d '\r\n')" "kept"
 check "a prune is scheduled" \
   "$(docker compose exec -T cli wp eval 'echo wp_next_scheduled("gmcp_audit_prune") ? "yes" : "no";' 2>/dev/null | tr -d '\r\n')" "yes"
+
+# THE BOUNDS MUST NOT DELETE RECENT ENTRIES, and this is the test for the path that did.
+# The row and byte bounds used to delete from the oldest end whatever those rows' age, so
+# any key could exceed a bound with recorded calls (a refused call is recorded, and
+# mcp_ping is reachable from a key scoped to it) and make the next cron prune erase real
+# history. Measured before the fix: 52 rows crossing the byte bound became 0 rows, and
+# verify() still reported the chain intact because a loss at the oldest end is invisible to
+# a walk that starts at the boundary. README says nothing exposed through MCP can prune or
+# clear the log; this was the path that made that untrue.
+# Filled by hand rather than by 52 MB of real calls, because the state is what is under
+# test: the bound is crossed and the prune must not act on it. The rows are dated NOW, so
+# every one of them is inside the retention window and none is old enough to remove.
+flood_audit() { docker compose exec -T cli wp eval 'global $wpdb; $t = GMCP_Audit::table(); GMCP_Audit::clear(); delete_option( GMCP_Audit::STOPPED_OPTION );
+  for ( $i = 0; $i < 52; $i++ ) { $wpdb->query( $wpdb->prepare( "INSERT INTO {$t} (ts, tool, outcome, args, hash, prev_hash) VALUES (UTC_TIMESTAMP(), %s, \"ok\", %s, \"\", \"\")", "pad{$i}", str_repeat( "x", 1000000 ) ) ); }
+  echo GMCP_Audit::count();' 2>/dev/null | tr -d '\r\n'; }
+check "CONTROL: the fixture crosses the byte bound" "$(flood_audit)" "52"
+check "CONTROL: and the log really is over its bound" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::over_bound() ? "over" : "under";' 2>/dev/null | tr -d '\r\n')" "over"
+check "a prune at the byte bound deletes NOTHING" \
+  "$(docker compose exec -T cli wp eval 'GMCP_Audit::prune(); echo GMCP_Audit::count();' 2>/dev/null | tr -d '\r\n')" "52"
+check "and says which bound stopped it" \
+  "$(docker compose exec -T cli wp eval '$s = GMCP_Audit::stopped(); echo $s ? $s["bound"] : "none";' 2>/dev/null | tr -d '\r\n')" "bytes"
+# The other half: at a bound, recording must refuse rather than add a row whose arrival
+# would evict the ones already there.
+check "recording refuses while at the bound" \
+  "$(docker compose exec -T cli wp eval '$b = GMCP_Audit::count(); $a = new GMCP_Audit(); $a->record(["tool"=>"while_stopped","status"=>"success","args"=>[],"user_id"=>1]); echo GMCP_Audit::count() === $b ? "refused" : "RECORDED";' 2>/dev/null | tr -d '\r\n')" "refused"
+# CONTROL: the age bound is the one that is supposed to delete, and it still does. Without
+# this, a prune that did nothing at all would pass every check above.
+check "CONTROL: the age bound still deletes what is past retention" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb; $t = GMCP_Audit::table(); GMCP_Audit::clear(); delete_option( GMCP_Audit::STOPPED_OPTION );
+    $a = new GMCP_Audit(); $a->record(["tool"=>"fresh","status"=>"success","args"=>[],"user_id"=>1]);
+    $wpdb->query( "INSERT INTO {$t} (ts, tool, outcome, hash, prev_hash) VALUES (\"2000-01-01 00:00:00\", \"ancient\", \"ok\", \"\", \"\")" );
+    $r = GMCP_Audit::prune(); echo $r["age"] === 1 && GMCP_Audit::count() === 1 ? "aged" : "WRONG age=" . $r["age"] . " rows=" . GMCP_Audit::count();' 2>/dev/null | tr -d '\r\n')" "aged"
+# And once back under the bound it records again, so a site cannot be left permanently
+# silent by one flood.
+check "CONTROL: it records again once back under the bound" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb; $t = GMCP_Audit::table(); GMCP_Audit::clear(); delete_option( GMCP_Audit::STOPPED_OPTION );
+    for ( $i = 0; $i < 52; $i++ ) { $wpdb->query( $wpdb->prepare( "INSERT INTO {$t} (ts, tool, outcome, args, hash, prev_hash) VALUES (UTC_TIMESTAMP(), %s, \"ok\", %s, \"\", \"\")", "pad{$i}", str_repeat( "x", 1000000 ) ) ); }
+    GMCP_Audit::prune();
+    $wpdb->query( "UPDATE {$t} SET args = NULL" );
+    GMCP_Audit::prune();
+    $b = GMCP_Audit::count(); $a = new GMCP_Audit(); $a->record(["tool"=>"recovered","status"=>"success","args"=>[],"user_id"=>1]);
+    echo GMCP_Audit::count() > $b ? "recording" : "STILL SILENT";' 2>/dev/null | tr -d '\r\n')" "recording"
+docker compose exec -T cli wp eval 'GMCP_Audit::clear(); delete_option(GMCP_Audit::STOPPED_OPTION);' >/dev/null 2>&1
 
 # An agent that can prune its own audit trail is not being audited.
 call au_tools '{"jsonrpc":"2.0","id":214,"method":"tools/list"}'
