@@ -250,6 +250,33 @@ check "a group that matched nothing expands to nothing" \
   "$(py 'import json,sys,re;t=json.load(sys.stdin)["result"]["content"][0]["text"];print(re.search(r"becomes: .*?\[(.*?)\]",t).group(1))' pv_unmatched)" "c--ow"
 docker compose exec -T cli wp post delete "$LB_ID" --force >/dev/null 2>&1
 
+echo "-- wp_alter_post sanitizes what it writes, the way wp_update_post does --"
+# MEASURED BEFORE THIS WAS FIXED: replacing a word in a published post's content with
+# "<script>window.XSS=1;</script>" stored the script tag verbatim, so an agent relaying text
+# from a comment or a fetched page could plant persistent script on the site. The tool is at
+# "write" access level, so a token deliberately limited to "read and write, no destructive
+# tools" could reach it. wp_write_blocks was checked at the same time and sanitizes through
+# clean_html(), so the gap was this tool alone.
+XSS_P=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"XSS probe","post_content"=>"plain ORIGINAL text","post_status"=>"publish","post_type"=>"post"]);' 2>/dev/null | tr -d '\r\n')
+call xss_script "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":{\"ID\":$XSS_P,\"field\":\"post_content\",\"search\":\"ORIGINAL\",\"replace\":\"<script>window.XSS=1;</script>\"}}}"
+check "a script tag in the replacement is refused by kses" \
+  "$(docker compose exec -T cli wp eval "echo strpos(get_post($XSS_P)->post_content,'<script>')!==false?'STORED':'stripped';" 2>/dev/null | tr -d '\r\n')" "stripped"
+# The event-handler shape, which is the one kses has to remove while keeping the tag.
+docker compose exec -T cli wp post update "$XSS_P" --post_content='plain TARGET text' >/dev/null 2>&1
+call xss_handler "{\"jsonrpc\":\"2.0\",\"id\":64,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":{\"ID\":$XSS_P,\"field\":\"post_content\",\"search\":\"TARGET\",\"replace\":\"<img src=x onerror=alert(1)>\"}}}"
+check "an onerror handler is stripped from the replacement" \
+  "$(docker compose exec -T cli wp eval "echo strpos(get_post($XSS_P)->post_content,'onerror')!==false?'STORED':'stripped';" 2>/dev/null | tr -d '\r\n')" "stripped"
+# The control, without which "stripped" could mean the tool stopped writing anything.
+docker compose exec -T cli wp post update "$XSS_P" --post_content='plain TARGET2 text' >/dev/null 2>&1
+call xss_benign "{\"jsonrpc\":\"2.0\",\"id\":65,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":{\"ID\":$XSS_P,\"field\":\"post_content\",\"search\":\"TARGET2\",\"replace\":\"<strong>bold</strong>\"}}}"
+check "CONTROL: an ordinary replacement still applies" \
+  "$(docker compose exec -T cli wp eval "echo get_post($XSS_P)->post_content;" 2>/dev/null | tr -d '\r\n')" "plain <strong>bold</strong> text"
+# And the title path, which takes the text sanitizer rather than kses.
+call xss_title "{\"jsonrpc\":\"2.0\",\"id\":66,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":{\"ID\":$XSS_P,\"field\":\"post_title\",\"search\":\"XSS\",\"replace\":\"Renamed\"}}}"
+check "CONTROL: a title replacement still applies" \
+  "$(docker compose exec -T cli wp eval "echo get_post($XSS_P)->post_title;" 2>/dev/null | tr -d '\r\n')" "Renamed probe"
+docker compose exec -T cli wp post delete "$XSS_P" --force >/dev/null 2>&1
+
 echo "-- prompts --"
 # The listing is filtered to prompts whose backing tools the caller can actually reach, so
 # two of the six (update_review, site_health_brief) come from the administration group. This

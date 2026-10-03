@@ -4156,6 +4156,26 @@ class GMCP_Tools_Core {
           break;
         }
 
+        // The replacement is content, and it was written straight to the post. Measured:
+        // replacing a word in a published post's content with "<script>window.XSS=1;</script>"
+        // stored the script tag verbatim, so an agent relaying text from a comment or a
+        // fetched page could plant persistent script on the site. This sits at "write" access
+        // level, so a token deliberately limited to "read and write, no destructive tools"
+        // could reach it. The same field handling wp_update_post uses now applies here:
+        // wp_kses_post for content and excerpt (through store_html(), which honours the
+        // site's raw-HTML setting), and sanitize_text_field for the title.
+        //
+        // Sanitised AFTER the replacement count is taken, so the count still reports what
+        // the pattern matched rather than what survived kses, and applied to the whole field
+        // rather than to the replacement string alone: a sanitizer run on the replacement
+        // cannot see the context it is being spliced into.
+        if ( $field === 'post_title' ) {
+          $new_content = sanitize_text_field( $new_content );
+        }
+        else {
+          $new_content = $this->store_html( $new_content );
+        }
+
         // wp_update_post() runs wp_unslash() internally, which would strip the
         // backslash from Unicode escapes like \u003c in block JSON (Rank Math
         // FAQ, etc.) and silently corrupt the post. Pre-slash to compensate.
