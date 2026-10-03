@@ -310,6 +310,16 @@ class GMCP_Core {
   * repoint account recovery, and a filter here would exist mainly to be found by
   * somebody looking for a way past it.
   *
+  * The rule is about the ROW, not about the tool that normally writes it, which is why
+  * these live here rather than in the tools that own them. Every one of the four below
+  * is already handled correctly by a tool that knows what it is doing: wp_deactivate_plugin
+  * refuses to deactivate this plugin, wp_activate_theme runs the theme requirement checks,
+  * wp_run_cron_event refuses this plugin's own hooks, and default_role_objection refuses
+  * a default role that would hand out capabilities to anyone who registers. None of that
+  * is reachable by writing the row the tool would have written, and the option writer is
+  * one call away at admin level with no two-step. A guard that only the well-behaved
+  * writer consults is a guard two other writers do not have.
+  *
   * @return array<string,string> option name => refusal message
   */
   public static function unwritable_options(): array {
@@ -317,6 +327,41 @@ class GMCP_Core {
       'siteurl' => 'Changing the site URL rewrites every generated URL including this API endpoint, and a wrong value locks wp-admin too, so there would be no way to undo it from here.',
       'home' => 'Same as siteurl: a wrong value makes the site and this endpoint unreachable with no recovery path through the API.',
       'admin_email' => 'Set "new_admin_email" instead. WordPress emails a confirmation link to the new address and only completes the change when someone clicks it. Writing admin_email directly skips that and silently repoints password recovery.',
+
+      // The plugin list. This is how the tools keep their own promises: wp_deactivate_plugin
+      // refuses to switch this plugin off, and the WP Activity Log group refuses to switch
+      // the log off. Both checks compare the plugin's own file name, and both are bypassed
+      // by removing that name from this array, which update_option does in one call with no
+      // hooks fired, no deactivation the tool could refuse, and no undo — the journal treats
+      // the row as noise, so wp_undo_change cannot put it back either. An agent that can do
+      // this does not need to defeat the self-protection guard; it can rewrite the list the
+      // guard reads.
+      'active_plugins' => 'The active plugin list is written by wp_activate_plugin and wp_deactivate_plugin, which refuse to switch off this plugin and the site\'s activity log. Replacing the array directly does the same thing while bypassing every one of those checks, with no hooks fired and no undo. Use those tools.',
+      // Multisite keeps the same list per site and a network-wide one under a different
+      // name; both are the same shape of write.
+      'active_sitewide_plugins' => 'Same as active_plugins, for the network-wide list on multisite: replacing it switches plugins off without going through the tools that refuse to switch off this plugin and the activity log.',
+
+      // The theme requirement checks. wp_activate_theme refuses a theme that declares a
+      // newer PHP than the server runs, because switching to one takes the front end,
+      // wp-admin and this endpoint down together, with no way back in to switch away. It
+      // also checks the parent exists and is allowed on the network. Writing the row skips
+      // all of it, and WordPress will happily activate a theme it cannot render.
+      'template' => 'The active theme is set by wp_activate_theme, which refuses a theme whose PHP requirement this server cannot meet, whose parent is missing, or which the network has not enabled. Writing the row directly skips those checks, and a theme that cannot load takes the front end, wp-admin and this endpoint down with no way back to switch away. Use wp_activate_theme.',
+      'stylesheet' => 'Same as template: use wp_activate_theme, which checks the theme\'s requirements before switching. A stylesheet written directly can name a theme that cannot run.',
+
+      // The whole schedule, and this plugin's own housekeeping inside it. wp_run_cron_event
+      // refuses to fire this plugin's hooks and refuses a hook the site never scheduled.
+      // Replacing the array does both at once: it can remove the audit prune so the log
+      // grows without bound, or schedule gmcp_audit_prune for the next request so the log
+      // is pruned immediately, or schedule any hook the caller likes — which is the
+      // arbitrary-code-execution shape wp_run_cron_event exists to prevent.
+      'cron' => 'The cron array is the whole schedule. Replacing it can remove the audit log\'s own pruning, run this plugin\'s housekeeping on demand, or schedule any hook at all — which is exactly what wp_run_cron_event refuses to do one event at a time. Use wp_list_cron_events, wp_run_cron_event and wp_unschedule_cron_event.',
+
+      // The role definitions themselves. default_role_objection refuses to make a
+      // privileged role the default, because that hands its capabilities to anyone who
+      // registers. This row can grant those capabilities to the role directly, so every
+      // subscriber on the site gets them without the default role changing at all.
+      'wp_user_roles' => 'This row holds the site\'s role definitions, so writing it can grant any capability to any role — every subscriber becomes an administrator without the default role changing, which is what the default_role check exists to prevent. Manage roles through WordPress itself.',
     ];
   }
 
