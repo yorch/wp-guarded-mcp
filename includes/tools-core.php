@@ -2567,6 +2567,19 @@ class GMCP_Tools_Core {
         }
         $upd = [ 'ID' => $target_id ];
         if ( !empty( $a['fields'] ) && is_array( $a['fields'] ) ) {
+          // Same refusal as wp_update_post, and it matters more here. edit_user and
+          // promote_user were checked against $target_id, and an ID inside "fields"
+          // replaced it before the write — so an administrator who could not touch the
+          // Network Owner could name an account they were allowed to edit and have the
+          // password change land on the one they were not. This is the boundary the
+          // responsible-disclosure fix above exists to enforce, reached by sending one
+          // extra key.
+          foreach ( [ 'ID', 'id', 'user_id', 'user_ID' ] as $id_key ) {
+            if ( array_key_exists( $id_key, $a['fields'] ) ) {
+              $r = $this->error( $r, "Remove \"{$id_key}\" from \"fields\". The user to update is named by the top-level ID, and edit_user and promote_user are checked against that one — an id inside \"fields\" would change the target after those checks ran. Pass the id you mean as ID.", -32600 );
+              break 2;
+            }
+          }
           foreach ( $a['fields'] as $k => $v ) {
             $upd[ $k ] = ( $k === 'role' ) ? sanitize_key( $v ) : sanitize_text_field( $v );
           }
@@ -3813,6 +3826,23 @@ class GMCP_Tools_Core {
         // Track what we're trying to update for verification
         $content_to_verify = null;
         if ( !empty( $fields ) && is_array( $fields ) ) {
+          // The ID inside "fields" is refused rather than merged, because merging it would
+          // retarget the write AFTER every guard has looked at the id the caller named.
+          // Measured: {"ID":<harmless post>,"fields":{"ID":<shop_subscription>}} passed
+          // commerce_post_guard and template_reference_guard on the first id and then wrote
+          // the second, which is the whole point of those guards. The same shape reached
+          // wp_update_user, where edit_user and promote_user were checked against one
+          // account and the write landed on another.
+          //
+          // Refused rather than silently preferring one id, because a caller that sent two
+          // different ids does not agree with itself about what it is updating, and picking
+          // either one produces a write nobody asked for.
+          foreach ( [ 'ID', 'id', 'post_id', 'post_ID' ] as $id_key ) {
+            if ( array_key_exists( $id_key, $fields ) ) {
+              $r = $this->error( $r, "Remove \"{$id_key}\" from \"fields\". The post to update is named by the top-level ID, and every guard checks that one — an id inside \"fields\" would change the target after the checks ran. Pass the id you mean as ID.", -32600 );
+              break 2;
+            }
+          }
           foreach ( $fields as $k => $v ) {
             $c[ $k ] = in_array( $k, [ 'post_content', 'post_excerpt' ], true ) ? $this->store_html( $v ) : sanitize_text_field( $v );
           }
