@@ -94,6 +94,34 @@ class GMCP_Tools_Core {
   }
 
   /**
+  * The commerce post guard, in the shape a caller can use inline.
+  *
+  * A wrapper rather than eleven copies of the same three lines, because the copies are
+  * how this went wrong the first time: five writers asked commerce_post_guard() and ten
+  * did not, and which ten was an accident of who wrote each one. Every generic writer
+  * that can reach a post by id calls this, so a writer added later has one place to look
+  * and one thing to copy.
+  *
+  * The caller's shape is uniform, and it hands over the response it is already building
+  * so the refusal carries the request's own jsonrpc id:
+  *
+  *   $refused = $this->refuse_commerce_post( $r, $pid, 'Updating' );
+  *   if ( $refused !== null ) { $r = $refused; break; }
+  *
+  * @param array  $r       The response being built, used for its jsonrpc and id.
+  * @param int    $post_id The post about to be written.
+  * @param string $verb    What the caller is doing, for the message.
+  * @return array|null The refusal to return, or null to continue.
+  */
+  private function refuse_commerce_post( array $r, int $post_id, string $verb ): ?array {
+    $guard = GMCP_Core::commerce_post_guard( $post_id, $verb );
+    if ( $guard === true ) {
+      return null;
+    }
+    return $this->error( $r, $guard, -32600 );
+  }
+
+  /**
   * Sanitize post content without destroying Gutenberg.
   *
   * wp_kses_post() cannot be pointed at block markup wholesale. Block attributes live in
@@ -1017,10 +1045,25 @@ class GMCP_Tools_Core {
   * @return int|WP_Error The new post ID.
   */
   private function create_one_post( array $a, string $tool ) {
+    $post_type = sanitize_key( $a['post_type'] ?? 'post' );
+    // The create side of the same rule the update side enforces. commerce_post_guard()
+    // needs an id because it asks what the post currently is; here there is no post yet,
+    // so the question is what the caller is asking for. Measured on a fresh store with
+    // HPOS on: wp_insert_post( ['post_type' => 'shop_order', ...] ) returns an id,
+    // get_post_type() reports shop_order, no row is written to wc_orders, and
+    // wc_get_order() still resolves it to a WooCommerce Order — a row some WooCommerce
+    // code paths treat as a real order and others cannot find. That is not a post the
+    // generic tools should be able to make, and wp_create_posts inherits this by
+    // funnelling through here.
+    $commerce_type = GMCP_Core::commerce_post_type_objection( $post_type, 'Creating' );
+    if ( $commerce_type !== true ) {
+      return new WP_Error( 'gmcp_commerce_type', $commerce_type );
+    }
+
     $ins = [
       'post_title' => sanitize_text_field( $a['post_title'] ),
       'post_status' => sanitize_key( $a['post_status'] ?? 'draft' ),
-      'post_type' => sanitize_key( $a['post_type'] ?? 'post' ),
+      'post_type' => $post_type,
     ];
     if ( $a['post_content'] ?? '' ) {
       $ins['post_content'] = $this->prepare_new_content( $a['post_content'] );
@@ -2221,6 +2264,13 @@ class GMCP_Tools_Core {
     if ( !$post ) {
       $r = $this->error( $r, 'No post with ID ' . (int) ( $a['ID'] ?? 0 ) . '.', -32602 );
       return $r;
+    }
+    // The preview shows what the write would do, so it refuses for the same posts the
+    // write refuses. Without this the preview describes replacements in detail and the
+    // write that follows says no, which reads as the preview having gone wrong.
+    $refused = $this->refuse_commerce_post( $r, $post->ID, 'Altering' );
+    if ( $refused !== null ) {
+      return $refused;
     }
     $field = sanitize_key( $a['field'] ?? '' );
     if ( !in_array( $field, [ 'post_content', 'post_excerpt', 'post_title' ], true ) ) {
@@ -3664,6 +3714,11 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'Post ' . $wb_id . ' not found.', -32602 );
           break;
         }
+        $refused = $this->refuse_commerce_post( $r, $wb_id, 'Writing blocks to' );
+        if ( $refused !== null ) {
+          $r = $refused;
+          break;
+        }
         // Some MCP clients send arrays as JSON strings.
         $wb_blocks = $a['blocks'] ?? null;
         if ( is_string( $wb_blocks ) ) {
@@ -3759,6 +3814,11 @@ class GMCP_Tools_Core {
         $bp_post = get_post( $bp_id );
         if ( !$bp_post ) {
           $r = $this->error( $r, 'Post ' . $bp_id . ' not found.', -32602 );
+          break;
+        }
+        $refused = $this->refuse_commerce_post( $r, $bp_id, 'Inserting a block pattern into' );
+        if ( $refused !== null ) {
+          $r = $refused;
           break;
         }
         $bp_mode = in_array( $a['mode'] ?? 'append', [ 'replace', 'append', 'prepend' ], true ) ? ( $a['mode'] ?? 'append' ) : 'append';
@@ -4065,6 +4125,11 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'Post not found', -32602 );
           break;
         }
+        $refused = $this->refuse_commerce_post( $r, $post_id, 'Altering' );
+        if ( $refused !== null ) {
+          $r = $refused;
+          break;
+        }
 
         $content = $post->$field;
         $count = 0;
@@ -4245,6 +4310,14 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'No target post with ID ' . $to_id . '.', -32602 );
           break;
         }
+        // The target, not the source: this is the post whose meta is about to change, and
+        // an order's meta is exactly what the guard exists to keep the generic tools out
+        // of. Copying into one is the same write as setting the keys one at a time.
+        $refused = $this->refuse_commerce_post( $r, $to_id, 'Copying meta into' );
+        if ( $refused !== null ) {
+          $r = $refused;
+          break;
+        }
         // Some MCP clients send arrays as JSON strings.
         $copy_keys = $a['keys'] ?? [];
         if ( is_string( $copy_keys ) ) {
@@ -4287,6 +4360,11 @@ class GMCP_Tools_Core {
         }
         if ( !$chunk_pid || !get_post( $chunk_pid ) ) {
           $r = $this->error( $r, 'No post with ID ' . $chunk_pid . '.', -32602 );
+          break;
+        }
+        $refused = $this->refuse_commerce_post( $r, $chunk_pid, 'Writing meta to' );
+        if ( $refused !== null ) {
+          $r = $refused;
           break;
         }
         $chunk_why = $this->meta_key_allowed( $chunk_key );
@@ -4514,6 +4592,11 @@ class GMCP_Tools_Core {
         }
         $post_id = intval( $a['post_id'] );
         $media_id = isset( $a['media_id'] ) ? intval( $a['media_id'] ) : 0;
+        $refused = $this->refuse_commerce_post( $r, $post_id, 'Setting a featured image on' );
+        if ( $refused !== null ) {
+          $r = $refused;
+          break;
+        }
         if ( $media_id ) {
           $done = set_post_thumbnail( $post_id, $media_id );
           if ( $done ) {
@@ -4645,6 +4728,11 @@ class GMCP_Tools_Core {
         }
         $tax = sanitize_key( $a['taxonomy'] ?? 'category' );
         $append = !isset( $a['append'] ) || $a['append'];
+        $refused = $this->refuse_commerce_post( $r, intval( $a['ID'] ), 'Adding terms to' );
+        if ( $refused !== null ) {
+          $r = $refused;
+          break;
+        }
         $set = wp_set_post_terms( intval( $a['ID'] ), $terms, $tax, $append );
         if ( is_wp_error( $set ) ) {
           $r = $this->error( $r, $set->get_error_message(), $set->get_error_code() );
@@ -4786,6 +4874,11 @@ class GMCP_Tools_Core {
           break;
         }
         $upd = [ 'ID' => intval( $a['ID'] ) ];
+        $refused = $this->refuse_commerce_post( $r, intval( $a['ID'] ), 'Updating' );
+        if ( $refused !== null ) {
+          $r = $refused;
+          break;
+        }
         if ( $a['title'] ?? '' ) {
           $upd['post_title'] = sanitize_text_field( $a['title'] );
         }

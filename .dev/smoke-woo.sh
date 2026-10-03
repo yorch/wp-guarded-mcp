@@ -380,6 +380,114 @@ else
   echo "  SKIP  subscription guard checks: WooCommerce Subscriptions is not active"
 fi
 
+echo "-- the generic post tools cannot reach a commerce post --"
+# commerce_post_guard() has been asked by five writers since the Subscriptions work and was
+# missing from ten others, which is the "policy belongs to the row" defect this repo has
+# now learned three times: a guard consulted by one writer is a guard the others lack. The
+# writes are all at "write" access level, so a token deliberately limited to "read and
+# write, no destructive tools" could reach every one of them.
+#
+# The create side is new and was measured before it was fixed. On a fresh store with
+# High-Performance Order Storage on — the default — wp_insert_post( ['post_type' =>
+# 'shop_order'] ) returns an id, get_post_type() reports shop_order, no row is written to
+# wc_orders, and wc_get_order() still resolves it to a WooCommerce Order. So the row is a
+# phantom that some WooCommerce code paths treat as an order and others cannot find.
+if docker compose exec -T cli wp plugin is-active woocommerce-subscriptions >/dev/null 2>&1; then
+  # Its own fixture, because the subscription block above deletes its own before this
+  # point. The first version of this block reused $SUB_ID and measured a post that was
+  # no longer a subscription: the two tools that already had the guard wrote to a plain
+  # post, and the two assertions failed while the code was correct. A fixture that has
+  # been cleaned up is not a fixture.
+  GP_SUB=$(wpc eval '
+    $uid = (int) get_user_by( "login", "gmcp_wcs_guard" )->ID;
+    if ( ! $uid ) {
+      $uid = wp_insert_user( [ "user_login" => "gmcp_wcs_guard", "user_pass" => wp_generate_password(), "user_email" => "wcs-guard-cust@example.test", "role" => "customer" ] );
+    }
+    $parent = wc_create_order();
+    $parent->set_billing_email( "gmcp-gp-parent@example.test" );
+    $parent->set_customer_id( $uid );
+    $parent->save();
+    $sub = wcs_create_subscription( [ "order_id" => $parent->get_id(), "customer_id" => $uid, "billing_period" => "month", "billing_interval" => 1, "start_date" => gmdate( "Y-m-d H:i:s", time() - DAY_IN_SECONDS ), "status" => "active" ] );
+    if ( is_wp_error( $sub ) ) { echo 0; } else {
+      $sub->set_billing_email( "gmcp-gp-" . $sub->get_id() . "@example.test" );
+      $sub->save();
+      echo $sub->get_id();
+    }')
+  # The fixture is proved to be what the checks assume before any of them runs. Without
+  # this, a fixture that failed to create would leave every refusal below reporting "error"
+  # for the wrong reason, and the block would pass while measuring nothing.
+  check "CONTROL: the commerce-guard fixture is a live subscription" \
+    "$(wpc eval "echo get_post_type($GP_SUB);" 2>/dev/null)" "shop_subscription"
+  # A page to prove each refusal is about the post's TYPE and not about the tool having
+  # stopped working, and an ordinary post type that must still be creatable.
+  GP_PAGE=$(wpc eval 'echo wp_insert_post(["post_title"=>"ZZ guard control page","post_type"=>"page","post_status"=>"draft"]);')
+  # The subscription is the subject throughout, because it is the type with the most to
+  # lose: its billing period, next payment date and status all live in the post row.
+  call gp_blocks "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_write_blocks\",\"arguments\":{\"ID\":$GP_SUB,\"blocks\":[{\"type\":\"paragraph\",\"content\":\"x\"}]}}}"
+  check "wp_write_blocks refuses a subscription" "$(verdict gp_blocks)" "error"
+  check "and says why rather than that it is missing" "$(body gp_blocks | grep -c 'shop_subscription')" "1"
+  call gp_alter "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":{\"ID\":$GP_SUB,\"field\":\"post_title\",\"search\":\"Subscription\",\"replace\":\"TAMPERED\"}}}"
+  check "wp_alter_post refuses a subscription" "$(verdict gp_alter)" "error"
+  call gp_meta "{\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post_meta\",\"arguments\":{\"ID\":$GP_SUB,\"key\":\"probe_key\",\"value\":\"x\"}}}"
+  check "wp_update_post_meta refuses a subscription" "$(verdict gp_meta)" "error"
+  call gp_terms "{\"jsonrpc\":\"2.0\",\"id\":83,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_post_terms\",\"arguments\":{\"ID\":$GP_SUB,\"terms\":[\"Uncategorized\"],\"taxonomy\":\"category\"}}}"
+  check "wp_add_post_terms refuses a subscription" "$(verdict gp_terms)" "error"
+  call gp_pattern "{\"jsonrpc\":\"2.0\",\"id\":84,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_insert_block_pattern\",\"arguments\":{\"ID\":$GP_SUB,\"pattern\":\"core/query-standard-posts\",\"mode\":\"append\"}}}"
+  check "wp_insert_block_pattern refuses a subscription" "$(verdict gp_pattern)" "error"
+  # The create side. A refusal here is the difference between a phantom order existing and
+  # not existing, so the check that matters is the count afterwards, not the reply.
+  ORDERS_BEFORE=$(wpc db query "SELECT COUNT(*) FROM $(wpc db prefix)posts WHERE post_type='shop_order'" --skip-column-names)
+  call gp_create "{\"jsonrpc\":\"2.0\",\"id\":85,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_post\",\"arguments\":{\"post_title\":\"smuggled order\",\"post_type\":\"shop_order\"}}}"
+  check "wp_create_post refuses to make a shop_order" "$(verdict gp_create)" "error"
+  call gp_batch "{\"jsonrpc\":\"2.0\",\"id\":86,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_posts\",\"arguments\":{\"items\":[{\"post_title\":\"batch smuggled\",\"post_type\":\"shop_order\"}]}}}"
+  check "wp_create_posts refuses too, through the same path" "$(body gp_batch | grep -c 'shop_order')" "1"
+  ORDERS_AFTER=$(wpc db query "SELECT COUNT(*) FROM $(wpc db prefix)posts WHERE post_type='shop_order'" --skip-column-names)
+  check "and no order row was created by either attempt" "$ORDERS_AFTER" "$ORDERS_BEFORE"
+  # The subject is untouched, which is the assertion the replies cannot make for themselves.
+  # Two witnesses, chosen because each one CAN fail:
+  #
+  #  - The title. wp_alter_post is one of the writers this change wired, and a raw title
+  #    change on a subscription sticks (measured), so a title still containing "Subscription"
+  #    is evidence the guard held rather than evidence nothing was attempted. The search
+  #    string is the one word every subscription title contains, without touching "&ndash;",
+  #    which would make this fail on HTML-entity spelling instead of on the guard.
+  #  - The meta key. wp_update_post_meta already had the guard before this change, so this
+  #    one is a regression guard rather than a proof of the new wiring, and it is labelled
+  #    as such. A real meta write on a subscription does stick (measured), so a missing key
+  #    is meaningful.
+  #
+  # A third witness was removed rather than kept: "no term landed" could never fail, because
+  # wp_set_post_terms() returns an empty array on a shop_subscription — WooCommerce's
+  # subscription type does not support the category taxonomy, so the write is a no-op with
+  # or without the guard. It read as a passing check and measured nothing.
+  check "and the refused wp_alter_post did not change the title" \
+    "$(wpc eval "echo strpos(get_post($GP_SUB)->post_title, 'TAMPERED') === false ? 'clean' : 'TAMPERED';")" "clean"
+  check "and no meta from the refused call landed (regression: this tool already had the guard)" \
+    "$(wpc eval "echo metadata_exists('post', $GP_SUB, 'probe_key') ? 'PRESENT' : 'absent';")" "absent"
+  # Controls: the same tools on an ordinary page. Without these, a tool that had simply
+  # stopped working would pass every check above.
+  call gp_ctl_blocks "{\"jsonrpc\":\"2.0\",\"id\":87,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_write_blocks\",\"arguments\":{\"ID\":$GP_PAGE,\"blocks\":[{\"type\":\"paragraph\",\"content\":\"ok\"}]}}}"
+  check "CONTROL: wp_write_blocks still writes to a page" "$(verdict gp_ctl_blocks)" "ok"
+  call gp_ctl_create "{\"jsonrpc\":\"2.0\",\"id\":88,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_post\",\"arguments\":{\"post_title\":\"CONTROL created post\",\"post_type\":\"post\"}}}"
+  check "CONTROL: an ordinary post is still creatable" "$(verdict gp_ctl_create)" "ok"
+  GP_NEW=$(body gp_ctl_create | python3 -c 'import json,sys,re;t=sys.stdin.read();m=re.search(r"ID (\d+)",t);print(m.group(1) if m else "0")')
+  check "CONTROL: and the created post really exists" \
+    "$(wpc eval "echo get_post($GP_NEW) ? get_post($GP_NEW)->post_title : 'MISSING';" 2>/dev/null)" "CONTROL created post"
+  # Cleanup through WooCommerce's own API, the same way the block above does it: a
+  # subscription is an order, and wp_delete_post would leave the wc_orders row behind.
+  wpc eval "
+    wp_delete_post($GP_PAGE,true);
+    if ('$GP_NEW' !== '0') wp_delete_post($GP_NEW,true);
+    \$o = wc_get_order($GP_SUB);
+    if (\$o) { \$o->delete(true); }
+    foreach ( get_posts( [ 'post_type' => 'shop_order', 'post_status' => 'any', 'numberposts' => -1, 'fields' => 'ids' ] ) as \$pid ) {
+      \$p = wc_get_order(\$pid);
+      if ( \$p && strpos( (string) \$p->get_billing_email(), 'gmcp-gp-parent' ) === 0 ) { \$p->delete(true); }
+    }" >/dev/null 2>&1
+else
+  echo "  SKIP  commerce guard checks: WooCommerce Subscriptions is not active"
+fi
+
 echo "-- the switch really is a switch --"
 docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_woo"]=false;update_option("gmcp_options",$o);' >/dev/null 2>&1
 call w_off '{"jsonrpc":"2.0","id":16,"method":"tools/list"}'

@@ -587,10 +587,37 @@ class GMCP_Core {
     if ( $post_id <= 0 ) {
       return true;
     }
+    $type = get_post_type( $post_id );
+    if ( !$type ) {
+      return true;
+    }
+    return self::commerce_post_type_objection( $type, $verb );
+  }
+
+  /**
+  * Whether a post TYPE is one the generic post tools must keep out of, and if so why.
+  *
+  * The create side of commerce_post_guard(), and it asks the same question from the
+  * other end: the guard already knows what an existing post is, and a create has no post
+  * yet, so the only thing to check is the type the caller asked for. Both read the same
+  * list, through the same filter, so a site that extends one cannot end up with the two
+  * disagreeing about which types are WooCommerce's.
+  *
+  * Measured on a fresh store with High-Performance Order Storage on, which is the
+  * default: wp_insert_post( ['post_type' => 'shop_order'] ) returns an id, get_post_type()
+  * reports shop_order, and no row is written to the wc_orders table — yet wc_get_order()
+  * still hands back a WooCommerce Order for it. So a created row is a phantom: some
+  * WooCommerce code paths treat it as a real order and others cannot see it, which is a
+  * worse state than either. This is not a post a generic tool should be able to make.
+  *
+  * @param string $type The post type being created.
+  * @param string $verb What the caller is doing, for the message.
+  * @return true|string True when the type is fine, or the refusal.
+  */
+  public static function commerce_post_type_objection( string $type, string $verb = 'Creating' ) {
     $types = (array) apply_filters( 'gmcp_commerce_post_types', [
       'shop_order', 'shop_subscription', 'shop_order_refund', 'shop_order_placehold',
     ] );
-    $type = get_post_type( $post_id );
     if ( !$type || !in_array( $type, $types, true ) ) {
       return true;
     }
