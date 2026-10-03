@@ -1765,6 +1765,24 @@ check "the promotion really happened" \
   "$(docker compose exec -T cli wp user get "$C_UID" --field=roles 2>/dev/null | tr -d '\r\n')" "editor"
 check "and is recorded from and to" \
   "$(changes_of wp_update_user | grep -c '"roles":{"from":"subscriber","to":"editor"}')" "1"
+# The password is stored, not displayed, so it must reach WordPress exactly as sent. The
+# field loop used to run every non-role field through sanitize_text_field(), which turned
+# "Pa<ss>word&1" into "Paword&1" (reading the angle brackets as a tag) and "P%40ss" into
+# "Pss" (eating the percent-encoding). The write succeeded and the reply said "updated", so
+# the caller was told the password had been set to a value the account did not have and
+# could not be logged into with. Asserted by authenticating, which is the only check that
+# can tell a stored password from a stored hash of the wrong one.
+call c_ppass "{\"jsonrpc\":\"2.0\",\"id\":228,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_user\",\"arguments\":{\"ID\":$C_UID,\"fields\":{\"user_pass\":\"Pa<ss>word&1\"}}}}"
+check "a password with angle brackets and an ampersand is set as sent" \
+  "$(docker compose exec -T cli wp eval 'echo wp_authenticate("diffuser","Pa<ss>word&1") instanceof WP_User ? "auth ok" : "auth failed";' 2>/dev/null | tr -d '\r\n')" "auth ok"
+# The control opposite: the value sanitize_text_field() would have produced must NOT work,
+# or "auth ok" above would be true for a different reason and the check would prove nothing.
+check "and the sanitized form of it does not" \
+  "$(docker compose exec -T cli wp eval 'echo wp_authenticate("diffuser","Paword&1") instanceof WP_User ? "auth ok" : "auth failed";' 2>/dev/null | tr -d '\r\n')" "auth failed"
+# A bare percent, which is the other shape the sanitizer ate.
+call c_ppct "{\"jsonrpc\":\"2.0\",\"id\":229,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_user\",\"arguments\":{\"ID\":$C_UID,\"fields\":{\"user_pass\":\"P%40ss!x\"}}}}"
+check "a password containing a percent sign is set as sent" \
+  "$(docker compose exec -T cli wp eval 'echo wp_authenticate("diffuser","P%40ss!x") instanceof WP_User ? "auth ok" : "auth failed";' 2>/dev/null | tr -d '\r\n')" "auth ok"
 docker compose exec -T cli wp user delete "$C_UID" --yes >/dev/null 2>&1
 
 # A credential inside an option value is refused by the names inside it, both sides.

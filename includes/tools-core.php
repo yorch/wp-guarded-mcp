@@ -2631,7 +2631,24 @@ class GMCP_Tools_Core {
             }
           }
           foreach ( $a['fields'] as $k => $v ) {
-            $upd[ $k ] = ( $k === 'role' ) ? sanitize_key( $v ) : sanitize_text_field( $v );
+            // user_pass is stored, not displayed, and WordPress hashes it on the way in —
+            // so sanitizing it can only corrupt it. Measured: sanitize_text_field() turns
+            // "Pa<ss>word&1" into "Paword&1" and "P%40ss" into "Pss", because it reads the
+            // angle brackets as a tag and eats the percent-encoding. The write then succeeds,
+            // the reply says "User #2 updated", and the account's password is a value the
+            // caller never chose and cannot know — so the person who asked for a specific
+            // password is locked out of the account they were told they had set it on. It
+            // reached every field through this loop, not just this one, because the loop
+            // treated every non-role field as display text.
+            //
+            // The other fields stay as they were: display_name and user_email insist on
+            // being text, and a value that is not text is not a value this should store.
+            if ( $k === 'user_pass' ) {
+              $upd[ $k ] = (string) $v;
+            }
+            else {
+              $upd[ $k ] = ( $k === 'role' ) ? sanitize_key( $v ) : sanitize_text_field( $v );
+            }
           }
         }
         // A role change is a promotion/demotion. Require promote_user on the
