@@ -33,6 +33,13 @@ ordering storage off, and their billing period, next payment date and status liv
 same rows. One write tool enforcing it and the next not is the same defect as the settings
 tool that once enforced an option policy no other writer did.
 
+The rule covers creating one, not only changing one. `wp_insert_post( ['post_type' =>
+'shop_order'] )` returns an id, `get_post_type()` reports `shop_order`, and with HPOS on —
+the default — **no row is written to `wc_orders`**, yet `wc_get_order()` still resolves it to
+a WooCommerce order. The result is a phantom: some WooCommerce code paths treat it as an
+order and others cannot see it. `GMCP_Core::commerce_post_type_objection()` asks the same
+filter-driven list from the create side, so the two ends cannot drift apart.
+
 **Never run `wp plugin install --force`, `wp plugin update` or `wp plugin delete` against
 the `.dev` stack.** Its plugin directory is a bind mount of this repository, and WordPress
 deletes the old directory before unpacking the new one. The delete goes through the mount
@@ -61,6 +68,15 @@ two cannot drift apart. The debug `error_log` at `server.php:604` routes tool
 arguments through `GMCP_Core::redact()` for the same reason: it is a third channel
 the same credential can reach, and a channel with no redaction is a leak waiting
 for the first caller that passes a secret.
+
+**A sanitizer belongs on display text, never on a value that is stored.** `user_pass`
+reached `wp_insert_user`/`wp_update_user` through the same `sanitize_text_field()` the
+field loop used for `display_name`, and a sanitizer can only corrupt a password:
+`Pa<ss>word&1` was stored as `Paword&1` and `P%40ss` as `Pss`, while the reply said the
+user had been updated. The account then held a password the caller never chose and could
+not know, and authenticating with the value that was sent failed. Measured, both directions.
+Ask of every field: is this displayed, or is it stored? Only the first takes a sanitizer.
+The same reasoning applies to anything hashed, signed, or compared byte-for-byte.
 
 **There is no restore tool, at any access level.** Backups can be started and read. That is
 deliberate and not an omission to be helpfully filled in.
@@ -147,6 +163,25 @@ describing a catastrophe rather than one missing guard.
 **Prove a new test fails without the fix.** Revert the source files, run, confirm that
 exactly your assertions fail and your controls still pass, then restore. A test that would
 have passed before the change tests nothing.
+
+**Measure that the witness can fail before trusting it.** Two shapes, both hit while fixing
+the commerce guard:
+
+- An assertion that a write did *not* land is only worth something if the same write
+  would have landed without the guard. Check it: `wp_set_post_terms()` on a
+  `shop_subscription` returns an empty array and stores nothing, because WooCommerce's
+  subscription type does not support the category taxonomy. So "no term landed" passed on
+  vulnerable code and on fixed code alike, and was removed rather than kept. Titles and
+  meta values were measured to stick on a subscription first, then used as witnesses.
+- A fixture that was cleaned up is not a fixture. A block reused `$SUB_ID` after the block
+  above had deleted that subscription, so two correct refusals were being asserted against
+  a plain post and the suite reported the code as broken. Build the fixture the block
+  needs, and assert it is what the checks assume (`get_post_type()`) before using it.
+
+**A first-run failure needs a second run before it is believed.** `smoke-admin.sh` and
+`smoke-woo.sh` assert exact counts and carry fixtures between blocks, so a run against state
+left by the previous run can report one failure that the same commit does not produce on a
+second run. Run twice before calling it a regression; this predates the current branch.
 
 **Watch what a block leaves behind.** One block ended with `GMCP_Audit::clear()`, which
 emptied the table the next block tampers with, so its `UPDATE` matched nothing, verification
