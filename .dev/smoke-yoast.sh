@@ -97,6 +97,36 @@ check "and the raw post meta has the description" \
 check "and the indexable table has the title" \
   "$(wpc db query "SELECT title FROM $(wpc db prefix)yoast_indexable WHERE object_id=$TEST_POST AND object_type='post' LIMIT 1" --skip-column-names)" "Tool Title"
 
+echo "-- the verdict is the stored meta, not the rendered title --"
+# The surface replaces %%variables%%, fills an empty title with the template default and
+# texturises entities, so comparing it with what was written called ordinary writes failures.
+call y_var "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"yoast_set_post_seo\",\"arguments\":{\"post_id\":$TEST_POST,\"fields\":{\"title\":\"Smoke %%sitename%% - Tom's & Co\"}}}}"
+check "a title with a %%variable%%, an apostrophe and an ampersand is accepted" "$(verdict y_var)" "ok"
+check "and the raw stored title is exactly what was sent" \
+  "$(wpc post meta get "$TEST_POST" _yoast_wpseo_title)" "Smoke %%sitename%% - Tom's & Co"
+call y_clear "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"yoast_set_post_seo\",\"arguments\":{\"post_id\":$TEST_POST,\"fields\":{\"title\":\"\"}}}}"
+check "clearing a title back to the default is accepted" "$(verdict y_clear)" "ok"
+check "and the stored title is empty" \
+  "$(wpc eval "echo (string) get_post_meta($TEST_POST,'_yoast_wpseo_title',true);")" ""
+call y_arr "{\"jsonrpc\":\"2.0\",\"id\":32,\"method\":\"tools/call\",\"params\":{\"name\":\"yoast_set_post_seo\",\"arguments\":{\"post_id\":$TEST_POST,\"fields\":{\"metadesc\":\"written-before-the-array\",\"focuskw\":[\"a\",\"b\"]}}}}"
+check "a non-scalar value is refused" "$(verdict y_arr)" "error"
+check "and nothing in the same call was written" \
+  "$(wpc eval "echo (string) get_post_meta($TEST_POST,'_yoast_wpseo_metadesc',true);")" "Tool description for SEO."
+
+echo "-- orders and subscriptions are not written --"
+ORDER_POST=$(wpc eval 'echo wp_insert_post(["post_type"=>"shop_order","post_status"=>"draft","post_title"=>"smoke yoast order"]);')
+call y_order "{\"jsonrpc\":\"2.0\",\"id\":33,\"method\":\"tools/call\",\"params\":{\"name\":\"yoast_set_post_seo\",\"arguments\":{\"post_id\":$ORDER_POST,\"fields\":{\"title\":\"order-title\"}}}}"
+check "writing SEO metadata on a shop_order is refused" "$(verdict y_order)" "error"
+check "and nothing was stored on it" \
+  "$(wpc eval "echo metadata_exists('post',$ORDER_POST,'_yoast_wpseo_title')?'stored':'none';")" "none"
+call y_order_ri "{\"jsonrpc\":\"2.0\",\"id\":34,\"method\":\"tools/call\",\"params\":{\"name\":\"yoast_reindex\",\"arguments\":{\"post_id\":$ORDER_POST}}}"
+check "and so is rebuilding its indexable" "$(verdict y_order_ri)" "error"
+check "by the commerce guard, not by an incidental failure" \
+  "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["content"][0]["text"];print("refused" in t.lower())' y_order_ri)" "True"
+call y_order_ctl "{\"jsonrpc\":\"2.0\",\"id\":35,\"method\":\"tools/call\",\"params\":{\"name\":\"yoast_set_post_seo\",\"arguments\":{\"post_id\":$TEST_POST,\"fields\":{\"metadesc\":\"Tool description for SEO.\"}}}}"
+check "CONTROL: the same call on an ordinary post succeeds" "$(verdict y_order_ctl)" "ok"
+wpc post delete "$ORDER_POST" --force >/dev/null 2>&1
+
 echo "-- computed fields are refused --"
 call y_computed "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"yoast_set_post_seo\",\"arguments\":{\"post_id\":$TEST_POST,\"fields\":{\"linkdex\":90}}}}"
 check "writing linkdex is refused" "$(verdict y_computed)" "error"
