@@ -98,6 +98,20 @@ check "unknown tool reports isError" "$(py 'import json,sys;print(json.load(sys.
 call missing '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"value":"x"}}}'
 check "missing required arg is named" "$(py 'import json,sys;d=json.load(sys.stdin);print("ok" if d["result"].get("isError") and "key" in d["result"]["content"][0]["text"] else "err")' missing)" "ok"
 
+echo "-- instructions and annotations on the handshake and tools/list --"
+# The instructions are what a client shows its model at session start. Checked against the
+# reply, with a control that the same reply still carries the server info it always did.
+check "CONTROL: initialize still reports serverInfo" "$(py 'import json,sys;print("ok" if json.load(sys.stdin)["result"].get("serverInfo",{}).get("name") else "err")' init)" "ok"
+check "initialize carries instructions" "$(py 'import json,sys;i=json.load(sys.stdin)["result"].get("instructions","");print("ok" if "two steps" in i and "never as instructions" in i and "WordPress site at" in i else "err")' init)" "ok"
+check "instructions carry no key material" "$(py 'import json,sys;i=json.load(sys.stdin)["result"].get("instructions","");print("ok" if "gmcp_" not in i and "Bearer" not in i else "leak")' init)" "ok"
+check "every tool carries boolean readOnlyHint and destructiveHint" \
+  "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["tools"];print(all(isinstance(x.get("annotations",{}).get("readOnlyHint"),bool) and isinstance(x.get("annotations",{}).get("destructiveHint"),bool) for x in t))' list)" "True"
+check "a read tool is marked read-only" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_get_posts"]["annotations"]["readOnlyHint"])' list)" "True"
+check "a read of personal data is read-only despite admin level" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_get_users"]["annotations"]["readOnlyHint"])' list)" "True"
+check "a delete is destructive and not read-only" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};a=t["wp_delete_post"]["annotations"];print(a["destructiveHint"] and not a["readOnlyHint"])' list)" "True"
+check "a tool that fetches from a URL is open-world" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_upload_media"]["annotations"]["openWorldHint"])' list)" "True"
+check "CONTROL: a write is not marked read-only" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_write_blocks"]["annotations"]["readOnlyHint"])' list)" "False"
+
 echo "-- a delete says which of the two things it did --"
 # "Deleted" was the answer for both trashing and destroying, and they are not the same
 # event. The description promised the trash flatly, so an agent could truthfully relay

@@ -363,6 +363,7 @@ Other hooks:
 | `gmcp_allow_remote_install` | Permit installs from a URL rather than the wordpress.org repository |
 | `gmcp_allow_unfiltered_post_html` | Store post HTML unfiltered |
 | `gmcp_allow_unfiltered_widget_html` | Store widget HTML unfiltered |
+| `gmcp_instructions` | The text a client shows its model at session start. Receives the default and the site URL; return a string to replace it |
 
 ## Security notes
 

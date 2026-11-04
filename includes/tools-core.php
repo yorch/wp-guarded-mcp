@@ -1916,6 +1916,8 @@ class GMCP_Tools_Core {
       'wp_upload_media' => [
         'name' => 'wp_upload_media',
         'description' => 'Upload a file to the WordPress Media Library. Provide either a url (WordPress will download it) or base64-encoded content with a filename. Base64 mode is useful for local files but doubles the payload size — keep files under a few MB to avoid memory or timeout issues.',
+        // A url makes WordPress fetch from outside the site, so this one is open-world.
+        'annotations' => [ 'openWorldHint' => true ],
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1999,34 +2001,12 @@ class GMCP_Tools_Core {
     // All 36 core tools enabled and tested with ChatGPT.
     // Automatic validation in mcp.php fixes problematic type definitions.
 
-    // Add category and annotations to each tool
+    // Add category to each tool. Annotations are not set here: GMCP_Server derives them
+    // for every tool from its access level, and a second, name-based guess made here would
+    // answer first and contradict it (it called wp_update_post non-destructive).
     foreach ( $tools as &$tool ) {
       if ( !isset( $tool['category'] ) ) {
         $tool['category'] = 'WordPress';
-      }
-
-      // Add MCP tool annotations based on tool name/behavior
-      if ( !isset( $tool['annotations'] ) ) {
-        $name = $tool['name'];
-
-        // Read-only tools (safe, no modifications)
-        $is_readonly = (
-          strpos( $name, 'wp_get_' ) === 0 ||
-          strpos( $name, 'wp_list_' ) === 0 ||
-          strpos( $name, 'wp_count_' ) === 0
-        );
-
-        // Destructive tools (can delete/destroy data)
-        $is_destructive = (
-          strpos( $name, 'wp_delete_' ) === 0 ||
-          $name === 'wp_update_user' // Can change passwords/roles
-        );
-
-        $tool['annotations'] = [
-          'readOnlyHint' => $is_readonly,
-          'destructiveHint' => !$is_readonly && $is_destructive,
-          'openWorldHint' => false, // All operate on closed WordPress system
-        ];
       }
     }
 
