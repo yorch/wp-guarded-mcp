@@ -124,6 +124,69 @@ class GMCP_Tools_Admin {
   }
 
   /**
+  * Whether a change that reaches every site on a multisite network is permitted.
+  *
+  * activate_plugins is not the question. On multisite, map_meta_cap grants it to a site
+  * administrator whenever the network has enabled the Plugins menu for site admins, a
+  * common setting, and activate_plugin() and deactivate_plugins() check nothing further.
+  * So without this a key minted on sub-site 5 could switch a security plugin off on
+  * every site in the network, which wp-admin refuses to a site admin on plugins.php.
+  * manage_network_plugins is the capability wp-admin's network screen requires.
+  *
+  * @return true|string
+  */
+  private function may_touch_network( string $action ) {
+    if ( !is_multisite() || current_user_can( 'manage_network_plugins' ) ) {
+      return true;
+    }
+    return "Not permitted: {$action} affects every site on this network and requires a network administrator (the 'manage_network_plugins' capability). The authenticated account administers this site only. Nothing was changed.";
+  }
+
+  /**
+  * On multisite, the sites other than this one where a plugin or theme is in use.
+  *
+  * Deleting is a network-wide act, because there is one copy of the files, but every
+  * check the delete tools made was about the current site: get_stylesheet() and
+  * is_plugin_active() read this site's options. A theme active on sub-site 7 would be
+  * deleted from under it, leaving that site rendering nothing. Core's network screen has
+  * the same blind spot, which is not a reason to copy it.
+  *
+  * Bounded: on a network larger than the bound the answer is null, "could not check",
+  * and the caller refuses rather than guessing.
+  *
+  * @param string $kind 'plugin' or 'theme'.
+  * @return array|null Site ids where it is in use, or null when the network is too large to check.
+  */
+  private function used_on_other_sites( string $kind, string $name ): ?array {
+    if ( !is_multisite() ) {
+      return [];
+    }
+    $limit = 500;
+    $ids = get_sites( [ 'fields' => 'ids', 'number' => $limit + 1 ] );
+    if ( count( $ids ) > $limit ) {
+      return null;
+    }
+    $current = get_current_blog_id();
+    $using = [];
+    foreach ( $ids as $blog_id ) {
+      $blog_id = (int) $blog_id;
+      if ( $blog_id === $current ) {
+        continue;
+      }
+      if ( $kind === 'plugin' ) {
+        $in_use = in_array( $name, (array) get_blog_option( $blog_id, 'active_plugins', [] ), true );
+      }
+      else {
+        $in_use = get_blog_option( $blog_id, 'stylesheet' ) === $name || get_blog_option( $blog_id, 'template' ) === $name;
+      }
+      if ( $in_use ) {
+        $using[] = $blog_id;
+      }
+    }
+    return $using;
+  }
+
+  /**
   * Two-step confirmation, shared with every other group that deletes something
   * irreversible. @see GMCP_Core::confirm_gate() for the reasoning and the token rules.
   *
@@ -405,7 +468,7 @@ class GMCP_Tools_Admin {
           'type' => 'object',
           'properties' => [
             'plugin' => [ 'type' => 'string' ],
-            'network_wide' => [ 'type' => 'boolean', 'description' => 'Multisite only. Activate across the network.' ],
+            'network_wide' => [ 'type' => 'boolean', 'description' => 'Multisite only. Activate across the network. Needs a network administrator (manage_network_plugins).' ],
           ],
           'required' => [ 'plugin' ],
         ],
@@ -413,7 +476,7 @@ class GMCP_Tools_Admin {
       ],
       'wp_deactivate_plugin' => [
         'name' => 'wp_deactivate_plugin',
-        'description' => 'Deactivate an active plugin. Refuses to deactivate the MCP plugin itself, which would end this connection.',
+        'description' => 'Deactivate an active plugin. Refuses to deactivate the MCP plugin itself, which would end this connection. On multisite, a plugin active network-wide is deactivated network-wide, and only by a network administrator.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [ 'plugin' => [ 'type' => 'string' ] ],
@@ -1063,6 +1126,18 @@ class GMCP_Tools_Admin {
     }
 
     $network_wide = !empty( $a['network_wide'] ) && is_multisite();
+    if ( $network_wide ) {
+      $network = $this->may_touch_network( 'activating a plugin network-wide' );
+      if ( $network !== true ) {
+        return $this->error( $r, $network );
+      }
+    }
+    // A plugin that declares "Network: true" is meant to run network-wide or not at all,
+    // and wp-admin's site-level screen will not activate one. Activated on one site it
+    // runs without the network setup it assumes.
+    elseif ( is_multisite() && is_network_only_plugin( $plugin ) ) {
+      return $this->error( $r, "\"{$plugin}\" is a network-only plugin, so it can only be activated network-wide, by a network administrator (network_wide: true). Nothing was changed." );
+    }
 
     $activation = $this->activate_and_verify( $plugin, $network_wide );
     if ( !$activation['active'] ) {
@@ -1092,8 +1167,23 @@ class GMCP_Tools_Admin {
     if ( !is_plugin_active( $plugin ) && !is_plugin_active_for_network( $plugin ) ) {
       return $this->text( $r, "\"{$plugin}\" is already inactive." );
     }
-    deactivate_plugins( [ $plugin ] );
-    return $this->text( $r, "Deactivated \"{$plugin}\"." );
+    // deactivate_plugins() defaults $network_wide to null, and null means "wherever it is
+    // active", so a plain call on a network-active plugin switches it off on every site.
+    // The scope is therefore always passed explicitly, and the network one needs a
+    // network administrator.
+    $network_wide = is_plugin_active_for_network( $plugin );
+    if ( $network_wide ) {
+      $network = $this->may_touch_network( "deactivating \"{$plugin}\", which is active network-wide," );
+      if ( $network !== true ) {
+        return $this->error( $r, $network );
+      }
+    }
+    deactivate_plugins( [ $plugin ], false, $network_wide );
+    $still = $network_wide ? is_plugin_active_for_network( $plugin ) : in_array( $plugin, $this->site_active_plugins(), true );
+    if ( $still ) {
+      return $this->error( $r, "\"{$plugin}\" is still active after the deactivation call. Something on the site put it back or stopped the change." );
+    }
+    return $this->text( $r, "Deactivated \"{$plugin}\"" . ( $network_wide ? ' network-wide, on every site of the network.' : '.' ) );
   }
 
   private function delete_plugin_tool( array $r, array $a ): array {
@@ -1116,6 +1206,13 @@ class GMCP_Tools_Admin {
     }
     if ( is_plugin_active( $plugin ) || is_plugin_active_for_network( $plugin ) ) {
       return $this->error( $r, "\"{$plugin}\" is active. Deactivate it first with wp_deactivate_plugin." );
+    }
+    $elsewhere = $this->used_on_other_sites( 'plugin', $plugin );
+    if ( $elsewhere === null ) {
+      return $this->error( $r, "This network is too large to check whether \"{$plugin}\" is active on another site, and deleting it would break any site where it is. Delete it from Network Admin instead. Nothing was changed." );
+    }
+    if ( $elsewhere ) {
+      return $this->error( $r, "\"{$plugin}\" is still active on " . count( $elsewhere ) . ' other site(s) of this network (site id ' . implode( ', ', $elsewhere ) . '). The files are shared, so deleting it would break those sites. Nothing was changed.' );
     }
     $ok = $this->confirmed( 'wp_delete_plugin', $plugin, $a, "This permanently deletes the plugin \"{$plugin}\" and all of its files from disk." );
     if ( $ok !== true ) {
@@ -1328,7 +1425,7 @@ class GMCP_Tools_Admin {
 
     $health = $this->front_end_healthy();
     if ( $health === false ) {
-      deactivate_plugins( [ $plugin ], true );
+      deactivate_plugins( [ $plugin ], true, $network_wide );
       return [
         'active' => false,
         'warning' => null,
@@ -1566,6 +1663,13 @@ class GMCP_Tools_Admin {
     // parent of the active theme breaks the site just as surely as deleting the theme.
     if ( $stylesheet === get_template() ) {
       return $this->error( $r, 'Refusing to delete "' . $stylesheet . '": it is the parent of the active theme.' );
+    }
+    $elsewhere = $this->used_on_other_sites( 'theme', $stylesheet );
+    if ( $elsewhere === null ) {
+      return $this->error( $r, "This network is too large to check whether \"{$stylesheet}\" is in use on another site, and deleting it would leave any such site rendering nothing. Delete it from Network Admin instead. Nothing was changed." );
+    }
+    if ( $elsewhere ) {
+      return $this->error( $r, "\"{$stylesheet}\" is the active theme, or its parent, on " . count( $elsewhere ) . ' other site(s) of this network (site id ' . implode( ', ', $elsewhere ) . '). The files are shared, so deleting it would leave those sites rendering nothing. Nothing was changed.' );
     }
     $ok = $this->confirmed( 'wp_delete_theme', $stylesheet, $a, "This permanently deletes the theme \"{$stylesheet}\" and all of its files from disk." );
     if ( $ok !== true ) {
