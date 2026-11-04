@@ -120,6 +120,37 @@ check "a grouped write does not wipe a sibling key" \
 check "and the field itself was updated" \
   "$(wpc eval 'echo get_option("smoke_options")["smoke_text_opt"];')" "second-write"
 
+# A field registered under a named config is read back through that config, whatever the
+# caller passed. Without config_id this used to read through "global" (a theme_mod config) and
+# return the default instead of what was just written, so "the same field id reads back what
+# was written" was false for exactly the fields that use a named config.
+call k_get_named '{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"kirki_get_field_value","arguments":{"field_id":"smoke_text_opt"}}}'
+check "a field under a named config reads back what was written, with no config_id" \
+  "$(py 'import json,sys;d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(d["value"])' k_get_named)" "second-write"
+call k_get_wrongcfg '{"jsonrpc":"2.0","id":62,"method":"tools/call","params":{"name":"kirki_get_field_value","arguments":{"field_id":"smoke_text_opt","config_id":"global"}}}'
+check "and a wrong config_id from the caller does not change the answer" \
+  "$(py 'import json,sys;d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(d["value"])' k_get_wrongcfg)" "second-write"
+
+echo "-- an explicit null is not written --"
+NULL_BEFORE=$(wpc eval 'echo get_theme_mod("smoke_color_mod");')
+call k_null '{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"kirki_set_field_value","arguments":{"field_id":"smoke_color_mod","value":null}}}'
+check "a null value is refused" "$(verdict k_null)" "error"
+check "and the stored value did not change" "$(wpc eval 'echo get_theme_mod("smoke_color_mod");')" "$NULL_BEFORE"
+check "CONTROL: the probe reads a stored value" "$NULL_BEFORE" "#00ff00"
+
+echo "-- a write that lands as something else is rolled back --"
+# The first write to the standalone field is turned into another value by a filter in the
+# mu-plugin, standing in for a sanitizer. The caller is told it failed, so the site must not
+# be left holding the value the caller was told did not happen.
+call k_std_seed '{"jsonrpc":"2.0","id":64,"method":"tools/call","params":{"name":"kirki_set_field_value","arguments":{"field_id":"smoke_standalone_opt","value":"before-cast"}}}'
+check "CONTROL: without the hook the field takes the value" "$(wpc eval 'echo get_option("smoke_standalone_opt");')" "before-cast"
+wpc option update smoke_force_cast 1 >/dev/null
+call k_cast '{"jsonrpc":"2.0","id":65,"method":"tools/call","params":{"name":"kirki_set_field_value","arguments":{"field_id":"smoke_standalone_opt","value":"requested-value"}}}'
+wpc option delete smoke_force_cast >/dev/null
+check "a write the read-back disagrees with is reported as an error" "$(verdict k_cast)" "error"
+check "and the field holds what it held before, not the filtered value" \
+  "$(wpc eval 'echo get_option("smoke_standalone_opt");')" "before-cast"
+
 echo "-- writing a standalone option field --"
 call k_setstd '{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"kirki_set_field_value","arguments":{"field_id":"smoke_standalone_opt","value":"standalone-value"}}}'
 check "setting a standalone option field succeeds" "$(verdict k_setstd)" "ok"
