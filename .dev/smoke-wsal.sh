@@ -377,6 +377,57 @@ check "CONTROL: a start date inside the window is accepted" "$(verdict recentsin
 call fwindow "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"wsal_events_briefing\",\"arguments\":{\"days\":100000}}}"
 check "an oversized window is capped at 90 days" "$(jget fwindow "window.days")" "90"
 
+echo "-- the families hold the events they are named for --"
+# The first table filed logins under passwords and account creation under passwords, and left
+# out the role change itself, so a role escalation was invisible under "roles". Asserted
+# against the alert ids the plugin writes for real activity: a role change and a password
+# change made through this plugin's own tool, by a real actor.
+FAM_USER=$(wpc user get "$MARK" --field=ID)
+check "CONTROL: the fixture user exists to be changed" "$([ -n "$FAM_USER" ] && echo yes || echo no)" "yes"
+FAM_BOUND=$(dbq "SELECT COALESCE(MAX(id),0) FROM wp_wsal_occurrences")
+call fam_role "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_user\",\"arguments\":{\"ID\":$FAM_USER,\"fields\":{\"role\":\"editor\"}}}}"
+call fam_pass "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_user\",\"arguments\":{\"ID\":$FAM_USER,\"fields\":{\"user_pass\":\"Fam-pass-$MARK-9!\"}}}}"
+check "the role change went through" "$(verdict fam_role)" "ok"
+check "CONTROL: the plugin recorded a role change (4002)" \
+  "$(sqlhas "SELECT COUNT(*) FROM wp_wsal_occurrences WHERE id > $FAM_BOUND AND alert_id = 4002")" "yes"
+check "CONTROL: and a password change (4004)" \
+  "$(sqlhas "SELECT COUNT(*) FROM wp_wsal_occurrences WHERE id > $FAM_BOUND AND alert_id = 4004")" "yes"
+famcount() { # family alert_id -> events in the last day
+  call famq "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"wsal_list_events\",\"arguments\":{\"family\":\"$1\",\"alert_id\":$2,\"since\":\"$(date -u -d '-1 day' +%Y-%m-%dT%H:%M:%SZ)\",\"limit\":100}}}"
+  jnum famq "count"; }
+check "a role change is found under roles" "$([ "$(famcount roles 4002)" -ge 1 ] 2>/dev/null && echo yes || echo no)" "yes"
+check "and is not found under passwords" "$(famcount passwords 4002)" "0"
+check "a password change is found under passwords" "$([ "$(famcount passwords 4004)" -ge 1 ] 2>/dev/null && echo yes || echo no)" "yes"
+check "and is not found under roles" "$(famcount roles 4004)" "0"
+check "a login is not counted as a password event" "$(famcount passwords 1000)" "0"
+check "no alert id sits in two families" \
+  "$(wpc eval 'echo count( array_merge( ...array_values( GMCP_Tools_Wsal::FAMILIES ) ) ) === count( array_unique( array_merge( ...array_values( GMCP_Tools_Wsal::FAMILIES ) ) ) ) ? "disjoint" : "overlap";')" "disjoint"
+
+# One event by id has no use for a whole-table COUNT/MIN/MAX (a scan of a log that can be
+# millions of rows), so it is not run; the listing and the briefing still report the totals.
+FAM_EVT=$(dbq "SELECT id FROM wp_wsal_occurrences WHERE alert_id = 4002 ORDER BY id DESC LIMIT 1")
+call evt_one "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"wsal_get_event\",\"arguments\":{\"id\":$FAM_EVT}}}"
+call evt_many "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"wsal_list_events\",\"arguments\":{\"limit\":1}}}"
+check "CONTROL: the listing still reports how many events the log holds" "$(atleast evt_many "log_state.events" 1)" "yes"
+check "wsal_get_event does not run the whole-table aggregate" "$(jget evt_one "log_state.events")" ""
+check "but still finds the event and says the log is readable" "$(jget evt_one "log_state.readable")" "true"
+
+echo "-- the message filler prints no more than the event reader does --"
+# OldValue/NewValue are withheld from the metadata a reader gets, so they must not come back
+# through the message; a serialised object arrives as a string, and a field the site calls
+# secret is not printed through the name that holds it. Run on the filler itself with a
+# template and metadata made for the purpose, since no stock alert exposes all three.
+FILL=$(wpc eval '$t = new GMCP_Tools_Wsal(); $m = new ReflectionMethod( $t, "fill_message" ); $m->setAccessible( true );
+$meta = [ "PostTitle" => "Plain Title", "OldValue" => "old-secret-value", "NewValue" => "new-secret-value", "OptionName" => "my_api_key", "MetaKey" => "ordinary_field_name", "NewTitle" => "a:1:{s:5:\"email\";s:9:\"x@y.test\";}" ];
+echo $m->invoke( $t, "T=%PostTitle% O=%OldValue% N=%NewValue% OPT=%OptionName% MK=%MetaKey% NT=%NewTitle%", $meta );')
+check "CONTROL: an allowed site fact is filled" "$(echo "$FILL" | grep -c 'T=Plain Title')" "1"
+check "OldValue stays a placeholder" "$(echo "$FILL" | grep -c 'O=%OldValue%')" "1"
+check "NewValue stays a placeholder" "$(echo "$FILL" | grep -c 'N=%NewValue%')" "1"
+check "a name-holding field the site calls secret is not printed" "$(echo "$FILL" | grep -c 'OPT=%OptionName%')" "1"
+check "CONTROL: an ordinary name-holding field is" "$(echo "$FILL" | grep -c 'MK=ordinary_field_name')" "1"
+check "a serialised value is not printed as text" "$(echo "$FILL" | grep -c 'NT=%NewTitle%')" "1"
+check "and no part of it leaked" "$(echo "$FILL" | grep -c 'x@y.test')" "0"
+
 echo "-- the family filter narrows rather than widening --"
 # Same window on both sides, and a strict comparison, so a filter that does nothing cannot
 # pass. The control proves events outside the family exist, which is what makes the

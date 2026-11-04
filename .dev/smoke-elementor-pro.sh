@@ -251,6 +251,21 @@ check "and counting resumes" \
 d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])
 print(d["counts"]["total"])' "" ep_forms_back)" "3"
 
+echo "-- a failing count query is reported as a failure, not as zero --"
+# Simulated with a column the query needs taken away (an older Pro schema lacks some), then
+# put back. The query errors, $wpdb returns null, and the tool used to turn that into
+# "table_exists: true, counts: 0". NOT RUN on a site without Elementor Pro (the suite exits
+# above), so this block has only been exercised where Pro is installed.
+wpc db query "ALTER TABLE $TBL CHANGE is_read is_read_hidden TINYINT(1) NOT NULL DEFAULT 0" >/dev/null 2>&1
+check "CONTROL: the column is really gone" "$(dbq "SHOW COLUMNS FROM $TBL LIKE 'is_read'")" ""
+call ep_forms_broken "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_forms_briefing\",\"arguments\":{}}}"
+check "the broken query does not report counts" \
+  "$(py 'import json,sys
+d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])
+print(d["counts"] is None)' "" ep_forms_broken)" "True"
+wpc db query "ALTER TABLE $TBL CHANGE is_read_hidden is_read TINYINT(1) NOT NULL DEFAULT 0" >/dev/null 2>&1
+check "CONTROL: the column is restored" "$(dbq "SHOW COLUMNS FROM $TBL LIKE 'is_read'" | cut -c1-7)" "is_read"
+
 echo "-- the status tool answers with Pro switched off --"
 # This is the whole reason the status tool is not gated on Pro being loaded: it is what an
 # operator reaches for at the moment Pro is not working.

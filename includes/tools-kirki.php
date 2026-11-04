@@ -130,6 +130,18 @@ class GMCP_Tools_Kirki {
     if ( !class_exists( 'Kirki' ) ) {
       return $this->error( $r, 'Kirki is not loaded on this site, so its tools cannot run.' );
     }
+    // A class named Kirki is not proof of Kirki. Themes ship a stub of that name when the
+    // plugin is absent (the documented "Kirki fallback"), and it declares none of what
+    // these tools read. Ask for the members themselves, so the answer is a sentence and not
+    // an Error from a static property that is not there.
+    foreach ( [ 'all_fields', 'fields', 'config' ] as $property ) {
+      if ( !property_exists( 'Kirki', $property ) ) {
+        return $this->error( $r, 'A class named Kirki is present but it is not the Kirki plugin\'s (it has no $' . $property . ' registry; a theme\'s fallback stub does this), so these tools cannot run. Install or activate the Kirki plugin.' );
+      }
+    }
+    if ( !method_exists( 'Kirki', 'get_option' ) ) {
+      return $this->error( $r, 'This Kirki version has no Kirki::get_option(), which every tool here reads through, so its tools cannot run on it.' );
+    }
 
     switch ( $tool ) {
       case 'kirki_list_fields': $r = $this->list_fields( $args, $r ); break;
@@ -150,21 +162,55 @@ class GMCP_Tools_Kirki {
   #region Helpers
 
   /**
-  * Read a value back through Kirki's own API after a write and confirm it matches.
+  * Read a value back through Kirki's own API after a write and confirm it matches, and put
+  * the previous state back when it does not.
   *
-  * A tool reporting "set" and a value actually landing where Kirki reads it are
-  * different claims. set_theme_mod and update_option can both return without error
-  * while writing nothing or the wrong row, so the only honest success is a read-back
-  * through the same path Kirki uses. The comparison is loose (==) because Kirki may
-  * cast or normalise a value on the way in, and the stored form is the one that
-  * matters, not the one the caller sent.
+  * A tool reporting "set" and a value actually landing where Kirki reads it are different
+  * claims. set_theme_mod and update_option can both return without error while writing
+  * nothing or the wrong row, so the only honest success is a read-back through the same
+  * path Kirki uses. The comparison is on the stored form and is strict about type where it
+  * matters: the loose == this used to be reported "0" and false, [] and false, and "1e3" and
+  * "1000" as the same value, so a write that landed wrong passed.
+  *
+  * On a mismatch the previous raw state is restored through $rollback. Reporting an error
+  * while leaving the changed value stored told the caller the call failed and the site
+  * disagreed.
   */
-  private function verify_write( array $r, string $field_id, string $config_id, $value, string $where ): array {
+  private function verify_write( array $r, string $field_id, string $config_id, $value, string $where, callable $rollback ): array {
     $stored = \Kirki::get_option( $config_id, $field_id );
-    if ( $stored == $value ) {
+    if ( $this->same_stored( $stored, $value ) ) {
       return $this->text( $r, 'Kirki field "' . $field_id . '" set (' . $where . '). Verified by reading back through Kirki::get_option().' );
     }
-    return $this->error( $r, 'Kirki field "' . $field_id . '" was written but the read-back through Kirki::get_option() did not match. The value may have been cast or rejected by a sanitizer. Requested: ' . wp_json_encode( $value ) . ', stored: ' . wp_json_encode( $stored ), -32603 );
+    $rollback();
+    $after = \Kirki::get_option( $config_id, $field_id );
+    $restored = $this->same_stored( $after, $stored ) ? 'unchanged from before the call' : 'restored to what the call started from';
+    $detail = GMCP_Core::field_looks_secret( $field_id )
+      ? ''
+      : ' Requested: ' . wp_json_encode( $value ) . ', read back: ' . wp_json_encode( $stored ) . '.';
+    return $this->error( $r, 'Kirki field "' . $field_id . '" was written but the read-back through Kirki::get_option() did not match, so the write was rolled back (the field now reads ' . $restored . '). Kirki may have cast or rejected the value.' . $detail, -32603 );
+  }
+
+  /**
+  * Whether two values are the same as stored: scalars compare as text with booleans as 1 and
+  * 0, and arrays and objects compare by their JSON form. Never ==.
+  */
+  private function same_stored( $a, $b ): bool {
+    $norm = function ( $v ) {
+      if ( is_bool( $v ) ) {
+        return $v ? '1' : '0';
+      }
+      if ( $v === null ) {
+        return '';
+      }
+      if ( is_scalar( $v ) ) {
+        return (string) $v;
+      }
+      return wp_json_encode( $v );
+    };
+    if ( ( is_array( $a ) || is_object( $a ) ) !== ( is_array( $b ) || is_object( $b ) ) ) {
+      return false;
+    }
+    return $norm( $a ) === $norm( $b );
   }
 
   private function error( array $r, string $message, int $code = -32602 ): array {
@@ -318,14 +364,28 @@ class GMCP_Tools_Kirki {
     if ( $field_id === '' ) {
       return $this->error( $r, 'field_id required' );
     }
-    $config_id = (string) ( $a['config_id'] ?? '' );
+    $field = $this->find_field( $field_id );
+    if ( !$field ) {
+      return $this->error( $r, 'No Kirki field registered with settings "' . $field_id . '". Call kirki_list_fields to see what is registered.' );
+    }
+    // Read through the config the field was registered under, the same as the write and the
+    // export do. A field under a named config can use a different storage model, and reading
+    // it through the caller's (default "global") config returned the default instead of what
+    // the write stored, which broke "reads back what was written".
+    $config_id = (string) ( $field['kirki_config'] ?? '' );
     if ( $config_id === '' ) {
       $config_id = 'global';
     }
 
-    $field = $this->find_field( $field_id );
-    if ( !$field ) {
-      return $this->error( $r, 'No Kirki field registered with settings "' . $field_id . '". Call kirki_list_fields to see what is registered.' );
+    // The row this field lives in answers to the same guard a write does: a field whose
+    // storage is an option the site has protected is not a way around that.
+    $storage_for_guard = $this->storage( $field );
+    $guarded_row = $storage_for_guard['option_type'] === 'theme_mod'
+      ? 'theme_mods_' . get_option( 'stylesheet' )
+      : ( $storage_for_guard['option_name'] !== '' ? $storage_for_guard['option_name'] : $storage_for_guard['settings'] );
+    $permitted = GMCP_Core::option_guard( $guarded_row );
+    if ( $permitted !== true ) {
+      return $this->error( $r, $permitted, -32600 );
     }
 
     // Kirki::get_option resolves the storage model and applies the field's default,
@@ -362,7 +422,13 @@ class GMCP_Tools_Kirki {
     if ( $config_id === '' ) {
       $config_id = 'global';
     }
-    $value = $a['value'] ?? null;
+    // An absent value or an explicit null is refused: null would store an empty value in a
+    // field the caller probably meant to leave alone, and the required-argument check on the
+    // server is satisfied by a key that is present with null in it.
+    if ( !array_key_exists( 'value', $a ) || $a['value'] === null ) {
+      return $this->error( $r, 'value is required. To restore a field to its default, pass the default itself (kirki_list_fields shows it).' );
+    }
+    $value = $a['value'];
 
     $field = $this->find_field( $field_id );
     if ( !$field ) {
@@ -400,8 +466,17 @@ class GMCP_Tools_Kirki {
       if ( $policy !== true ) {
         return $this->error( $r, $policy, -32600 );
       }
+      $mods = get_theme_mods();
+      $had = is_array( $mods ) && array_key_exists( $settings, $mods );
+      $prev = $had ? $mods[ $settings ] : null;
       set_theme_mod( $settings, $value );
-      return $this->verify_write( $r, $field_id, $field_config, $value, 'theme_mod "' . $settings . '"' );
+      return $this->verify_write( $r, $field_id, $field_config, $value, 'theme_mod "' . $settings . '"', function () use ( $had, $prev, $settings ) {
+        if ( $had ) {
+          set_theme_mod( $settings, $prev );
+        } else {
+          remove_theme_mod( $settings );
+        }
+      } );
     }
 
     if ( $option_type === 'option' && $option_name !== '' ) {
@@ -414,8 +489,8 @@ class GMCP_Tools_Kirki {
       if ( $permitted !== true ) {
         return $this->error( $r, $permitted, -32600 );
       }
-      $current = get_option( $option_name, [] );
-      $current = is_array( $current ) ? $current : [];
+      $raw_before = get_option( $option_name, '__gmcp_absent__' );
+      $current = is_array( $raw_before ) ? $raw_before : [];
       $new = $current;
       $new[ $settings ] = $value;
       $policy = GMCP_Core::option_write_policy( $option_name, $new );
@@ -423,7 +498,13 @@ class GMCP_Tools_Kirki {
         return $this->error( $r, $policy, -32600 );
       }
       update_option( $option_name, $new, null );
-      return $this->verify_write( $r, $field_id, $field_config, $value, 'option "' . $option_name . '"["' . $settings . '"]' );
+      return $this->verify_write( $r, $field_id, $field_config, $value, 'option "' . $option_name . '"["' . $settings . '"]', function () use ( $raw_before, $option_name ) {
+        if ( $raw_before === '__gmcp_absent__' ) {
+          delete_option( $option_name );
+        } else {
+          update_option( $option_name, $raw_before, null );
+        }
+      } );
     }
 
     if ( $option_type === 'option' ) {
@@ -438,8 +519,15 @@ class GMCP_Tools_Kirki {
       if ( $policy !== true ) {
         return $this->error( $r, $policy, -32600 );
       }
+      $raw_before = get_option( $settings, '__gmcp_absent__' );
       update_option( $settings, $value, null );
-      return $this->verify_write( $r, $field_id, $field_config, $value, 'option "' . $settings . '"' );
+      return $this->verify_write( $r, $field_id, $field_config, $value, 'option "' . $settings . '"', function () use ( $raw_before, $settings ) {
+        if ( $raw_before === '__gmcp_absent__' ) {
+          delete_option( $settings );
+        } else {
+          update_option( $settings, $raw_before, null );
+        }
+      } );
     }
 
     return $this->error( $r, 'The field "' . $field_id . '" uses an unknown option_type "' . $option_type . '", so its value cannot be written.' );
@@ -528,7 +616,7 @@ class GMCP_Tools_Kirki {
     // Configs: strip the 'id' key which duplicates the array key, and keep the rest.
     $configs = [];
     foreach ( \Kirki::$config as $id => $args ) {
-      $configs[ $id ] = array_diff_key( $args, [ 'id' => 1 ] );
+      $configs[ $id ] = GMCP_Core::redact( array_diff_key( $args, [ 'id' => 1 ] ) );
     }
 
     return $this->json( $r, [
