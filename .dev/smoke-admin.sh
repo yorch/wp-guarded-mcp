@@ -361,10 +361,65 @@ call self_off '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"
 check "cannot deactivate itself" "$(verdict self_off)" "error"
 call self_del '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"guarded-mcp"}}}'
 check "cannot delete itself" "$(verdict self_del)" "error"
+# Updating itself would replace the code serving the call, and a new version that failed
+# to load would leave nothing to call to put it back. Refused before any update check, so
+# the refusal does not depend on an update happening to be on offer.
+call self_upd '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"wp_update_plugin","arguments":{"plugin":"guarded-mcp"}}}'
+check "cannot update itself" "$(verdict self_upd)" "error"
+check "and says that is why" "$(refusal self_upd | grep -c 'Refusing to update the MCP plugin itself')" "1"
 
 echo "-- install source restriction --"
 call url_inst '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"url":"https://example.invalid/x.zip"}}}'
 check "arbitrary ZIP URL refused" "$(verdict url_inst)" "error"
+
+echo "-- a host whose content directory is not directly writable --"
+# The upgrader decides "direct or ask for FTP credentials" about WP_CONTENT_DIR: run()
+# calls fs_connect( [ WP_CONTENT_DIR, $destination ] ) and the first entry is the one
+# probed. The guard used to probe the plugins root instead, so on a host where wp-content
+# belongs to the deploy user and only the plugins directory is PHP's, it passed and the
+# call failed deep in the upgrader with a credentials sentence the agent cannot act on.
+# Simulated with core's own filesystem_method filter, scoped to the content directory.
+docker compose exec -T cli sh -c 'cat > /var/www/html/wp-content/mu-plugins/gmcp-smoke-fs.php' <<'PHP'
+<?php
+add_filter( 'filesystem_method', function ( $m, $args, $context ) {
+  return untrailingslashit( (string) $context ) === untrailingslashit( WP_CONTENT_DIR ) ? 'ftpext' : $m;
+}, 10, 3 );
+PHP
+# WP-CLI pins the method to direct with its own filter at priority 99, so the CLI has to
+# take that off to see what a web request sees. Without that, both controls read "direct"
+# whatever the simulation does.
+fs_method() { docker compose exec -T cli wp eval 'remove_all_filters( "filesystem_method", 99 ); require_once ABSPATH . "wp-admin/includes/file.php"; echo get_filesystem_method( [], '"$1"' );' 2>/dev/null | tr -d '\r\n'; }
+# CONTROLS: the simulation is in place, and it is the layout the old probe missed.
+check "CONTROL: the plugins directory still reads as direct" "$(fs_method WP_PLUGIN_DIR)" "direct"
+check "CONTROL: the content directory reads as ftpext" "$(fs_method WP_CONTENT_DIR)" "ftpext"
+call fs_inst '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"classic-editor"}}}'
+FS_INSTALLED=$(docker compose exec -T cli wp plugin list --format=csv 2>/dev/null | grep -c '^classic-editor,')
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-fs.php >/dev/null 2>&1
+check "an install on that host is refused" "$(verdict fs_inst)" "error"
+check "by the guard, with the sentence that names the method" "$(refusal fs_inst | grep -c "filesystem method is 'ftpext'")" "1"
+check "and nothing was installed" "$FS_INSTALLED" "0"
+check "CONTROL: the simulation is gone again" "$(fs_method WP_CONTENT_DIR)" "direct"
+
+echo "-- every package an install downloads is held to wordpress.org --"
+# resolve_package() checks the URL it hands over, but the upgrader can fetch others: a
+# child theme's missing parent comes from a second themes_api() answer, and any plugin can
+# swap the package through upgrader_package_options after the check. Simulated with the
+# second: the slug resolves to wordpress.org as normal, then the package is rewritten.
+docker compose exec -T cli sh -c 'cat > /var/www/html/wp-content/mu-plugins/gmcp-smoke-pkg.php' <<'PHP'
+<?php
+add_filter( 'upgrader_package_options', function ( $o ) {
+  $o['package'] = 'https://downloads.example.invalid/classic-editor.zip';
+  return $o;
+} );
+PHP
+call pkg_inst '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"classic-editor"}}}'
+PKG_INSTALLED=$(docker compose exec -T cli wp plugin list --format=csv 2>/dev/null | grep -c '^classic-editor,')
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-pkg.php >/dev/null 2>&1
+check "a rewritten package is refused" "$(verdict pkg_inst)" "error"
+check "by the host rule, not by the download failing" "$(refusal pkg_inst | grep -c 'not a wordpress.org host')" "1"
+check "and nothing was installed" "$PKG_INSTALLED" "0"
+check "CONTROL: the rewrite is gone again" \
+  "$(docker compose exec -T cli sh -c 'test -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-pkg.php && echo present || echo gone' 2>/dev/null | tr -d '\r\n')" "gone"
 
 echo "-- two-step confirmation (needs the network: installs from wordpress.org) --"
 call inst '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"classic-editor","activate":true}}}'
@@ -393,6 +448,51 @@ call replay "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\"
 check "token cannot be replayed on another target" "$(verdict replay)" "error"
 check "akismet untouched" \
   "$(docker compose exec -T cli wp plugin list --format=csv 2>/dev/null | grep -c '^akismet,')" "1"
+
+echo "-- updating a plugin keeps it active, and asks for fresh update data --"
+# Plugin_Upgrader::upgrade() deactivates an active plugin before replacing it and leaves
+# reactivating it to an iframe only wp-admin's skin prints, so every active plugin this
+# tool updated came back inactive under a reply that said "Updated". Akismet is made to
+# look old by lowering the version in its header, which is what the update check reads;
+# the update then installs the real current release from wordpress.org over it.
+AK=akismet/akismet.php
+# The container's sed is busybox, so POSIX classes only, and only the header lines.
+ak_age() { docker compose exec -T cli sed -i '1,20s/^\([[:space:]*]*Version:[[:space:]]*\).*/\15.0/' /var/www/html/wp-content/plugins/akismet/akismet.php >/dev/null 2>&1; }
+ak_version() { docker compose exec -T cli wp eval 'require_once ABSPATH . "wp-admin/includes/plugin.php"; echo get_plugin_data( WP_PLUGIN_DIR . "/akismet/akismet.php", false, false )["Version"];' 2>/dev/null | tr -d '\r\n'; }
+ak_active() { docker compose exec -T cli wp eval 'echo in_array( "akismet/akismet.php", (array) get_option( "active_plugins", [] ), true ) ? 1 : 0;' 2>/dev/null | tr -d '\r\n'; }
+ak_age
+docker compose exec -T cli wp plugin activate akismet >/dev/null 2>&1
+# The stale case: a check an hour ago saw this version and nothing newer. wp_update_plugins()
+# does not ask again for 12 hours outside wp-admin, so "already up to date" was the answer
+# however long ago a release had come out.
+docker compose exec -T cli wp eval '
+  $t = get_site_transient( "update_plugins" );
+  if ( !is_object( $t ) ) { $t = new stdClass(); $t->response = []; $t->checked = []; }
+  $t->last_checked = time();
+  $t->checked["akismet/akismet.php"] = "5.0";
+  unset( $t->response["akismet/akismet.php"] );
+  set_site_transient( "update_plugins", $t );' >/dev/null 2>&1
+check "CONTROL: akismet reads as the old version" "$(ak_version)" "5.0"
+check "CONTROL: and is active before the update" "$(ak_active)" "1"
+call upd_stale '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"wp_update_plugin","arguments":{"plugin":"akismet"}}}'
+UPD1_VERSION=$(ak_version); UPD1_ACTIVE=$(ak_active)
+# The plain case: no update data at all, so any version of this tool has to ask, and the
+# update really runs. This is where upgrade() left the plugin inactive.
+ak_age
+docker compose exec -T cli wp plugin activate akismet >/dev/null 2>&1
+docker compose exec -T cli wp eval 'delete_site_transient( "update_plugins" );' >/dev/null 2>&1
+check "CONTROL: aged and active again for the second update" "$(ak_version),$(ak_active)" "5.0,1"
+call upd_plain '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"wp_update_plugin","arguments":{"plugin":"akismet"}}}'
+UPD2_VERSION=$(ak_version); UPD2_ACTIVE=$(ak_active)
+# Put it back the way reset_state expects it before comparing anything.
+docker compose exec -T cli wp plugin deactivate akismet >/dev/null 2>&1
+check "a stale 'up to date' is not trusted: the update is found and applied" "$(verdict upd_stale),$([ "$UPD1_VERSION" != "5.0" ] && echo newer)" "ok,newer"
+check "and the plugin is still active after it" "$UPD1_ACTIVE" "1"
+check "an ordinary update succeeds" "$(verdict upd_plain)" "ok"
+check "and really replaces the files" "$([ -n "$UPD2_VERSION" ] && [ "$UPD2_VERSION" != "5.0" ] && echo newer)" "newer"
+check "and leaves the plugin active, as stored" "$UPD2_ACTIVE" "1"
+check "and the reply says so" "$(refusal upd_plain | grep -c 'still active')" "1"
+check "CONTROL: akismet is inactive again" "$(ak_active)" "0"
 
 echo "-- settings allowlist --"
 call s_read '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"wp_get_settings","arguments":{"group":"general"}}}'
@@ -532,6 +632,22 @@ docker compose exec -T cli wp post delete "$DRAFT_ID" --force >/dev/null 2>&1
 call m_list '{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"wp_get_menu_items","arguments":{"menu":"Smoke Menu"}}}'
 check "item is published, not draft" \
   "$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(len(t["items"])==1)' m_list)" "True"
+# A parent from another menu is stored without complaint and the item never renders.
+# wp_update_menu_item has refused that since may_reparent() was written; adding was the
+# neighbouring tool that did not ask.
+docker compose exec -T cli wp menu create "Smoke Other" >/dev/null 2>&1
+OTHER_ITEM=$(docker compose exec -T cli wp menu item add-custom "Smoke Other" "Elsewhere" "https://example.test/" --porcelain 2>/dev/null | tr -d '\r\n')
+HOME_ITEM=$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(t["items"][0]["item_id"])' m_list)
+menu_count() { docker compose exec -T cli wp menu item list "Smoke Menu" --format=count 2>/dev/null | tr -d '\r\n'; }
+check "CONTROL: the other menu's item exists" "$([ -n "$OTHER_ITEM" ] && echo yes)" "yes"
+call m_xparent "{\"jsonrpc\":\"2.0\",\"id\":59,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_menu_item\",\"arguments\":{\"menu\":\"Smoke Menu\",\"title\":\"Orphan\",\"type\":\"custom\",\"url\":\"https://example.test/o\",\"parent_id\":$OTHER_ITEM}}}"
+XP_COUNT=$(menu_count)
+call m_parent "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_menu_item\",\"arguments\":{\"menu\":\"Smoke Menu\",\"title\":\"Child\",\"type\":\"custom\",\"url\":\"https://example.test/c\",\"parent_id\":$HOME_ITEM}}}"
+OK_COUNT=$(menu_count)
+docker compose exec -T cli wp menu delete "Smoke Other" >/dev/null 2>&1
+check "a parent from another menu is refused" "$(verdict m_xparent)" "error"
+check "and no item was added" "$XP_COUNT" "1"
+check "CONTROL: a parent in the same menu is accepted, and adds one item" "$(verdict m_parent),$((OK_COUNT - XP_COUNT))" "ok,1"
 call m_loc '{"jsonrpc":"2.0","id":55,"method":"tools/call","params":{"name":"wp_assign_menu_location","arguments":{"location":"nope","menu":"Smoke Menu"}}}'
 check "unknown menu location refused" "$(verdict m_loc)" "error"
 call m_del '{"jsonrpc":"2.0","id":56,"method":"tools/call","params":{"name":"wp_delete_menu","arguments":{"menu":"Smoke Menu"}}}'
@@ -1516,6 +1632,30 @@ call bk_start '{"jsonrpc":"2.0","id":231,"method":"tools/call","params":{"name":
 check "starting succeeds" "$(verdict bk_start)" "ok"
 check "and says plainly that it is not finished" "$(refusal bk_start | grep -c 'not finished yet')" "1"
 check "and never claims a backup was taken" "$(refusal bk_start | grep -ci 'backup complete\|backup taken\|backed up successfully')" "0"
+# The job runs in its own request now, queued on WP-Cron, rather than inside this one: a
+# medium site used to hold the call for the whole first resumption, and a proxy timeout
+# answered 504 while the backup carried on. Measured as "the job is visible as in flight
+# once the reply is back", which inline running could never show: by then it had finished.
+call bk_status2 '{"jsonrpc":"2.0","id":233,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
+BK_RUNNING=$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(d['running'])" bk_status2)
+call bk_again '{"jsonrpc":"2.0","id":235,"method":"tools/call","params":{"name":"wp_start_backup","arguments":{}}}'
+check "the job reads as in flight after the reply" "$BK_RUNNING" "True"
+# boot_backup() returns false on a held lock and do_action() threw that away, so a second
+# start read as a start. Refused here, before anything is queued.
+check "a second start while one is in flight is refused" "$(verdict bk_again)" "error"
+check "and the refusal says why" "$(refusal bk_again | grep -c 'already has a backup in progress')" "1"
+# The job id is the secret half of every archive filename, which is why the listing
+# withholds it. The start reply must not hand it over either.
+check "the reply carries no job id" "$(refusal bk_start | grep -cE '[0-9a-f]{12}')" "0"
+# Let it finish, so the sections below begin with nothing in flight: Backuply's section
+# deactivates UpdraftPlus, and doing that mid-job leaves resumptions nothing will run.
+for _ in $(seq 1 60); do
+  [ "$(docker compose exec -T cli wp eval 'foreach ( (array) _get_cron_array() as $e ) { foreach ( [ "updraft_backup_resume", "updraft_backupnow_backup_all" ] as $h ) { if ( !empty( $e[ $h ] ) ) { echo 1; return; } } } echo 0;' 2>/dev/null | tr -d '\r\n')" = "0" ] && break
+  sleep 5
+done
+call bk_status3 '{"jsonrpc":"2.0","id":236,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
+check "CONTROL: and reads as finished once UpdraftPlus is done" \
+  "$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(d['running'])" bk_status3)" "False"
 
 # The two-step confirmation reports the situation rather than gating on it.
 call bk_confirm '{"jsonrpc":"2.0","id":232,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"akismet/akismet.php"}}}'
