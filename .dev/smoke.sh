@@ -642,6 +642,31 @@ call cr_one_chunk "{\"jsonrpc\":\"2.0\",\"id\":424,\"method\":\"tools/call\",\"p
 check "and the chunked reader refuses it rather than handing out its bytes" "$(verdict cr_one_chunk)" "error"
 docker compose exec -T cli wp eval "wp_delete_post($CR_ORDER,true); wp_delete_post($CR_POST,true); foreach (GMCP_Tokens::all() as \$k) { if ((\$k['label'] ?? '') === 'smoke reader') { GMCP_Tokens::revoke(\$k['id']); } }" >/dev/null 2>&1
 
+echo "-- the media tools touch media only --"
+# Only the preview of wp_delete_media checked the type. The real call deleted whatever the
+# id named, permanently, past the commerce and template guards wp_delete_post asks, and
+# wp_update_media rewrote any post's title, excerpt and body at write level.
+MO=$(docker compose exec -T cli wp eval '
+  $s = wp_insert_post(["post_title"=>"Media probe sub","post_type"=>"shop_subscription","post_status"=>"wc-active"]);
+  $p = wp_insert_post(["post_title"=>"Media probe page","post_type"=>"page","post_status"=>"publish"]);
+  $m = wp_insert_attachment(["post_title"=>"Media probe file","post_mime_type"=>"image/png","post_status"=>"inherit"], false, 0);
+  echo $s, " ", $p, " ", $m;' 2>/dev/null | tr -d '\r\n')
+read -r MO_SUB MO_PAGE MO_ATT <<< "$MO"
+call mo_del "{\"jsonrpc\":\"2.0\",\"id\":430,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_media\",\"arguments\":{\"ID\":$MO_SUB,\"force\":true}}}"
+call mo_del2 "{\"jsonrpc\":\"2.0\",\"id\":431,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_media\",\"arguments\":{\"ID\":$MO_PAGE,\"force\":true}}}"
+check "wp_delete_media does not delete a subscription or a page" \
+  "$(docker compose exec -T cli wp eval "echo (get_post($MO_SUB)?'s':'-') . (get_post($MO_PAGE)?'p':'-');" 2>/dev/null | tr -d '\r\n')" "sp"
+call mo_upd "{\"jsonrpc\":\"2.0\",\"id\":432,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_media\",\"arguments\":{\"ID\":$MO_PAGE,\"title\":\"Media tool wrote this\"}}}"
+check "wp_update_media does not rewrite a page" \
+  "$(docker compose exec -T cli wp post get "$MO_PAGE" --field=post_title 2>/dev/null | tr -d '\r\n')" "Media probe page"
+call mo_upd_ok "{\"jsonrpc\":\"2.0\",\"id\":433,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_media\",\"arguments\":{\"ID\":$MO_ATT,\"title\":\"Media probe renamed\"}}}"
+check "CONTROL: it still renames an attachment" \
+  "$(docker compose exec -T cli wp post get "$MO_ATT" --field=post_title 2>/dev/null | tr -d '\r\n')" "Media probe renamed"
+call mo_del_ok "{\"jsonrpc\":\"2.0\",\"id\":434,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_media\",\"arguments\":{\"ID\":$MO_ATT}}}"
+check "CONTROL: and still deletes one" \
+  "$(docker compose exec -T cli wp eval "echo get_post($MO_ATT)?'present':'gone';" 2>/dev/null | tr -d '\r\n')" "gone"
+docker compose exec -T cli wp eval "wp_delete_post($MO_SUB,true); wp_delete_post($MO_PAGE,true);" >/dev/null 2>&1
+
 echo "-- the everyday meta tool keeps backslashes --"
 # update_post_meta() unslashes what it is given, so a value carrying backslashes arrives
 # stripped: a JSON payload stops parsing, a regex stops matching and a Windows path loses

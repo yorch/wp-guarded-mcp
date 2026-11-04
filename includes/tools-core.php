@@ -4920,6 +4920,14 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
+        // Attachments only, in the handler. The tool's name says media and its fields are an
+        // attachment's, but it wrote title, caption and description onto whatever post the
+        // id named, at write level, past the commerce guard: an order's post_excerpt is the
+        // customer's note.
+        if ( get_post_type( intval( $a['ID'] ) ) !== 'attachment' ) {
+          $r = $this->error( $r, 'No attachment with ID ' . intval( $a['ID'] ) . '. This tool edits media only; use wp_update_post for other posts.', -32602 );
+          break;
+        }
         $upd = [ 'ID' => intval( $a['ID'] ) ];
         if ( $a['title'] ?? '' ) {
           $upd['post_title'] = sanitize_text_field( $a['title'] );
@@ -4949,6 +4957,15 @@ class GMCP_Tools_Core {
           break;
         }
         $media_id = intval( $a['ID'] );
+        // The same refusal the preview gives, made by the real call. Only the preview used to
+        // check the type, so a caller that previewed was told "No attachment" and the real
+        // call then permanently deleted the post anyway, a subscription or an Elementor
+        // template still rendered by live pages among them, past both the commerce guard and
+        // the template guard that wp_delete_post asks.
+        if ( get_post_type( $media_id ) !== 'attachment' ) {
+          $r = $this->error( $r, 'No attachment with ID ' . $media_id . '. This tool deletes media only; use wp_delete_post for other posts.', -32602 );
+          break;
+        }
         $d = wp_delete_post( $media_id, !empty( $a['force'] ) );
         if ( $d ) {
           // An attachment has no trash, so this is always the permanent branch. Asked
