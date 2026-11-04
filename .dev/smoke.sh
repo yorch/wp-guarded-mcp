@@ -739,7 +739,7 @@ def req(name, i, args):
     open('%s/%s.json' % (out, name), 'w').write(json.dumps({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": name.split('-')[0], "arguments": args}}))
 req('wp_update_post-mi', 460, {"ID": pid, "meta_input": {"mi_probe": "a\\b \"q\""}})
 req('wp_create_comment-c', 461, {"post_id": pid, "comment_content": "C:\\Users\\x"})
-req('wp_create_post-ex', 462, {"post_title": "Excerpt slash probe", "post_excerpt": "C:\\Temp"})
+req('wp_create_post-ex', 462, {"post_title": "Excerpt slash probe", "post_excerpt": "C:\\Temp", "meta_input": {"mj_probe": "{\"a\":\"x\\\\y\"}"}})
 PYMS
 for f in wp_update_post-mi wp_create_comment-c wp_create_post-ex; do
   curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
@@ -749,6 +749,10 @@ check "meta_input keeps the backslashes in a value" \
   "$(docker compose exec -T cli wp eval "echo get_post_meta($MS_ID,'mi_probe',true) === 'a' . chr(92) . 'b \"q\"' ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
 check "a comment keeps its backslashes" \
   "$(docker compose exec -T cli wp eval "\$c=get_comments(['post_id'=>$MS_ID,'number'=>1]); echo \$c && \$c[0]->comment_content === 'C:' . chr(92) . 'Users' . chr(92) . 'x' ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
+# One answer for every meta writer: JSON for an array is stored as the array, not as a
+# string through one tool and an array through the next.
+check "wp_create_post meta_input stores JSON as the array it describes, backslash intact" \
+  "$(docker compose exec -T cli wp eval "\$p=get_posts(['title'=>'Excerpt slash probe','post_status'=>'any','numberposts'=>1]); \$v=\$p?get_post_meta(\$p[0]->ID,'mj_probe',true):null; echo is_array(\$v) && \$v['a'] === 'x' . chr(92) . 'y' ? 'array' : gettype(\$v);" 2>/dev/null | tr -d '\r\n')" "array"
 check "and so does an excerpt" \
   "$(docker compose exec -T cli wp eval "\$p=get_posts(['title'=>'Excerpt slash probe','post_status'=>'any','numberposts'=>1]); echo \$p && \$p[0]->post_excerpt === 'C:' . chr(92) . 'Temp' ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
 MS_CAT=$(docker compose exec -T cli wp term create category 'Misc probe cat' --porcelain 2>/dev/null | tr -d '\r\n')

@@ -590,15 +590,20 @@ class GMCP_Tools_Core {
   * is worse than a refusal, because nothing downstream has any reason to look again.
   */
   private function prepare_meta_value( $value ) {
+    // Deep by way of map_deep(), so a nested array is slashed at every leaf, and a
+    // non-string leaf is returned untouched rather than cast.
+    return wp_slash( $this->decode_meta_value( $value ) );
+  }
+
+  /** The decoding half of prepare_meta_value(), for a writer that slashes on its own. */
+  private function decode_meta_value( $value ) {
     if ( is_string( $value ) && isset( $value[0] ) && ( $value[0] === '[' || $value[0] === '{' ) ) {
       $decoded = json_decode( $value, true );
       if ( json_last_error() === JSON_ERROR_NONE && is_array( $decoded ) ) {
-        $value = $decoded;
+        return $decoded;
       }
     }
-    // Deep by way of map_deep(), so a nested array is slashed at every leaf, and a
-    // non-string leaf is returned untouched rather than cast.
-    return wp_slash( $value );
+    return $value;
   }
 
   private function bust_post_cache( int $post_id, array $context = [] ): void {
@@ -1075,7 +1080,10 @@ class GMCP_Tools_Core {
       $meta_input = json_decode( $meta_input, true ) ?? [];
     }
     if ( !empty( $meta_input ) && is_array( $meta_input ) ) {
-      $ins['meta_input'] = $meta_input;
+      // JSON for an array is decoded here as every other meta writer decodes it, so the
+      // same payload is not an array through wp_update_post_meta and a string through this
+      // tool. Not slashed here: wp_slash( $ins ) below does that once for the whole row.
+      $ins['meta_input'] = array_map( [ $this, 'decode_meta_value' ], $meta_input );
     }
 
     // meta_input rides inside $ins, so wp_slash() below slashes its values once and
