@@ -21,21 +21,41 @@ It also speaks the parts of MCP most servers skip: prompts, so your client offer
 
 ## Install
 
-Build the zip with `.dev/build.sh`, then upload it through Plugins, Add New, Upload
-Plugin. Or copy the directory into `wp-content/plugins/guarded-mcp` and activate it.
+Download `guarded-mcp.zip` from the [latest release](https://github.com/yorch/wp-guarded-mcp/releases/latest),
+then upload it through Plugins, Add New, Upload Plugin. Or, from the command line:
 
 ```
-wp plugin install /path/to/guarded-mcp.zip --activate
+wp plugin install https://github.com/yorch/wp-guarded-mcp/releases/latest/download/guarded-mcp.zip --activate
 ```
+
+Each release also carries a `.sha256` checksum and a build provenance attestation. The
+checksum catches a damaged download: it is produced in the same job as the zip, so it proves
+nothing about who built it. The attestation does. Check it with
+
+```
+gh attestation verify guarded-mcp.zip --repo yorch/wp-guarded-mcp \
+  --signer-workflow yorch/wp-guarded-mcp/.github/workflows/release.yml
+```
+
+which confirms the zip was built by this repository's release workflow, not that anyone
+has reviewed what it contains.
+
+This plugin does not update itself, and GitHub releases are not an update channel. Watch the
+repository's releases and install each new one by hand: upload it again through Plugins, Add
+New, Upload Plugin and choose "Replace current with uploaded".
+
+To build the zip yourself instead, run `.dev/build.sh` from a committed checkout (see
+[Building an installable zip](.dev/README.md#building-an-installable-zip)). Or copy the
+directory into `wp-content/plugins/guarded-mcp` and activate it.
 
 **The directory must be named `guarded-mcp`.** Not `wp-guarded-mcp`, not
 `wp-guarded-mcp-main`, not `ai-engine`.
 The plugin derives its own identity from the folder through `plugin_basename()`, and the
 guard that stops an agent deactivating or deleting the plugin mid-call compares against
-that. Rename the folder and the self-protection silently stops matching. A GitHub
-"Download ZIP" gives you `wp-guarded-mcp-main`, so rename it if you go that route. The
-repository is named `wp-guarded-mcp` and the plugin `guarded-mcp`; only the second name
-matters to WordPress.
+that. Rename the folder and the self-protection silently stops matching. Release zips
+already unpack to `guarded-mcp/`. A GitHub "Download ZIP" of the repository gives you
+`wp-guarded-mcp-main`, so rename it if you go that route. The repository is named
+`wp-guarded-mcp` and the plugin `guarded-mcp`; only the second name matters to WordPress.
 
 Then open **MCP Server** in the admin menu.
 
@@ -411,6 +431,24 @@ Plugin Check passing is not the same as WordPress.org approval. The directory re
 covers more than this tool can check, and the tool's warnings include patterns that are
 intentional in this plugin (direct database access for the audit log, third-party hook
 names, `error_log()` for the connector's own diagnostics).
+
+### Releasing
+
+1. Set the new version in **three** places: `Version:` and the `GMCP_VERSION` define in
+   `guarded-mcp.php`, and `Stable tag:` in `readme.txt`. `.dev/check-release.sh version`
+   fails if they disagree, and CI runs it on every push and pull request.
+2. Merge to `main`. The release workflow refuses a tag whose commit is not reachable from it.
+3. Tag the merged commit and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+The tag runs the release workflow, which checks the versions against the tag, builds the zip
+with `.dev/build.sh`, checks its contents, and publishes it as a GitHub Release with checksums
+and a provenance attestation. Nothing is sent to wordpress.org. The install links in this
+README resolve only once the first release exists.
+
+The workflow runs in the `release` environment. Add required reviewers to that environment
+and restrict who may create `v*` tags (Settings, Environments and Rules): a tag's workflow
+file comes from the tagged commit, so the on-main check alone does not stop someone with
+write access.
 
 ## Licence
 
