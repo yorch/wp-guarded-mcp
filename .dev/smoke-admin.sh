@@ -361,6 +361,12 @@ call self_off '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"
 check "cannot deactivate itself" "$(verdict self_off)" "error"
 call self_del '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"guarded-mcp"}}}'
 check "cannot delete itself" "$(verdict self_del)" "error"
+# Updating itself would replace the code serving the call, and a new version that failed
+# to load would leave nothing to call to put it back. Refused before any update check, so
+# the refusal does not depend on an update happening to be on offer.
+call self_upd '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"wp_update_plugin","arguments":{"plugin":"guarded-mcp"}}}'
+check "cannot update itself" "$(verdict self_upd)" "error"
+check "and says that is why" "$(refusal self_upd | grep -c 'Refusing to update the MCP plugin itself')" "1"
 
 echo "-- install source restriction --"
 call url_inst '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"url":"https://example.invalid/x.zip"}}}'
@@ -421,6 +427,51 @@ call replay "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\"
 check "token cannot be replayed on another target" "$(verdict replay)" "error"
 check "akismet untouched" \
   "$(docker compose exec -T cli wp plugin list --format=csv 2>/dev/null | grep -c '^akismet,')" "1"
+
+echo "-- updating a plugin keeps it active, and asks for fresh update data --"
+# Plugin_Upgrader::upgrade() deactivates an active plugin before replacing it and leaves
+# reactivating it to an iframe only wp-admin's skin prints, so every active plugin this
+# tool updated came back inactive under a reply that said "Updated". Akismet is made to
+# look old by lowering the version in its header, which is what the update check reads;
+# the update then installs the real current release from wordpress.org over it.
+AK=akismet/akismet.php
+# The container's sed is busybox, so POSIX classes only, and only the header lines.
+ak_age() { docker compose exec -T cli sed -i '1,20s/^\([[:space:]*]*Version:[[:space:]]*\).*/\15.0/' /var/www/html/wp-content/plugins/akismet/akismet.php >/dev/null 2>&1; }
+ak_version() { docker compose exec -T cli wp eval 'require_once ABSPATH . "wp-admin/includes/plugin.php"; echo get_plugin_data( WP_PLUGIN_DIR . "/akismet/akismet.php", false, false )["Version"];' 2>/dev/null | tr -d '\r\n'; }
+ak_active() { docker compose exec -T cli wp eval 'echo in_array( "akismet/akismet.php", (array) get_option( "active_plugins", [] ), true ) ? 1 : 0;' 2>/dev/null | tr -d '\r\n'; }
+ak_age
+docker compose exec -T cli wp plugin activate akismet >/dev/null 2>&1
+# The stale case: a check an hour ago saw this version and nothing newer. wp_update_plugins()
+# does not ask again for 12 hours outside wp-admin, so "already up to date" was the answer
+# however long ago a release had come out.
+docker compose exec -T cli wp eval '
+  $t = get_site_transient( "update_plugins" );
+  if ( !is_object( $t ) ) { $t = new stdClass(); $t->response = []; $t->checked = []; }
+  $t->last_checked = time();
+  $t->checked["akismet/akismet.php"] = "5.0";
+  unset( $t->response["akismet/akismet.php"] );
+  set_site_transient( "update_plugins", $t );' >/dev/null 2>&1
+check "CONTROL: akismet reads as the old version" "$(ak_version)" "5.0"
+check "CONTROL: and is active before the update" "$(ak_active)" "1"
+call upd_stale '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"wp_update_plugin","arguments":{"plugin":"akismet"}}}'
+UPD1_VERSION=$(ak_version); UPD1_ACTIVE=$(ak_active)
+# The plain case: no update data at all, so any version of this tool has to ask, and the
+# update really runs. This is where upgrade() left the plugin inactive.
+ak_age
+docker compose exec -T cli wp plugin activate akismet >/dev/null 2>&1
+docker compose exec -T cli wp eval 'delete_site_transient( "update_plugins" );' >/dev/null 2>&1
+check "CONTROL: aged and active again for the second update" "$(ak_version),$(ak_active)" "5.0,1"
+call upd_plain '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"wp_update_plugin","arguments":{"plugin":"akismet"}}}'
+UPD2_VERSION=$(ak_version); UPD2_ACTIVE=$(ak_active)
+# Put it back the way reset_state expects it before comparing anything.
+docker compose exec -T cli wp plugin deactivate akismet >/dev/null 2>&1
+check "a stale 'up to date' is not trusted: the update is found and applied" "$(verdict upd_stale),$([ "$UPD1_VERSION" != "5.0" ] && echo newer)" "ok,newer"
+check "and the plugin is still active after it" "$UPD1_ACTIVE" "1"
+check "an ordinary update succeeds" "$(verdict upd_plain)" "ok"
+check "and really replaces the files" "$([ -n "$UPD2_VERSION" ] && [ "$UPD2_VERSION" != "5.0" ] && echo newer)" "newer"
+check "and leaves the plugin active, as stored" "$UPD2_ACTIVE" "1"
+check "and the reply says so" "$(refusal upd_plain | grep -c 'still active')" "1"
+check "CONTROL: akismet is inactive again" "$(ak_active)" "0"
 
 echo "-- settings allowlist --"
 call s_read '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"wp_get_settings","arguments":{"group":"general"}}}'

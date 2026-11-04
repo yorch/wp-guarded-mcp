@@ -152,6 +152,16 @@ class GMCP_Tools_Admin {
   }
 
   /**
+  * Plugins on THIS site's own active list, as opposed to network-active ones.
+  *
+  * is_plugin_active() answers true for both, which is the right question for "is its
+  * code running here" and the wrong one for "which list does it have to go back onto".
+  */
+  private function site_active_plugins(): array {
+    return (array) get_option( 'active_plugins', [] );
+  }
+
+  /**
   * Whether a stylesheet names an INSTALLED theme, and nothing else.
   *
   * `wp_get_theme( $stylesheet )->exists()` is not this question, and the difference is a
@@ -426,7 +436,7 @@ class GMCP_Tools_Admin {
       ],
       'wp_update_plugin' => [
         'name' => 'wp_update_plugin',
-        'description' => 'Update an installed plugin to the latest wordpress.org version. Checks for available updates first and reports when none is pending.',
+        'description' => 'Update an installed plugin to the newest version this site\'s update data offers: wordpress.org for plugins hosted there, a premium plugin\'s own update server otherwise. Asks for fresh update data first and reports when none is pending. A plugin that was active stays active. Refuses to update the MCP plugin itself, whose code is serving the call.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [ 'plugin' => [ 'type' => 'string' ] ],
@@ -480,7 +490,7 @@ class GMCP_Tools_Admin {
       ],
       'wp_update_theme' => [
         'name' => 'wp_update_theme',
-        'description' => 'Update an installed theme to the latest wordpress.org version.',
+        'description' => 'Update an installed theme to the newest version this site\'s update data offers: wordpress.org for themes hosted there, a premium theme\'s own update server otherwise. Asks for fresh update data first and reports when none is pending.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [ 'stylesheet' => [ 'type' => 'string' ] ],
@@ -1137,25 +1147,151 @@ class GMCP_Tools_Admin {
     if ( $plugin === null ) {
       return $this->error( $r, "No installed plugin matches \"{$a['plugin']}\"." );
     }
+    // Refused for the same reason deactivating and deleting it are, and one more. The
+    // upgrader deletes this plugin's directory and unpacks the new one while this request
+    // is still running out of it: every class the autoloader has not yet required would
+    // then load from the new version into a process running the old one, and if the new
+    // version fails to load on the next request the endpoint is gone with nothing left to
+    // call to put it back. wp-admin, WP-CLI and WordPress's own auto-updates all update it
+    // from outside a call it is serving, which is where that belongs.
+    if ( $plugin === $this->self_plugin_file() ) {
+      return $this->error( $r, 'Refusing to update the MCP plugin itself from inside one of its own calls: the update replaces the code serving this request, and if the new version failed to load there would be no way back in. Update it from wp-admin, with WP-CLI, or let WordPress auto-update it.' );
+    }
 
-    // The update transient is what the upgrader consults. It can be stale or empty on
-    // a site that has not run its update cron, in which case the upgrader reports a
-    // confusing "no update available" for a plugin that does have one. Refresh first.
-    wp_update_plugins();
+    $checked = $this->refresh_update_data( 'plugin' );
     $updates = get_site_transient( 'update_plugins' );
     if ( empty( $updates->response[ $plugin ] ) ) {
-      return $this->text( $r, "\"{$plugin}\" is already up to date." );
+      return $this->text( $r, $checked
+        ? "\"{$plugin}\" is already up to date: the update service was asked just now and offers nothing newer."
+        : "No update is known for \"{$plugin}\", but the update service could not be reached just now, so that is only as fresh as this site's last successful check. Nothing was changed."
+      );
     }
+    $offered = (string) ( $updates->response[ $plugin ]->new_version ?? '' );
 
+    // Which list it is on, recorded before anything moves. See restore_activation().
+    $was_site = in_array( $plugin, $this->site_active_plugins(), true );
+    $was_network = is_multisite() && is_plugin_active_for_network( $plugin );
+
+    // bulk_upgrade(), not upgrade(), even for one plugin. upgrade() hooks
+    // deactivate_plugin_before_upgrade, which deactivates an active plugin outside cron and
+    // leaves reactivating it to the iframe Plugin_Upgrader_Skin::after() prints in wp-admin.
+    // No skin prints that here, so every active plugin this tool updated came back
+    // inactive, a shop's WooCommerce included, under a reply that said "Updated". On
+    // multisite the same call deactivated a network-active plugin network-wide.
+    // bulk_upgrade() is the path wp-admin's own AJAX updater and WP-CLI take, and it leaves
+    // activation alone.
     $skin = $this->skin();
     $upgrader = new Plugin_Upgrader( $skin );
-    $result = $upgrader->upgrade( $plugin );
+    $results = $this->quietly( function () use ( $upgrader, $plugin ) { return $upgrader->bulk_upgrade( [ $plugin ] ); } );
+    $result = is_array( $results ) ? ( $results[ $plugin ] ?? null ) : $results;
 
-    if ( $result !== true ) {
-      return $this->error( $r, 'Update failed: ' . $this->upgrader_error( $result, $skin, 'the update could not be applied.' ) );
+    // Whatever happened to the files, the plugin goes back onto the lists it was on.
+    $lost = $this->restore_activation( $plugin, $was_site, $was_network );
+
+    if ( $result === true ) {
+      return $this->error( $r, "The upgrader found no update to apply for \"{$plugin}\", although one to {$offered} was listed a moment ago. Nothing was changed." . $lost );
     }
-    $new = $updates->response[ $plugin ]->new_version ?? '';
-    return $this->text( $r, "Updated \"{$plugin}\"" . ( $new ? " to {$new}." : '.' ) );
+    if ( !is_array( $result ) || is_wp_error( $skin->result ) || ( $skin->get_errors() instanceof WP_Error && $skin->get_errors()->has_errors() ) ) {
+      $why = $this->upgrader_error( is_wp_error( $skin->result ) ? $skin->result : $result, $skin, 'the update could not be applied.' );
+      return $this->error( $r, 'Update failed: ' . $why . $lost );
+    }
+
+    // The stored truth, not the upgrader's word: read the version off the file on disk.
+    $data = get_plugin_data( WP_PLUGIN_DIR . '/' . $plugin, false, false );
+    $now = (string) ( $data['Version'] ?? '' );
+    if ( $offered !== '' && $now !== '' && version_compare( $now, $offered, '<' ) ) {
+      return $this->error( $r, "The upgrader reported success but \"{$plugin}\" still reads as version {$now} on disk, not {$offered}." . $lost );
+    }
+    if ( $lost !== '' ) {
+      return $this->error( $r, "Updated \"{$plugin}\" to {$now}, but it is no longer active." . $lost );
+    }
+
+    $message = "Updated \"{$plugin}\"" . ( $now !== '' ? " to {$now}." : '.' );
+    if ( $was_site || $was_network ) {
+      // The new code runs for the first time on the next request, not this one, so a
+      // version that fatals has not been tried yet. wp-admin finds out by reactivating it
+      // in a sandboxed request; the equivalent here is to load a page and look.
+      $health = $this->front_end_healthy();
+      if ( $health === false ) {
+        return $this->error( $r, "Updated \"{$plugin}\" to {$now} and it is still active, but the site's front end now returns a server error. The update cannot be rolled back from here. Deactivate it with wp_deactivate_plugin if the site needs to come back first." );
+      }
+      $message .= ( $was_network ? ' It is still active network-wide' : ' It is still active' ) . ( $health === null ? ', though whether the front end still loads could not be checked from here.' : ', and the front end still loads.' );
+    }
+    return $this->text( $r, $message );
+  }
+
+  /**
+  * Put a plugin back on the active lists it was on before an update, and say if it is not.
+  *
+  * bulk_upgrade() should leave activation alone, so this normally finds nothing to do. It
+  * exists because "should" is the upgrader's promise and the reply is ours: a filter on
+  * upgrader_pre_install or a future core change that deactivates again would otherwise
+  * reproduce exactly the defect this tool used to have. Silent, as core's own reactivation
+  * after an update is (update.php?action=activate-plugin passes $silent = true): the
+  * plugin's activation hook already ran when it was first activated, and running it again
+  * mid-update can reset its settings.
+  *
+  * @return string '' when it is back where it was, otherwise a sentence to append.
+  */
+  private function restore_activation( string $plugin, bool $was_site, bool $was_network ): string {
+    if ( $was_site && !in_array( $plugin, $this->site_active_plugins(), true ) ) {
+      activate_plugin( $plugin, '', false, true );
+    }
+    if ( $was_network && !is_plugin_active_for_network( $plugin ) ) {
+      activate_plugin( $plugin, '', true, true );
+    }
+    $missing = [];
+    if ( $was_site && !in_array( $plugin, $this->site_active_plugins(), true ) ) {
+      $missing[] = 'on this site';
+    }
+    if ( $was_network && !is_plugin_active_for_network( $plugin ) ) {
+      $missing[] = 'network-wide';
+    }
+    if ( !$missing ) {
+      return '';
+    }
+    return ' It was active ' . implode( ' and ', $missing ) . ' before the update and could not be reactivated, so it is inactive now. Reactivate it with wp_activate_plugin once the cause is clear.';
+  }
+
+  /**
+  * Ask the update service now, rather than trusting an answer up to 12 hours old.
+  *
+  * wp_update_plugins() and wp_update_themes() return early when the last check is
+  * younger than their timeout, which outside wp-admin and cron is 12 hours, so "already
+  * up to date" could describe yesterday. Setting last_checked back to zero forces the
+  * request while keeping the stored response: if the service cannot be reached, the
+  * previous answer survives instead of an empty one that would read as "nothing to do".
+  *
+  * @param string $kind 'plugin' or 'theme'.
+  * @return bool Whether the update service answered this time.
+  */
+  private function refresh_update_data( string $kind ): bool {
+    $transient = $kind === 'theme' ? 'update_themes' : 'update_plugins';
+    $endpoint = $kind === 'theme' ? '/themes/update-check/' : '/plugins/update-check/';
+    $current = get_site_transient( $transient );
+    if ( is_object( $current ) ) {
+      $current->last_checked = 0;
+      set_site_transient( $transient, $current );
+    }
+    $reached = false;
+    $listen = function ( $response, $context, $class, $args, $url ) use ( &$reached, $endpoint ) {
+      if ( strpos( (string) $url, $endpoint ) !== false ) {
+        $reached = !is_wp_error( $response ) && (int) wp_remote_retrieve_response_code( $response ) === 200;
+      }
+    };
+    add_action( 'http_api_debug', $listen, 10, 5 );
+    try {
+      if ( $kind === 'theme' ) {
+        wp_update_themes();
+      }
+      else {
+        wp_update_plugins();
+      }
+    }
+    finally {
+      remove_action( 'http_api_debug', $listen, 10 );
+    }
+    return $reached;
   }
 
   /**
@@ -1466,11 +1602,19 @@ class GMCP_Tools_Admin {
       return $this->error( $r, "No installed theme has the stylesheet \"{$stylesheet}\"." );
     }
 
-    wp_update_themes();
+    $checked = $this->refresh_update_data( 'theme' );
     $updates = get_site_transient( 'update_themes' );
     if ( empty( $updates->response[ $stylesheet ] ) ) {
-      return $this->text( $r, "\"{$stylesheet}\" is already up to date." );
+      return $this->text( $r, $checked
+        ? "\"{$stylesheet}\" is already up to date: the update service was asked just now and offers nothing newer."
+        : "No update is known for \"{$stylesheet}\", but the update service could not be reached just now, so that is only as fresh as this site's last successful check. Nothing was changed."
+      );
     }
+    // Theme_Upgrader::upgrade(), unlike the plugin upgrader's, keeps an active theme
+    // active (current_after() even follows a renamed directory). Recorded anyway so the
+    // reply is checked against the stored options rather than taken on trust.
+    $was_stylesheet = get_stylesheet();
+    $was_template = get_template();
 
     $skin = $this->skin();
     $upgrader = new Theme_Upgrader( $skin );
@@ -1480,6 +1624,9 @@ class GMCP_Tools_Admin {
       return $this->error( $r, 'Update failed: ' . $this->upgrader_error( $result, $skin, 'the update could not be applied.' ) );
     }
     $new = $updates->response[ $stylesheet ]['new_version'] ?? '';
+    if ( get_option( 'stylesheet' ) !== $was_stylesheet || get_option( 'template' ) !== $was_template ) {
+      return $this->error( $r, "Updated \"{$stylesheet}\", but the active theme is no longer what it was before the update (it was \"{$was_stylesheet}\", it is now \"" . get_option( 'stylesheet' ) . '"). Check the site with wp_list_themes.' );
+    }
     return $this->text( $r, "Updated \"{$stylesheet}\"" . ( $new ? " to {$new}." : '.' ) );
   }
 
