@@ -64,6 +64,15 @@ add_action('acf/init', function() {
                 'required' => false,
             ],
             [
+                'key' => 'field_smoke_date',
+                'name' => 'smoke_date',
+                'label' => 'Smoke Date',
+                'type' => 'date_picker',
+                'display_format' => 'd/m/Y',
+                'return_format' => 'd/m/Y',
+                'required' => false,
+            ],
+            [
                 'key' => 'field_smoke_secret',
                 'name' => 'smoke_api_key',
                 'label' => 'Smoke API Key',
@@ -150,6 +159,53 @@ check "a credential-shaped field is redacted on read (by key)" \
 # Writing a credential-shaped field should be refused.
 call a_set_secret "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"acf_set_field_value\",\"arguments\":{\"field\":\"smoke_api_key\",\"value\":\"sk-live-secret-12345\",\"post_id\":$TEST_POST}}}"
 check "writing a credential-shaped field is refused" "$(verdict a_set_secret)" "error"
+
+echo "-- only a registered field is read (raw meta must not be reachable by name) --"
+# get_field() on a name ACF does not know builds a dummy field and returns the raw meta row,
+# for a user, term, comment or post. Seed two such rows on user 1: one whose name is
+# credential-shaped (the shape of a two-factor seed) and one whose name is innocuous, so the
+# refusal is shown to be about registration and not only about the name.
+SEED_USER=$(wpc eval 'echo get_users(["role"=>"administrator","number"=>1,"orderby"=>"ID","order"=>"ASC","fields"=>"ID"])[0];')
+docker compose exec -T cli wp eval "update_user_meta($SEED_USER,'_two_factor_totp_key','JBSWY3DPEHPK3PXP-smoke');update_user_meta($SEED_USER,'smoke_plain_note','plain-raw-meta-smoke');update_post_meta($TEST_POST,'smoke_text','registered-control');update_post_meta($TEST_POST,'_smoke_text','field_smoke_text');" >/dev/null 2>&1
+call a_raw_secret "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"acf_get_field_value\",\"arguments\":{\"field\":\"_two_factor_totp_key\",\"post_id\":\"user_$SEED_USER\"}}}"
+check "an unregistered credential-shaped user meta key is refused" "$(verdict a_raw_secret)" "error"
+check "and its value is nowhere in the reply" \
+  "$(py 'import sys;print("JBSWY3DPEHPK3PXP" in sys.stdin.read())' a_raw_secret)" "False"
+call a_raw_plain "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"acf_get_field_value\",\"arguments\":{\"field\":\"smoke_plain_note\",\"post_id\":\"user_$SEED_USER\"}}}"
+check "an unregistered innocuous user meta key is refused too" "$(verdict a_raw_plain)" "error"
+check "and its value is nowhere in the reply" \
+  "$(py 'import sys;print("plain-raw-meta-smoke" in sys.stdin.read())' a_raw_plain)" "False"
+call a_raw_ctrl "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/call\",\"params\":{\"name\":\"acf_get_field_value\",\"arguments\":{\"field\":\"smoke_text\",\"post_id\":$TEST_POST}}}"
+check "CONTROL: a registered field still reads" \
+  "$(py 'import json,sys;d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(d["value"])' a_raw_ctrl)" "registered-control"
+check "CONTROL: the probe can see the seeded meta when it is there" \
+  "$(wpc eval "echo get_user_meta($SEED_USER,'smoke_plain_note',true);")" "plain-raw-meta-smoke"
+docker compose exec -T cli wp eval "delete_user_meta($SEED_USER,'_two_factor_totp_key');delete_user_meta($SEED_USER,'smoke_plain_note');" >/dev/null 2>&1
+
+echo "-- writing is refused on an order or subscription post --"
+# A commerce post is a wp_posts row with HPOS off. Make one without WooCommerce: the guard
+# asks the post's type, which does not need the type to be registered.
+ORDER_POST=$(wpc eval 'echo wp_insert_post(["post_type"=>"shop_order","post_status"=>"draft","post_title"=>"smoke acf order"]);')
+call a_order "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"tools/call\",\"params\":{\"name\":\"acf_set_field_value\",\"arguments\":{\"field\":\"field_smoke_text\",\"value\":\"order-write\",\"post_id\":$ORDER_POST}}}"
+check "writing an ACF field on a shop_order is refused" "$(verdict a_order)" "error"
+check "and nothing was stored on it" \
+  "$(wpc eval "echo metadata_exists('post',$ORDER_POST,'smoke_text')?'stored':'none';")" "none"
+call a_order_ctrl "{\"jsonrpc\":\"2.0\",\"id\":24,\"method\":\"tools/call\",\"params\":{\"name\":\"acf_set_field_value\",\"arguments\":{\"field\":\"field_smoke_text\",\"value\":\"post-write\",\"post_id\":$TEST_POST}}}"
+check "CONTROL: the same call on an ordinary post succeeds" "$(verdict a_order_ctrl)" "ok"
+wpc post delete "$ORDER_POST" --force >/dev/null 2>&1
+
+echo "-- the verdict is the stored value, not update_field()'s return --"
+# Unchanged: update_field() returns false for an identical value. Applying the same value
+# twice is idempotent, not an error.
+call a_same1 "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":\"tools/call\",\"params\":{\"name\":\"acf_set_field_value\",\"arguments\":{\"field\":\"smoke_text\",\"value\":\"idempotent\",\"post_id\":$TEST_POST}}}"
+call a_same2 "{\"jsonrpc\":\"2.0\",\"id\":26,\"method\":\"tools/call\",\"params\":{\"name\":\"acf_set_field_value\",\"arguments\":{\"field\":\"smoke_text\",\"value\":\"idempotent\",\"post_id\":$TEST_POST}}}"
+check "the first write succeeds" "$(verdict a_same1)" "ok"
+check "writing the same value again also succeeds" "$(verdict a_same2)" "ok"
+check "and the stored value is the one asked for" "$(wpc eval "echo get_post_meta($TEST_POST,'smoke_text',true);")" "idempotent"
+# A date picker returns d/m/Y when formatted; the stored value is Ymd. The write is right.
+call a_date "{\"jsonrpc\":\"2.0\",\"id\":27,\"method\":\"tools/call\",\"params\":{\"name\":\"acf_set_field_value\",\"arguments\":{\"field\":\"smoke_date\",\"value\":\"20260315\",\"post_id\":$TEST_POST}}}"
+check "a date picker write is not reported as a failure" "$(verdict a_date)" "ok"
+check "and the raw stored date is what was sent" "$(wpc eval "echo get_post_meta($TEST_POST,'smoke_date',true);")" "20260315"
 
 echo "-- post_id validation --"
 # An arbitrary string post_id should be refused.

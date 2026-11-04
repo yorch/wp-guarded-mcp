@@ -738,10 +738,18 @@ class GMCP_Tools_Gravityforms {
 
   private function list_entries( array $args, array $r ): array {
     $form_id = (int) ( $args['form_id'] ?? 0 );
-    $forms = $this->forms_all();
-
-    if ( $form_id > 0 && !isset( $forms[ $form_id ] ) ) {
-      return $this->error( $r, 'No form with ID ' . $form_id . ' exists.' );
+    // One form named: fetch that form alone. forms_all() unserialises every form's full
+    // field schema, twice, and this ran it on every page of results just to validate one
+    // id. A form in the trash is treated as absent, as forms_all() always did.
+    if ( $form_id > 0 ) {
+      $one = $this->form( $form_id );
+      if ( !$one || (int) ( $one['is_trash'] ?? 0 ) === 1 ) {
+        return $this->error( $r, 'No form with ID ' . $form_id . ' exists.' );
+      }
+      $forms = [ $form_id => $one ];
+    }
+    else {
+      $forms = $this->forms_all();
     }
 
     $status_arg = isset( $args['status'] ) ? strtolower( trim( (string) $args['status'] ) ) : '';
@@ -825,8 +833,18 @@ class GMCP_Tools_Gravityforms {
     $order = ( isset( $args['order'] ) && strtolower( (string) $args['order'] ) === 'asc' ) ? 'ASC' : 'DESC';
 
     $total = 0;
+    // No form named: get_entries( 0, … ) applies no form restriction at all, trashed
+    // forms' entries included, which the description says are excluded. Name the live forms
+    // instead. An empty list must not reach GFAPI, where it would mean "every form".
+    $scope = $form_id;
+    if ( $form_id <= 0 ) {
+      if ( !$forms ) {
+        return $this->json( $r, [ 'entries' => [], 'count' => 0, 'total' => 0, 'page' => $page, 'limit' => $limit, 'statuses_queried' => array_values( $criteria['status'] ), 'note' => 'There are no forms that are not in the trash.' ] );
+      }
+      $scope = array_keys( $forms );
+    }
     $entries = \GFAPI::get_entries(
-      $form_id,
+      $scope,
       $criteria,
       [ 'key' => 'id', 'direction' => $order, 'is_numeric' => true ],
       [ 'offset' => ( $page - 1 ) * $limit, 'page_size' => $limit ],
@@ -839,7 +857,7 @@ class GMCP_Tools_Gravityforms {
     $rows = [];
     foreach ( $entries as $entry ) {
       $eid = (int) ( $entry['id'] ?? 0 );
-      $eform = $this->form( (int) ( $entry['form_id'] ?? 0 ) );
+      $eform = $forms[ (int) ( $entry['form_id'] ?? 0 ) ] ?? $this->form( (int) ( $entry['form_id'] ?? 0 ) );
       $rows[] = [
         'id' => $eid,
         'form_id' => (int) ( $entry['form_id'] ?? 0 ),
@@ -1090,7 +1108,17 @@ class GMCP_Tools_Gravityforms {
     $after = $this->entry( $entry_id );
     $stored = $after ? $this->display_value( $after[ $input_id ] ?? '' ) : null;
     if ( $stored !== $value ) {
-      return $this->error( $r, 'Input "' . $input_id . '" on entry ' . $entry_id . ' was written but reads back as "' . $this->preview( (string) $stored ) . '" rather than the requested value.', -32603 );
+      // Two different things look alike here. If the stored value is still what it was, the
+      // write did not happen and that is a failure. If it changed to something else, the
+      // write happened and Gravity Forms normalised it on the way in (a field's own save
+      // filter, sanitising, number or date formatting, a length limit, an encryption
+      // add-on), and reporting that as an error withheld the change announcement, left the
+      // caller to retry, and described a successful overwrite as a failed one. The caller
+      // gets success with the stored value so the difference is visible.
+      if ( $stored === null || $stored === $current ) {
+        return $this->error( $r, 'Input "' . $input_id . '" on entry ' . $entry_id . ' was not changed: it still reads back as "' . $this->preview( (string) $stored ) . '" rather than the requested value.', -32603 );
+      }
+      return $this->text( $r, 'Entry ' . $entry_id . ': input "' . $input_id . '" (' . $info['label'] . ') was written, but Gravity Forms stored it as "' . $this->preview( (string) $stored ) . '", which differs from the requested "' . $this->preview( $value ) . '". Fields normalise what they save (escaping, number and date formats, length limits, save filters), so check that the stored form is what you wanted.' );
     }
 
     return $this->text( $r, 'Entry ' . $entry_id . ': input "' . $input_id . '" (' . $info['label'] . ') updated and verified by reading it back.' );

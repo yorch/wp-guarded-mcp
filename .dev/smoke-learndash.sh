@@ -170,6 +170,20 @@ check "and nests the quiz under lesson two" \
   "$(py 'import json,sys;d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);s=d["structure"]["lessons"];print(s[1]["quizzes"][0]["id"])' "" ld_course)" "$QUIZ"
 check "and never returns the course_access_list setting (user IDs)" \
   "$(py 'import json,sys;d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print("course_access_list" in json.dumps(d))' "" ld_course)" "False"
+# Course materials are author content shown only to enrolled students, and this tool is
+# read level. Seeded through LearnDash's own setting writer, with a control that a different
+# setting of the same course does come back, so the absence is not a broken probe.
+docker compose exec -T cli wp eval "if ( function_exists( 'learndash_update_setting' ) ) { learndash_update_setting( $COURSE, 'course_materials', '<a href=\"https://private.example.test/secret-pack.zip\">GMCP-MATERIALS-MARKER</a>' ); }" >/dev/null 2>&1
+check "CONTROL: the materials really are stored on the course" \
+  "$(docker compose exec -T cli wp eval "echo function_exists( 'learndash_get_course_meta_setting' ) && strpos( (string) learndash_get_course_meta_setting( $COURSE, 'course_materials' ), 'GMCP-MATERIALS-MARKER' ) !== false ? 'stored' : 'missing';" 2>/dev/null | tr -d '\r\n')" "stored"
+call ld_course_m "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"ld_get_course\",\"arguments\":{\"course_id\":$COURSE}}}"
+check "CONTROL: the same reply does carry the course's other settings" \
+  "$(py 'import json,sys;d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print("course_price_type" in d["settings"])' "" ld_course_m)" "True"
+check "the course materials are not returned at read level" \
+  "$(py 'import json,sys;print("GMCP-MATERIALS-MARKER" in sys.stdin.read())' "" ld_course_m)" "False"
+check "and the reply says only that some are set" \
+  "$(py 'import json,sys;d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(d["settings"].get("course_materials_set"))' "" ld_course_m)" "True"
+docker compose exec -T cli wp eval "if ( function_exists( 'learndash_update_setting' ) ) { learndash_update_setting( $COURSE, 'course_materials', '' ); }" >/dev/null 2>&1
 call ld_brief '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ld_courses_briefing","arguments":{}}}'
 check "ld_courses_briefing succeeds" "$(verdict ld_brief)" "ok"
 
@@ -195,6 +209,14 @@ check "ld_list_user_courses succeeds" "$(verdict ld_ucourses)" "ok"
 check "and reports both reasons for a member who is enrolled as well" \
   "$(py 'import json,sys;d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);c=[x for x in d["courses"] if x["course_id"]==int(sys.argv[1])][0];print("group" in c["reasons"] and "direct" in c["reasons"])' "$COURSE" ld_ucourses)" "True"
 
+# The page argument was missing, so a user with more than one page of reachable courses
+# could never see past the first.
+call ld_ucourses_p2 "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/call\",\"params\":{\"name\":\"ld_list_user_courses\",\"arguments\":{\"user_id\":$GROUPIE,\"limit\":1,\"page\":2}}}"
+check "ld_list_user_courses honours page (page 2 of limit 1 is not page 1)" \
+  "$(py 'import json,sys
+a=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])
+print(a["page"])' "" ld_ucourses_p2)" "2"
+
 echo "-- reading progress --"
 call ld_prog "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"ld_get_user_progress\",\"arguments\":{\"user_id\":$STUDENT,\"course_id\":$COURSE}}}"
 check "ld_get_user_progress succeeds" "$(verdict ld_prog)" "ok"
@@ -214,6 +236,9 @@ check "CONTROL: the user to enrol starts with no direct enrolment" \
   "$(dbq "SELECT COUNT(*) FROM $(wpc db prefix)usermeta WHERE user_id=$OTHER AND meta_key='course_${COURSE}_access_from'")" "0"
 call ld_enrol "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ld_enroll_user\",\"arguments\":{\"user_id\":$OTHER,\"course_id\":$COURSE}}}"
 check "ld_enroll_user succeeds" "$(verdict ld_enrol)" "ok"
+# The mail measurement is stated either way: a count, or an explicit "none through wp_mail".
+check "and the reply states what was emailed, or that nothing went through wp_mail" \
+  "$(ctext ld_enrol | grep -c -E 'went out during the change|No email went through wp_mail')" "1"
 check "and the enrolment meta now exists" \
   "$(dbq "SELECT CASE WHEN meta_value <> '' THEN 'set' ELSE 'empty' END FROM $(wpc db prefix)usermeta WHERE user_id=$OTHER AND meta_key='course_${COURSE}_access_from' LIMIT 1")" "set"
 call ld_enrol2 "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"ld_enroll_user\",\"arguments\":{\"user_id\":$OTHER,\"course_id\":$COURSE}}}"

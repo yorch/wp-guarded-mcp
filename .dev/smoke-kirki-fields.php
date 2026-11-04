@@ -58,3 +58,15 @@ add_action( 'init', function () {
     'default'  => '',
   ] );
 } );
+
+// Test hook for the rollback check: when smoke_force_cast is set, the FIRST write to the
+// standalone field stores something other than what was asked for, the way a sanitizer or
+// a filter on the option would. One-shot, so the rollback's own write is not also changed.
+add_filter( 'pre_update_option_smoke_standalone_opt', function ( $value ) {
+  static $used = false;
+  if ( !$used && get_option( 'smoke_force_cast' ) ) {
+    $used = true;
+    return 'cast-by-filter';
+  }
+  return $value;
+} );

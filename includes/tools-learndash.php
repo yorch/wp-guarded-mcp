@@ -95,7 +95,7 @@ class GMCP_Tools_Learndash {
       ],
       'ld_get_course' => [
         'name' => 'ld_get_course',
-        'description' => 'Read one LearnDash course: its structure and its access settings. The structure is the ordered list of lessons, each with the topics and quizzes attached to it, plus the course-level and global quizzes; quizzes are attached to lessons or to the course rather than being steps in the lesson/topic tree, so they are returned under the lesson or course they belong to. The settings summary covers what decides whether a user can reach the course (price type, price, the join setting) and a few course options. It deliberately does not return the course_access_list setting, which is a list of user IDs. This is configuration only: nothing about any individual student is returned.',
+        'description' => 'Read one LearnDash course: its structure and its access settings. The structure is the ordered list of lessons, each with the topics and quizzes attached to it, plus the course-level and global quizzes; quizzes are attached to lessons or to the course rather than being steps in the lesson/topic tree, so they are returned under the lesson or course they belong to. The settings summary covers what decides whether a user can reach the course (price type, price, the join setting) and a few course options. It deliberately does not return the course_access_list setting, which is a list of user IDs, nor the course materials, which are content LearnDash shows only to enrolled users (the reply says only whether any are set). A draft, pending or private course can be read too, structure included, so a readonly key sees unpublished course outlines. This is configuration only: nothing about any individual student is returned.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -136,6 +136,7 @@ class GMCP_Tools_Learndash {
           'properties' => [
             'user_id' => [ 'type' => 'integer' ],
             'limit' => [ 'type' => 'integer', 'description' => 'Rows per page, 1 to 100. Default 20.' ],
+            'page' => [ 'type' => 'integer', 'description' => 'Page number, 1-based. Default 1.' ],
           ],
           'required' => [ 'user_id' ],
         ],
@@ -168,7 +169,7 @@ class GMCP_Tools_Learndash {
       ],
       'ld_enroll_user' => [
         'name' => 'ld_enroll_user',
-        'description' => 'Give a user a DIRECT enrolment in a course, the same enrolment the course\'s users list shows. This grants access; it does not revoke anything and it is not a group membership. The reply reports whether the enrolment was newly created or already existed, and separately says when the user could already reach the course for another reason (an open course, a group, or an administrator\'s automatic access), so a caller is not told that access was granted when the user already had it. Not recorded by wp_undo_change: LearnDash keeps enrolment in user meta, which the change journal does not read, so there is no undo beyond calling ld_unenroll_user. Call ld_get_course first if you need the course\'s access settings.',
+        'description' => 'Give a user a DIRECT enrolment in a course, the same enrolment the course\'s users list shows. This grants access; it does not revoke anything and it is not a group membership. The reply reports whether the enrolment was newly created or already existed, and separately says when the user could already reach the course for another reason (an open course, a group, or an administrator\'s automatic access), so a caller is not told that access was granted when the user already had it. Enrolling can notify people: LearnDash add-ons and automation plugins hook the enrolment and send the student an email or call an outside service. The reply reports every email that went through wp_mail during the call; a webhook or a mail library that bypasses wp_mail is invisible to that measurement, so its absence is not proof that nothing left the site. Not recorded by wp_undo_change: LearnDash keeps enrolment in user meta, which the change journal does not read, so there is no undo beyond calling ld_unenroll_user. Call ld_get_course first if you need the course\'s access settings.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -181,7 +182,7 @@ class GMCP_Tools_Learndash {
       ],
       'ld_unenroll_user' => [
         'name' => 'ld_unenroll_user',
-        'description' => 'Remove a user\'s DIRECT enrolment from a course. Two steps: the first call changes nothing and returns a confirmation token, and only a second call carrying it removes the enrolment. It refuses when the user has no direct enrolment to remove, and it refuses when their access comes from a LearnDash Group, because deleting the direct enrolment would do nothing and a caller would wrongly believe access had been revoked; where access is a group membership the reply names the group. Access that comes from an open course or from an administrator\'s automatic access is not revoked here either, and a purchase-granted enrolment IS removed as a direct enrolment because that is how a purchase grants one: the transaction itself is untouched and a re-sync from the payment provider can grant it again. Removal is not a faithful undo of ld_enroll_user: the enrolment timestamp is replaced on re-enrolment, and the original drives content drip and access expiry. The record that the user was once enrolled is also kept, because LearnDash keeps it for reporting. Not recorded by wp_undo_change.',
+        'description' => 'Remove a user\'s DIRECT enrolment from a course. Two steps: the first call changes nothing and returns a confirmation token, and only a second call carrying it removes the enrolment. It refuses when the user has no direct enrolment to remove, and it refuses when their access comes from a LearnDash Group, because deleting the direct enrolment would do nothing and a caller would wrongly believe access had been revoked; where access is a group membership the reply names the group. Access that comes from an open course or from an administrator\'s automatic access is not revoked here either, and a purchase-granted enrolment IS removed as a direct enrolment because that is how a purchase grants one: the transaction itself is untouched and a re-sync from the payment provider can grant it again. Removal is not a faithful undo of ld_enroll_user: the enrolment timestamp is replaced on re-enrolment, and the original drives content drip and access expiry. The record that the user was once enrolled is also kept, because LearnDash keeps it for reporting. Removing can notify too (add-ons hook the removal); the reply reports every email that went through wp_mail during the call and cannot see a webhook. Not recorded by wp_undo_change.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -526,9 +527,15 @@ class GMCP_Tools_Learndash {
     // course_access_list, an array of user IDs, which is personal data by reference and is
     // not needed to read a course's structure.
     $settings = [];
-    foreach ( [ 'course_price_type', 'course_price', 'course_join', 'course_prerequisite', 'course_materials', 'certificate' ] as $key ) {
+    foreach ( [ 'course_price_type', 'course_price', 'course_join', 'course_prerequisite', 'certificate' ] as $key ) {
       $settings[ $key ] = $this->meta_setting( $course_id, $key );
     }
+    // The course materials are HTML the author writes for ENROLLED students — download
+    // links, private URLs, instructor notes — and LearnDash withholds them from everyone
+    // else. This tool is read level, the lowest tier, so the content is not returned, only
+    // whether there is any.
+    $materials = $this->meta_setting( $course_id, 'course_materials' );
+    $settings['course_materials_set'] = is_string( $materials ) ? trim( $materials ) !== '' : !empty( $materials );
 
     $price = function_exists( 'learndash_get_course_price' ) ? learndash_get_course_price( $course_id ) : [];
 
@@ -638,12 +645,13 @@ class GMCP_Tools_Learndash {
       return $this->error( $r, 'No user with ID ' . $user_id . ' exists.' );
     }
     $limit = $this->clamp_limit( $args['limit'] ?? null );
+    $page = $this->page( $args['page'] ?? 1 );
     $course_ids = array_map( 'intval', (array) learndash_user_get_enrolled_courses( $user_id ) );
     sort( $course_ids, SORT_NUMERIC );
     $total = count( $course_ids );
 
     $rows = [];
-    foreach ( array_slice( $course_ids, 0, $limit ) as $course_id ) {
+    foreach ( array_slice( $course_ids, ( $page - 1 ) * $limit, $limit ) as $course_id ) {
       $post = get_post( $course_id );
       if ( !$post || $post->post_type !== 'sfwd-courses' ) {
         continue;
@@ -669,6 +677,7 @@ class GMCP_Tools_Learndash {
       'courses' => $rows,
       'count' => count( $rows ),
       'total' => $total,
+      'page' => $page,
       'limit' => $limit,
       'note' => 'These are courses the user can REACH, which includes open courses and, for an administrator, every course. Each row carries the reasons so "reachable" is not read as "enrolled".',
     ] );
@@ -802,14 +811,22 @@ class GMCP_Tools_Learndash {
       return $this->text( $r, 'User ' . $user_id . ' already holds a direct enrolment in course ' . $course_id . ( $before['direct_since'] ? ' (since ' . $before['direct_since'] . ')' : '' ) . '. Nothing was written.' . $this->reachability_note( $before ) );
     }
 
-    $result = ld_update_course_access( $user_id, $course_id );
+    $sent = [];
+    $capture = $this->mail_capture( $sent );
+    add_filter( 'wp_mail', $capture, PHP_INT_MAX );
+    try {
+      $result = ld_update_course_access( $user_id, $course_id );
+    }
+    finally {
+      remove_filter( 'wp_mail', $capture, PHP_INT_MAX );
+    }
 
     $after = $this->access_state( $user_id, $course_id );
     if ( !$after['direct'] ) {
       return $this->error( $r, 'LearnDash did not record a direct enrolment for user ' . $user_id . ' in course ' . $course_id . ' (ld_update_course_access returned ' . var_export( $result, true ) . ' and no enrolment meta exists).', -32603 );
     }
 
-    return $this->text( $r, 'Granted user ' . $user_id . ' a direct enrolment in course ' . $course_id . '.' . $this->reachability_note( $before ) );
+    return $this->text( $r, 'Granted user ' . $user_id . ' a direct enrolment in course ' . $course_id . '.' . $this->reachability_note( $before ) . ' ' . $this->describe_mail( $sent, $user_id ) );
   }
 
   private function unenroll_user( array $args, array $r ): array {
@@ -853,14 +870,60 @@ class GMCP_Tools_Learndash {
       return $this->error( $r, 'User ' . $user_id . '\'s access to course ' . $course_id . ' now also comes from a LearnDash Group (' . $this->group_names( $recheck ) . '), so removing the direct enrolment would not revoke it. Nothing was removed; remove the user from the group instead.' );
     }
 
-    ld_update_course_access( $user_id, $course_id, true );
+    $sent = [];
+    $capture = $this->mail_capture( $sent );
+    add_filter( 'wp_mail', $capture, PHP_INT_MAX );
+    try {
+      ld_update_course_access( $user_id, $course_id, true );
+    }
+    finally {
+      remove_filter( 'wp_mail', $capture, PHP_INT_MAX );
+    }
 
     $after = $this->access_state( $user_id, $course_id );
     if ( $after['direct'] ) {
       return $this->error( $r, 'LearnDash did not remove the direct enrolment for user ' . $user_id . ' in course ' . $course_id . '; the enrolment meta is still present.', -32603 );
     }
 
-    return $this->text( $r, 'Removed the direct enrolment of user ' . $user_id . ' from course ' . $course_id . '. The enrolment-date record is kept, as LearnDash does for reporting.' . $this->surviving_note( $after ) );
+    return $this->text( $r, 'Removed the direct enrolment of user ' . $user_id . ' from course ' . $course_id . '. The enrolment-date record is kept, as LearnDash does for reporting.' . $this->surviving_note( $after ) . ' ' . $this->describe_mail( $sent, $user_id ) );
+  }
+
+  /** A wp_mail filter recording each recipient, reduced to the bare address, into $sent. */
+  private function mail_capture( array &$sent ): \Closure {
+    return function ( $args ) use ( &$sent ) {
+      foreach ( (array) ( is_array( $args ) ? ( $args['to'] ?? [] ) : [] ) as $to ) {
+        foreach ( explode( ',', (string) $to ) as $one ) {
+          $one = trim( $one );
+          if ( preg_match( '/<([^<>]+)>/', $one, $m ) ) {
+            $one = trim( $m[1] );
+          }
+          $one = strtolower( $one );
+          if ( $one !== '' ) {
+            $sent[] = $one;
+          }
+        }
+      }
+      return $args;
+    };
+  }
+
+  /**
+  * What the change sent by email, measured at wp_mail.
+  *
+  * LearnDash itself does not mail on enrolment, but its notification add-ons and many
+  * automation plugins hook the enrolment action and do. This is the same measurement the
+  * shop tools make. It says what it cannot see: a webhook, or a mailer that does not go
+  * through wp_mail, leaves no trace here.
+  */
+  private function describe_mail( array $sent, int $user_id ): string {
+    $sent = array_values( array_unique( $sent ) );
+    if ( !$sent ) {
+      return 'No email went through wp_mail during the change. This cannot see a webhook or a plugin that sends mail another way.';
+    }
+    $user = $this->user( $user_id );
+    $addr = $user ? strtolower( trim( (string) $user->user_email ) ) : '';
+    $to_user = $addr !== '' && in_array( $addr, $sent, true );
+    return count( $sent ) . ' email(s) went out during the change' . ( $to_user ? ', including one to the user (' . $addr . '), which cannot be taken back' : '' ) . ': ' . implode( ', ', $sent ) . '.';
   }
 
   /** A sentence naming the NON-direct reasons a user can still reach a course, or ''. */

@@ -110,7 +110,7 @@ class GMCP_Tools_Woo_Subscriptions {
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
-            'status' => [ 'type' => 'string', 'description' => 'active, on-hold, pending, cancelled, expired, switched, pending-cancel, trash, or any. Default any.' ],
+            'status' => [ 'type' => 'string', 'description' => 'active, on-hold, pending, cancelled, expired, switched, pending-cancel, or any. Default any.' ],
             'customer_id' => [ 'type' => 'integer', 'description' => 'Only this customer\'s subscriptions.' ],
             'limit' => [ 'type' => 'integer', 'description' => 'Default 20, maximum 100.' ],
             'page' => [ 'type' => 'integer', 'description' => 'Page number, 1-based. Default 1.' ],
@@ -120,7 +120,7 @@ class GMCP_Tools_Woo_Subscriptions {
       ],
       'wcs_get_subscription' => [
         'name' => 'wcs_get_subscription',
-        'description' => 'Read one subscription: its status, every date it holds (start, trial end, next payment, last payment, end, cancelled) in both GMT and the site\'s time zone, the billing interval and period, the total and currency, the gateway, whether it renews automatically or requires manual renewal, the parent order and the renewal orders related to it, and the signed numbers that matter for support — how many times it has been suspended and whether it is behind on payment. Also reports whether the payment job is actually scheduled and for when, which is the real answer to "will this charge", since it can disagree with the stored date. Deliberately no billing email or address, no line-item names, no notes and no payment-method meta. Changes nothing.',
+        'description' => 'Read one subscription: its status, every date it holds (start, trial end, next payment, last payment, end, cancelled) in both GMT and the site\'s time zone, the billing interval and period, the total and currency, the gateway, whether it renews automatically or requires manual renewal, the parent order and the renewal orders related to it, and the signed numbers that matter for support — how many times it has been suspended and whether it is behind on payment. Also reports whether the payment job is actually scheduled and for when, which is the real answer to "will this charge", since it can disagree with the stored date. Deliberately no billing email or address, no line-item names, no notes and no payment-method meta. Changes no subscription data; the first read of a subscription\'s related orders can make WooCommerce Subscriptions store its own related-order cache row on it, which is bookkeeping and not a change to the subscription.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -132,13 +132,13 @@ class GMCP_Tools_Woo_Subscriptions {
       ],
       'wcs_subscriptions_briefing' => [
         'name' => 'wcs_subscriptions_briefing',
-        'description' => 'The recurring-revenue picture in one call: how many subscriptions exist in each status, how many renew in the next 7 and 30 days, how many are on hold or behind on payment, and the committed monthly and annual amount broken down by currency. Counts and totals only, so it is a read tool. Two honesty notes live in the reply: the monthly figure is derived by normalising each subscription\'s interval to a month, which is an approximation and says so, and the payment retry setting is reported as enabled, disabled or unset rather than as a number of retries.',
+        'description' => 'The recurring-revenue picture in one call: how many subscriptions exist in each status, how many renew in the next 7 and 30 days, and the committed monthly and annual amount broken down by currency (the on-hold count is in the status breakdown; it does not separately count payment arrears). Counts and totals only, so it is a read tool. It reads at most 2000 active subscriptions for the amounts and says when it stopped early. Two honesty notes live in the reply: the monthly figure is derived by normalising each subscription\'s interval to a month, which is an approximation and says so, and the payment retry setting is reported as enabled, disabled or unset rather than as a number of retries.',
         'inputSchema' => [ 'type' => 'object', 'properties' => new \stdClass() ],
         'accessLevel' => 'read',
       ],
       'wcs_set_subscription_status' => [
         'name' => 'wcs_set_subscription_status',
-        'description' => 'Move a subscription between the states a shop owner manages: active to on-hold (stop charging, keep the agreement), on-hold to active (start again), active to pending-cancel (the customer asked to stop, so it ends at the period end), and pending-cancel back to active (they changed their mind). Everything else is refused, including transitions WooCommerce Subscriptions itself allows. Two of the four can also be refused for this particular subscription: reactivating one that is behind on payment is refused, because it would restore service and cancel the pending retry without collecting the debt, and reactivating a pending-cancel one is refused when the original end date was not recorded, because the subscription would then renew forever. This goes through the subscription\'s own API, so the payment schedule, the dates and the gateway are kept in step — which is why it takes the call and not a plain write. It can email the customer: the reply names every address written to. Not reversible in one step and not recorded by wp_undo_change, so the reply reports what changed. Requires admin.',
+        'description' => 'Move a subscription between the states a shop owner manages: active to on-hold (stop charging, keep the agreement), on-hold to active (start again), active to pending-cancel (the customer asked to stop, so it ends at the period end), and pending-cancel back to active (they changed their mind). Everything else is refused, including transitions WooCommerce Subscriptions itself allows. Two of the four can also be refused for this particular subscription: reactivating one that is behind on payment is refused, because it would restore service and cancel the pending retry without collecting the debt, and reactivating a pending-cancel one is refused when the original end date was not recorded, because the subscription would then renew forever. This goes through the subscription\'s own API, so the payment schedule, the dates and the gateway are kept in step — which is why it takes the call and not a plain write. It can email the customer: the reply names every address written to, except on a shop that defers its transactional emails until after the request, where it says that mail may follow and the recipients cannot be reported. Not reversible in one step and not recorded by wp_undo_change, so the reply reports what changed. Requires admin.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -232,6 +232,10 @@ class GMCP_Tools_Woo_Subscriptions {
   /** Every status a subscription can hold, unprefixed. */
   private function statuses(): array {
     return array_map( [ $this, 'bare' ], array_keys( (array) wcs_get_subscription_statuses() ) );
+  }
+
+  private function statuses_flip(): array {
+    return array_flip( $this->statuses() );
   }
 
   private function limit( array $a ): int {
@@ -332,8 +336,9 @@ class GMCP_Tools_Woo_Subscriptions {
       $rows[] = $this->summary_row( $sub );
     }
     // wcs_get_subscriptions() keys its array by id, which json_encode turns into an object
-    // for a caller expecting a list.
-    sort( $rows );
+    // for a caller expecting a list. array_values() is all that needs: a sort() here
+    // compared the row arrays key by key, the first key is the id, and the page came out
+    // ordered by id instead of the start date it was queried by.
     $rows = array_values( $rows );
 
     return $this->json( $r, [
@@ -421,36 +426,78 @@ class GMCP_Tools_Woo_Subscriptions {
     ] );
   }
 
+  /** The most active subscriptions the amounts are summed over, and the page they are read in. */
+  const BRIEFING_CAP = 2000;
+  const BRIEFING_PAGE = 200;
+
+  /**
+  * How many subscriptions hold a status, without loading them.
+  *
+  * wcs_get_subscriptions() has no id-only mode: it builds a WC_Subscription for every match,
+  * so counting through it with limit -1 loaded the whole table once per status. The count
+  * comes from the order query instead, which can paginate to a total of one row.
+  *
+  * @return array{0:int,1:bool} count, and whether it is a lower bound
+  */
+  private function count_status( string $status ): array {
+    if ( function_exists( 'wc_get_orders' ) ) {
+      $res = wc_get_orders( [ 'type' => 'shop_subscription', 'status' => 'wc-' . $status, 'limit' => 1, 'paginate' => true, 'return' => 'ids' ] );
+      if ( is_object( $res ) && isset( $res->total ) ) {
+        return [ (int) $res->total, false ];
+      }
+    }
+    // A build where that query does not answer: count a bounded page instead and say so.
+    $subs = wcs_get_subscriptions( [ 'subscriptions_per_page' => self::BRIEFING_PAGE, 'subscription_status' => $status ] );
+    $n = is_array( $subs ) ? count( $subs ) : 0;
+    return [ $n, $n >= self::BRIEFING_PAGE ];
+  }
+
+  /** Pending payment jobs due before $days days from now, counted by the store when it can. */
+  private function due_within( int $days ): ?int {
+    $query = [
+      'hook' => 'woocommerce_scheduled_subscription_payment',
+      'status' => \ActionScheduler_Store::STATUS_PENDING,
+      // Action Scheduler takes a bare date plus a separate comparison. A "<=" prefix on
+      // the date itself fails to parse and would make the whole briefing throw.
+      'date' => gmdate( 'Y-m-d H:i:s', time() + $days * DAY_IN_SECONDS ),
+      'date_compare' => '<=',
+    ];
+    if ( class_exists( '\ActionScheduler' ) && method_exists( '\ActionScheduler', 'store' ) ) {
+      $store = \ActionScheduler::store();
+      if ( is_object( $store ) && method_exists( $store, 'query_actions' ) ) {
+        $n = $store->query_actions( $query, 'count' );
+        if ( is_numeric( $n ) ) {
+          return (int) $n;
+        }
+      }
+    }
+    return null;
+  }
+
   private function briefing( array $a, array $r ): array {
     $counts = [];
     $total = 0;
+    $lower_bound = [];
     foreach ( $this->statuses() as $status ) {
-      $ids = wcs_get_subscriptions( [ 'subscriptions_per_page' => -1, 'subscription_status' => $status, 'return' => 'ids' ] );
-      $n = is_array( $ids ) ? count( $ids ) : 0;
+      [ $n, $approx ] = $this->count_status( $status );
       if ( $n > 0 ) {
         $counts[ $status ] = $n;
+      }
+      if ( $approx ) {
+        $lower_bound[] = $status;
       }
       $total += $n;
     }
 
     // Renewals due, from the payment schedule rather than from the stored dates, because the
     // schedule is what actually charges.
-    $due = [ 'next_7_days' => 0, 'next_30_days' => 0 ];
-    if ( function_exists( 'as_get_scheduled_actions' ) && class_exists( '\ActionScheduler_Store' ) ) {
-      foreach ( [ 7, 30 ] as $days ) {
-        // Action Scheduler takes a bare date plus a separate comparison. A "<=" prefix on
-        // the date itself fails to parse and would make the whole briefing throw.
-        $found = as_get_scheduled_actions( [
-          'hook' => 'woocommerce_scheduled_subscription_payment',
-          'status' => \ActionScheduler_Store::STATUS_PENDING,
-          'date' => gmdate( 'Y-m-d H:i:s', time() + $days * DAY_IN_SECONDS ),
-          'date_compare' => '<=',
-          'per_page' => -1,
-        ], 'ids' );
-        $due[ 'next_' . $days . '_days' ] = is_array( $found ) ? count( $found ) : 0;
+    $due = null;
+    if ( class_exists( '\ActionScheduler_Store' ) ) {
+      $d7 = $this->due_within( 7 );
+      $d30 = $this->due_within( 30 );
+      if ( $d7 !== null && $d30 !== null ) {
+        $due = [ 'next_7_days' => $d7, 'next_30_days' => $d30 ];
       }
-    } else {
-      $due = null;
     }
 
     // Committed recurring amount, normalised to a month, grouped by currency. This is an
@@ -458,48 +505,78 @@ class GMCP_Tools_Woo_Subscriptions {
     // an interval is not always a whole number of months.
     $mrr = [];
     $annual = [];
-    $active = wcs_get_subscriptions( [ 'subscriptions_per_page' => -1, 'subscription_status' => 'active' ] );
-    foreach ( (array) $active as $sub ) {
-      if ( !$sub instanceof \WC_Subscription ) {
-        continue;
+    $seen = 0;
+    $page = 1;
+    $active_total = (int) ( $counts['active'] ?? 0 );
+    // Read a page of subscriptions at a time and drop it before the next. This was one
+    // call with limit -1, which held every active subscription, with its items, at once.
+    do {
+      $batch = wcs_get_subscriptions( [ 'subscriptions_per_page' => self::BRIEFING_PAGE, 'paged' => $page, 'subscription_status' => 'active' ] );
+      $batch = is_array( $batch ) ? $batch : [];
+      foreach ( $batch as $sub ) {
+        if ( $seen >= self::BRIEFING_CAP ) {
+          break;
+        }
+        $seen++;
+        $this->add_committed( $sub, $mrr, $annual );
       }
-      $currency = (string) $sub->get_currency();
-      $amount = (float) $sub->get_total();
-      $period = (string) $sub->get_billing_period();
-      $interval = max( 1, (int) $sub->get_billing_interval() );
-      $per_month = 0.0;
-      if ( $period === 'day' ) {
-        $per_month = $amount * ( 30 / $interval );
-      } elseif ( $period === 'week' ) {
-        $per_month = $amount * ( 4.348 / $interval );
-      } elseif ( $period === 'month' ) {
-        $per_month = $amount / $interval;
-      } elseif ( $period === 'year' ) {
-        $per_month = $amount / ( 12 * $interval );
-      }
-      if ( !isset( $mrr[ $currency ] ) ) {
-        $mrr[ $currency ] = 0.0;
-        $annual[ $currency ] = 0.0;
-      }
-      $mrr[ $currency ] += $per_month;
-      $annual[ $currency ] += $per_month * 12;
-    }
+      $got = count( $batch );
+      unset( $batch );
+      $page++;
+    } while ( $got >= self::BRIEFING_PAGE && $seen < self::BRIEFING_CAP );
+    $truncated = $active_total > $seen;
+
     foreach ( $mrr as $currency => $value ) {
       $mrr[ $currency ] = round( $value, 2 );
       $annual[ $currency ] = round( $annual[ $currency ], 2 );
     }
 
-    return $this->json( $r, [
+    $committed = [
+      'per_month' => $mrr,
+      'per_year' => $annual,
+      'note' => 'The committed amount is each active subscription\'s total normalised to a month and to a year, per currency. It is an approximation: an interval is not always a whole number of months, and it ignores tax, shipping and anything a gateway adds.',
+    ];
+    if ( $truncated ) {
+      $committed['truncated'] = 'Only ' . $seen . ' of ' . $active_total . ' active subscriptions were summed, so these amounts understate the total.';
+    }
+    $out = [
       'total_subscriptions' => $total,
       'by_status' => $counts,
       'renewals_due' => $due,
-      'committed' => [
-        'per_month' => $mrr,
-        'per_year' => $annual,
-        'note' => 'The committed amount is each active subscription\'s total normalised to a month and to a year, per currency. It is an approximation: an interval is not always a whole number of months, and it ignores tax, shipping and anything a gateway adds.',
-      ],
+      'committed' => $committed,
       'retries' => $this->retry_state(),
-    ] );
+    ];
+    if ( $lower_bound ) {
+      $out['counts_are_lower_bounds_for'] = $lower_bound;
+    }
+    return $this->json( $r, $out );
+  }
+
+  /** Add one subscription's normalised monthly and annual amount to the per-currency sums. */
+  private function add_committed( $sub, array &$mrr, array &$annual ): void {
+    if ( !$sub instanceof \WC_Subscription ) {
+      return;
+    }
+    $currency = (string) $sub->get_currency();
+    $amount = (float) $sub->get_total();
+    $period = (string) $sub->get_billing_period();
+    $interval = max( 1, (int) $sub->get_billing_interval() );
+    $per_month = 0.0;
+    if ( $period === 'day' ) {
+      $per_month = $amount * ( 30 / $interval );
+    } elseif ( $period === 'week' ) {
+      $per_month = $amount * ( 4.348 / $interval );
+    } elseif ( $period === 'month' ) {
+      $per_month = $amount / $interval;
+    } elseif ( $period === 'year' ) {
+      $per_month = $amount / ( 12 * $interval );
+    }
+    if ( !isset( $mrr[ $currency ] ) ) {
+      $mrr[ $currency ] = 0.0;
+      $annual[ $currency ] = 0.0;
+    }
+    $mrr[ $currency ] += $per_month;
+    $annual[ $currency ] += $per_month * 12;
   }
 
   #endregion
@@ -516,14 +593,16 @@ class GMCP_Tools_Woo_Subscriptions {
     $target = $this->bare( sanitize_key( (string) ( $a['status'] ?? '' ) ) );
     $from = $this->bare( $sub->get_status() );
 
+    // Before the allow-list: the list has no same-state pairs, so with this test after it
+    // the friendly answer was unreachable and "already active" was reported as a refusal.
+    if ( $from === $target && $target !== '' && isset( $this->statuses_flip()[ $target ] ) ) {
+      $this->noop = true;
+      return $this->text( $r, 'Subscription ' . $id . ' is already ' . $target . '. Nothing changed, and no email was sent.' );
+    }
+
     if ( !isset( self::ALLOWED_TRANSITIONS[ $from ] ) || !in_array( $target, self::ALLOWED_TRANSITIONS[ $from ], true ) ) {
       $allowed = isset( self::ALLOWED_TRANSITIONS[ $from ] ) ? implode( ', ', self::ALLOWED_TRANSITIONS[ $from ] ) : 'nothing';
       return $this->error( $r, 'A subscription that is ' . $from . ' can be moved to ' . $allowed . ' by this tool, not to ' . $target . '. Other transitions exist in WooCommerce Subscriptions but are refused here: cancelling is terminal and cancels at the gateway on gateways that manage billing, and the states this tool does not offer are reached by the shop or the customer, not by an agent.' );
-    }
-
-    if ( $from === $target ) {
-      $this->noop = true;
-      return $this->text( $r, 'Subscription ' . $id . ' is already ' . $target . '. Nothing changed, and no email was sent.' );
     }
 
     // Guard one: reactivating a subscription that is behind on a renewal payment.
@@ -592,17 +671,8 @@ class GMCP_Tools_Woo_Subscriptions {
     // Watch what is actually sent rather than predicting it from a status. The subscription
     // plugin hooks its own emails onto the transition actions, and a shop can add more.
     $sent = [];
-    $capture = function ( $args ) use ( &$sent ) {
-      foreach ( (array) ( $args['to'] ?? [] ) as $to ) {
-        foreach ( explode( ',', (string) $to ) as $one ) {
-          $one = strtolower( trim( $one ) );
-          if ( $one !== '' ) {
-            $sent[] = $one;
-          }
-        }
-      }
-      return $args;
-    };
+    $capture = $this->mail_capture( $sent );
+    $deferred = $this->emails_deferred();
     add_filter( 'wp_mail', $capture, PHP_INT_MAX );
 
     // The note ids before the call, so the notes the transition writes can be reported
@@ -655,7 +725,7 @@ class GMCP_Tools_Woo_Subscriptions {
     }
 
     $msg = 'Subscription ' . $id . ' moved from ' . $from . ' to ' . $stored . '.'
-      . ' ' . $this->describe_mail( $sent );
+      . ' ' . $this->describe_mail( $sent, $deferred );
     if ( $target === 'pending-cancel' ) {
       $msg .= ' The subscription is not cancelled yet: it ends at the period end, and an admin "cancelled subscription" email is sent for that, which does not mean it has already stopped.';
     }
@@ -744,12 +814,56 @@ class GMCP_Tools_Woo_Subscriptions {
   }
 
   /** Who was written to, in the same shape the order tool uses. */
-  private function describe_mail( array $sent ): string {
+  private function describe_mail( array $sent, bool $deferred = false ): string {
     $sent = array_values( array_unique( $sent ) );
+    // Same reasoning as the order tool: with the shop's transactional email deferred to
+    // after the request, the send happens once the capture has stopped, so silence is
+    // "not measurable" and not "nobody was written to".
+    $later = $deferred
+      ? ' This shop defers its transactional emails until after the request, so any notification is sent later and its recipients cannot be reported here. Do not assume the customer was not written to.'
+      : '';
     if ( !$sent ) {
-      return 'No email was sent.';
+      return $deferred ? 'No email went out during the change itself.' . $later : 'No email was sent.';
     }
-    return count( $sent ) . ' notification(s) went out to: ' . implode( ', ', $sent ) . '. Treat that as having reached a real person: it cannot be taken back.';
+    return count( $sent ) . ' notification(s) went out to: ' . implode( ', ', $sent ) . '. Treat that as having reached a real person: it cannot be taken back.' . $later;
+  }
+
+  /** A wp_mail filter recording each recipient, reduced to the bare address, into $sent. */
+  private function mail_capture( array &$sent ): \Closure {
+    return function ( $args ) use ( &$sent ) {
+      foreach ( (array) ( is_array( $args ) ? ( $args['to'] ?? [] ) : [] ) as $to ) {
+        foreach ( explode( ',', (string) $to ) as $one ) {
+          $one = trim( $one );
+          if ( preg_match( '/<([^<>]+)>/', $one, $m ) ) {
+            $one = trim( $m[1] );
+          }
+          $one = strtolower( $one );
+          if ( $one !== '' ) {
+            $sent[] = $one;
+          }
+        }
+      }
+      return $args;
+    };
+  }
+
+  /**
+  * Whether WooCommerce is queueing its transactional emails for later.
+  *
+  * Decided once, when WC_Emails registers its listeners, so the listener that is attached
+  * is the evidence; the filter is the fallback when the method is not there. Subscription
+  * emails ride the same WC_Emails queue when it is on.
+  */
+  private function emails_deferred(): bool {
+    if ( class_exists( 'WC_Emails' ) && method_exists( 'WC_Emails', 'queue_transactional_email' ) ) {
+      foreach ( [ 'woocommerce_order_status_pending_to_processing', 'woocommerce_order_status_completed', 'woocommerce_order_status_on-hold' ] as $hook ) {
+        if ( has_action( $hook, [ 'WC_Emails', 'queue_transactional_email' ] ) !== false ) {
+          return true;
+        }
+      }
+      return false;
+    }
+    return (bool) apply_filters( 'woocommerce_defer_transactional_emails', false );
   }
 
   #endregion

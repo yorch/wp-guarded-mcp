@@ -53,18 +53,137 @@ class GMCP_Tools_Admin {
     if ( !function_exists( 'get_filesystem_method' ) ) {
       require_once ABSPATH . 'wp-admin/includes/file.php';
     }
-    // The directory matters. Called with no arguments this probes WP_CONTENT_DIR, but
-    // WP_Upgrader::fs_connect() probes the plugins or themes root, and the "direct"
-    // decision is made by comparing the owner of a probe file in THAT directory. On a
-    // hardened layout where wp-content belongs to the deploy user and only
-    // wp-content/plugins is writable by PHP, the two disagree and this guard refuses
-    // every install on a site where wp-admin's own installer works fine.
-    $directory = $context === 'theme' ? get_theme_root() : WP_PLUGIN_DIR;
-    $method = get_filesystem_method( [], $directory );
-    if ( $method !== 'direct' ) {
-      return "This site's filesystem method is '{$method}', which needs FTP or SSH credentials that cannot be collected over an API call. Installing, updating and deleting must be done another way on this host.";
+    // Probe what the upgrader probes, both of it. WP_Upgrader::run() connects with
+    // fs_connect( [ WP_CONTENT_DIR, $destination ] ), and fs_connect() hands
+    // $directories[0], the content directory, to request_filesystem_credentials(), which
+    // is where the "direct" decision is made by comparing the owner of a probe file.
+    // delete_plugins() and delete_theme() ask about the content directory as well. So the
+    // content directory is the one that decides; the plugins or themes root is checked too
+    // because the files land there and a host can own the two differently. A guard that
+    // probed only the destination passed on a layout where wp-content belongs to the
+    // deploy user, and the call then failed deep inside the upgrader with a sentence about
+    // credentials instead of this one. wp-admin's own installer fails on that host too.
+    $directories = [ WP_CONTENT_DIR, $context === 'theme' ? get_theme_root() : WP_PLUGIN_DIR ];
+    foreach ( $directories as $directory ) {
+      $method = get_filesystem_method( [], $directory );
+      if ( $method === 'direct' ) {
+        continue;
+      }
+      // A non-direct method is workable when wp-config.php already carries the
+      // credentials, because then core never needs to ask: request_filesystem_credentials()
+      // fills host, user and password (or the SSH key pair) from these constants and the
+      // form is never built. Without them the upgrader would need a person to type into
+      // an HTML form, and there is no form here.
+      if ( $this->fs_credentials_configured( (string) $method ) ) {
+        continue;
+      }
+      return "This site's filesystem method is '{$method}', which needs FTP or SSH credentials, and they cannot be collected over an API call. Installing, updating and deleting have to be done from wp-admin on this host, or the site owner can define FTP_HOST, FTP_USER and FTP_PASS (or FTP_PUBKEY and FTP_PRIKEY for SSH) in wp-config.php. Nothing was changed.";
     }
     return true;
+  }
+
+  /**
+  * Whether wp-config.php already supplies what a non-direct filesystem method needs.
+  *
+  * Mirrors the constants request_filesystem_credentials() reads. Deliberately answers
+  * only yes or no: the values themselves never leave this function, so nothing about
+  * them can reach a reply, the audit log or the journal.
+  */
+  private function fs_credentials_configured( string $method ): bool {
+    if ( !in_array( $method, [ 'ftpext', 'ftpsockets', 'ssh2' ], true ) ) {
+      return false;
+    }
+    if ( !defined( 'FTP_HOST' ) || !defined( 'FTP_USER' ) ) {
+      return false;
+    }
+    if ( defined( 'FTP_PASS' ) ) {
+      return true;
+    }
+    return $method === 'ssh2' && defined( 'FTP_PUBKEY' ) && defined( 'FTP_PRIKEY' );
+  }
+
+  /**
+  * Run an upgrader or deleter call with any output it prints thrown away.
+  *
+  * WP_Ajax_Upgrader_Skin already buffers the credentials form, and delete_plugins()
+  * buffers its own. This is the backstop for whatever does not: a third-party filter on
+  * an upgrader hook that echoes, or a future core change. A stray byte ahead of the JSON
+  * makes the whole reply unparseable, and a credentials form in particular is not
+  * something to hand to a client even by accident.
+  *
+  * @return mixed Whatever the callback returned.
+  */
+  private function quietly( callable $callback ) {
+    ob_start();
+    try {
+      return $callback();
+    }
+    finally {
+      ob_end_clean();
+    }
+  }
+
+  /**
+  * Whether a change that reaches every site on a multisite network is permitted.
+  *
+  * activate_plugins is not the question. On multisite, map_meta_cap grants it to a site
+  * administrator whenever the network has enabled the Plugins menu for site admins, a
+  * common setting, and activate_plugin() and deactivate_plugins() check nothing further.
+  * So without this a key minted on sub-site 5 could switch a security plugin off on
+  * every site in the network, which wp-admin refuses to a site admin on plugins.php.
+  * manage_network_plugins is the capability wp-admin's network screen requires.
+  *
+  * @return true|string
+  */
+  private function may_touch_network( string $action ) {
+    if ( !is_multisite() || current_user_can( 'manage_network_plugins' ) ) {
+      return true;
+    }
+    return "Not permitted: {$action} affects every site on this network and requires a network administrator (the 'manage_network_plugins' capability). The authenticated account administers this site only. Nothing was changed.";
+  }
+
+  /**
+  * On multisite, the sites other than this one where a plugin or theme is in use.
+  *
+  * Deleting is a network-wide act, because there is one copy of the files, but every
+  * check the delete tools made was about the current site: get_stylesheet() and
+  * is_plugin_active() read this site's options. A theme active on sub-site 7 would be
+  * deleted from under it, leaving that site rendering nothing. Core's network screen has
+  * the same blind spot, which is not a reason to copy it.
+  *
+  * Bounded: on a network larger than the bound the answer is null, "could not check",
+  * and the caller refuses rather than guessing.
+  *
+  * @param string $kind 'plugin' or 'theme'.
+  * @return array|null Site ids where it is in use, or null when the network is too large to check.
+  */
+  private function used_on_other_sites( string $kind, string $name ): ?array {
+    if ( !is_multisite() ) {
+      return [];
+    }
+    $limit = 500;
+    $ids = get_sites( [ 'fields' => 'ids', 'number' => $limit + 1 ] );
+    if ( count( $ids ) > $limit ) {
+      return null;
+    }
+    $current = get_current_blog_id();
+    $using = [];
+    foreach ( $ids as $blog_id ) {
+      $blog_id = (int) $blog_id;
+      if ( $blog_id === $current ) {
+        continue;
+      }
+      if ( $kind === 'plugin' ) {
+        $in_use = in_array( $name, (array) get_blog_option( $blog_id, 'active_plugins', [] ), true );
+      }
+      else {
+        $in_use = get_blog_option( $blog_id, 'stylesheet' ) === $name || get_blog_option( $blog_id, 'template' ) === $name;
+      }
+      if ( $in_use ) {
+        $using[] = $blog_id;
+      }
+    }
+    return $using;
   }
 
   /**
@@ -83,12 +202,26 @@ class GMCP_Tools_Admin {
   /**
   * The plugin file of this plugin, e.g. "guarded-mcp/guarded-mcp.php".
   *
-  * Deactivating or deleting ourselves would tear down the endpoint handling the very
-  * call that asked for it: the agent gets a dropped connection rather than a result,
-  * and then has no way back in to undo it. Refuse instead.
+  * Deactivating, deleting or updating ourselves would tear down or swap out the endpoint
+  * handling the very call that asked for it: the agent gets a dropped connection rather
+  * than a result, and then has no way back in to undo it. Refuse instead.
+  *
+  * Derived from the folder the plugin actually sits in, through plugin_basename(), and
+  * compared against keys of get_plugins(), which carry the same folder name. So it holds
+  * under a renamed folder as well as under the canonical one.
   */
   private function self_plugin_file(): string {
     return plugin_basename( GMCP_ENTRY );
+  }
+
+  /**
+  * Plugins on THIS site's own active list, as opposed to network-active ones.
+  *
+  * is_plugin_active() answers true for both, which is the right question for "is its
+  * code running here" and the wrong one for "which list does it have to go back onto".
+  */
+  private function site_active_plugins(): array {
+    return (array) get_option( 'active_plugins', [] );
   }
 
   /**
@@ -276,13 +409,59 @@ class GMCP_Tools_Admin {
     // earlier could redirect the next install to a package of its choosing. Check the
     // host of the answer, not just the provenance of the question.
     $host = strtolower( (string) wp_parse_url( $link, PHP_URL_HOST ) );
-    if ( $host !== 'wordpress.org' && substr( $host, -14 ) !== '.wordpress.org' ) {
+    if ( !self::is_dot_org_host( $host ) ) {
       return new WP_Error(
         'gmcp_not_dot_org',
         "The download for \"{$slug}\" resolved to \"{$host}\", which is not a wordpress.org host. Something on this site is rewriting the repository response, so the package was not installed."
       );
     }
     return $link;
+  }
+
+  private static function is_dot_org_host( string $host ): bool {
+    return $host === 'wordpress.org' || substr( $host, -14 ) === '.wordpress.org';
+  }
+
+  /**
+  * Run an install with every package the upgrader downloads held to resolve_package()'s rule.
+  *
+  * resolve_package() checks the one URL it hands over, and the upgrader can download
+  * others. Theme_Upgrader::install() hooks check_parent_theme_filter, which asks
+  * themes_api() again for a child theme's missing parent and installs whatever
+  * download_link comes back, unchecked; and upgrader_package_options lets any plugin
+  * swap the package after the check. Holding the rule at upgrader_pre_download, the
+  * last step before bytes are fetched, covers every one of those for the duration of
+  * this call and nothing outside it.
+  *
+  * Installs only. An update installs whatever the site's update data names, and for a
+  * premium plugin that is legitimately its vendor's server; the update tools say so
+  * rather than claiming wordpress.org.
+  *
+  * @return mixed Whatever the callback returned.
+  */
+  private function with_download_guard( string $type, callable $callback ) {
+    $guard = function ( $reply, $package ) use ( $type ) {
+      if ( is_wp_error( $reply ) ) {
+        return $reply;
+      }
+      $package = (string) $package;
+      $host = strtolower( (string) wp_parse_url( $package, PHP_URL_HOST ) );
+      if ( self::is_dot_org_host( $host ) || apply_filters( 'gmcp_allow_remote_install', false, $package, $type ) ) {
+        return $reply;
+      }
+      return new WP_Error(
+        'gmcp_not_dot_org',
+        'The upgrader was about to download a package from "' . ( $host !== '' ? $host : $package ) . '", which is not a wordpress.org host. Something on this site changed the download after it was checked (a parent theme lookup, or a filter on the package), so nothing was installed.'
+      );
+    };
+    // Early, so a refusal is in place before any other filter fetches the package itself.
+    add_filter( 'upgrader_pre_download', $guard, -1000, 2 );
+    try {
+      return $callback();
+    }
+    finally {
+      remove_filter( 'upgrader_pre_download', $guard, -1000 );
+    }
   }
 
   /**
@@ -335,7 +514,7 @@ class GMCP_Tools_Admin {
           'type' => 'object',
           'properties' => [
             'plugin' => [ 'type' => 'string' ],
-            'network_wide' => [ 'type' => 'boolean', 'description' => 'Multisite only. Activate across the network.' ],
+            'network_wide' => [ 'type' => 'boolean', 'description' => 'Multisite only. Activate across the network. Needs a network administrator (manage_network_plugins).' ],
           ],
           'required' => [ 'plugin' ],
         ],
@@ -343,7 +522,7 @@ class GMCP_Tools_Admin {
       ],
       'wp_deactivate_plugin' => [
         'name' => 'wp_deactivate_plugin',
-        'description' => 'Deactivate an active plugin. Refuses to deactivate the MCP plugin itself, which would end this connection.',
+        'description' => 'Deactivate an active plugin. Refuses to deactivate the MCP plugin itself, which would end this connection. On multisite, a plugin active network-wide is deactivated network-wide, and only by a network administrator.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [ 'plugin' => [ 'type' => 'string' ] ],
@@ -366,7 +545,7 @@ class GMCP_Tools_Admin {
       ],
       'wp_update_plugin' => [
         'name' => 'wp_update_plugin',
-        'description' => 'Update an installed plugin to the latest wordpress.org version. Checks for available updates first and reports when none is pending.',
+        'description' => 'Update an installed plugin to the newest version this site\'s update data offers: wordpress.org for plugins hosted there, a premium plugin\'s own update server otherwise. Asks for fresh update data first and reports when none is pending. A plugin that was active stays active. Refuses to update the MCP plugin itself, whose code is serving the call.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [ 'plugin' => [ 'type' => 'string' ] ],
@@ -384,7 +563,7 @@ class GMCP_Tools_Admin {
       ],
       'wp_install_theme' => [
         'name' => 'wp_install_theme',
-        'description' => 'Install a theme from the wordpress.org repository by slug, optionally activating it. Installing from an arbitrary URL is disabled unless the site opts in.',
+        'description' => 'Install a theme from the wordpress.org repository by slug, optionally activating it. A child theme\'s missing parent is installed too, from wordpress.org only. Installing from an arbitrary URL is disabled unless the site opts in.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -420,7 +599,7 @@ class GMCP_Tools_Admin {
       ],
       'wp_update_theme' => [
         'name' => 'wp_update_theme',
-        'description' => 'Update an installed theme to the latest wordpress.org version.',
+        'description' => 'Update an installed theme to the newest version this site\'s update data offers: wordpress.org for themes hosted there, a premium theme\'s own update server otherwise. Asks for fresh update data first and reports when none is pending.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [ 'stylesheet' => [ 'type' => 'string' ] ],
@@ -948,7 +1127,9 @@ class GMCP_Tools_Admin {
 
     $skin = $this->skin();
     $upgrader = new Plugin_Upgrader( $skin );
-    $result = $upgrader->install( $package );
+    $result = $this->with_download_guard( 'plugin', function () use ( $upgrader, $package ) {
+      return $this->quietly( function () use ( $upgrader, $package ) { return $upgrader->install( $package ); } );
+    } );
 
     if ( $result !== true ) {
       return $this->error( $r, 'Install failed: ' . $this->upgrader_error( $result, $skin, 'the package could not be installed.' ) );
@@ -993,6 +1174,18 @@ class GMCP_Tools_Admin {
     }
 
     $network_wide = !empty( $a['network_wide'] ) && is_multisite();
+    if ( $network_wide ) {
+      $network = $this->may_touch_network( 'activating a plugin network-wide' );
+      if ( $network !== true ) {
+        return $this->error( $r, $network );
+      }
+    }
+    // A plugin that declares "Network: true" is meant to run network-wide or not at all,
+    // and wp-admin's site-level screen will not activate one. Activated on one site it
+    // runs without the network setup it assumes.
+    elseif ( is_multisite() && is_network_only_plugin( $plugin ) ) {
+      return $this->error( $r, "\"{$plugin}\" is a network-only plugin, so it can only be activated network-wide, by a network administrator (network_wide: true). Nothing was changed." );
+    }
 
     $activation = $this->activate_and_verify( $plugin, $network_wide );
     if ( !$activation['active'] ) {
@@ -1022,8 +1215,23 @@ class GMCP_Tools_Admin {
     if ( !is_plugin_active( $plugin ) && !is_plugin_active_for_network( $plugin ) ) {
       return $this->text( $r, "\"{$plugin}\" is already inactive." );
     }
-    deactivate_plugins( [ $plugin ] );
-    return $this->text( $r, "Deactivated \"{$plugin}\"." );
+    // deactivate_plugins() defaults $network_wide to null, and null means "wherever it is
+    // active", so a plain call on a network-active plugin switches it off on every site.
+    // The scope is therefore always passed explicitly, and the network one needs a
+    // network administrator.
+    $network_wide = is_plugin_active_for_network( $plugin );
+    if ( $network_wide ) {
+      $network = $this->may_touch_network( "deactivating \"{$plugin}\", which is active network-wide," );
+      if ( $network !== true ) {
+        return $this->error( $r, $network );
+      }
+    }
+    deactivate_plugins( [ $plugin ], false, $network_wide );
+    $still = $network_wide ? is_plugin_active_for_network( $plugin ) : in_array( $plugin, $this->site_active_plugins(), true );
+    if ( $still ) {
+      return $this->error( $r, "\"{$plugin}\" is still active after the deactivation call. Something on the site put it back or stopped the change." );
+    }
+    return $this->text( $r, "Deactivated \"{$plugin}\"" . ( $network_wide ? ' network-wide, on every site of the network.' : '.' ) );
   }
 
   private function delete_plugin_tool( array $r, array $a ): array {
@@ -1047,12 +1255,19 @@ class GMCP_Tools_Admin {
     if ( is_plugin_active( $plugin ) || is_plugin_active_for_network( $plugin ) ) {
       return $this->error( $r, "\"{$plugin}\" is active. Deactivate it first with wp_deactivate_plugin." );
     }
+    $elsewhere = $this->used_on_other_sites( 'plugin', $plugin );
+    if ( $elsewhere === null ) {
+      return $this->error( $r, "This network is too large to check whether \"{$plugin}\" is active on another site, and deleting it would break any site where it is. Delete it from Network Admin instead. Nothing was changed." );
+    }
+    if ( $elsewhere ) {
+      return $this->error( $r, "\"{$plugin}\" is still active on " . count( $elsewhere ) . ' other site(s) of this network (site id ' . implode( ', ', $elsewhere ) . '). The files are shared, so deleting it would break those sites. Nothing was changed.' );
+    }
     $ok = $this->confirmed( 'wp_delete_plugin', $plugin, $a, "This permanently deletes the plugin \"{$plugin}\" and all of its files from disk." );
     if ( $ok !== true ) {
       return $this->error( $r, $ok );
     }
 
-    $result = delete_plugins( [ $plugin ] );
+    $result = $this->quietly( function () use ( $plugin ) { return delete_plugins( [ $plugin ] ); } );
     if ( is_wp_error( $result ) ) {
       return $this->error( $r, 'Delete failed: ' . $result->get_error_message() );
     }
@@ -1077,25 +1292,151 @@ class GMCP_Tools_Admin {
     if ( $plugin === null ) {
       return $this->error( $r, "No installed plugin matches \"{$a['plugin']}\"." );
     }
+    // Refused for the same reason deactivating and deleting it are, and one more. The
+    // upgrader deletes this plugin's directory and unpacks the new one while this request
+    // is still running out of it: every class the autoloader has not yet required would
+    // then load from the new version into a process running the old one, and if the new
+    // version fails to load on the next request the endpoint is gone with nothing left to
+    // call to put it back. wp-admin, WP-CLI and WordPress's own auto-updates all update it
+    // from outside a call it is serving, which is where that belongs.
+    if ( $plugin === $this->self_plugin_file() ) {
+      return $this->error( $r, 'Refusing to update the MCP plugin itself from inside one of its own calls: the update replaces the code serving this request, and if the new version failed to load there would be no way back in. Update it from wp-admin, with WP-CLI, or let WordPress auto-update it.' );
+    }
 
-    // The update transient is what the upgrader consults. It can be stale or empty on
-    // a site that has not run its update cron, in which case the upgrader reports a
-    // confusing "no update available" for a plugin that does have one. Refresh first.
-    wp_update_plugins();
+    $checked = $this->refresh_update_data( 'plugin' );
     $updates = get_site_transient( 'update_plugins' );
     if ( empty( $updates->response[ $plugin ] ) ) {
-      return $this->text( $r, "\"{$plugin}\" is already up to date." );
+      return $this->text( $r, $checked
+        ? "\"{$plugin}\" is already up to date: the update service was asked just now and offers nothing newer."
+        : "No update is known for \"{$plugin}\", but the update service could not be reached just now, so that is only as fresh as this site's last successful check. Nothing was changed."
+      );
     }
+    $offered = (string) ( $updates->response[ $plugin ]->new_version ?? '' );
 
+    // Which list it is on, recorded before anything moves. See restore_activation().
+    $was_site = in_array( $plugin, $this->site_active_plugins(), true );
+    $was_network = is_multisite() && is_plugin_active_for_network( $plugin );
+
+    // bulk_upgrade(), not upgrade(), even for one plugin. upgrade() hooks
+    // deactivate_plugin_before_upgrade, which deactivates an active plugin outside cron and
+    // leaves reactivating it to the iframe Plugin_Upgrader_Skin::after() prints in wp-admin.
+    // No skin prints that here, so every active plugin this tool updated came back
+    // inactive, a shop's WooCommerce included, under a reply that said "Updated". On
+    // multisite the same call deactivated a network-active plugin network-wide.
+    // bulk_upgrade() is the path wp-admin's own AJAX updater and WP-CLI take, and it leaves
+    // activation alone.
     $skin = $this->skin();
     $upgrader = new Plugin_Upgrader( $skin );
-    $result = $upgrader->upgrade( $plugin );
+    $results = $this->quietly( function () use ( $upgrader, $plugin ) { return $upgrader->bulk_upgrade( [ $plugin ] ); } );
+    $result = is_array( $results ) ? ( $results[ $plugin ] ?? null ) : $results;
 
-    if ( $result !== true ) {
-      return $this->error( $r, 'Update failed: ' . $this->upgrader_error( $result, $skin, 'the update could not be applied.' ) );
+    // Whatever happened to the files, the plugin goes back onto the lists it was on.
+    $lost = $this->restore_activation( $plugin, $was_site, $was_network );
+
+    if ( $result === true ) {
+      return $this->error( $r, "The upgrader found no update to apply for \"{$plugin}\", although one to {$offered} was listed a moment ago. Nothing was changed." . $lost );
     }
-    $new = $updates->response[ $plugin ]->new_version ?? '';
-    return $this->text( $r, "Updated \"{$plugin}\"" . ( $new ? " to {$new}." : '.' ) );
+    if ( !is_array( $result ) || is_wp_error( $skin->result ) || ( $skin->get_errors() instanceof WP_Error && $skin->get_errors()->has_errors() ) ) {
+      $why = $this->upgrader_error( is_wp_error( $skin->result ) ? $skin->result : $result, $skin, 'the update could not be applied.' );
+      return $this->error( $r, 'Update failed: ' . $why . $lost );
+    }
+
+    // The stored truth, not the upgrader's word: read the version off the file on disk.
+    $data = get_plugin_data( WP_PLUGIN_DIR . '/' . $plugin, false, false );
+    $now = (string) ( $data['Version'] ?? '' );
+    if ( $offered !== '' && $now !== '' && version_compare( $now, $offered, '<' ) ) {
+      return $this->error( $r, "The upgrader reported success but \"{$plugin}\" still reads as version {$now} on disk, not {$offered}." . $lost );
+    }
+    if ( $lost !== '' ) {
+      return $this->error( $r, "Updated \"{$plugin}\" to {$now}, but it is no longer active." . $lost );
+    }
+
+    $message = "Updated \"{$plugin}\"" . ( $now !== '' ? " to {$now}." : '.' );
+    if ( $was_site || $was_network ) {
+      // The new code runs for the first time on the next request, not this one, so a
+      // version that fatals has not been tried yet. wp-admin finds out by reactivating it
+      // in a sandboxed request; the equivalent here is to load a page and look.
+      $health = $this->front_end_healthy();
+      if ( $health === false ) {
+        return $this->error( $r, "Updated \"{$plugin}\" to {$now} and it is still active, but the site's front end now returns a server error. The update cannot be rolled back from here. Deactivate it with wp_deactivate_plugin if the site needs to come back first." );
+      }
+      $message .= ( $was_network ? ' It is still active network-wide' : ' It is still active' ) . ( $health === null ? ', though whether the front end still loads could not be checked from here.' : ', and the front end still loads.' );
+    }
+    return $this->text( $r, $message );
+  }
+
+  /**
+  * Put a plugin back on the active lists it was on before an update, and say if it is not.
+  *
+  * bulk_upgrade() should leave activation alone, so this normally finds nothing to do. It
+  * exists because "should" is the upgrader's promise and the reply is ours: a filter on
+  * upgrader_pre_install or a future core change that deactivates again would otherwise
+  * reproduce exactly the defect this tool used to have. Silent, as core's own reactivation
+  * after an update is (update.php?action=activate-plugin passes $silent = true): the
+  * plugin's activation hook already ran when it was first activated, and running it again
+  * mid-update can reset its settings.
+  *
+  * @return string '' when it is back where it was, otherwise a sentence to append.
+  */
+  private function restore_activation( string $plugin, bool $was_site, bool $was_network ): string {
+    if ( $was_site && !in_array( $plugin, $this->site_active_plugins(), true ) ) {
+      activate_plugin( $plugin, '', false, true );
+    }
+    if ( $was_network && !is_plugin_active_for_network( $plugin ) ) {
+      activate_plugin( $plugin, '', true, true );
+    }
+    $missing = [];
+    if ( $was_site && !in_array( $plugin, $this->site_active_plugins(), true ) ) {
+      $missing[] = 'on this site';
+    }
+    if ( $was_network && !is_plugin_active_for_network( $plugin ) ) {
+      $missing[] = 'network-wide';
+    }
+    if ( !$missing ) {
+      return '';
+    }
+    return ' It was active ' . implode( ' and ', $missing ) . ' before the update and could not be reactivated, so it is inactive now. Reactivate it with wp_activate_plugin once the cause is clear.';
+  }
+
+  /**
+  * Ask the update service now, rather than trusting an answer up to 12 hours old.
+  *
+  * wp_update_plugins() and wp_update_themes() return early when the last check is
+  * younger than their timeout, which outside wp-admin and cron is 12 hours, so "already
+  * up to date" could describe yesterday. Setting last_checked back to zero forces the
+  * request while keeping the stored response: if the service cannot be reached, the
+  * previous answer survives instead of an empty one that would read as "nothing to do".
+  *
+  * @param string $kind 'plugin' or 'theme'.
+  * @return bool Whether the update service answered this time.
+  */
+  private function refresh_update_data( string $kind ): bool {
+    $transient = $kind === 'theme' ? 'update_themes' : 'update_plugins';
+    $endpoint = $kind === 'theme' ? '/themes/update-check/' : '/plugins/update-check/';
+    $current = get_site_transient( $transient );
+    if ( is_object( $current ) ) {
+      $current->last_checked = 0;
+      set_site_transient( $transient, $current );
+    }
+    $reached = false;
+    $listen = function ( $response, $context, $class, $args, $url ) use ( &$reached, $endpoint ) {
+      if ( strpos( (string) $url, $endpoint ) !== false ) {
+        $reached = !is_wp_error( $response ) && (int) wp_remote_retrieve_response_code( $response ) === 200;
+      }
+    };
+    add_action( 'http_api_debug', $listen, 10, 5 );
+    try {
+      if ( $kind === 'theme' ) {
+        wp_update_themes();
+      }
+      else {
+        wp_update_plugins();
+      }
+    }
+    finally {
+      remove_action( 'http_api_debug', $listen, 10 );
+    }
+    return $reached;
   }
 
   /**
@@ -1132,7 +1473,7 @@ class GMCP_Tools_Admin {
 
     $health = $this->front_end_healthy();
     if ( $health === false ) {
-      deactivate_plugins( [ $plugin ], true );
+      deactivate_plugins( [ $plugin ], true, $network_wide );
       return [
         'active' => false,
         'warning' => null,
@@ -1264,7 +1605,9 @@ class GMCP_Tools_Admin {
     $this->load_upgrader();
     $skin = $this->skin();
     $upgrader = new Theme_Upgrader( $skin );
-    $result = $upgrader->install( $package );
+    $result = $this->with_download_guard( 'theme', function () use ( $upgrader, $package ) {
+      return $this->quietly( function () use ( $upgrader, $package ) { return $upgrader->install( $package ); } );
+    } );
 
     if ( $result !== true ) {
       return $this->error( $r, 'Install failed: ' . $this->upgrader_error( $result, $skin, 'the package could not be installed.' ) );
@@ -1371,12 +1714,19 @@ class GMCP_Tools_Admin {
     if ( $stylesheet === get_template() ) {
       return $this->error( $r, 'Refusing to delete "' . $stylesheet . '": it is the parent of the active theme.' );
     }
+    $elsewhere = $this->used_on_other_sites( 'theme', $stylesheet );
+    if ( $elsewhere === null ) {
+      return $this->error( $r, "This network is too large to check whether \"{$stylesheet}\" is in use on another site, and deleting it would leave any such site rendering nothing. Delete it from Network Admin instead. Nothing was changed." );
+    }
+    if ( $elsewhere ) {
+      return $this->error( $r, "\"{$stylesheet}\" is the active theme, or its parent, on " . count( $elsewhere ) . ' other site(s) of this network (site id ' . implode( ', ', $elsewhere ) . '). The files are shared, so deleting it would leave those sites rendering nothing. Nothing was changed.' );
+    }
     $ok = $this->confirmed( 'wp_delete_theme', $stylesheet, $a, "This permanently deletes the theme \"{$stylesheet}\" and all of its files from disk." );
     if ( $ok !== true ) {
       return $this->error( $r, $ok );
     }
 
-    $result = delete_theme( $stylesheet );
+    $result = $this->quietly( function () use ( $stylesheet ) { return delete_theme( $stylesheet ); } );
     if ( is_wp_error( $result ) ) {
       return $this->error( $r, 'Delete failed: ' . $result->get_error_message() );
     }
@@ -1406,20 +1756,31 @@ class GMCP_Tools_Admin {
       return $this->error( $r, "No installed theme has the stylesheet \"{$stylesheet}\"." );
     }
 
-    wp_update_themes();
+    $checked = $this->refresh_update_data( 'theme' );
     $updates = get_site_transient( 'update_themes' );
     if ( empty( $updates->response[ $stylesheet ] ) ) {
-      return $this->text( $r, "\"{$stylesheet}\" is already up to date." );
+      return $this->text( $r, $checked
+        ? "\"{$stylesheet}\" is already up to date: the update service was asked just now and offers nothing newer."
+        : "No update is known for \"{$stylesheet}\", but the update service could not be reached just now, so that is only as fresh as this site's last successful check. Nothing was changed."
+      );
     }
+    // Theme_Upgrader::upgrade(), unlike the plugin upgrader's, keeps an active theme
+    // active (current_after() even follows a renamed directory). Recorded anyway so the
+    // reply is checked against the stored options rather than taken on trust.
+    $was_stylesheet = get_stylesheet();
+    $was_template = get_template();
 
     $skin = $this->skin();
     $upgrader = new Theme_Upgrader( $skin );
-    $result = $upgrader->upgrade( $stylesheet );
+    $result = $this->quietly( function () use ( $upgrader, $stylesheet ) { return $upgrader->upgrade( $stylesheet ); } );
 
     if ( $result !== true ) {
       return $this->error( $r, 'Update failed: ' . $this->upgrader_error( $result, $skin, 'the update could not be applied.' ) );
     }
     $new = $updates->response[ $stylesheet ]['new_version'] ?? '';
+    if ( get_option( 'stylesheet' ) !== $was_stylesheet || get_option( 'template' ) !== $was_template ) {
+      return $this->error( $r, "Updated \"{$stylesheet}\", but the active theme is no longer what it was before the update (it was \"{$was_stylesheet}\", it is now \"" . get_option( 'stylesheet' ) . '"). Check the site with wp_list_themes.' );
+    }
     return $this->text( $r, "Updated \"{$stylesheet}\"" . ( $new ? " to {$new}." : '.' ) );
   }
 
@@ -1558,6 +1919,15 @@ class GMCP_Tools_Admin {
 
       if ( !isset( $allowed[ $key ] ) ) {
         $skipped[ $key ] = 'Not a setting this tool can change. Call wp_get_settings to see what is available.';
+        continue;
+      }
+
+      // On multisite this row decides nothing: wp-login.php sends every registration to
+      // the network's wp-signup.php before it reads users_can_register, and wp-admin hides
+      // the checkbox on a network for that reason. Writing it would be reported as a
+      // change that changes nothing, which is the reply this tool exists not to give.
+      if ( $key === 'users_can_register' && is_multisite() ) {
+        $skipped[ $key ] = "On a multisite network, whether people may register is the network's setting (Network Admin, Settings, Allow new registrations), not this site's. Nothing was changed.";
         continue;
       }
 
@@ -2351,12 +2721,22 @@ class GMCP_Tools_Admin {
       }
     }
 
+    // The same check wp_update_menu_item makes. A parent in another menu, or an id that
+    // is not a menu item, is stored without complaint and the new item never renders,
+    // under a reply carrying its item_id. The cycle half of may_reparent() cannot fire
+    // for an item that does not exist yet, which is why 0 is passed as its id.
+    $parent_id = isset( $a['parent_id'] ) ? (int) $a['parent_id'] : 0;
+    $reparent = $this->may_reparent( 0, $parent_id, (int) $menu->term_id, (string) $menu->name );
+    if ( $reparent !== true ) {
+      return $this->error( $r, $reparent );
+    }
+
     $item = [
       'menu-item-title' => $title,
       'menu-item-type' => $type,
       'menu-item-object' => $object,
       'menu-item-object-id' => $object_id,
-      'menu-item-parent-id' => isset( $a['parent_id'] ) ? (int) $a['parent_id'] : 0,
+      'menu-item-parent-id' => $parent_id,
       // Without this the item is created as a draft and simply never renders, which
       // looks exactly like the call having silently done nothing.
       'menu-item-status' => 'publish',

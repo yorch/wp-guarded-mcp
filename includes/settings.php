@@ -365,7 +365,12 @@ class GMCP_Settings {
       set_transient( 'gmcp_setup_report', GMCP_SelfTest::report(), 5 * MINUTE_IN_SECONDS );
     }
     elseif ( $action === 'clear_activity' ) {
+      $before = GMCP_Audit::count();
       GMCP_Audit::clear();
+      // The first row of the new chain says the old one was thrown away, by whom and how
+      // many entries it held, so an empty-looking log is never the whole story.
+      GMCP_Audit::note( 'gmcp_audit_cleared', sprintf(
+        'The audit log was cleared from the settings screen; it held %d entries.', $before ) );
       $this->notice = __( 'Audit log cleared.', 'guarded-mcp' );
     }
     elseif ( $action === 'verify_audit' ) {
@@ -395,7 +400,7 @@ class GMCP_Settings {
         // reassurance about a log that has stopped growing.
         $this->notice = sprintf(
           /* translators: 1: the bound that was reached, 2: the number of entries. */
-          __( 'Pruned %1$d entries past the retention window. The log is at its %2$s limit and has stopped recording new entries, so nothing recent was deleted to make room. Raise the limit or lower the retention to start recording again.', 'guarded-mcp' ),
+          __( 'Pruned %1$d entries past the retention window. The log is at its %2$s limit and has stopped recording new entries, so nothing recent was deleted to make room, and tools that change the site are refused until it has room. Lower the retention, or raise the limit with the gmcp_audit_max_rows or gmcp_audit_max_bytes filter, to start recording again.', 'guarded-mcp' ),
           $gone['age'],
           $gone['stopped'] === 'bytes' ? __( 'size', 'guarded-mcp' ) : __( 'entry-count', 'guarded-mcp' )
         );
@@ -466,6 +471,16 @@ class GMCP_Settings {
       // person can copy out of tools/list.
       $raw = sanitize_textarea_field( wp_unslash( $_POST['key_tools'] ) );
       $tools = array_filter( array_map( 'trim', preg_split( '/[\s,]+/', $raw ) ) );
+
+      // The key store reduces every name with sanitize_key() and drops what is left
+      // empty, and an empty list means "everything the access level allows". So a box
+      // holding only names that reduce to nothing (an asterisk, a localised name) would
+      // mint an unrestricted key from a form that asked for a restricted one. Refuse
+      // instead of guessing.
+      if ( !array_filter( array_map( 'sanitize_key', $tools ) ) ) {
+        $this->notice = __( 'No key was created: none of the tool names you typed is a valid tool name (letters, digits and underscores only), and an empty list would have meant every tool the access level allows. Copy names from the tool list, or leave the box empty for no restriction.', 'guarded-mcp' );
+        return;
+      }
     }
 
     $key = GMCP_Tokens::create( $label, $level, $days, $tools );
@@ -1311,7 +1326,7 @@ class GMCP_Settings {
               <?php endif; ?>
               <label>
                 <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>
-                <?php esc_html_e( 'Generate tools from this site\'s REST API routes', 'guarded-mcp' ); ?>
+                <?php esc_html_e( 'Generate create, read, update and delete tools for posts, pages and media from the REST API', 'guarded-mcp' ); ?>
               </label>
             </fieldset>
             <p class="description">
@@ -1418,7 +1433,7 @@ class GMCP_Settings {
               <?php esc_html_e( 'days', 'guarded-mcp' ); ?>
             </p>
             <p class="description">
-              <?php esc_html_e( 'Pruned once a day. Two further limits apply whatever this says, because age alone does not bound a busy site: at most 50,000 entries and 50 MB of recorded arguments, oldest removed first.', 'guarded-mcp' ); ?>
+              <?php esc_html_e( 'Entries past this age are removed once a day, and age is the only thing that removes any. Two further limits apply, because age alone does not bound a busy site: 50,000 entries and 50 MB of recorded arguments. When either is reached the log stops recording and the plugin refuses tools that change the site until there is room, rather than deleting recent entries to make space.', 'guarded-mcp' ); ?>
             </p>
           </td>
         </tr>
@@ -1527,7 +1542,7 @@ class GMCP_Settings {
     if ( !$e ) {
       printf(
         '<p>%s</p><p><a href="%s">%s</a></p>',
-        esc_html__( 'There is no entry with that number. It may have been pruned: entries are removed oldest first once any of the retention bounds is reached.', 'guarded-mcp' ),
+        esc_html__( 'There is no entry with that number. It may have been pruned: entries past the retention period are removed daily.', 'guarded-mcp' ),
         esc_url( $back ),
         esc_html__( 'Back to the log', 'guarded-mcp' )
       );
@@ -1885,6 +1900,19 @@ class GMCP_Settings {
     ?>
     <h2 class="title"><?php esc_html_e( 'The audit log', 'guarded-mcp' ); ?></h2>
     <?php
+    $full = GMCP_Audit::stopped();
+    if ( $full ) {
+      printf(
+        '<div class="notice notice-error inline"><p><strong>%s</strong> %s</p></div>',
+        esc_html__( 'The log is full and has stopped recording.', 'guarded-mcp' ),
+        esc_html( sprintf(
+          /* translators: 1: entries, 2: entry limit, 3: size, 4: size limit. */
+          __( 'It holds %1$s of %2$s entries and %3$s of %4$s. Tools that change the site are refused until it has room; reads still work. Entries past the retention period are removed daily, and Prune now does it immediately. The limits can be raised with the gmcp_audit_max_rows and gmcp_audit_max_bytes filters.', 'guarded-mcp' ),
+          number_format_i18n( $full['rows'] ), number_format_i18n( $full['max_rows'] ),
+          size_format( $full['bytes'] ), size_format( $full['max_bytes'] )
+        ) )
+      );
+    }
     $table = new GMCP_Audit_Table( $filters );
     $table->prepare_items();
 
@@ -1920,7 +1948,7 @@ class GMCP_Settings {
     <p style="margin-top:12px">
       <?php printf(
         /* translators: 1: number of entries, 2: size of recorded data, 3: number of days */
-        esc_html__( '%1$s entries, %2$s of recorded arguments and changes. Kept for %3$d days, then pruned automatically.', 'guarded-mcp' ),
+        esc_html__( '%1$s entries, %2$s of recorded arguments and changes. Entries older than %3$d days are removed daily.', 'guarded-mcp' ),
         esc_html( number_format_i18n( $counts[''] ) ),
         esc_html( size_format( GMCP_Audit::bytes() ) ),
         (int) GMCP_Audit::retention_days()
@@ -2061,7 +2089,7 @@ class GMCP_Settings {
       </form>
       <form method="post">
         <?php $this->form_head( 'clear_activity' ); ?>
-        <button type="submit" class="button"><?php esc_html_e( 'Clear everything', 'guarded-mcp' ); ?></button>
+        <button type="submit" class="button" onclick="return confirm(<?php echo esc_attr( wp_json_encode( __( 'Delete every entry in the audit log? This cannot be undone. One entry recording that the log was cleared is written afterwards.', 'guarded-mcp' ) ) ); ?>);"><?php esc_html_e( 'Clear everything', 'guarded-mcp' ); ?></button>
       </form>
       <?php // Each carries the filters it was pressed under, so the file holds the rows
       // on screen. A separate form per button because the action is a hidden field. ?>

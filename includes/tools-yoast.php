@@ -96,7 +96,7 @@ class GMCP_Tools_Yoast {
       ],
       'yoast_set_post_seo' => [
         'name' => 'yoast_set_post_seo',
-        'description' => 'Write SEO metadata for a post through Yoast\'s own API, then rebuild the indexable so the front end shows the new value on the next load. Each field is written through WPSEO_Meta::set_value (the internal API that validates the key and adds the _yoast_wpseo_ prefix), and after all fields are written the indexable is rebuilt by calling the Indexable_Post_Watcher directly. The write is verified by reading back through YoastSEO()->meta->for_post, the same surface the front end uses. Only user-editable fields are writable: title, metadesc, focuskw, canonical, bctitle, meta-robots-noindex, meta-robots-nofollow, meta-robots-adv, opengraph-title, opengraph-description, opengraph-image, opengraph-image-id, twitter-title, twitter-description, twitter-image, twitter-image-id, schema_page_type, schema_article_type, is_cornerstone. Computed analysis fields (linkdex, content_score, inclusive_language_score, estimated-reading-time-minutes) are refused. The write is journalled through update_post_meta, so wp_undo_change can put it back.',
+        'description' => 'Write SEO metadata for a post through Yoast\'s own API, then rebuild the indexable so the front end shows the new value on the next load. Each field is written through WPSEO_Meta::set_value (the internal API that validates the key and adds the _yoast_wpseo_ prefix), and after all fields are written the indexable is rebuilt by calling the Indexable_Post_Watcher directly. The write is verified against the raw stored _yoast_wpseo_* meta (not the rendered surface, which replaces %%variables%% and fills in defaults), and a field Yoast left unchanged or altered is reported as such. Values must be strings, numbers or booleans; an empty string clears a field. Orders and subscriptions are refused. Only user-editable fields are writable: title, metadesc, focuskw, canonical, bctitle, meta-robots-noindex, meta-robots-nofollow, meta-robots-adv, opengraph-title, opengraph-description, opengraph-image, opengraph-image-id, twitter-title, twitter-description, twitter-image, twitter-image-id, schema_page_type, schema_article_type, is_cornerstone. Computed analysis fields (linkdex, content_score, inclusive_language_score, estimated-reading-time-minutes) are refused. The write is journalled through update_post_meta, so wp_undo_change can put it back.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -388,115 +388,135 @@ class GMCP_Tools_Yoast {
       return $this->error( $r, 'Unknown or non-writable SEO field(s): ' . $keys . '. Writable fields: ' . implode( ', ', array_keys( self::WRITABLE_FIELDS ) ) . '. Computed analysis fields (linkdex, content_score, inclusive_language_score, estimated-reading-time-minutes) are not writable.' );
     }
 
+    // A post-type policy belongs to the post type: with HPOS off an order or a subscription
+    // is a posts row, and this tool writes meta on any post id it is given.
+    $commerce = GMCP_Core::commerce_post_guard( $post_id, 'Writing SEO metadata on' );
+    if ( $commerce !== true ) {
+      return $this->error( $r, $commerce, -32600 );
+    }
+
+    // Scalars only. An array or object would be serialised into a meta row Yoast never
+    // writes and its sanitisers do not expect, and after earlier fields had been written.
+    // null means "clear", the same as an empty string.
+    $want = [];
+    foreach ( $fields as $short_key => $value ) {
+      if ( $value === null ) {
+        $want[ $short_key ] = '';
+      } elseif ( is_bool( $value ) ) {
+        $want[ $short_key ] = $value ? '1' : '0';
+      } elseif ( is_scalar( $value ) ) {
+        $want[ $short_key ] = (string) $value;
+      } else {
+        return $this->error( $r, 'Field "' . $short_key . '" must be a string, number or boolean (an empty string clears it); arrays and objects are not accepted. Nothing was written.' );
+      }
+    }
+
     // Write each field through WPSEO_Meta::set_value() if available, falling
     // back to update_post_meta with the full _yoast_wpseo_ key. Both write to
-    // the same place; set_value adds the prefix and validates the key, but is
+    // the same place; set_value slashes the value and adds the prefix, but is
     // not available on all Yoast versions.
-    $written = [];
-    foreach ( $fields as $short_key => $value ) {
+    $before = [];
+    foreach ( $want as $short_key => $value ) {
+      $before[ $short_key ] = (string) get_post_meta( $post_id, self::WRITABLE_FIELDS[ $short_key ], true );
+    }
+    foreach ( $want as $short_key => $value ) {
       $meta_key = self::WRITABLE_FIELDS[ $short_key ];
       if ( class_exists( 'WPSEO_Meta' ) && method_exists( 'WPSEO_Meta', 'set_value' ) ) {
         WPSEO_Meta::set_value( $short_key, $value, $post_id );
       } else {
-        update_post_meta( $post_id, $meta_key, $value );
+        update_post_meta( $post_id, $meta_key, wp_slash( $value ) );
       }
-      $written[ $short_key ] = $value;
+    }
+
+    // The verdict is the raw stored meta, never the rendered surface. YoastSEO()->meta
+    // returns the title as a visitor sees it: %%variables%% replaced, an empty value
+    // replaced by the template default, entities texturised. Comparing that with what was
+    // written called every ordinary write a failure.
+    $verified = [];
+    $unchanged = [];
+    $normalised = [];
+    $rejected = [];
+    foreach ( $want as $short_key => $value ) {
+      $stored = (string) get_post_meta( $post_id, self::WRITABLE_FIELDS[ $short_key ], true );
+      if ( $stored === $value ) {
+        if ( $before[ $short_key ] === $value ) {
+          $unchanged[] = $short_key;
+        } else {
+          $verified[] = $short_key;
+        }
+      } elseif ( $stored === $before[ $short_key ] ) {
+        $rejected[] = $short_key . ' (asked for ' . wp_json_encode( $value ) . ', still ' . wp_json_encode( $stored ) . ')';
+      } else {
+        $normalised[] = $short_key . ' (asked for ' . wp_json_encode( $value ) . ', stored ' . wp_json_encode( $stored ) . ')';
+      }
     }
 
     // Rebuild the indexable by calling the watcher directly, not by firing
-    // wp_insert_post and hoping the watcher is hooked. The watcher reads the
-    // post meta we just wrote and builds the indexable from it.
-    [ $err, $watcher ] = $this->get_post_watcher( $r );
-    if ( $err ) {
-      // The write succeeded but the indexable could not be rebuilt. This is
-      // not a silent success: we say so plainly, and the caller can run
-      // yoast_reindex or wp yoast index later.
-      return $this->text( $r, 'SEO metadata written for post ' . $post_id . ' (' . implode( ', ', array_keys( $written ) ) . '). WARNING: the indexable could not be rebuilt (' . $err['result']['content'][0]['text'] . '), so the front end may still show the old values. Run yoast_reindex for this post or `wp yoast index` from CLI.' );
-    }
-    try {
-      $watcher->build_indexable( $post_id );
-    } catch ( Throwable $e ) {
-      return $this->text( $r, 'SEO metadata written for post ' . $post_id . ' (' . implode( ', ', array_keys( $written ) ) . '). WARNING: the indexable rebuild threw an exception: ' . $e->getMessage() . '. The front end may still show the old values. Run yoast_reindex for this post or `wp yoast index` from CLI.' );
-    }
-
-    // Verify by reading back through the Surfaces API, the same path the front
-    // end uses. A mismatch means the indexable was not rebuilt correctly.
-    [ $err, $yoast ] = $this->surfaces_available( $r );
-    if ( $err ) {
-      return $this->text( $r, 'SEO metadata written and indexable rebuilt for post ' . $post_id . ' (' . implode( ', ', array_keys( $written ) ) . '). The read-back verification could not run (' . $err['result']['content'][0]['text'] . ').' );
-    }
-    try {
-      $meta = $yoast->meta->for_post( $post_id );
-    } catch ( Throwable $e ) {
-      return $this->text( $r, 'SEO metadata written and indexable rebuilt for post ' . $post_id . ' (' . implode( ', ', array_keys( $written ) ) . '). The read-back verification threw an exception: ' . $e->getMessage() . '.' );
-    }
-    if ( !$meta ) {
-      return $this->text( $r, 'SEO metadata written and indexable rebuilt for post ' . $post_id . ' (' . implode( ', ', array_keys( $written ) ) . '). The read-back returned no metadata, which may mean the post type is not indexable.' );
-    }
-
-    // Check the key fields the caller asked to write. The comparison is loose
-    // (==) because Yoast may normalise a value on the way into the indexable
-    // (e.g. trimming, casting).
-    $mismatches = [];
-    $verified = [];
-    $unverified = [];
-    foreach ( $written as $short_key => $value ) {
-      $surface_prop = $this->field_to_surface_prop( $short_key );
-      if ( $surface_prop === null ) {
-        $unverified[] = $short_key;
-        continue; // Some fields are not on the surface; skip verification.
-      }
-      try {
-        $stored = null;
-        if ( $surface_prop === 'title' || $surface_prop === 'description' || $surface_prop === 'canonical' ) {
-          $stored = $meta->{$surface_prop};
-        } else {
-          $stored = $meta->presentation->{$surface_prop} ?? null;
-        }
-      } catch ( Throwable $e ) {
-        $unverified[] = $short_key;
-        continue;
-      }
-      if ( $stored !== null && $stored !== false && (string) $stored != (string) $value ) {
-        $mismatches[] = $short_key . ' (wrote "' . $value . '", read back "' . $stored . '")';
+    // wp_insert_post and hoping the watcher is hooked. Yoast older than 14 has no
+    // indexables at all, and there post meta is the whole story.
+    $rebuilt = '';
+    if ( !function_exists( 'YoastSEO' ) ) {
+      $rebuilt = ' This Yoast version has no indexables, so the post meta is what the front end reads.';
+    } else {
+      $off = $this->indexing_disabled_reason();
+      if ( $off !== null ) {
+        $rebuilt = ' The indexable was not rebuilt: ' . $off;
       } else {
-        $verified[] = $short_key;
+        [ $err, $watcher ] = $this->get_post_watcher( $r );
+        if ( $err ) {
+          $rebuilt = ' WARNING: the indexable could not be rebuilt (' . $err['result']['content'][0]['text'] . '), so the front end may still show the old values. Run yoast_reindex for this post or `wp yoast index` from CLI.';
+        } else {
+          try {
+            $watcher->build_indexable( $post_id );
+            $rebuilt = ' Indexable rebuild requested.';
+          } catch ( Throwable $e ) {
+            $rebuilt = ' WARNING: the indexable rebuild threw an exception: ' . $e->getMessage() . '. The front end may still show the old values. Run yoast_reindex for this post or `wp yoast index` from CLI.';
+          }
+        }
       }
     }
-    if ( !empty( $mismatches ) ) {
-      return $this->error( $r, 'SEO metadata written and indexable rebuilt for post ' . $post_id . ', but the read-back through YoastSEO()->meta->for_post() did not match for: ' . implode( '; ', $mismatches ) . '. The values may have been normalised by Yoast.', -32603 );
-    }
 
-    // The success message says exactly which fields were verified through the
-    // Surfaces API and which were written but not verified (because they are
-    // not exposed as flat properties on the Meta_Surface). This is the
-    // honesty the adversarial review asked for: "verified by reading back"
-    // is only true of the fields in the verified list.
-    $msg = 'SEO metadata written for post ' . $post_id . ' (' . implode( ', ', array_keys( $written ) ) . '). Indexable rebuilt.';
-    if ( !empty( $verified ) ) {
-      $msg .= ' Verified through YoastSEO()->meta->for_post(): ' . implode( ', ', $verified ) . '.';
+    $msg = 'SEO metadata for post ' . $post_id . '.';
+    if ( $verified ) {
+      $msg .= ' Written and confirmed in the stored post meta: ' . implode( ', ', $verified ) . '.';
     }
-    if ( !empty( $unverified ) ) {
-      $msg .= ' Written but not verified through the Surfaces API (not exposed as a flat property): ' . implode( ', ', $unverified ) . '.';
+    if ( $unchanged ) {
+      $msg .= ' Already set to that value: ' . implode( ', ', $unchanged ) . '.';
+    }
+    if ( $normalised ) {
+      $msg .= ' Stored, but changed by Yoast on the way in: ' . implode( '; ', $normalised ) . '.';
+    }
+    $msg .= $rebuilt;
+    if ( $rejected ) {
+      return $this->error( $r, $msg . ' NOT written, Yoast left the previous value: ' . implode( '; ', $rejected ) . '.', -32603 );
     }
     return $this->text( $r, $msg );
   }
 
   /**
-  * Map a writable field key to the property name on the Meta_Surface.
+  * Why Yoast will not write indexables on this site, or null when it will.
+  *
+  * Yoast only indexes in production (wp_get_environment_type()); on staging, local and
+  * development the watcher does nothing, which otherwise looks like a post type that cannot
+  * be indexed.
   */
-  private function field_to_surface_prop( string $short_key ): ?string {
-    $map = [
-      'title'                 => 'title',
-      'metadesc'              => 'description',
-      'canonical'             => 'canonical',
-      'opengraph-title'       => 'opengraph_title',
-      'opengraph-description' => 'opengraph_description',
-      'twitter-title'         => 'twitter_title',
-      'twitter-description'   => 'twitter_description',
-      'bctitle'               => 'breadcrumb_title',
-    ];
-    return $map[ $short_key ] ?? null;
+  private function indexing_disabled_reason(): ?string {
+    try {
+      if ( function_exists( 'YoastSEO' ) ) {
+        $yoast = YoastSEO();
+        $helper = $yoast->helpers->indexable ?? null;
+        if ( is_object( $helper ) && method_exists( $helper, 'should_index_indexables' ) ) {
+          if ( $helper->should_index_indexables() ) {
+            return null;
+          }
+          $env = function_exists( 'wp_get_environment_type' ) ? wp_get_environment_type() : 'unknown';
+          return 'Yoast does not write indexables in this environment (wp_get_environment_type() is "' . $env . '"; it indexes in "production" only, unless the Yoast\WP\SEO\should_index_indexables filter says otherwise).';
+        }
+      }
+    } catch ( Throwable $e ) {
+      return null;
+    }
+    return null;
   }
 
   /**
@@ -512,22 +532,32 @@ class GMCP_Tools_Yoast {
       return $this->error( $r, 'Post ' . $post_id . ' does not exist.' );
     }
 
+    $commerce = GMCP_Core::commerce_post_guard( $post_id, 'Rebuilding the SEO indexable of' );
+    if ( $commerce !== true ) {
+      return $this->error( $r, $commerce, -32600 );
+    }
+
+    $off = $this->indexing_disabled_reason();
+    if ( $off !== null ) {
+      return $this->error( $r, 'Nothing was rebuilt. ' . $off );
+    }
+
     [ $err, $watcher ] = $this->get_post_watcher( $r );
     if ( $err ) {
       return $err;
     }
 
-    // Record the indexable row state before the rebuild, so we can confirm
-    // the rebuild actually changed it. build_indexable() returns early
-    // without throwing for non-indexable post types, so a success message
-    // without a read-back would be a silent success — the same shape this
-    // group exists to prevent.
+    // Compare the row before and after, so "rebuilt" is only said when something shows it.
+    // build_indexable() returns early without throwing for non-indexable post types.
     global $wpdb;
     $table = $wpdb->prefix . 'yoast_indexable';
-    $before = $wpdb->get_row( $wpdb->prepare(
-      "SELECT title, description, canonical, version FROM `{$table}` WHERE object_id = %d AND object_type = 'post' LIMIT 1",
-      $post_id
-    ), ARRAY_A );
+    if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) !== $table ) {
+      return $this->error( $r, 'Yoast\'s indexable table (' . $table . ') does not exist on this site, so there is nothing to rebuild into. Yoast creates it on activation or its first indexing run; run `wp yoast index` from CLI or re-save the post in the editor.' );
+    }
+    $fetch = function () use ( $wpdb, $table, $post_id ) {
+      return $wpdb->get_row( $wpdb->prepare( "SELECT * FROM `{$table}` WHERE object_id = %d AND object_type = 'post' LIMIT 1", $post_id ), ARRAY_A );
+    };
+    $before = $fetch();
 
     try {
       $watcher->build_indexable( $post_id );
@@ -535,17 +565,14 @@ class GMCP_Tools_Yoast {
       return $this->error( $r, 'The indexable rebuild threw an exception: ' . $e->getMessage() );
     }
 
-    // Verify the indexable row exists after the rebuild. If it was missing
-    // before and is still missing, the post type may not be indexable.
-    $after = $wpdb->get_row( $wpdb->prepare(
-      "SELECT title, description, canonical, version FROM `{$table}` WHERE object_id = %d AND object_type = 'post' LIMIT 1",
-      $post_id
-    ), ARRAY_A );
+    $after = $fetch();
     if ( !$after ) {
       return $this->error( $r, 'The indexable rebuild ran but no indexable row exists for post ' . $post_id . '. The post type may not be indexable by Yoast (revisions, autosaves, and excluded post types are not).' );
     }
-
-    return $this->text( $r, 'Indexable rebuilt for post ' . $post_id . '. The front end will show the current SEO metadata on the next page load.' );
+    if ( $before && $before === $after ) {
+      return $this->text( $r, 'The indexable row for post ' . $post_id . ' exists and the rebuild left it unchanged: it was already current, or Yoast skipped this post.' );
+    }
+    return $this->text( $r, 'Indexable ' . ( $before ? 'rebuilt' : 'created' ) . ' for post ' . $post_id . '. The front end will show the current SEO metadata on the next page load.' );
   }
 
 }

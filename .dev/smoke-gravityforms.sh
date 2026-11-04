@@ -233,6 +233,27 @@ check "writing the value it already holds is a no-op, not a second confirmation"
 wpc eval 'GFAPI::update_entry_field('"$A"',"3","Message body for Alpha");' >/dev/null 2>&1
 check "the value is restored for the checks that follow" "$(dbq "SELECT meta_value FROM wp_gf_entry_meta WHERE entry_id=$A AND meta_key='3'")" "Message body for Alpha"
 
+# A field's save filter changes what is stored (encryption add-ons, sanitising, number and
+# date formats). The write happened, so reporting an error withheld the change announcement
+# and described a successful overwrite as a failed one. The stored state is the evidence.
+docker exec -u 0 "${COMPOSE_PROJECT_NAME:-wptest}-wp-1" mkdir -p /var/www/html/wp-content/mu-plugins
+docker compose exec -T wp sh -c 'cat > /var/www/html/wp-content/mu-plugins/gf-normalise.php <<"PHPEOF"
+<?php
+add_filter( "gform_save_field_value", function ( $value, $entry, $field, $form, $input_id ) {
+  return is_string( $value ) && strpos( $value, "NORMALISE-ME" ) === 0 ? strtoupper( $value ) : $value;
+}, 10, 5 );
+PHPEOF' >/dev/null 2>&1
+call gf_norm1 "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"gf_update_entry_field\",\"arguments\":{\"entry_id\":$A,\"input_id\":\"3\",\"value\":\"NORMALISE-ME lower\"}}}"
+NTOKEN=$(tokof gf_norm1)
+call gf_norm2 "{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\",\"params\":{\"name\":\"gf_update_entry_field\",\"arguments\":{\"entry_id\":$A,\"input_id\":\"3\",\"value\":\"NORMALISE-ME lower\",\"confirm\":\"$NTOKEN\"}}}"
+N_STORED=$(dbq "SELECT meta_value FROM wp_gf_entry_meta WHERE entry_id=$A AND meta_key='3'")
+docker compose exec -T wp sh -c 'rm -f /var/www/html/wp-content/mu-plugins/gf-normalise.php' >/dev/null 2>&1
+wpc eval 'GFAPI::update_entry_field('"$A"',"3","Message body for Alpha");' >/dev/null 2>&1
+check "CONTROL: the filter really changed what was stored" "$N_STORED" "NORMALISE-ME LOWER"
+check "a write that Gravity Forms normalised is reported as written, not as an error" "$(verdict gf_norm2)" "ok"
+check "and the reply shows what was actually stored" "$(ctext gf_norm2 | grep -c 'NORMALISE-ME LOWER')" "1"
+check "and the value is restored for the checks that follow" "$(dbq "SELECT meta_value FROM wp_gf_entry_meta WHERE entry_id=$A AND meta_key='3'")" "Message body for Alpha"
+
 echo "-- a token is bound to its target --"
 call gf_bind1 "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"gf_update_entry_field\",\"arguments\":{\"entry_id\":$C,\"input_id\":\"3\",\"value\":\"bound value\"}}}"
 TOKEN2=$(tokof gf_bind1)

@@ -143,6 +143,44 @@ check "and it is still valid JSON after the round trip" \
 call e_again "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_apply_template\",\"arguments\":{\"page_id\":$POST,\"template_id\":$SRC,\"mode\":\"copy\"}}}"
 check "applying over an existing design needs overwrite" "$(verdict e_again)" "error"
 
+echo "-- apply_template never writes a library template, a commerce post, or a blank design --"
+# A header the site is using. Copy mode used to rewrite its template type to wp-post, taking it
+# out of its theme-builder location, and shortcode mode with page_id equal to template_id
+# deleted its own design and wrote a self-referencing shortcode.
+LIBHDR=$(wpc eval '$id = wp_insert_post(["post_title"=>"Smoke Live Header","post_type"=>"elementor_library","post_status"=>"publish"]); update_post_meta($id,"_elementor_template_type","header"); update_post_meta($id,"_elementor_data",wp_slash("[{\"id\":\"h1\",\"settings\":{}}]")); echo $id;')
+LIB_DATA_BEFORE=$(wpc eval "echo md5(get_post_meta($LIBHDR,'_elementor_data',true));")
+call e_lib "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_apply_template\",\"arguments\":{\"page_id\":$LIBHDR,\"template_id\":$SRC,\"mode\":\"copy\",\"overwrite\":true}}}"
+check "applying a template onto a library template is refused" "$(verdict e_lib)" "error"
+check "and its template type is still header" "$(wpc eval "echo get_post_meta($LIBHDR,'_elementor_template_type',true);")" "header"
+check "and its design is untouched" "$(wpc eval "echo md5(get_post_meta($LIBHDR,'_elementor_data',true));")" "$LIB_DATA_BEFORE"
+call e_self "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_apply_template\",\"arguments\":{\"page_id\":$SRC,\"template_id\":$SRC,\"overwrite\":true}}}"
+check "a template applied to itself is refused" "$(verdict e_self)" "error"
+check "and its design is still there" "$(wpc eval "echo json_decode(get_post_meta($SRC,'_elementor_data',true))===null?'broken':'parses';")" "parses"
+ORDER_POST=$(wpc eval 'echo wp_insert_post(["post_type"=>"shop_order","post_status"=>"draft","post_title"=>"smoke elementor order"]);')
+call e_order "{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_apply_template\",\"arguments\":{\"page_id\":$ORDER_POST,\"template_id\":$SRC,\"mode\":\"copy\"}}}"
+check "applying a template onto a shop_order is refused" "$(verdict e_order)" "error"
+check "and nothing was written to it" "$(wpc eval "echo metadata_exists('post',$ORDER_POST,'_elementor_data')?'written':'none';")" "none"
+EMPTYTPL=$(wpc eval '$id = wp_insert_post(["post_title"=>"Smoke Empty","post_type"=>"elementor_library","post_status"=>"publish"]); update_post_meta($id,"_elementor_template_type","section"); update_post_meta($id,"_elementor_data","[]"); echo $id;')
+BLANKPG=$(wpc eval 'echo wp_insert_post(["post_title"=>"Smoke Blank Target","post_type"=>"page","post_status"=>"publish"]);')
+call e_blank "{\"jsonrpc\":\"2.0\",\"id\":73,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_apply_template\",\"arguments\":{\"page_id\":$BLANKPG,\"template_id\":$EMPTYTPL,\"mode\":\"copy\"}}}"
+check "a template whose design is an empty \"[]\" is not reported as applied" "$(verdict e_blank)" "error"
+wpc post delete $LIBHDR $ORDER_POST $EMPTYTPL $BLANKPG --force >/dev/null
+
+echo "-- set_conditions does not delete other features' entries from the shared cache --"
+# Free Elementor's floating buttons keep their own conditions under a key of the same option,
+# which cannot be rebuilt from the templates. Without the theme builder the fallback used to
+# delete the whole option. (With Pro present the cache is rebuilt through its own manager.)
+if [ "$PRO_PRESENT" != "1" ]; then
+  wpc eval 'update_option("elementor_pro_theme_builder_conditions",["floating_buttons"=>[9999=>["include/general"]],"header"=>[88888=>["include/general"]]],false);' >/dev/null
+  call e_shared "{\"jsonrpc\":\"2.0\",\"id\":74,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_set_conditions\",\"arguments\":{\"ID\":$HDR,\"conditions\":[\"include/general\"]}}}"
+  check "setting conditions succeeds with other entries in the cache" "$(verdict e_shared)" "ok"
+  check "the other feature's entry is still in the option" \
+    "$(wpc eval '$o=get_option("elementor_pro_theme_builder_conditions",[]);echo isset($o["floating_buttons"][9999])?"kept":"lost";')" "kept"
+  check "CONTROL: the stale theme-builder entry was the part removed" \
+    "$(wpc eval '$o=get_option("elementor_pro_theme_builder_conditions",[]);echo isset($o["header"][88888])?"present":"gone";')" "gone"
+  wpc option delete elementor_pro_theme_builder_conditions >/dev/null
+fi
+
 echo "-- the active kit --"
 # A kit holds the site's global colours, fonts and theme styles, so most of what wiring up
 # a theme means lives in it. Elementor records the active one in a single option, which
@@ -168,8 +206,13 @@ check "and the reply names the kit it replaced" \
 # new one, which is the same silent success the conditions tools exist for.
 check "and it clears the generated CSS rather than leaving the old design rendering" \
   "$(py "import json,sys;t=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print('cleared' in t['generated_css'])" k_set)" "True"
-check "and says undo cannot reverse it" \
-  "$(py "import json,sys;t=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print('not journalled' in t['note'])" k_set)" "True"
+# The reply used to say the switch "is not journalled". It is: updated_option reaches the
+# change journal. Asserted against the journal itself, not the wording of the reply.
+call k_jlist '{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+check "and the option change really is in the change journal" \
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(any('elementor_active_kit' in x['what'] for x in e))" k_jlist)" "True"
+check "and the reply no longer claims it is not journalled" \
+  "$(py "import json,sys;t=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print('not journalled' not in t['note'])" k_set)" "True"
 
 # Elementor reads this option and looks the post up without asking what it is, so an id
 # pointing at the wrong thing leaves the site with no usable global styles and no error.
@@ -188,6 +231,23 @@ check "and neither refusal changed the active kit" \
 call k_again "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_set_active_kit\",\"arguments\":{\"ID\":$KIT_NEW}}}"
 check "setting the kit that is already active says so rather than churning the CSS" \
   "$(py "import json,sys;print('already the active one' in json.load(sys.stdin)['result']['content'][0]['text'])" k_again)" "True"
+
+# A policy about an option belongs to the option, so a site that protects this row must not
+# have it written around by the one tool that happens to know its name. The protection is a
+# filter, so an mu-plugin switched by an option stands in for a site that has added it.
+docker compose exec -T cli wp eval 'file_put_contents(WPMU_PLUGIN_DIR."/smoke-protect-kit.php","<?php add_filter(\"gmcp_protected_options\", function(\$e){ if (get_option(\"smoke_protect_kit\")) { \$e[] = \"elementor_active_kit\"; } return \$e; });");' >/dev/null 2>&1
+KIT_OTHER=$(docker compose exec -T cli wp eval '$id = wp_insert_post([ "post_title"=>"Other Kit", "post_type"=>"elementor_library", "post_status"=>"publish" ]); update_post_meta( $id, "_elementor_template_type", "kit" ); echo $id;' 2>/dev/null | tr -d '\r\n')
+call k_prot_ctl "{\"jsonrpc\":\"2.0\",\"id\":45,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_set_active_kit\",\"arguments\":{\"ID\":$KIT_OTHER}}}"
+check "CONTROL: with nothing protected, a second kit can be activated" "$(verdict k_prot_ctl)" "ok"
+check "and the option names it" "$(wpc eval 'echo (int) get_option("elementor_active_kit");')" "$KIT_OTHER"
+wpc option update smoke_protect_kit 1 >/dev/null
+call k_prot "{\"jsonrpc\":\"2.0\",\"id\":46,\"method\":\"tools/call\",\"params\":{\"name\":\"elementor_set_active_kit\",\"arguments\":{\"ID\":$KIT_NEW}}}"
+PROT_NOW=$(wpc eval 'echo (int) get_option("elementor_active_kit");')
+wpc option delete smoke_protect_kit >/dev/null
+check "a site that protects the kit option is not written around" "$(verdict k_prot)" "error"
+check "and the option was left alone" "$PROT_NOW" "$KIT_OTHER"
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/smoke-protect-kit.php >/dev/null 2>&1
+docker compose exec -T cli wp post delete "$KIT_OTHER" --force >/dev/null 2>&1
 
 docker compose exec -T cli wp eval "update_option( 'elementor_active_kit', $KIT_WAS );" >/dev/null 2>&1
 check "and the site's own kit is back as it was found" \

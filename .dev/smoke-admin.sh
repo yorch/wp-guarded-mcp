@@ -361,10 +361,65 @@ call self_off '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"
 check "cannot deactivate itself" "$(verdict self_off)" "error"
 call self_del '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"guarded-mcp"}}}'
 check "cannot delete itself" "$(verdict self_del)" "error"
+# Updating itself would replace the code serving the call, and a new version that failed
+# to load would leave nothing to call to put it back. Refused before any update check, so
+# the refusal does not depend on an update happening to be on offer.
+call self_upd '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"wp_update_plugin","arguments":{"plugin":"guarded-mcp"}}}'
+check "cannot update itself" "$(verdict self_upd)" "error"
+check "and says that is why" "$(refusal self_upd | grep -c 'Refusing to update the MCP plugin itself')" "1"
 
 echo "-- install source restriction --"
 call url_inst '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"url":"https://example.invalid/x.zip"}}}'
 check "arbitrary ZIP URL refused" "$(verdict url_inst)" "error"
+
+echo "-- a host whose content directory is not directly writable --"
+# The upgrader decides "direct or ask for FTP credentials" about WP_CONTENT_DIR: run()
+# calls fs_connect( [ WP_CONTENT_DIR, $destination ] ) and the first entry is the one
+# probed. The guard used to probe the plugins root instead, so on a host where wp-content
+# belongs to the deploy user and only the plugins directory is PHP's, it passed and the
+# call failed deep in the upgrader with a credentials sentence the agent cannot act on.
+# Simulated with core's own filesystem_method filter, scoped to the content directory.
+docker compose exec -T cli sh -c 'cat > /var/www/html/wp-content/mu-plugins/gmcp-smoke-fs.php' <<'PHP'
+<?php
+add_filter( 'filesystem_method', function ( $m, $args, $context ) {
+  return untrailingslashit( (string) $context ) === untrailingslashit( WP_CONTENT_DIR ) ? 'ftpext' : $m;
+}, 10, 3 );
+PHP
+# WP-CLI pins the method to direct with its own filter at priority 99, so the CLI has to
+# take that off to see what a web request sees. Without that, both controls read "direct"
+# whatever the simulation does.
+fs_method() { docker compose exec -T cli wp eval 'remove_all_filters( "filesystem_method", 99 ); require_once ABSPATH . "wp-admin/includes/file.php"; echo get_filesystem_method( [], '"$1"' );' 2>/dev/null | tr -d '\r\n'; }
+# CONTROLS: the simulation is in place, and it is the layout the old probe missed.
+check "CONTROL: the plugins directory still reads as direct" "$(fs_method WP_PLUGIN_DIR)" "direct"
+check "CONTROL: the content directory reads as ftpext" "$(fs_method WP_CONTENT_DIR)" "ftpext"
+call fs_inst '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"classic-editor"}}}'
+FS_INSTALLED=$(docker compose exec -T cli wp plugin list --format=csv 2>/dev/null | grep -c '^classic-editor,')
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-fs.php >/dev/null 2>&1
+check "an install on that host is refused" "$(verdict fs_inst)" "error"
+check "by the guard, with the sentence that names the method" "$(refusal fs_inst | grep -c "filesystem method is 'ftpext'")" "1"
+check "and nothing was installed" "$FS_INSTALLED" "0"
+check "CONTROL: the simulation is gone again" "$(fs_method WP_CONTENT_DIR)" "direct"
+
+echo "-- every package an install downloads is held to wordpress.org --"
+# resolve_package() checks the URL it hands over, but the upgrader can fetch others: a
+# child theme's missing parent comes from a second themes_api() answer, and any plugin can
+# swap the package through upgrader_package_options after the check. Simulated with the
+# second: the slug resolves to wordpress.org as normal, then the package is rewritten.
+docker compose exec -T cli sh -c 'cat > /var/www/html/wp-content/mu-plugins/gmcp-smoke-pkg.php' <<'PHP'
+<?php
+add_filter( 'upgrader_package_options', function ( $o ) {
+  $o['package'] = 'https://downloads.example.invalid/classic-editor.zip';
+  return $o;
+} );
+PHP
+call pkg_inst '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"classic-editor"}}}'
+PKG_INSTALLED=$(docker compose exec -T cli wp plugin list --format=csv 2>/dev/null | grep -c '^classic-editor,')
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-pkg.php >/dev/null 2>&1
+check "a rewritten package is refused" "$(verdict pkg_inst)" "error"
+check "by the host rule, not by the download failing" "$(refusal pkg_inst | grep -c 'not a wordpress.org host')" "1"
+check "and nothing was installed" "$PKG_INSTALLED" "0"
+check "CONTROL: the rewrite is gone again" \
+  "$(docker compose exec -T cli sh -c 'test -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-pkg.php && echo present || echo gone' 2>/dev/null | tr -d '\r\n')" "gone"
 
 echo "-- two-step confirmation (needs the network: installs from wordpress.org) --"
 call inst '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"classic-editor","activate":true}}}'
@@ -393,6 +448,51 @@ call replay "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\"
 check "token cannot be replayed on another target" "$(verdict replay)" "error"
 check "akismet untouched" \
   "$(docker compose exec -T cli wp plugin list --format=csv 2>/dev/null | grep -c '^akismet,')" "1"
+
+echo "-- updating a plugin keeps it active, and asks for fresh update data --"
+# Plugin_Upgrader::upgrade() deactivates an active plugin before replacing it and leaves
+# reactivating it to an iframe only wp-admin's skin prints, so every active plugin this
+# tool updated came back inactive under a reply that said "Updated". Akismet is made to
+# look old by lowering the version in its header, which is what the update check reads;
+# the update then installs the real current release from wordpress.org over it.
+AK=akismet/akismet.php
+# The container's sed is busybox, so POSIX classes only, and only the header lines.
+ak_age() { docker compose exec -T cli sed -i '1,20s/^\([[:space:]*]*Version:[[:space:]]*\).*/\15.0/' /var/www/html/wp-content/plugins/akismet/akismet.php >/dev/null 2>&1; }
+ak_version() { docker compose exec -T cli wp eval 'require_once ABSPATH . "wp-admin/includes/plugin.php"; echo get_plugin_data( WP_PLUGIN_DIR . "/akismet/akismet.php", false, false )["Version"];' 2>/dev/null | tr -d '\r\n'; }
+ak_active() { docker compose exec -T cli wp eval 'echo in_array( "akismet/akismet.php", (array) get_option( "active_plugins", [] ), true ) ? 1 : 0;' 2>/dev/null | tr -d '\r\n'; }
+ak_age
+docker compose exec -T cli wp plugin activate akismet >/dev/null 2>&1
+# The stale case: a check an hour ago saw this version and nothing newer. wp_update_plugins()
+# does not ask again for 12 hours outside wp-admin, so "already up to date" was the answer
+# however long ago a release had come out.
+docker compose exec -T cli wp eval '
+  $t = get_site_transient( "update_plugins" );
+  if ( !is_object( $t ) ) { $t = new stdClass(); $t->response = []; $t->checked = []; }
+  $t->last_checked = time();
+  $t->checked["akismet/akismet.php"] = "5.0";
+  unset( $t->response["akismet/akismet.php"] );
+  set_site_transient( "update_plugins", $t );' >/dev/null 2>&1
+check "CONTROL: akismet reads as the old version" "$(ak_version)" "5.0"
+check "CONTROL: and is active before the update" "$(ak_active)" "1"
+call upd_stale '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"wp_update_plugin","arguments":{"plugin":"akismet"}}}'
+UPD1_VERSION=$(ak_version); UPD1_ACTIVE=$(ak_active)
+# The plain case: no update data at all, so any version of this tool has to ask, and the
+# update really runs. This is where upgrade() left the plugin inactive.
+ak_age
+docker compose exec -T cli wp plugin activate akismet >/dev/null 2>&1
+docker compose exec -T cli wp eval 'delete_site_transient( "update_plugins" );' >/dev/null 2>&1
+check "CONTROL: aged and active again for the second update" "$(ak_version),$(ak_active)" "5.0,1"
+call upd_plain '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"wp_update_plugin","arguments":{"plugin":"akismet"}}}'
+UPD2_VERSION=$(ak_version); UPD2_ACTIVE=$(ak_active)
+# Put it back the way reset_state expects it before comparing anything.
+docker compose exec -T cli wp plugin deactivate akismet >/dev/null 2>&1
+check "a stale 'up to date' is not trusted: the update is found and applied" "$(verdict upd_stale),$([ "$UPD1_VERSION" != "5.0" ] && echo newer)" "ok,newer"
+check "and the plugin is still active after it" "$UPD1_ACTIVE" "1"
+check "an ordinary update succeeds" "$(verdict upd_plain)" "ok"
+check "and really replaces the files" "$([ -n "$UPD2_VERSION" ] && [ "$UPD2_VERSION" != "5.0" ] && echo newer)" "newer"
+check "and leaves the plugin active, as stored" "$UPD2_ACTIVE" "1"
+check "and the reply says so" "$(refusal upd_plain | grep -c 'still active')" "1"
+check "CONTROL: akismet is inactive again" "$(ak_active)" "0"
 
 echo "-- settings allowlist --"
 call s_read '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"wp_get_settings","arguments":{"group":"general"}}}'
@@ -467,8 +567,12 @@ call o_role '{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"wp
 ROLE_NOW=$(docker compose exec -T cli wp option get default_role 2>/dev/null | tr -d '\r\n')
 docker compose exec -T cli wp option update default_role subscriber >/dev/null 2>&1
 check "nor set a privileged registration default" "$ROLE_NOW" "subscriber"
+# Read wherever the refusal landed. It used to be a raw JSON-RPC error, which a client
+# discards whole, so the one refusal that mattered most was the one least likely to be read.
 check "and it says why rather than failing silently" \
-  "$(py 'import json,sys;print("to anyone who registers" in json.load(sys.stdin)["error"]["message"])' o_role)" "True"
+  "$(refusal o_role | grep -c 'to anyone who registers')" "1"
+check "as a tool result the model is shown, not a protocol error" \
+  "$(py 'import json,sys;d=json.load(sys.stdin);print("error" not in d and d["result"].get("isError") is True)' o_role)" "True"
 
 # Control. Without it, a policy that refused every write would pass all five checks above.
 call o_ok '{"jsonrpc":"2.0","id":45,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"blogdescription","value":"policy control tagline"}}}'
@@ -489,6 +593,54 @@ call o_undo "{\"jsonrpc\":\"2.0\",\"id\":48,\"method\":\"tools/call\",\"params\"
 UNDO_NOW=$(docker compose exec -T cli wp option get default_role 2>/dev/null | tr -d '\r\n')
 docker compose exec -T cli wp option update default_role subscriber >/dev/null 2>&1
 check "undo cannot restore the privileged default role" "$UNDO_NOW" "subscriber"
+
+# The rows the plugin and theme tools exist to change safely, and the role definitions.
+# Each is compared as a hash of the stored row, read before, read after, PUT BACK, and only
+# then compared: an empty active_plugins written by a missing guard switches this plugin
+# off, and every later check would describe that instead of the one missing rule.
+probe_row() { # probe_row <label> <file> <id> <option> <hostile value json>
+  local was now
+  was=$(docker compose exec -T cli wp eval "echo md5(serialize(get_option('$4')));" 2>/dev/null | tr -d '\r\n')
+  docker compose exec -T cli wp eval "echo base64_encode(serialize(get_option('$4')));" 2>/dev/null | tr -d '\r\n' > "$OUT/$2.saved"
+  call "$2" "{\"jsonrpc\":\"2.0\",\"id\":$3,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_option\",\"arguments\":{\"key\":\"$4\",\"value\":$5}}}"
+  now=$(docker compose exec -T cli wp eval "echo md5(serialize(get_option('$4')));" 2>/dev/null | tr -d '\r\n')
+  docker compose exec -T cli wp eval "update_option('$4', unserialize(base64_decode('$(cat "$OUT/$2.saved")')));" >/dev/null 2>&1
+  check "$1" "$now" "$was"
+}
+ROLES_KEY=$(docker compose exec -T cli wp eval 'global $wpdb; echo $wpdb->get_blog_prefix() . "user_roles";' 2>/dev/null | tr -d '\r\n')
+probe_row "wp_update_option cannot rewrite the role definitions" o_roles 49 "$ROLES_KEY" '{"subscriber":{"name":"Subscriber","capabilities":{"read":true,"manage_options":true,"promote_users":true}}}'
+probe_row "nor empty the active plugin list" o_plugins 50 active_plugins '[]'
+probe_row "nor switch theme past the theme tools" o_template 51 template '"no-such-theme"'
+probe_row "nor the stylesheet" o_stylesheet 52 stylesheet '"no-such-theme"'
+# Not hashed: every request that loads WordPress may reschedule core's own events, so the
+# row moves on its own. A sentinel nothing else touches says whether the schedule survived.
+docker compose exec -T cli wp eval 'wp_schedule_single_event(time()+86400*365,"smoke_cron_sentinel");' >/dev/null 2>&1
+docker compose exec -T cli wp eval 'echo base64_encode(serialize(get_option("cron")));' 2>/dev/null | tr -d '\r\n' > "$OUT/cron.saved"
+call o_cron '{"jsonrpc":"2.0","id":53,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"cron","value":[]}}}'
+CRON_NOW=$(docker compose exec -T cli wp eval 'echo wp_next_scheduled("smoke_cron_sentinel") ? "kept" : "dropped";' 2>/dev/null | tr -d '\r\n')
+[ "$CRON_NOW" = "kept" ] || docker compose exec -T cli wp eval "update_option('cron', unserialize(base64_decode('$(cat "$OUT/cron.saved")')));" >/dev/null 2>&1
+docker compose exec -T cli wp cron event delete smoke_cron_sentinel >/dev/null 2>&1
+check "nor drop every scheduled event" "$CRON_NOW" "kept"
+check "and the refusal names the tool to use instead" "$(refusal o_plugins | grep -c 'wp_deactivate_plugin')" "1"
+# Opening registration was never judged against the default role it opens onto. A site
+# where a person had set the default to editor was opened to the public by one call.
+docker compose exec -T cli wp option update users_can_register 0 >/dev/null 2>&1
+docker compose exec -T cli wp option update default_role editor >/dev/null 2>&1
+call o_reg '{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"users_can_register","value":"1"}}}'
+REG_NOW=$(docker compose exec -T cli wp option get users_can_register 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp option update users_can_register 0 >/dev/null 2>&1
+docker compose exec -T cli wp option update default_role subscriber >/dev/null 2>&1
+check "registration cannot be opened onto an editing default role" "$REG_NOW" "0"
+call o_reg_ok '{"jsonrpc":"2.0","id":55,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"users_can_register","value":"1"}}}'
+check "CONTROL: it can be opened onto subscriber" \
+  "$(docker compose exec -T cli wp option get users_can_register 2>/dev/null | tr -d '\r\n')" "1"
+docker compose exec -T cli wp option update users_can_register 0 >/dev/null 2>&1
+# wp_salt() keeps logged_in_key in the options table when wp-config.php lacks it.
+docker compose exec -T cli wp option update logged_in_key "LOGGEDINKEYPROBE" >/dev/null 2>&1
+call o_lik '{"jsonrpc":"2.0","id":56,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"logged_in_key"}}}'
+check "the logged-in cookie key is not readable" "$(grep -c LOGGEDINKEYPROBE "$OUT/o_lik")" "0"
+check "CONTROL: because it was refused, not because it was empty" "$(verdict o_lik)" "error"
+docker compose exec -T cli wp option delete logged_in_key >/dev/null 2>&1
 
 # The admin-email flow mails an arbitrary address from this domain, with body text
 # drawn from blogname, which this same tool can rewrite. It needs a token and a cooldown.
@@ -532,6 +684,22 @@ docker compose exec -T cli wp post delete "$DRAFT_ID" --force >/dev/null 2>&1
 call m_list '{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"wp_get_menu_items","arguments":{"menu":"Smoke Menu"}}}'
 check "item is published, not draft" \
   "$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(len(t["items"])==1)' m_list)" "True"
+# A parent from another menu is stored without complaint and the item never renders.
+# wp_update_menu_item has refused that since may_reparent() was written; adding was the
+# neighbouring tool that did not ask.
+docker compose exec -T cli wp menu create "Smoke Other" >/dev/null 2>&1
+OTHER_ITEM=$(docker compose exec -T cli wp menu item add-custom "Smoke Other" "Elsewhere" "https://example.test/" --porcelain 2>/dev/null | tr -d '\r\n')
+HOME_ITEM=$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(t["items"][0]["item_id"])' m_list)
+menu_count() { docker compose exec -T cli wp menu item list "Smoke Menu" --format=count 2>/dev/null | tr -d '\r\n'; }
+check "CONTROL: the other menu's item exists" "$([ -n "$OTHER_ITEM" ] && echo yes)" "yes"
+call m_xparent "{\"jsonrpc\":\"2.0\",\"id\":59,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_menu_item\",\"arguments\":{\"menu\":\"Smoke Menu\",\"title\":\"Orphan\",\"type\":\"custom\",\"url\":\"https://example.test/o\",\"parent_id\":$OTHER_ITEM}}}"
+XP_COUNT=$(menu_count)
+call m_parent "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_menu_item\",\"arguments\":{\"menu\":\"Smoke Menu\",\"title\":\"Child\",\"type\":\"custom\",\"url\":\"https://example.test/c\",\"parent_id\":$HOME_ITEM}}}"
+OK_COUNT=$(menu_count)
+docker compose exec -T cli wp menu delete "Smoke Other" >/dev/null 2>&1
+check "a parent from another menu is refused" "$(verdict m_xparent)" "error"
+check "and no item was added" "$XP_COUNT" "1"
+check "CONTROL: a parent in the same menu is accepted, and adds one item" "$(verdict m_parent),$((OK_COUNT - XP_COUNT))" "ok,1"
 call m_loc '{"jsonrpc":"2.0","id":55,"method":"tools/call","params":{"name":"wp_assign_menu_location","arguments":{"location":"nope","menu":"Smoke Menu"}}}'
 check "unknown menu location refused" "$(verdict m_loc)" "error"
 call m_del '{"jsonrpc":"2.0","id":56,"method":"tools/call","params":{"name":"wp_delete_menu","arguments":{"menu":"Smoke Menu"}}}'
@@ -734,6 +902,35 @@ check "reverting restores the post status" \
   "$(docker compose exec -T cli wp post get "$J_POST" --field=post_status 2>/dev/null | tr -d '\r\n')" "publish"
 docker compose exec -T cli wp post delete "$J_POST" --force >/dev/null 2>&1
 
+# The restored fields are raw WP_Post values, and wp_insert_post() unslashes what it is
+# given, so every backslash came back stripped: Gutenberg stores "<b>" in an attribute as
+# <b>, which returned as u003cbu003e, and the reply said "Restored". Seeded with
+# wp_slash, the way the plugin's own writers store content, and compared byte for byte.
+J_BS=$(docker compose exec -T cli wp eval '
+  $c = "<!-- wp:paragraph {\"x\":\"" . chr(92) . "u003cb" . chr(92) . "u003e\"} --><p>C:" . chr(92) . "Users</p><!-- /wp:paragraph -->";
+  echo wp_insert_post(wp_slash(["post_title"=>"Undo slash probe","post_content"=>$c,"post_status"=>"draft"]));' 2>/dev/null | tr -d '\r\n')
+J_BS_MD5=$(docker compose exec -T cli wp eval "echo md5(get_post_field('post_content',$J_BS,'raw'));" 2>/dev/null | tr -d '\r\n')
+check "CONTROL: the seed kept its backslashes" \
+  "$(docker compose exec -T cli wp eval "echo substr_count(get_post_field('post_content',$J_BS,'raw'), chr(92));" 2>/dev/null | tr -d '\r\n')" "3"
+call j_bs_edit "{\"jsonrpc\":\"2.0\",\"id\":110,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$J_BS,\"post_content\":\"<p>replaced</p>\"}}}"
+call j_bs_list '{"jsonrpc":"2.0","id":111,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":1}}}'
+J_BS_ID=$(py "import json,sys;d=json.load(sys.stdin);print(json.loads(d['result']['content'][0]['text'])[0]['id'])" j_bs_list)
+# A restore WordPress refuses must not be stamped as done. A must-use plugin makes the next
+# post write fail on request, which is the only way to make wp_update_post() say no.
+docker compose exec -T cli bash -c 'mkdir -p /var/www/html/wp-content/mu-plugins && printf "%s\n" "<?php" "if ( get_option( \"smoke_fail_post_write\" ) ) { add_filter( \"wp_insert_post_empty_content\", \"__return_true\" ); }" > /var/www/html/wp-content/mu-plugins/smoke-fail-post-write.php' >/dev/null 2>&1
+docker compose exec -T cli wp option update smoke_fail_post_write 1 >/dev/null 2>&1
+call j_bs_fail "{\"jsonrpc\":\"2.0\",\"id\":112,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$J_BS_ID\"}}}"
+docker compose exec -T cli wp option delete smoke_fail_post_write >/dev/null 2>&1
+check "a restore WordPress refused is reported as failed" "$(verdict j_bs_fail)" "error"
+call j_bs_list2 '{"jsonrpc":"2.0","id":113,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":5}}}'
+check "and is still on the list as reversible, to be tried again" \
+  "$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next((r['reversible'] for r in rows if r['id']=='$J_BS_ID'),'MISSING'))" j_bs_list2)" "True"
+call j_bs_undo "{\"jsonrpc\":\"2.0\",\"id\":114,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$J_BS_ID\"}}}"
+check "undo puts post content back byte for byte, backslashes included" \
+  "$(docker compose exec -T cli wp eval "echo md5(get_post_field('post_content',$J_BS,'raw'));" 2>/dev/null | tr -d '\r\n')" "$J_BS_MD5"
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/smoke-fail-post-write.php >/dev/null 2>&1
+docker compose exec -T cli wp post delete "$J_BS" --force >/dev/null 2>&1
+
 # Only the agent's writes. A person saving a settings page is not the agent's to undo,
 # and listing it would make the history untrustworthy at exactly the wrong moment.
 docker compose exec -T cli wp option update blogname "Edited by a person" >/dev/null 2>&1
@@ -894,6 +1091,18 @@ check "a value that cannot be snapshotted is still refused outright" \
 check "and that secret is not in the journal either" \
   "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("gmcp_journal",[])),"sk_live_OBJECT")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
 docker compose exec -T cli wp option delete acme_object_settings >/dev/null 2>&1
+
+echo "-- a tool call's arguments, as any log may keep them --"
+# The debug error_log redacted arguments with redact() alone, which blanks the top-level
+# "key" (the option's NAME) and prints "value" whatever it holds, and does not open a JSON
+# string. GMCP_Core::redact_call_args() is the one answer for every channel that writes a
+# call down. Each case greps for the planted secret, with the identifier as its control.
+ARGS_OUT=$(docker compose exec -T cli wp eval '
+  echo wp_json_encode( GMCP_Core::redact_call_args( [ "key" => "myplugin_pwd", "value" => "ARGSECRET1" ] ) ), "|",
+    wp_json_encode( GMCP_Core::redact_call_args( [ "ID" => 5, "meta" => "{\"_stripe_secret_key\":\"ARGSECRET2\"}" ] ) );' 2>/dev/null | tr -d '\r\n')
+check "a value stored under a secret-looking name is not kept" "$(echo "$ARGS_OUT" | grep -c 'ARGSECRET1')" "0"
+check "CONTROL: and the name it was stored under is" "$(echo "$ARGS_OUT" | grep -c 'myplugin_pwd')" "1"
+check "a secret inside a JSON-string argument is not kept" "$(echo "$ARGS_OUT" | grep -c 'ARGSECRET2')" "0"
 
 echo "-- redaction reaches every shape the detector reaches --"
 # The blanking has to be at least as thorough as holds_credential(), or it is a hole
@@ -1183,6 +1392,136 @@ check "deleting a row is detected too" \
 check "imported rows are reported, not called tampering" \
   "$(docker compose exec -T cli wp eval 'GMCP_Audit::clear();global $wpdb;$wpdb->insert($wpdb->prefix."gmcp_audit",["ts"=>gmdate("Y-m-d H:i:s"),"tool"=>"old","outcome"=>"ok","hash"=>"","prev_hash"=>""]);$v=GMCP_Audit::verify();echo $v["ok"]&&$v["imported"]===1?"handled":"WRONG";' 2>/dev/null | tr -d '\r\n')" "handled"
 
+# THE CHAIN UNDER CONCURRENCY. record() read the newest hash and then inserted, with
+# nothing between the two, so two calls landing together both chained to the same
+# predecessor. Parallel tool calls are ordinary client behaviour, and the fork it left was
+# permanent: verify() reported a missing row in a log nobody had touched, from then on.
+# Sixty calls, twenty at a time, are enough to fork it without the lock. The first check is
+# the control: an unrecorded call would shrink the chain and could hide a fork.
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+export TOK URL
+seq 1 60 | xargs -P 20 -I% sh -c 'curl -sS -o /dev/null -X POST "$URL" -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":%,\"method\":\"tools/call\",\"params\":{\"name\":\"mcp_ping\",\"arguments\":{}}}"'
+check "CONTROL: every one of sixty parallel calls was recorded" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"mcp_ping\"");' 2>/dev/null | tr -d '\r\n')" "60"
+check "the chain written by parallel calls verifies, end to end" \
+  "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify("all");echo $v["ok"]&&$v["complete"]&&$v["checked"]===60?"intact":"FORKED at ".var_export($v["broken_at"],true);' 2>/dev/null | tr -d '\r\n')" "intact"
+check "and no two rows share a predecessor" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(*) FROM (SELECT prev_hash FROM {$wpdb->prefix}gmcp_audit GROUP BY prev_hash HAVING COUNT(*) > 1) d");' 2>/dev/null | tr -d '\r\n')" "0"
+# The lock is released afterwards, or the next writer would wait five seconds for nothing.
+check "the chain lock is not left held" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$n="gmcp_audit_".md5(DB_NAME.GMCP_Audit::table());echo (int)$wpdb->get_var($wpdb->prepare("SELECT IS_FREE_LOCK(%s)",$n));' 2>/dev/null | tr -d '\r\n')" "1"
+
+# AN EMPTY HASH IS ACCEPTED ONLY BEFORE THE FIRST SIGNED ROW. Rows carried over from the
+# option-based version are the oldest rows there are; an unsigned row after a signed one is
+# an edit, and when it is the newest row nothing after it contradicts the blanking.
+check "CONTROL: unsigned rows ahead of the signed ones are still carried over, not broken" \
+  "$(docker compose exec -T cli wp eval 'GMCP_Audit::clear();global $wpdb;$t=GMCP_Audit::table();$wpdb->insert($t,["ts"=>gmdate("Y-m-d H:i:s"),"tool"=>"old","outcome"=>"ok","hash"=>"","prev_hash"=>""]);$a=new GMCP_Audit();foreach(["a","b","c"] as $n){$a->record(["tool"=>"t_".$n,"status"=>"success","args"=>[],"user_id"=>1]);}$v=GMCP_Audit::verify("all");echo $v["ok"]&&$v["imported"]===1&&$v["checked"]===3?"handled":"WRONG ".json_encode($v);' 2>/dev/null | tr -d '\r\n')" "handled"
+check "blanking the hash of the newest row is detected" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$t=GMCP_Audit::table();$id=(int)$wpdb->get_var("SELECT MAX(id) FROM $t");$wpdb->query($wpdb->prepare("UPDATE $t SET hash=\"\", target=%s WHERE id=%d","edited",$id));$v=GMCP_Audit::verify("all");$r=GMCP_Audit::verify_row($id);echo !$v["ok"]&&$v["broken_at"]===$id&&!$r["ok"]?"detected":"MISSED ".json_encode($v);' 2>/dev/null | tr -d '\r\n')" "detected"
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+
+# THE PRUNE EVENT HEALS ITSELF. It was scheduled by the activation hook alone, which runs
+# once, so a site that lost the event (or a subsite of a network activation) was never
+# pruned. The first check is the control: unscheduling has to be observable, or "scheduled
+# again" below would pass on an event that was never gone.
+check "CONTROL: the event can be seen to be gone" \
+  "$(docker compose exec -T cli wp eval 'wp_clear_scheduled_hook("gmcp_audit_prune");echo wp_next_scheduled("gmcp_audit_prune") ? "present" : "absent";' 2>/dev/null | tr -d '\r\n')" "absent"
+check "and the next request puts it back" \
+  "$(docker compose exec -T cli wp eval 'echo wp_next_scheduled("gmcp_audit_prune") ? "scheduled" : "STILL GONE";' 2>/dev/null | tr -d '\r\n')" "scheduled"
+
+# A REFUSED CALL IS STORED SMALL. It costs the caller nothing, so a key limited to one
+# harmless tool could fill the byte bound with refused calls carrying 60 KB each. The
+# control is an accepted call with the same padding, which keeps the full cap: it proves
+# the length probe can see a large row.
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+PAD=$(python3 -c "print('p'*20000)")
+call au_big_refused "{\"jsonrpc\":\"2.0\",\"id\":230,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_theme\",\"arguments\":{\"stylesheet\":\"twentytwentyfive\",\"pad\":\"$PAD\"}}}"
+call au_big_ok "{\"jsonrpc\":\"2.0\",\"id\":231,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_post\",\"arguments\":{\"post_title\":\"Padded audit probe\",\"post_status\":\"draft\",\"post_content\":\"$PAD\"}}}"
+check "CONTROL: an accepted call keeps its large arguments" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT LENGTH(args) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_create_post\" ORDER BY id DESC LIMIT 1") > 15000 ? "large" : "SMALL";' 2>/dev/null | tr -d '\r\n')" "large"
+check "CONTROL: the refused call was recorded as refused" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (string)$wpdb->get_var("SELECT outcome FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_delete_theme\" ORDER BY id DESC LIMIT 1");' 2>/dev/null | tr -d '\r\n')" "refused"
+check "a refused call's stored arguments are capped near 2 KB" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT LENGTH(args) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_delete_theme\" ORDER BY id DESC LIMIT 1") <= 2300 ? "capped" : "UNCAPPED";' 2>/dev/null | tr -d '\r\n')" "capped"
+check "and the cap says how large the call really was" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo strpos((string)$wpdb->get_var("SELECT args FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_delete_theme\" ORDER BY id DESC LIMIT 1"),"__gmcp_truncated")!==false?"marked":"UNMARKED";' 2>/dev/null | tr -d '\r\n')" "marked"
+docker compose exec -T cli wp post list --post_type=post --post_status=draft --name='' --format=ids --s='Padded audit probe' 2>/dev/null | xargs -r docker compose exec -T cli wp post delete --force >/dev/null 2>&1
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+
+# A FULL LOG SAYS SO, AND THE PLUGIN STOPS DOING THINGS IT CANNOT RECORD. The bounds are
+# constants, so the test lowers the row bound through the filter, from a must-use plugin
+# that reads an option and is removed again below. The log stopped silently before: the
+# marker was set only by the daily prune, so for a day nothing said that every call since
+# had gone unrecorded, and a hostile caller who filled it could act freely afterwards.
+MU=/var/www/html/wp-content/mu-plugins/gmcp-test-audit-limit.php
+docker compose exec -T cli sh -c "mkdir -p /var/www/html/wp-content/mu-plugins && echo '<?php add_filter( \"gmcp_audit_max_rows\", function ( \$n ) { \$v = get_option( \"gmcp_test_max_rows\" ); return \$v ? (int) \$v : \$n; } );' > $MU" >/dev/null 2>&1
+fill_audit() { # fill_audit <limit> <rows>: a log holding <rows> rows under a bound of <limit>
+  docker compose exec -T cli wp eval 'update_option("gmcp_test_max_rows",'"$1"'); GMCP_Audit::clear(); $a=new GMCP_Audit();
+    for($i=0;$i<'"$2"';$i++){ GMCP_Audit::note("fixture","row ".$i); }
+    GMCP_Audit::forget_usage(); echo GMCP_Audit::count();' 2>/dev/null | tr -d '\r\n'; }
+check "CONTROL: the filter lowers the bound and the fixture fills it" "$(fill_audit 3 3)" "3"
+check "CONTROL: the log is over its bound" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::over_bound() ? "over" : "under";' 2>/dev/null | tr -d '\r\n')" "over"
+call full_write '{"jsonrpc":"2.0","id":232,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Written into a full log","post_status":"draft"}}}'
+check "a full log refuses a tool that writes" "$(verdict full_write)" "error"
+check "and says why" \
+  "$(py 'import json,sys;d=json.load(sys.stdin);print("audit log" in d["result"]["content"][0]["text"])' full_write)" "True"
+check "and the post was not created" \
+  "$(docker compose exec -T cli wp post list --post_type=post --post_status=any --s='Written into a full log' --format=count 2>/dev/null | tr -d '\r\n')" "0"
+call full_read '{"jsonrpc":"2.0","id":233,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"limit":1}}}'
+check "CONTROL: a read still answers" "$(verdict full_read)" "ok"
+call full_ping '{"jsonrpc":"2.0","id":234,"method":"tools/call","params":{"name":"mcp_ping","arguments":{}}}'
+check "CONTROL: and so does the connectivity check" "$(verdict full_ping)" "ok"
+check "nothing was recorded for them while it was full" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::count();' 2>/dev/null | tr -d '\r\n')" "3"
+check "the stopped marker is set from the recorder, not only from a prune" \
+  "$(docker compose exec -T cli wp eval 'echo is_array(get_option(GMCP_Audit::STOPPED_OPTION,null)) ? "set" : "NOT SET";' 2>/dev/null | tr -d '\r\n')" "set"
+check "an administrator is shown a notice" \
+  "$(docker compose exec -T cli wp eval 'wp_set_current_user(1);ob_start();GMCP_Audit::admin_notice();echo strpos(ob_get_clean(),"stopped recording")!==false?"shown":"SILENT";' 2>/dev/null | tr -d '\r\n')" "shown"
+check "Site Health reports it as critical" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::site_health_test()["status"];' 2>/dev/null | tr -d '\r\n')" "critical"
+check "and the Audit Log screen says it is full" \
+  "$(docker compose exec -T cli wp eval 'wp_set_current_user(1);$r=new ReflectionMethod("GMCP_Settings","render_entry_list");$r->setAccessible(true);$s=(new ReflectionClass("GMCP_Settings"))->newInstanceWithoutConstructor();ob_start();$r->invoke($s);echo strpos(ob_get_clean(),"has stopped recording")!==false?"said":"SILENT";' 2>/dev/null | tr -d '\r\n')" "said"
+# The other direction: room again, and everything returns to normal with no manual step.
+check "CONTROL: raising the bound makes room" \
+  "$(docker compose exec -T cli wp eval 'update_option("gmcp_test_max_rows",100);GMCP_Audit::forget_usage();echo GMCP_Audit::over_bound() ? "over" : "under";' 2>/dev/null | tr -d '\r\n')" "under"
+call room_write '{"jsonrpc":"2.0","id":235,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Written once there was room","post_status":"draft"}}}'
+check "a write goes through again" "$(verdict room_write)" "ok"
+check "and is recorded" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(*) FROM ".GMCP_Audit::table()." WHERE tool=\"wp_create_post\"");' 2>/dev/null | tr -d '\r\n')" "1"
+check "and the stopped marker is cleared" \
+  "$(docker compose exec -T cli wp eval 'GMCP_Audit::forget_usage();GMCP_Audit::over_bound();echo get_option(GMCP_Audit::STOPPED_OPTION,null)===null ? "cleared" : "STILL SET";' 2>/dev/null | tr -d '\r\n')" "cleared"
+check "and Site Health is good again" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::site_health_test()["status"];' 2>/dev/null | tr -d '\r\n')" "good"
+docker compose exec -T cli sh -c "rm -f $MU" >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_test_max_rows >/dev/null 2>&1
+docker compose exec -T cli wp post list --post_type=post --post_status=any --s='Written once there was room' --format=ids 2>/dev/null | xargs -r docker compose exec -T cli wp post delete --force >/dev/null 2>&1
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+check "CONTROL: the test limit is gone again" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::max_rows();' 2>/dev/null | tr -d '\r\n')" "50000"
+
+# Clearing the log leaves a first row that says it happened.
+check "a cleared log starts with a row recording the clear" \
+  "$(docker compose exec -T cli wp eval 'GMCP_Audit::clear();GMCP_Audit::note("gmcp_audit_cleared","cleared in a test");$v=GMCP_Audit::verify("all");echo GMCP_Audit::count()===1&&$v["ok"]&&$v["checked"]===1?"tombstone":"WRONG";' 2>/dev/null | tr -d '\r\n')" "tombstone"
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+
+# A KEY LIMITED TO NAMES THAT SANITISE TO NOTHING WAS UNRESTRICTED. The key store drops
+# empty names, and an empty list means every tool the access level allows. Driven through
+# the same method the form posts to, with the keys counted before and after.
+keycount() { docker compose exec -T cli wp eval 'echo count(GMCP_Tokens::all());' 2>/dev/null | tr -d '\r\n'; }
+mint_limited() { # mint_limited <tools text>: prints the notice and leaves any key created
+  docker compose exec -T cli wp eval '$_POST=["key_label"=>"limit probe","key_level"=>"readonly","key_tools"=>'"$1"'];
+    $s=(new ReflectionClass("GMCP_Settings"))->newInstanceWithoutConstructor();
+    $m=new ReflectionMethod("GMCP_Settings","create_key");$m->setAccessible(true);$m->invoke($s);
+    $p=new ReflectionProperty("GMCP_Settings","notice");$p->setAccessible(true);echo substr((string)$p->getValue($s),0,8);' 2>/dev/null | tr -d '\r\n'; }
+KEYS_BEFORE=$(keycount)
+check "CONTROL: a valid tool list does mint a key" "$(mint_limited '"wp_get_posts"')" "Key crea"
+check "CONTROL: and the key store grew by one" "$(( $(keycount) - KEYS_BEFORE ))" "1"
+docker compose exec -T cli wp eval 'foreach(GMCP_Tokens::all() as $k){ if(($k["label"]??"")==="limit probe"){GMCP_Tokens::revoke($k["id"]);} }' >/dev/null 2>&1
+check "a list of names that all reduce to nothing is refused" "$(mint_limited '"* ."')" "No key w"
+check "and no key was created" "$(keycount)" "$KEYS_BEFORE"
+docker compose exec -T cli wp transient delete "gmcp_new_key_0" >/dev/null 2>&1
+
 # Age, row count and byte count, because any one alone fails: age lets a runaway agent
 # fill a disk in a day, a row cap lets one enormous entry do it, a byte cap throws away
 # last week because of last year.
@@ -1386,6 +1725,30 @@ call bk_start '{"jsonrpc":"2.0","id":231,"method":"tools/call","params":{"name":
 check "starting succeeds" "$(verdict bk_start)" "ok"
 check "and says plainly that it is not finished" "$(refusal bk_start | grep -c 'not finished yet')" "1"
 check "and never claims a backup was taken" "$(refusal bk_start | grep -ci 'backup complete\|backup taken\|backed up successfully')" "0"
+# The job runs in its own request now, queued on WP-Cron, rather than inside this one: a
+# medium site used to hold the call for the whole first resumption, and a proxy timeout
+# answered 504 while the backup carried on. Measured as "the job is visible as in flight
+# once the reply is back", which inline running could never show: by then it had finished.
+call bk_status2 '{"jsonrpc":"2.0","id":233,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
+BK_RUNNING=$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(d['running'])" bk_status2)
+call bk_again '{"jsonrpc":"2.0","id":235,"method":"tools/call","params":{"name":"wp_start_backup","arguments":{}}}'
+check "the job reads as in flight after the reply" "$BK_RUNNING" "True"
+# boot_backup() returns false on a held lock and do_action() threw that away, so a second
+# start read as a start. Refused here, before anything is queued.
+check "a second start while one is in flight is refused" "$(verdict bk_again)" "error"
+check "and the refusal says why" "$(refusal bk_again | grep -c 'already has a backup in progress')" "1"
+# The job id is the secret half of every archive filename, which is why the listing
+# withholds it. The start reply must not hand it over either.
+check "the reply carries no job id" "$(refusal bk_start | grep -cE '[0-9a-f]{12}')" "0"
+# Let it finish, so the sections below begin with nothing in flight: Backuply's section
+# deactivates UpdraftPlus, and doing that mid-job leaves resumptions nothing will run.
+for _ in $(seq 1 60); do
+  [ "$(docker compose exec -T cli wp eval 'foreach ( (array) _get_cron_array() as $e ) { foreach ( [ "updraft_backup_resume", "updraft_backupnow_backup_all" ] as $h ) { if ( !empty( $e[ $h ] ) ) { echo 1; return; } } } echo 0;' 2>/dev/null | tr -d '\r\n')" = "0" ] && break
+  sleep 5
+done
+call bk_status3 '{"jsonrpc":"2.0","id":236,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
+check "CONTROL: and reads as finished once UpdraftPlus is done" \
+  "$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(d['running'])" bk_status3)" "False"
 
 # The two-step confirmation reports the situation rather than gating on it.
 call bk_confirm '{"jsonrpc":"2.0","id":232,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"akismet/akismet.php"}}}'
@@ -2073,6 +2436,27 @@ check "and it is still there" \
 call do_cron '{"jsonrpc":"2.0","id":89,"method":"tools/call","params":{"name":"wp_delete_option","arguments":{"key":"cron"}}}'
 # Deleting the cron row drops every scheduled event on the site and nothing errors.
 check "and neither can the whole cron schedule" "$(verdict do_cron)" "error"
+# Deleting asked a list composed in the tool, which missed every rule living inside the write
+# policy. The wsal_ row is refused for writing (control) and was deletable.
+docker compose exec -T cli wp option update wsal_smoke_probe "keep me" >/dev/null 2>&1
+call do_wsal_w '{"jsonrpc":"2.0","id":94,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"wsal_smoke_probe","value":"x"}}}'
+check "CONTROL: an activity log row is refused for writing" "$(verdict do_wsal_w)" "error"
+call do_wsal '{"jsonrpc":"2.0","id":95,"method":"tools/call","params":{"name":"wp_delete_option","arguments":{"key":"wsal_smoke_probe"}}}'
+check "and it cannot be deleted either" \
+  "$(docker compose exec -T cli wp option get wsal_smoke_probe 2>/dev/null | tr -d '\r\n')" "keep me"
+ROLES_KEY=$(docker compose exec -T cli wp eval 'global $wpdb; echo $wpdb->get_blog_prefix() . "user_roles";' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp eval "echo base64_encode(serialize(get_option('$ROLES_KEY')));" 2>/dev/null | tr -d '\r\n' > "$OUT/roles.saved"
+call do_roles "{\"jsonrpc\":\"2.0\",\"id\":96,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_option\",\"arguments\":{\"key\":\"$ROLES_KEY\"}}}"
+ROLES_NOW=$(docker compose exec -T cli wp eval "echo get_option('$ROLES_KEY') ? 'present' : 'absent';" 2>/dev/null | tr -d '\r\n')
+[ "$ROLES_NOW" = "present" ] || docker compose exec -T cli wp eval "update_option('$ROLES_KEY', unserialize(base64_decode('$(cat "$OUT/roles.saved")')));" >/dev/null 2>&1
+check "nor can the role definitions, which would leave every account powerless" "$ROLES_NOW" "present"
+# The journal's undo of a created option deletes the row, so it asks the same policy. An
+# entry is planted directly because no tool can create such a row to begin with.
+docker compose exec -T cli wp eval '$l=get_option("gmcp_journal",[]); $l=is_array($l)?$l:[]; $l[]=["id"=>"wsalplant1","kind"=>"option","key"=>"wsal_smoke_probe","what"=>"Option \"wsal_smoke_probe\" created","previous"=>null,"absent"=>true,"tool"=>"wp_update_option","call"=>"plantcall","t"=>time()]; update_option("gmcp_journal",$l,false);' >/dev/null 2>&1
+call do_wsal_undo '{"jsonrpc":"2.0","id":97,"method":"tools/call","params":{"name":"wp_undo_change","arguments":{"id":"wsalplant1"}}}'
+check "nor removed by undoing its creation" \
+  "$(docker compose exec -T cli wp option get wsal_smoke_probe 2>/dev/null | tr -d '\r\n')" "keep me"
+docker compose exec -T cli wp option delete wsal_smoke_probe >/dev/null 2>&1
 
 echo "-- flushing caches --"
 docker compose exec -T cli wp eval 'set_transient("smoke_fresh","keep",3600); set_transient("smoke_stale","go",1); update_option("_transient_timeout_smoke_stale", time()-60);' >/dev/null 2>&1
@@ -2460,6 +2844,40 @@ check "and a restored value keeps its backslashes" \
   "$(docker compose exec -T cli wp eval "
       \$v = get_post_meta($JM_ID, 'jm_slash', true);
       echo is_array( \$v ) && \$v['sl'] === 'C:' . chr(92) . 'path' ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
+
+# A key can hold several rows, and undo used to treat every key as one value: it recorded
+# the first row, restored it with update_post_meta() over all of them, and undid an
+# addition by deleting every row of the key. core adds a _wp_old_slug row on every rename,
+# so undoing one rename deleted the redirects from all the earlier ones.
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+docker compose exec -T cli wp eval "
+  delete_post_meta($JM_ID,'jm_multi'); delete_post_meta($JM_ID,'_wp_old_slug');
+  add_post_meta($JM_ID,'jm_multi','ra'); add_post_meta($JM_ID,'jm_multi','rb'); add_post_meta($JM_ID,'jm_multi','rc');
+  add_post_meta($JM_ID,'_wp_old_slug','old-one'); add_post_meta($JM_ID,'_wp_old_slug','old-two');" >/dev/null 2>&1
+jm_rows() { docker compose exec -T cli wp eval "\$v=get_post_meta($JM_ID,'$1'); sort(\$v); echo implode(',',\$v);" 2>/dev/null | tr -d '\r\n'; }
+jm_undo_key() { # jm_undo_key <file> <id> <substring of what>
+  call "$1_l" '{"jsonrpc":"2.0","id":320,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":40}}}'
+  local jid; jid=$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next((r['id'] for r in rows if '$3' in r['what']),''))" "$1_l")
+  call "$1" "{\"jsonrpc\":\"2.0\",\"id\":$2,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$jid\"}}}"
+}
+check "CONTROL: the multi-row key was seeded with three rows" "$(jm_rows jm_multi)" "ra,rb,rc"
+jm_call jm_mu 321 "{\"ID\":$JM_ID,\"key\":\"jm_multi\",\"value\":\"ZZ\"}"
+check "CONTROL: the update rewrote every row" "$(jm_rows jm_multi)" "ZZ,ZZ,ZZ"
+jm_undo_key jm_mu_undo 322 '"jm_multi" changed'
+check "undoing an update of a multi-row key puts every row back" "$(jm_rows jm_multi)" "ra,rb,rc"
+call jm_md "{\"jsonrpc\":\"2.0\",\"id\":323,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post_meta\",\"arguments\":{\"ID\":$JM_ID,\"key\":\"jm_multi\",\"value\":\"rb\"}}}"
+check "CONTROL: deleting one value left its siblings" "$(jm_rows jm_multi)" "ra,rc"
+jm_undo_key jm_md_undo 324 '"jm_multi" removed'
+check "undoing it re-adds that row without overwriting the others" "$(jm_rows jm_multi)" "ra,rb,rc"
+# A published post, because core keeps no old slugs for pages or drafts.
+JM_SP=$(docker compose exec -T cli wp eval '$p=wp_insert_post(["post_title"=>"Slug history probe","post_name"=>"slug-history-probe","post_status"=>"publish"]); add_post_meta($p,"_wp_old_slug","old-one"); add_post_meta($p,"_wp_old_slug","old-two"); echo $p;' 2>/dev/null | tr -d '\r\n')
+slug_rows() { docker compose exec -T cli wp eval "\$v=get_post_meta($JM_SP,'_wp_old_slug'); sort(\$v); echo implode(',',\$v);" 2>/dev/null | tr -d '\r\n'; }
+call jm_ren "{\"jsonrpc\":\"2.0\",\"id\":325,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$JM_SP,\"post_name\":\"slug-history-renamed\"}}}"
+check "CONTROL: the rename added a redirect row for the old slug" "$(slug_rows)" "old-one,old-two,slug-history-probe"
+jm_undo_key jm_ren_undo 326 '"_wp_old_slug" added'
+check "undoing that addition removes only the row it added" "$(slug_rows)" "old-one,old-two"
+docker compose exec -T cli wp post delete "$JM_SP" --force >/dev/null 2>&1
+docker compose exec -T cli wp eval "delete_post_meta($JM_ID,'jm_multi');" >/dev/null 2>&1
 
 echo "-- one call, one unit of undo --"
 # A single call routinely changes several things and they read as unrelated events without

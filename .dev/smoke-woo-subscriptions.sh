@@ -210,6 +210,14 @@ check "filtering by a status nothing has finds nothing" \
   "$(py 'import json,sys
 d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])
 print(len(d["subscriptions"]))' "" wcs_filter)" "0"
+# The page was re-sorted by id with sort(), which compares the row arrays key by key and the
+# first key is the id. Only meaningful with two or more subscriptions, so a lone fixture
+# passes trivially; the check exists for stacks that have more.
+check "the page is in start order, newest first, not re-sorted by id" \
+  "$(py 'import json,sys
+d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])
+s=[x["started_gmt"] or "" for x in d["subscriptions"]]
+print(s == sorted(s, reverse=True))' "" wcs_many)" "True"
 call wcs_bad "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"wcs_list_subscriptions\",\"arguments\":{\"status\":\"teleported\"}}}"
 check "an unknown status is refused" "$(verdict wcs_bad)" "error"
 
@@ -249,6 +257,12 @@ check "and the status is active again" \
   "$(wpc eval "echo wcs_get_subscription($SUB)->get_status();")" "active"
 check "and the payment job is scheduled again" \
   "$(wpc eval "echo as_next_scheduled_action('woocommerce_scheduled_subscription_payment',['subscription_id'=>$SUB]) ? 'yes' : 'no';")" "yes"
+
+# The same-state test sat after the allow-list, which has no same-state pairs, so "already
+# active" was reported as a refusal and the no-op path was dead code.
+call wcs_same "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{\"name\":\"wcs_set_subscription_status\",\"arguments\":{\"id\":$SUB,\"status\":\"active\"}}}"
+check "asking for the status it already has is a no-op, not a refusal" "$(verdict wcs_same)" "ok"
+check "and says so" "$(ctext wcs_same | grep -c 'already active')" "1"
 
 echo "-- refused transitions, and the states they would leave behind --"
 # Cancelling is terminal, and cancels at the gateway on gateways that manage billing.

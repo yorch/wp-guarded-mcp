@@ -468,8 +468,13 @@ class GMCP_Audit_Table extends WP_List_Table {
 
     // Cut back to a word boundary, because a sentence that stops mid-word reads as
     // damaged text rather than as a message with more of it elsewhere.
-    $short = mb_strwidth( $why ) > 140
-      ? preg_replace( '/\s+\S*$/u', '', mb_strimwidth( $why, 0, 140 ) ) . '…'
+    //
+    // mbstring's width functions are not among those WordPress polyfills (mb_substr and
+    // mb_strlen are), so without the extension this fell over on the first refusal listed.
+    // Character counts stand in for display width there.
+    $has_width = function_exists( 'mb_strwidth' ) && function_exists( 'mb_strimwidth' );
+    $short = ( $has_width ? mb_strwidth( $why ) : mb_strlen( $why ) ) > 140
+      ? preg_replace( '/\s+\S*$/u', '', $has_width ? mb_strimwidth( $why, 0, 140 ) : mb_substr( $why, 0, 140 ) ) . '…'
       : $why;
 
     printf( '<tr class="%s"><td colspan="%d" class="gmcp-detail">%s%s%s</td></tr>',

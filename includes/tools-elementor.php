@@ -245,7 +245,7 @@ class GMCP_Tools_Elementor {
       ],
       'elementor_set_active_kit' => [
         'name' => 'elementor_set_active_kit',
-        'description' => 'Make one Elementor kit the active one. A kit holds the site\'s global colours, fonts, layout defaults and theme-style rules, so most of what "wire up a theme" means lives in it rather than in any page. Elementor records the active one in a single option, which is why this looks small and is not: switching it changes every page at once. Two things come with the switch and both matter. Elementor compiles the kit\'s colours and typography into generated CSS files, so the files are cleared here as well and rebuilt on the next page load; without that the site keeps rendering the old kit\'s design while reporting the new one as active, which is the exact shape of silent failure the conditions tools exist for. And the previous kit is named in the reply, because it is the only record of what to switch back to: this is not journalled and there is no undo for it. Refuses anything that is not a published kit, including an ordinary library template, since Elementor reads the option without checking and an id pointing at the wrong thing leaves the site with no usable global styles at all. List the kits with elementor_list_templates and type "kit".',
+        'description' => 'Make one Elementor kit the active one. A kit holds the site\'s global colours, fonts, layout defaults and theme-style rules, so most of what "wire up a theme" means lives in it rather than in any page. Elementor records the active one in a single option, which is why this looks small and is not: switching it changes every page at once. Two things come with the switch and both matter. Elementor compiles the kit\'s colours and typography into generated CSS files, so the files are cleared here as well and rebuilt on the next page load; without that the site keeps rendering the old kit\'s design while reporting the new one as active, which is the exact shape of silent failure the conditions tools exist for. And the previous kit is named in the reply, so it is easy to switch back: the option write is also recorded in the change journal and wp_undo_change can restore it, but an undo does not regenerate the CSS, so follow it with elementor_regenerate_css. Refuses anything that is not a published kit, including an ordinary library template, since Elementor reads the option without checking and an id pointing at the wrong thing leaves the site with no usable global styles at all. List the kits with elementor_list_templates and type "kit".',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -338,7 +338,7 @@ class GMCP_Tools_Elementor {
     // And the kit report reads elementor_active_kit, which is an option like any other and
     // answers to the same guard for the same reason: a site that has protected that name is
     // not read around by a tool that happens to know a different way in.
-    if ( $tool === 'elementor_kit_report' ) {
+    if ( $tool === 'elementor_kit_report' || $tool === 'elementor_set_active_kit' ) {
       $allowed = GMCP_Core::option_guard( self::KIT_OPTION );
       if ( $allowed !== true ) {
         return $this->error( $r, $allowed );
@@ -530,6 +530,7 @@ class GMCP_Tools_Elementor {
 
   private function get_conditions( array $a, array $r ): array {
     $cache = $this->cache_value();
+    $truncated = false;
 
     if ( !empty( $a['ID'] ) ) {
       $post = get_post( (int) $a['ID'] );
@@ -540,7 +541,11 @@ class GMCP_Tools_Elementor {
     }
     else {
       $rows = [];
-      foreach ( $this->templates() as $post ) {
+      // One more than the cap, so a site with more templates than that is told so instead
+      // of being given "every template checked" over the first hundred.
+      $posts = $this->templates( [ 'posts_per_page' => 101 ] );
+      $truncated = count( $posts ) > 100;
+      foreach ( array_slice( $posts, 0, 100 ) as $post ) {
         $rows[] = $this->template_row( $post, $cache );
       }
     }
@@ -554,7 +559,12 @@ class GMCP_Tools_Elementor {
       ? 'Every template checked has the same conditions on the template and in the cache.'
       : 'The template and the cache disagree for ' . count( $disagree ) . ' template' . ( count( $disagree ) === 1 ? '' : 's' ) . ' (' . implode( ', ', array_map( function ( $id ) { return '#' . $id; }, $disagree ) ) . '). Elementor applies what the cache says, so those are configured but not live. elementor_set_conditions writes both halves together.';
 
+    if ( $truncated ) {
+      $summary = 'Only the first 100 templates (by ID) were checked; this site has more. Pass ID for a specific one. ' . $summary;
+    }
+
     return $this->json( $r, [
+      'truncated' => $truncated,
       'theme_builder_present' => $this->theme_builder_present(),
       'theme_builder_note' => $this->theme_builder_present()
         ? null
@@ -611,6 +621,9 @@ class GMCP_Tools_Elementor {
 
     $type = (string) get_post_meta( $id, self::TYPE_META, true );
     $location = isset( $a['location'] ) ? sanitize_key( (string) $a['location'] ) : ( self::LOCATIONS[ $type ] ?? '' );
+    if ( $location !== '' && !in_array( $location, array_values( self::LOCATIONS ), true ) ) {
+      return $this->error( $r, 'location must be one of header, footer, single or archive; "' . $location . '" is not a theme-builder location.' );
+    }
     if ( $location === '' ) {
       return $this->error( $r, 'Template #' . $id . ' has type "' . ( $type === '' ? 'unset' : $type ) . '", which is not one of the theme-builder types that take conditions (' . implode( ', ', array_keys( self::LOCATIONS ) ) . '). Pass location explicitly if this template really does belong to header, footer, single or archive.' );
     }
@@ -620,12 +633,17 @@ class GMCP_Tools_Elementor {
     $refresh = $this->refresh_cache();
     $after = $this->cache_value();
 
+    // Elementor decides the real location from the template type; the location argument is
+    // only a statement of intent. Report what the cache holds, and say when they differ.
+    $in_cache = $this->cached_conditions( $after, $id );
+
     $out = [
       'template' => [
         'id' => $id,
         'title' => $post->post_title,
         'template_type' => $type,
-        'location' => $location,
+        'location_requested' => $location,
+        'location_in_cache' => $in_cache === null ? null : $in_cache['location'],
         'conditions' => $conditions,
       ],
       'cache' => [
@@ -641,13 +659,17 @@ class GMCP_Tools_Elementor {
 
     // What was in the option before it was deleted, because deleted_option records the
     // deletion but not the value, so the change journal cannot put this back.
-    if ( $refresh['action'] === 'deleted' && is_array( $before ) && $before !== [] ) {
+    if ( in_array( $refresh['action'], [ 'deleted', 'trimmed' ], true ) && is_array( $before ) && $before !== [] ) {
       $out['cache']['value_before_delete'] = $before;
+    }
+
+    if ( $in_cache !== null && $in_cache['location'] !== $location ) {
+      $out['location_note'] = 'The cache filed this template under "' . $in_cache['location'] . '", not the requested "' . $location . '": Elementor places a template by its type (' . ( $type === '' ? 'unset' : $type ) . '), and the location argument does not move it.';
     }
 
     $out['next'] = !$this->theme_builder_present()
       ? 'The conditions are stored, but the theme builder is not installed on this site, so nothing reads them and the front end will not change. Elementor Pro or PRO Elements provides it.'
-      : ( $refresh['action'] === 'deleted'
+      : ( $refresh['action'] !== 'regenerated'
         ? 'Load any front-end page once so Elementor rebuilds the cache from the templates, then call elementor_get_conditions to confirm the template now appears in it.'
         : 'The cache was rebuilt in place; elementor_get_conditions confirms what it now says.' );
 
@@ -686,10 +708,24 @@ class GMCP_Tools_Elementor {
       }
     }
 
+    // The option is shared. Free Elementor's floating buttons keep their own conditions under
+    // a key of it that cannot be rebuilt from the templates, so deleting it wholesale loses
+    // them. Only the theme-builder locations are dropped; the rest is kept as it was.
+    $current = get_option( self::CONDITIONS_OPTION, null );
+    if ( is_array( $current ) ) {
+      $foreign = array_diff_key( $current, array_flip( [ 'header', 'footer', 'single', 'archive' ] ) );
+      if ( $foreign !== [] ) {
+        update_option( self::CONDITIONS_OPTION, $foreign, false );
+        return [
+          'action' => 'trimmed',
+          'note' => 'Elementor Pro\'s conditions manager was not reachable, so the theme-builder locations were removed from the cached option for Elementor to rebuild from the templates. The other entries in it (' . implode( ', ', array_keys( $foreign ) ) . ', kept by other Elementor features) were left as they were.',
+        ];
+      }
+    }
     delete_option( self::CONDITIONS_OPTION );
     return [
       'action' => 'deleted',
-      'note' => 'Elementor Pro\'s conditions manager was not reachable, so the cached option was deleted instead and Elementor will rebuild it from the templates on the next read. Any entry another Elementor feature keeps in that option, such as floating buttons, went with it.',
+      'note' => 'Elementor Pro\'s conditions manager was not reachable, so the cached option was deleted instead and Elementor will rebuild it from the templates on the next read. Nothing else was stored in it.',
     ];
   }
 
@@ -731,6 +767,13 @@ class GMCP_Tools_Elementor {
       return $this->text( $r, "Kit {$id} \"" . get_the_title( $id ) . "\" was already the active one. Nothing changed." );
     }
 
+    // A policy about an option belongs to the option: ask it, as every other writer of an
+    // option does, so a rule added there later reaches this tool without it being edited.
+    $policy = GMCP_Core::option_write_policy( self::ACTIVE_KIT_OPTION, $id );
+    if ( $policy !== true ) {
+      return $this->error( $r, $policy );
+    }
+
     update_option( self::ACTIVE_KIT_OPTION, $id );
 
     // Asked of the option rather than assumed from the write, for the reason this file
@@ -769,7 +812,7 @@ class GMCP_Tools_Elementor {
       'generated_css' => $css,
       // The previous id is the only record of what to go back to, so it is said rather
       // than left to be worked out later.
-      'note' => 'This is not journalled and wp_undo_change cannot reverse it. To switch back, call this again with '
+      'note' => 'The option change is recorded in the change journal, so wp_undo_change can restore the option; it does not regenerate the CSS, so run elementor_regenerate_css after an undo. To switch back directly, call this again with '
         . ( $before ? 'ID ' . $before . '.' : 'the kit that was active before, which this site did not have recorded.' )
         . ( $css === 'cleared, and will rebuild on the next page load'
             ? ' A full-page cache in front of WordPress is separate and was not touched.'
@@ -865,6 +908,23 @@ class GMCP_Tools_Elementor {
       return $this->error( $r, 'template_id must be an Elementor library template. Post #' . $template_id . ' is ' . ( $template ? 'a ' . $template->post_type : 'not a post that exists' ) . '.' );
     }
 
+    // A policy about a post type belongs to the post type. With HPOS off an order or a
+    // subscription is a posts row, and this tool rewrites post_content and meta on any post.
+    $commerce = GMCP_Core::commerce_post_guard( $page_id, 'Applying a template to' );
+    if ( $commerce !== true ) {
+      return $this->error( $r, $commerce );
+    }
+
+    // The target is a page or a post, never a library item. Applying a template over a
+    // library item rewrites a design that other pages embed (a header, a footer, the kit)
+    // and, in copy mode, its template type, which silently takes it out of its theme-builder
+    // location. page_id equal to template_id is the same thing with a self-referencing
+    // shortcode on top. None of this goes through template_reference_guard(): refusing the
+    // target outright means no write can reach a template that pages depend on.
+    if ( $page_id === $template_id || $page->post_type === 'elementor_library' ) {
+      return $this->error( $r, 'page_id #' . $page_id . ' is ' . ( $page_id === $template_id ? 'the template itself' : 'an Elementor library template' ) . ', not a page or post. Applying a template onto a library item would overwrite a design other pages may embed and could change its template type. Edit library templates in Elementor, or pass an ordinary page or post as page_id.' );
+    }
+
     $mode = isset( $a['mode'] ) ? sanitize_key( (string) $a['mode'] ) : 'shortcode';
     if ( !in_array( $mode, [ 'shortcode', 'copy' ], true ) ) {
       return $this->error( $r, 'mode must be shortcode or copy.' );
@@ -931,7 +991,9 @@ class GMCP_Tools_Elementor {
       $notes[] = 'Nothing refuses a later delete or unpublish of template #' . $template_id . ' on account of this page. elementor_template_references is the query that finds what points at a template; ask it before removing one.';
     }
     else {
-      if ( !$this->copy_meta( $template_id, $page_id, self::DATA_META ) ) {
+      // The same test the overwrite check uses: Elementor stores "[]" for a document never
+      // built, and copying it would report an applied design that is a blank page.
+      if ( !$this->has_elementor_data( $template_id ) || !$this->copy_meta( $template_id, $page_id, self::DATA_META ) ) {
         return $this->error( $r, 'Template #' . $template_id . ' has no Elementor data to copy, so there is nothing to apply.' );
       }
       $this->copy_meta( $template_id, $page_id, '_elementor_page_settings' );
@@ -943,6 +1005,7 @@ class GMCP_Tools_Elementor {
       // and the change announced on gmcp_mutate the way every other write in this file is.
       clean_post_cache( $page_id );
       $notes[] = 'This is a copy, not a link: later edits to template #' . $template_id . ' will not reach this page.';
+      $notes[] = 'Only the Elementor data was copied. The page\'s post_content was not touched, and Elementor normally keeps rendered HTML there for search, excerpts, SEO plugins and the fallback when Elementor is off, so those see the old content until the page is saved once in the Elementor editor.';
     }
 
     if ( $page_template !== null ) {
