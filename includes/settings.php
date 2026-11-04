@@ -471,6 +471,16 @@ class GMCP_Settings {
     $key = GMCP_Tokens::create( $label, $level, $days, $tools );
     // Named for the person who minted it, so it is not a fixed target that anything else
     // can go and read. Belt to the option guard's braces: without a persistent object
+
+      // The key store reduces every name with sanitize_key() and drops what is left
+      // empty, and an empty list means "everything the access level allows". So a box
+      // holding only names that reduce to nothing (an asterisk, a localised name) would
+      // mint an unrestricted key from a form that asked for a restricted one. Refuse
+      // instead of guessing.
+      if ( !array_filter( array_map( 'sanitize_key', $tools ) ) ) {
+        $this->notice = __( 'No key was created: none of the tool names you typed is a valid tool name (letters, digits and underscores only), and an empty list would have meant every tool the access level allows. Copy names from the tool list, or leave the box empty for no restriction.', 'guarded-mcp' );
+        return;
+      }
     // cache a transient is an ordinary wp_options row, so for its sixty seconds the
     // plaintext really is in the database, which is the exact thing hashing the stored
     // keys exists to avoid.

@@ -1183,6 +1183,23 @@ check "deleting a row is detected too" \
 check "imported rows are reported, not called tampering" \
   "$(docker compose exec -T cli wp eval 'GMCP_Audit::clear();global $wpdb;$wpdb->insert($wpdb->prefix."gmcp_audit",["ts"=>gmdate("Y-m-d H:i:s"),"tool"=>"old","outcome"=>"ok","hash"=>"","prev_hash"=>""]);$v=GMCP_Audit::verify();echo $v["ok"]&&$v["imported"]===1?"handled":"WRONG";' 2>/dev/null | tr -d '\r\n')" "handled"
 
+# A KEY LIMITED TO NAMES THAT SANITISE TO NOTHING WAS UNRESTRICTED. The key store drops
+# empty names, and an empty list means every tool the access level allows. Driven through
+# the same method the form posts to, with the keys counted before and after.
+keycount() { docker compose exec -T cli wp eval 'echo count(GMCP_Tokens::all());' 2>/dev/null | tr -d '\r\n'; }
+mint_limited() { # mint_limited <tools text>: prints the notice and leaves any key created
+  docker compose exec -T cli wp eval '$_POST=["key_label"=>"limit probe","key_level"=>"readonly","key_tools"=>'"$1"'];
+    $s=(new ReflectionClass("GMCP_Settings"))->newInstanceWithoutConstructor();
+    $m=new ReflectionMethod("GMCP_Settings","create_key");$m->setAccessible(true);$m->invoke($s);
+    $p=new ReflectionProperty("GMCP_Settings","notice");$p->setAccessible(true);echo substr((string)$p->getValue($s),0,8);' 2>/dev/null | tr -d '\r\n'; }
+KEYS_BEFORE=$(keycount)
+check "CONTROL: a valid tool list does mint a key" "$(mint_limited '"wp_get_posts"')" "Key crea"
+check "CONTROL: and the key store grew by one" "$(( $(keycount) - KEYS_BEFORE ))" "1"
+docker compose exec -T cli wp eval 'foreach(GMCP_Tokens::all() as $k){ if(($k["label"]??"")==="limit probe"){GMCP_Tokens::revoke($k["id"]);} }' >/dev/null 2>&1
+check "a list of names that all reduce to nothing is refused" "$(mint_limited '"* ."')" "No key w"
+check "and no key was created" "$(keycount)" "$KEYS_BEFORE"
+docker compose exec -T cli wp transient delete "gmcp_new_key_0" >/dev/null 2>&1
+
 # Age, row count and byte count, because any one alone fails: age lets a runaway agent
 # fill a disk in a day, a row cap lets one enormous entry do it, a byte cap throws away
 # last week because of last year.
