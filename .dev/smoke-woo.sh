@@ -113,7 +113,7 @@ check "and really was not created" \
 P_ID=$(wpc post list --post_type=product --name=test-widget --field=ID)
 
 call p_stock "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_set_stock\",\"arguments\":{\"id\":$P_ID,\"delta\":-5}}}"
-check "a stock delta applies" "$(wpc post meta get "$P_ID" _stock)" "0"
+check "a stock delta applies" "$(wpc post meta get "$P_ID" _stock | awk '{printf "%d", $1}')" "0"
 # A quantity of zero with a status still saying instock leaves the product purchasable.
 check "stock status follows the quantity down" "$(wpc post meta get "$P_ID" _stock_status)" "outofstock"
 
@@ -121,6 +121,66 @@ call p_prev "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":
 check "a product preview changes nothing" "$(wpc post meta get "$P_ID" _regular_price)" "19.99"
 call p_upd "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_product\",\"arguments\":{\"id\":$P_ID,\"regular_price\":\"24.99\"}}}"
 check "and the real update does" "$(wpc post meta get "$P_ID" _regular_price)" "24.99"
+
+# status is written straight to post_status by WC_Product::set_status(), which validates
+# nothing. 'trash' that way skipped wp_trash_post(), and a made-up status hid the product
+# from every admin list. Read the stored status back after each hostile call.
+call p_st_ctl "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_product\",\"arguments\":{\"id\":$P_ID,\"status\":\"draft\"}}}"
+check "CONTROL: a valid status change goes through" "$(wpc post get "$P_ID" --field=post_status)" "draft"
+call p_st_back "{\"jsonrpc\":\"2.0\",\"id\":51,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_product\",\"arguments\":{\"id\":$P_ID,\"status\":\"publish\"}}}"
+check "CONTROL: and back to publish" "$(wpc post get "$P_ID" --field=post_status)" "publish"
+call p_st_trash "{\"jsonrpc\":\"2.0\",\"id\":52,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_product\",\"arguments\":{\"id\":$P_ID,\"status\":\"trash\"}}}"
+T_STORED=$(wpc post get "$P_ID" --field=post_status)
+[ "$T_STORED" = "publish" ] || docker compose exec -T cli wp post update "$P_ID" --post_status=publish >/dev/null 2>&1
+check "trashing through the update tool is refused" "$(verdict p_st_trash)" "error"
+check "and the stored status is untouched" "$T_STORED" "publish"
+check "and the refusal points at the delete tool" "$(body p_st_trash | grep -c 'wp_delete_post')" "1"
+call p_st_junk "{\"jsonrpc\":\"2.0\",\"id\":53,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_product\",\"arguments\":{\"id\":$P_ID,\"status\":\"foo\"}}}"
+J_STORED=$(wpc post get "$P_ID" --field=post_status)
+[ "$J_STORED" = "publish" ] || docker compose exec -T cli wp post update "$P_ID" --post_status=publish >/dev/null 2>&1
+check "an invented status is refused" "$(verdict p_st_junk)" "error"
+check "and the stored status is untouched by it" "$J_STORED" "publish"
+call p_st_prev "{\"jsonrpc\":\"2.0\",\"id\":54,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_product\",\"arguments\":{\"id\":$P_ID,\"status\":\"trash\",\"preview\":true}}}"
+check "a preview of a refused status is refused too" "$(verdict p_st_prev)" "error"
+
+# The description said search matches SKUs; it is a WP_Query text search and does not.
+call p_sku "{\"jsonrpc\":\"2.0\",\"id\":55,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_list_products\",\"arguments\":{\"sku\":\"TW-1\"}}}"
+check "CONTROL: the sku argument finds the product that has that SKU" \
+  "$(py 'import json,sys;print([p["id"] for p in json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])])' p_sku)" "[$P_ID]"
+call p_sku_none "{\"jsonrpc\":\"2.0\",\"id\":56,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_list_products\",\"arguments\":{\"sku\":\"NO-SUCH-SKU\"}}}"
+check "and a SKU nothing has finds nothing" \
+  "$(py 'import json,sys;print(len(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])))' p_sku_none)" "0"
+
+# A delta is applied in the database in one statement. Simulate a sale landing between the
+# tool reading the stock and writing it: the first read of the quantity decrements the
+# stored figure behind the tool's back, as a concurrent checkout would.
+docker exec -u 0 "${COMPOSE_PROJECT_NAME:-wptest}-wp-1" mkdir -p /var/www/html/wp-content/mu-plugins
+docker compose exec -T wp sh -c 'cat > /var/www/html/wp-content/mu-plugins/stock-race.php <<"PHPEOF"
+<?php
+add_filter( "woocommerce_product_get_stock_quantity", function ( $q ) {
+  $id = (int) get_option( "probe_race", 0 );
+  if ( $id ) {
+    delete_option( "probe_race" );
+    global $wpdb;
+    $wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->postmeta} SET meta_value = meta_value - 1 WHERE post_id = %d AND meta_key = %s", $id, "_stock" ) );
+  }
+  return $q;
+} );
+PHPEOF' >/dev/null 2>&1
+docker compose exec -T cli wp post meta update "$P_ID" _stock 10 >/dev/null 2>&1
+docker compose exec -T cli wp option update probe_race "$P_ID" >/dev/null 2>&1
+call p_race "{\"jsonrpc\":\"2.0\",\"id\":57,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_set_stock\",\"arguments\":{\"id\":$P_ID,\"delta\":3}}}"
+R_LEFT=$(wpc option get probe_race)
+R_STORED=$(wpc post meta get "$P_ID" _stock)
+docker compose exec -T wp sh -c 'rm -f /var/www/html/wp-content/mu-plugins/stock-race.php' >/dev/null 2>&1
+docker compose exec -T cli wp option delete probe_race >/dev/null 2>&1
+check "CONTROL: the simulated concurrent sale fired" "$R_LEFT" ""
+# 10, minus the concurrent sale, plus 3. A read-modify-write stores 13 and loses the sale.
+check "a stock delta does not overwrite a sale that landed in between" "$(printf '%s' "$R_STORED" | awk '{printf "%d", $1}')" "12"
+# Put it back, through the absolute path, which also goes through the atomic writer.
+call p_zero "{\"jsonrpc\":\"2.0\",\"id\":58,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_set_stock\",\"arguments\":{\"id\":$P_ID,\"quantity\":0}}}"
+check "an absolute quantity applies, and the status follows it down" \
+  "$(wpc post meta get "$P_ID" _stock | awk '{printf "%d", $1}'):$(wpc post meta get "$P_ID" _stock_status)" "0:outofstock"
 
 echo "-- orders --"
 O_ID=$(docker compose exec -T cli wp eval "
@@ -158,6 +218,20 @@ check "one order reads back with its line items" \
 call o_note "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_add_order_note\",\"arguments\":{\"id\":$O_ID,\"note\":\"internal only\"}}}"
 check "a note is private unless asked otherwise" "$(body o_note | grep -c 'customer was not told')" "1"
 
+echo "-- a refund is not an order --"
+# wc_get_order() resolves a refund id too, and a refund has no get_address(), so the tool
+# died with an undefined-method Error that only the server's catch-all turned into a reply.
+RF_ID=$(docker compose exec -T cli wp eval "
+  \$ref = wc_create_refund( [ 'order_id' => $O_ID, 'amount' => '1.00', 'reason' => 'suite', 'refund_payment' => false ] );
+  echo is_wp_error( \$ref ) ? 0 : \$ref->get_id();" 2>/dev/null | tr -d '\r\n')
+check "CONTROL: the refund fixture exists" "$(docker compose exec -T cli wp eval "echo wc_get_order($RF_ID) instanceof WC_Order_Refund ? 'refund' : 'other';" 2>/dev/null | tr -d '\r\n')" "refund"
+call rf_get "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_get_order\",\"arguments\":{\"id\":$RF_ID}}}"
+check "reading a refund id as an order is refused" "$(verdict rf_get)" "error"
+check "and says what it is, instead of failing on a missing method" "$(body rf_get | grep -c 'not an order')" "1"
+call rf_ctl "{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_get_order\",\"arguments\":{\"id\":$O_ID}}}"
+check "CONTROL: a real order still reads" "$(verdict rf_ctl)" "ok"
+docker compose exec -T cli wp eval "\$r = wc_get_order($RF_ID); if ( \$r ) { \$r->delete( true ); }" >/dev/null 2>&1
+
 echo "-- reporting --"
 call s_sum '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"wc_sales_summary","arguments":{"days":30}}}'
 check "the sales summary counts the paid order" \
@@ -167,6 +241,30 @@ check "the briefing reports order counts by real status names" \
   "$(py 'import json,sys;print("completed" in json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])["orders"])' s_brief)" "True"
 check "and flags the out-of-stock product" \
   "$(py 'import json,sys;print("Test Widget" in json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])["products"]["out_of_stock"])' s_brief)" "True"
+check "the briefing counts the paid order in the last 30 days" \
+  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])["last_30_days"]["orders"])' s_brief)" "1"
+check "and reports the order counts it got from WooCommerce's own counter" \
+  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])["orders"].get("completed"))' s_brief)" "1"
+check "revenue is labelled gross, with a currency" \
+  "$(py 'import json,sys;d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print("gross" in d["revenue_basis"] and bool(d["revenue_by_currency"]))' s_sum)" "True"
+check "CONTROL: nothing was truncated at the default cap" \
+  "$(py 'import json,sys;print("truncated" in json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]))' s_sum)" "False"
+# Stop the walk after one order and the reply must say so, with the true total.
+docker exec -u 0 "${COMPOSE_PROJECT_NAME:-wptest}-wp-1" mkdir -p /var/www/html/wp-content/mu-plugins
+docker compose exec -T wp sh -c 'cat > /var/www/html/wp-content/mu-plugins/report-cap.php <<"PHPEOF"
+<?php
+add_filter( "gmcp_woo_report_order_cap", function () { return 1; } );
+PHPEOF' >/dev/null 2>&1
+CAP_ORD=$(docker compose exec -T cli wp eval '
+  $o = wc_create_order(); $o->set_status( "processing" ); $o->set_total( "10.00" ); $o->save(); echo $o->get_id();' 2>/dev/null | tr -d '\r\n')
+call s_cap '{"jsonrpc":"2.0","id":58,"method":"tools/call","params":{"name":"wc_sales_summary","arguments":{"days":30}}}'
+call s_cap_b '{"jsonrpc":"2.0","id":59,"method":"tools/call","params":{"name":"wc_store_briefing","arguments":{}}}'
+docker compose exec -T wp sh -c 'rm -f /var/www/html/wp-content/mu-plugins/report-cap.php' >/dev/null 2>&1
+docker compose exec -T cli wp eval "\$o = wc_get_order($CAP_ORD); if ( \$o ) { \$o->delete( true ); }" >/dev/null 2>&1
+check "a capped summary still reports the full order count" \
+  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])["orders"])' s_cap)" "2"
+check "and says it stopped early" "$(py 'import json,sys;print("truncated" in json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]))' s_cap)" "True"
+check "the briefing says so too" "$(py 'import json,sys;print("truncated" in json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])["last_30_days"])' s_cap_b)" "True"
 
 echo "-- who actually gets emailed --"
 # Predicting this from a list of statuses was wrong in both directions, and measuring it
@@ -202,6 +300,25 @@ call e_killed "{\"jsonrpc\":\"2.0\",\"id\":38,\"method\":\"tools/call\",\"params
 check "a mail-intercepting plugin does not hide the notification" \
   "$(body e_killed | grep -c 'customer@example.test')" "1"
 docker compose exec -T wp sh -c 'rm -f /var/www/html/wp-content/mu-plugins/mailkill.php' >/dev/null 2>&1
+
+# A shop that defers its transactional email sends it after this request, once the capture
+# is gone. "No email was sent" was then a statement the customer's inbox contradicted.
+D_ORD=$(docker compose exec -T cli wp eval '
+  $o = wc_create_order();
+  $o->set_address( [ "first_name" => "Ada", "email" => "defer@example.test" ], "billing" );
+  $o->set_total( "5.00" ); $o->set_status( "pending" ); $o->save(); echo $o->get_id();' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T wp sh -c 'cat > /var/www/html/wp-content/mu-plugins/defer-mail.php <<"PHPEOF"
+<?php
+add_filter( "woocommerce_defer_transactional_emails", "__return_true" );
+PHPEOF' >/dev/null 2>&1
+check "CONTROL: the shop really defers its emails now" \
+  "$(docker compose exec -T cli wp eval 'echo has_action("woocommerce_order_status_completed", ["WC_Emails","queue_transactional_email"]) !== false ? "deferred" : "immediate";' 2>/dev/null | tr -d '\r\n')" "deferred"
+call e_defer "{\"jsonrpc\":\"2.0\",\"id\":39,\"method\":\"tools/call\",\"params\":{\"name\":\"wc_update_order_status\",\"arguments\":{\"id\":$D_ORD,\"status\":\"on-hold\"}}}"
+docker compose exec -T wp sh -c 'rm -f /var/www/html/wp-content/mu-plugins/defer-mail.php' >/dev/null 2>&1
+check "CONTROL: the change itself happened" "$(docker compose exec -T cli wp eval "echo wc_get_order($D_ORD)->get_status();" 2>/dev/null | tr -d '\r\n')" "on-hold"
+check "a deferring shop is not told that no email was sent" "$(body e_defer | grep -c 'No email was sent')" "0"
+check "and the reply says the recipients cannot be reported" "$(body e_defer | grep -c 'cannot be reported')" "1"
+docker compose exec -T cli wp eval "\$o = wc_get_order($D_ORD); if ( \$o ) { \$o->delete( true ); }" >/dev/null 2>&1
 
 # The flag was documented as emailing the note and was never read: set_status records
 # whatever it is given privately, so a note meant for the customer stayed internal.
