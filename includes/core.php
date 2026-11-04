@@ -132,6 +132,16 @@ class GMCP_Core {
       // that an agent cannot read this plugin's own bookkeeping, which is not its business.
       'gmcp_',
       'password', 'secret', 'token', 'private_key', 'api_key', 'apikey', 'auth_key', 'salt', 'nonce_key',
+      // The fourth of WordPress's cookie keys. wp_salt() stores {scheme}_key and
+      // {scheme}_salt as options whenever wp-config.php does not define them, or defines the
+      // placeholder phrase. auth_key (which also matches secure_auth_key), nonce_key and
+      // every *_salt were covered; logged_in_key was not, so half of the secret that signs
+      // logged-in cookies was readable on exactly those sites, and writable, which logs
+      // everyone out.
+      'logged_in_key',
+      // Recovery-mode keys. Hashed, but writing the hash of a key the caller chose is how a
+      // recovery link it can mint would come to validate.
+      'recovery_keys',
     ];
 
 
@@ -248,9 +258,9 @@ class GMCP_Core {
   public static function option_write_policy( string $key, $value ) {
     $key = strtolower( trim( $key ) );
 
-    $refused = self::unwritable_options();
-    if ( isset( $refused[ $key ] ) ) {
-      return $refused[ $key ];
+    $refused = self::option_refusal( $key );
+    if ( $refused !== true ) {
+      return $refused;
     }
 
     // Construction checks, for keys that are writable but not to every value. A value
@@ -261,6 +271,50 @@ class GMCP_Core {
       return is_scalar( $value )
         ? self::default_role_objection( (string) $value )
         : 'The default role has to be the name of a role.';
+    }
+
+    // The other half of the same door. The default_role rule above runs only when
+    // default_role itself is written, so a site where a person once set the default to
+    // editor or shop_manager was opened to the public by one call setting this, and the
+    // rule never ran. Judged by PHP truthiness because that is how WordPress reads the
+    // option: the string "false" turns registration on.
+    if ( $key === 'users_can_register' && $value ) {
+      $objection = self::default_role_objection( (string) get_option( 'default_role', 'subscriber' ) );
+      if ( $objection !== true ) {
+        return 'Opening registration is refused while the current default role is not safe to hand to anyone who signs up. ' . $objection
+          . ' Set default_role to subscriber first, then open registration.';
+      }
+    }
+
+    return true;
+  }
+
+  /**
+  * The refusals that hold whatever the value, shared by writing and deleting.
+  *
+  * Separate from option_write_policy() so a deletion, which has no value to judge, can be
+  * asked exactly these and not the construction checks: deleting default_role is not
+  * "an invalid role name", it is a different question with a different answer.
+  *
+  * @param string $key Already lowercased and trimmed.
+  * @return true|string
+  */
+  private static function option_refusal( string $key ) {
+    $refused = self::unwritable_options();
+    if ( isset( $refused[ $key ] ) ) {
+      return $refused[ $key ];
+    }
+
+    // The role definitions. default_role_objection() exists so registration cannot hand out
+    // administrator rights, and it judges a role by its capabilities, which live here: one
+    // write adding manage_options to subscriber turned the public form into an administrator
+    // factory without default_role ever being written, and deleting the row left every
+    // account, the key's own owner included, with no capabilities at all. By suffix, because
+    // the name is the table prefix plus user_roles (wp_user_roles, abc_user_roles,
+    // wp_3_user_roles on a network), and a rule built on the literal wp_ name misses a custom
+    // prefix. Over-matching an unrelated *_user_roles row costs a refusal.
+    if ( self::is_role_definitions_option( $key ) ) {
+      return 'This option holds every role on the site and the capabilities each one grants. Rewriting it can give subscribers manage_options, which with open registration makes the sign-up form an administrator factory, and removing it leaves every account, this key\'s owner included, with no capabilities at all. Change roles in wp-admin with a role editor.';
     }
 
     // An audit log this plugin does not own is still not writable through it. The rule is
@@ -275,18 +329,97 @@ class GMCP_Core {
     // uninstall, wsal_pruning-date shortens the retention window to a day, and
     // wsal_excluded-users stops recording named accounts. Each is one call, none is
     // reversible from here, and all four are exactly the settings an agent would change if
-    // it wanted its own activity to stop being written down.
+    // it wanted its own activity to stop being written down. Deleting one is the same
+    // change made the other way, which is why deletion asks this too.
     //
     // This is the same shape as the option policies above it and lives in the same place for
     // the same reason: the settings tool, the generic option tool and the journal's undo all
     // write options, and a rule enforced in one of them is a rule two of them do not have.
     foreach ( self::audit_log_option_prefixes() as $prefix ) {
-      if ( strpos( $key, $prefix ) === 0 ) {
+      if ( $prefix !== '' && strpos( $key, strtolower( (string) $prefix ) ) === 0 ) {
         return 'This option configures an activity log that records what happens on this site. Changing it can stop events being recorded, shorten how long they are kept, or arm deleting the log on uninstall, and none of that can be undone from here. A log an agent can switch off is not a log. Change it on the plugin\'s own settings screen.';
       }
     }
 
     return true;
+  }
+
+  /**
+  * Whether an option name is a site's role definitions: {table prefix}user_roles.
+  *
+  * Matched by suffix so a custom table prefix and a network's per-site prefixes are
+  * covered without having to know them, and the live prefixes are checked as well so the
+  * rule says what it is for.
+  */
+  public static function is_role_definitions_option( string $key ): bool {
+    $key = strtolower( trim( $key ) );
+    if ( $key === '' ) {
+      return false;
+    }
+    if ( substr( $key, -strlen( 'user_roles' ) ) === 'user_roles' ) {
+      return true;
+    }
+    global $wpdb;
+    if ( isset( $wpdb ) && is_object( $wpdb ) ) {
+      foreach ( [ $wpdb->prefix ?? '', $wpdb->base_prefix ?? '' ] as $prefix ) {
+        if ( $prefix !== '' && $key === strtolower( $prefix . 'user_roles' ) ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+  * Whether an option may be DELETED, and the refusal if not.
+  *
+  * Asked by wp_delete_option and by the journal's undo of a created option, which deletes.
+  * Both used to compose their own answer out of unwritable_options() and a list kept in
+  * the tool class, and both missed the rules that live in option_write_policy(), so the
+  * wsal_ rows the write policy protects and wp_user_roles could each be removed in one
+  * call. One function now answers for both, built from the same refusals the write policy
+  * uses plus the rows that are only dangerous to remove.
+  *
+  * @return true|string True if the deletion is allowed, otherwise the full refusal sentence.
+  */
+  public static function option_delete_policy( string $key ) {
+    $needle = strtolower( trim( $key ) );
+    $never = self::undeletable_options();
+    $why = $never[ $needle ] ?? self::option_refusal( $needle );
+    if ( $why === true ) {
+      return true;
+    }
+    return 'The option "' . $key . '" cannot be deleted through this API: ' . $why;
+  }
+
+  /**
+  * Options that may not be deleted, each with what actually breaks if it goes.
+  *
+  * Moved here from the tool class so there is one list. These are rows WordPress either
+  * cannot run without or cannot rebuild, so losing one is not a recoverable mistake. The
+  * value is the sentence the refusal says, so the reason and the rule cannot drift apart.
+  * Anything the write policy refuses outright is refused for deletion too, by
+  * option_delete_policy(); this list holds the sentences that answer a deletion better.
+  *
+  * rewrite_rules is deliberately NOT here. It is a derived cache, WordPress regenerates
+  * it on the next permalink flush, and deleting it is a normal repair for broken
+  * permalinks rather than damage.
+  *
+  * @return array<string,string>
+  */
+  public static function undeletable_options(): array {
+    return [
+      'siteurl' => 'WordPress builds every URL from it, so with the row gone the site cannot resolve its own address; wp-admin and this endpoint included, which means there is no way back in through the API that deleted it.',
+      'home' => 'Same as siteurl: the front page and every link on it become unreachable, and so does the route this request arrived on.',
+      'template' => 'It names the active theme. With no theme WordPress has nothing to render the front end with.',
+      'stylesheet' => 'It names the active child or parent theme. Removing it leaves WordPress looking for a theme directory that is not identified anywhere.',
+      'active_plugins' => 'Every plugin deactivates at once, this one among them, so the API that deleted the row is no longer running to restore it.',
+      'db_version' => 'It records which schema the database is on. Missing, WordPress runs its upgrade routine against a schema it can no longer place.',
+      'initial_db_version' => 'It records the schema the site was installed at, which upgrade routines read to decide what to skip.',
+      'cron' => 'The entire schedule is this one row. Deleting it silently drops every scheduled event on the site: publishing, backups, renewals, WooCommerce actions. Nothing errors; things just stop happening.',
+      'admin_email' => 'It is where recovery mail, password resets and fatal-error notices go. Without it nobody is told when the site is in trouble.',
+      'default_role' => 'New accounts take their role from it. Without it, an account created by the registration form or by a plugin gets no role at all.',
+    ];
   }
 
   /**
@@ -317,6 +450,24 @@ class GMCP_Core {
       'siteurl' => 'Changing the site URL rewrites every generated URL including this API endpoint, and a wrong value locks wp-admin too, so there would be no way to undo it from here.',
       'home' => 'Same as siteurl: a wrong value makes the site and this endpoint unreachable with no recovery path through the API.',
       'admin_email' => 'Set "new_admin_email" instead. WordPress emails a confirmation link to the new address and only completes the change when someone clicks it. Writing admin_email directly skips that and silently repoints password recovery.',
+      // The rows the plugin and theme tools exist to change safely. Each was refused for
+      // deletion with a reason that applies to writing it just as much, and writing it was
+      // allowed: an empty list deactivated every plugin, this one included, mid-call, with
+      // nothing left running to put it back, and a short list silenced the security and
+      // logging plugins while getting round every refusal the plugin tools make.
+      'active_plugins' => 'It is the list of active plugins. Writing it activates or deactivates plugins without running a single activation or deactivation hook, can switch this plugin off mid-call with nothing left to switch it back on, and gets round every refusal the plugin tools make. Use wp_activate_plugin and wp_deactivate_plugin.',
+      // A network's list is a site option and update_option() never reaches it, so this
+      // entry refuses a meaningless per-site row rather than a real write. It is listed so the
+      // rule reads as complete and stays complete if a site-option writer is ever added.
+      'active_sitewide_plugins' => 'It is the list of network-activated plugins. Writing it changes what runs on every site in the network without running any activation or deactivation hook. Activate plugins through the network admin.',
+      'template' => 'It names the active (parent) theme. Writing it switches theme without the checks wp_activate_theme makes, that the theme exists, is complete and runs on this PHP, and a wrong value leaves the front end with nothing to render. Use wp_activate_theme.',
+      'stylesheet' => 'It names the active theme. Writing it switches theme without the checks wp_activate_theme makes, and a wrong value leaves the front end with nothing to render. Use wp_activate_theme.',
+      'cron' => 'The entire schedule of scheduled events is this one row. Writing it can drop every scheduled event on the site, or add one that calls any hook at any time. Use wp_list_cron_events, wp_run_cron_event and wp_unschedule_cron_event.',
+      'db_version' => 'It records which database schema WordPress is on. A wrong value makes WordPress run, or skip, its upgrade routines against a schema it can no longer place.',
+      'initial_db_version' => 'It records the schema the site was installed at, which upgrade routines read to decide what to skip.',
+      // Maps a plugin to the callback WordPress calls when that plugin is deleted. Writing it
+      // names a function to be run the next time someone deletes that plugin in wp-admin.
+      'uninstall_plugins' => 'It maps each plugin to the callback WordPress runs when that plugin is deleted, so writing it names a function to be called later, by somebody else, from wp-admin.',
     ];
   }
 

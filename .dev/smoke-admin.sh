@@ -467,8 +467,12 @@ call o_role '{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"wp
 ROLE_NOW=$(docker compose exec -T cli wp option get default_role 2>/dev/null | tr -d '\r\n')
 docker compose exec -T cli wp option update default_role subscriber >/dev/null 2>&1
 check "nor set a privileged registration default" "$ROLE_NOW" "subscriber"
+# Read wherever the refusal landed. It used to be a raw JSON-RPC error, which a client
+# discards whole, so the one refusal that mattered most was the one least likely to be read.
 check "and it says why rather than failing silently" \
-  "$(py 'import json,sys;print("to anyone who registers" in json.load(sys.stdin)["error"]["message"])' o_role)" "True"
+  "$(refusal o_role | grep -c 'to anyone who registers')" "1"
+check "as a tool result the model is shown, not a protocol error" \
+  "$(py 'import json,sys;d=json.load(sys.stdin);print("error" not in d and d["result"].get("isError") is True)' o_role)" "True"
 
 # Control. Without it, a policy that refused every write would pass all five checks above.
 call o_ok '{"jsonrpc":"2.0","id":45,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"blogdescription","value":"policy control tagline"}}}'
@@ -489,6 +493,54 @@ call o_undo "{\"jsonrpc\":\"2.0\",\"id\":48,\"method\":\"tools/call\",\"params\"
 UNDO_NOW=$(docker compose exec -T cli wp option get default_role 2>/dev/null | tr -d '\r\n')
 docker compose exec -T cli wp option update default_role subscriber >/dev/null 2>&1
 check "undo cannot restore the privileged default role" "$UNDO_NOW" "subscriber"
+
+# The rows the plugin and theme tools exist to change safely, and the role definitions.
+# Each is compared as a hash of the stored row, read before, read after, PUT BACK, and only
+# then compared: an empty active_plugins written by a missing guard switches this plugin
+# off, and every later check would describe that instead of the one missing rule.
+probe_row() { # probe_row <label> <file> <id> <option> <hostile value json>
+  local was now
+  was=$(docker compose exec -T cli wp eval "echo md5(serialize(get_option('$4')));" 2>/dev/null | tr -d '\r\n')
+  docker compose exec -T cli wp eval "echo base64_encode(serialize(get_option('$4')));" 2>/dev/null | tr -d '\r\n' > "$OUT/$2.saved"
+  call "$2" "{\"jsonrpc\":\"2.0\",\"id\":$3,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_option\",\"arguments\":{\"key\":\"$4\",\"value\":$5}}}"
+  now=$(docker compose exec -T cli wp eval "echo md5(serialize(get_option('$4')));" 2>/dev/null | tr -d '\r\n')
+  docker compose exec -T cli wp eval "update_option('$4', unserialize(base64_decode('$(cat "$OUT/$2.saved")')));" >/dev/null 2>&1
+  check "$1" "$now" "$was"
+}
+ROLES_KEY=$(docker compose exec -T cli wp eval 'global $wpdb; echo $wpdb->get_blog_prefix() . "user_roles";' 2>/dev/null | tr -d '\r\n')
+probe_row "wp_update_option cannot rewrite the role definitions" o_roles 49 "$ROLES_KEY" '{"subscriber":{"name":"Subscriber","capabilities":{"read":true,"manage_options":true,"promote_users":true}}}'
+probe_row "nor empty the active plugin list" o_plugins 50 active_plugins '[]'
+probe_row "nor switch theme past the theme tools" o_template 51 template '"no-such-theme"'
+probe_row "nor the stylesheet" o_stylesheet 52 stylesheet '"no-such-theme"'
+# Not hashed: every request that loads WordPress may reschedule core's own events, so the
+# row moves on its own. A sentinel nothing else touches says whether the schedule survived.
+docker compose exec -T cli wp eval 'wp_schedule_single_event(time()+86400*365,"smoke_cron_sentinel");' >/dev/null 2>&1
+docker compose exec -T cli wp eval 'echo base64_encode(serialize(get_option("cron")));' 2>/dev/null | tr -d '\r\n' > "$OUT/cron.saved"
+call o_cron '{"jsonrpc":"2.0","id":53,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"cron","value":[]}}}'
+CRON_NOW=$(docker compose exec -T cli wp eval 'echo wp_next_scheduled("smoke_cron_sentinel") ? "kept" : "dropped";' 2>/dev/null | tr -d '\r\n')
+[ "$CRON_NOW" = "kept" ] || docker compose exec -T cli wp eval "update_option('cron', unserialize(base64_decode('$(cat "$OUT/cron.saved")')));" >/dev/null 2>&1
+docker compose exec -T cli wp cron event delete smoke_cron_sentinel >/dev/null 2>&1
+check "nor drop every scheduled event" "$CRON_NOW" "kept"
+check "and the refusal names the tool to use instead" "$(refusal o_plugins | grep -c 'wp_deactivate_plugin')" "1"
+# Opening registration was never judged against the default role it opens onto. A site
+# where a person had set the default to editor was opened to the public by one call.
+docker compose exec -T cli wp option update users_can_register 0 >/dev/null 2>&1
+docker compose exec -T cli wp option update default_role editor >/dev/null 2>&1
+call o_reg '{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"users_can_register","value":"1"}}}'
+REG_NOW=$(docker compose exec -T cli wp option get users_can_register 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp option update users_can_register 0 >/dev/null 2>&1
+docker compose exec -T cli wp option update default_role subscriber >/dev/null 2>&1
+check "registration cannot be opened onto an editing default role" "$REG_NOW" "0"
+call o_reg_ok '{"jsonrpc":"2.0","id":55,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"users_can_register","value":"1"}}}'
+check "CONTROL: it can be opened onto subscriber" \
+  "$(docker compose exec -T cli wp option get users_can_register 2>/dev/null | tr -d '\r\n')" "1"
+docker compose exec -T cli wp option update users_can_register 0 >/dev/null 2>&1
+# wp_salt() keeps logged_in_key in the options table when wp-config.php lacks it.
+docker compose exec -T cli wp option update logged_in_key "LOGGEDINKEYPROBE" >/dev/null 2>&1
+call o_lik '{"jsonrpc":"2.0","id":56,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"logged_in_key"}}}'
+check "the logged-in cookie key is not readable" "$(grep -c LOGGEDINKEYPROBE "$OUT/o_lik")" "0"
+check "CONTROL: because it was refused, not because it was empty" "$(verdict o_lik)" "error"
+docker compose exec -T cli wp option delete logged_in_key >/dev/null 2>&1
 
 # The admin-email flow mails an arbitrary address from this domain, with body text
 # drawn from blogname, which this same tool can rewrite. It needs a token and a cooldown.
@@ -2073,6 +2125,27 @@ check "and it is still there" \
 call do_cron '{"jsonrpc":"2.0","id":89,"method":"tools/call","params":{"name":"wp_delete_option","arguments":{"key":"cron"}}}'
 # Deleting the cron row drops every scheduled event on the site and nothing errors.
 check "and neither can the whole cron schedule" "$(verdict do_cron)" "error"
+# Deleting asked a list composed in the tool, which missed every rule living inside the write
+# policy. The wsal_ row is refused for writing (control) and was deletable.
+docker compose exec -T cli wp option update wsal_smoke_probe "keep me" >/dev/null 2>&1
+call do_wsal_w '{"jsonrpc":"2.0","id":94,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"wsal_smoke_probe","value":"x"}}}'
+check "CONTROL: an activity log row is refused for writing" "$(verdict do_wsal_w)" "error"
+call do_wsal '{"jsonrpc":"2.0","id":95,"method":"tools/call","params":{"name":"wp_delete_option","arguments":{"key":"wsal_smoke_probe"}}}'
+check "and it cannot be deleted either" \
+  "$(docker compose exec -T cli wp option get wsal_smoke_probe 2>/dev/null | tr -d '\r\n')" "keep me"
+ROLES_KEY=$(docker compose exec -T cli wp eval 'global $wpdb; echo $wpdb->get_blog_prefix() . "user_roles";' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp eval "echo base64_encode(serialize(get_option('$ROLES_KEY')));" 2>/dev/null | tr -d '\r\n' > "$OUT/roles.saved"
+call do_roles "{\"jsonrpc\":\"2.0\",\"id\":96,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_option\",\"arguments\":{\"key\":\"$ROLES_KEY\"}}}"
+ROLES_NOW=$(docker compose exec -T cli wp eval "echo get_option('$ROLES_KEY') ? 'present' : 'absent';" 2>/dev/null | tr -d '\r\n')
+[ "$ROLES_NOW" = "present" ] || docker compose exec -T cli wp eval "update_option('$ROLES_KEY', unserialize(base64_decode('$(cat "$OUT/roles.saved")')));" >/dev/null 2>&1
+check "nor can the role definitions, which would leave every account powerless" "$ROLES_NOW" "present"
+# The journal's undo of a created option deletes the row, so it asks the same policy. An
+# entry is planted directly because no tool can create such a row to begin with.
+docker compose exec -T cli wp eval '$l=get_option("gmcp_journal",[]); $l=is_array($l)?$l:[]; $l[]=["id"=>"wsalplant1","kind"=>"option","key"=>"wsal_smoke_probe","what"=>"Option \"wsal_smoke_probe\" created","previous"=>null,"absent"=>true,"tool"=>"wp_update_option","call"=>"plantcall","t"=>time()]; update_option("gmcp_journal",$l,false);' >/dev/null 2>&1
+call do_wsal_undo '{"jsonrpc":"2.0","id":97,"method":"tools/call","params":{"name":"wp_undo_change","arguments":{"id":"wsalplant1"}}}'
+check "nor removed by undoing its creation" \
+  "$(docker compose exec -T cli wp option get wsal_smoke_probe 2>/dev/null | tr -d '\r\n')" "keep me"
+docker compose exec -T cli wp option delete wsal_smoke_probe >/dev/null 2>&1
 
 echo "-- flushing caches --"
 docker compose exec -T cli wp eval 'set_transient("smoke_fresh","keep",3600); set_transient("smoke_stale","go",1); update_option("_transient_timeout_smoke_stale", time()-60);' >/dev/null 2>&1

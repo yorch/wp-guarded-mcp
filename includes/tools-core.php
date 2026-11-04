@@ -534,30 +534,6 @@ class GMCP_Tools_Core {
   }
 
   /**
-  * Options that may not be deleted, each with what actually breaks if it goes.
-  *
-  * These are separate from option_guard(), which is about secrecy. These are rows
-  * WordPress either cannot run without or cannot rebuild, so losing one is not a
-  * recoverable mistake. The value is the sentence the refusal says, so the reason and
-  * the rule cannot drift apart.
-  *
-  * rewrite_rules is deliberately NOT here. It is a derived cache, WordPress regenerates
-  * it on the next permalink flush, and deleting it is a normal repair for broken
-  * permalinks rather than damage.
-  */
-  private const OPTIONS_NEVER_DELETED = [
-    'siteurl' => 'WordPress builds every URL from it, so with the row gone the site cannot resolve its own address; wp-admin and this endpoint included, which means there is no way back in through the API that deleted it.',
-    'home' => 'Same as siteurl: the front page and every link on it become unreachable, and so does the route this request arrived on.',
-    'template' => 'It names the active theme. With no theme WordPress has nothing to render the front end with.',
-    'stylesheet' => 'It names the active child or parent theme. Removing it leaves WordPress looking for a theme directory that is not identified anywhere.',
-    'active_plugins' => 'Every plugin deactivates at once, this one among them, so the API that deleted the row is no longer running to restore it.',
-    'db_version' => 'It records which schema the database is on. Missing, WordPress runs its upgrade routine against a schema it can no longer place.',
-    'initial_db_version' => 'It records the schema the site was installed at, which upgrade routines read to decide what to skip.',
-    'cron' => 'The entire schedule is this one row. Deleting it silently drops every scheduled event on the site: publishing, backups, renewals, WooCommerce actions. Nothing errors; things just stop happening.',
-    'admin_email' => 'It is where recovery mail, password resets and fatal-error notices go. Without it nobody is told when the site is in trouble.',
-  ];
-
-  /**
   * A meta value as it should be STORED, from a value that arrived as a tool argument.
   *
   * Two corrections, and they live here rather than in a caller for the reason
@@ -2867,7 +2843,10 @@ class GMCP_Tools_Core {
         // refusal wp_update_settings makes was reachable here by naming the same row.
         $policy = GMCP_Core::option_write_policy( $key, $value );
         if ( $policy !== true ) {
-          $r['error'] = [ 'code' => -32600, 'message' => $policy ];
+          // An isError result like every other refusal here, not a JSON-RPC error. A client
+          // discards a protocol error whole, so the most important refusal this tool makes was
+          // the one most likely never to reach the model. @see error().
+          $r = $this->error( $r, $policy, -32600 );
           break;
         }
         // update_option() returns false both when the write fails AND when the value
@@ -2905,27 +2884,15 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $permitted, -32600 );
           break;
         }
-        // Anything the shared write policy will not let you change, this will not let you
-        // remove. Deleting a row is the harsher edit of the two, so a key too dangerous to
-        // set cannot be safe to drop, and composing the two lists here means a key added to
-        // the shared one is covered the day it is added rather than the day someone
-        // notices. The entries this file names itself win, because they answer the question
-        // that was actually asked: "set new_admin_email instead" is the right answer to a
-        // write and not to a deletion.
-        $undeletable = self::OPTIONS_NEVER_DELETED;
-        foreach ( GMCP_Core::unwritable_options() as $name => $why ) {
-          if ( !isset( $undeletable[ $name ] ) ) {
-            $undeletable[ $name ] = $why;
-          }
-        }
-        if ( isset( $undeletable[ strtolower( $key ) ] ) ) {
-          $r = $this->error(
-            $r,
-            'The option "' . $key . '" cannot be deleted through this API: '
-              . $undeletable[ strtolower( $key ) ]
-              . ' Change it with wp_update_option if you need a different value.',
-            -32600
-          );
+        // Asked of the one deletion policy, which the journal's undo of a created option asks
+        // too. This used to compose its own answer from unwritable_options() and a list kept
+        // in this file, and claimed that made it cover everything the write policy refuses.
+        // It did not: the rules inside option_write_policy() were never consulted, so the
+        // wsal_ rows that policy protects and the site's role definitions could each be
+        // deleted in one call. @see GMCP_Core::option_delete_policy().
+        $deletable = GMCP_Core::option_delete_policy( $key );
+        if ( $deletable !== true ) {
+          $r = $this->error( $r, $deletable, -32600 );
           break;
         }
         // "Absent" and "stored as false" are different states and get_option() returns
@@ -3017,9 +2984,15 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $permitted, -32600 );
           break;
         }
-        $policy = GMCP_Core::option_write_policy( $row, $value );
+        // Asked about the row as it will be written, the whole merged array, because that
+        // is what update_option() receives. Passing the one mod's value was harmless only
+        // while no rule judged this row by its value.
+        $merged_mods = get_theme_mods();
+        $merged_mods = is_array( $merged_mods ) ? $merged_mods : [];
+        $merged_mods[ $key ] = $value;
+        $policy = GMCP_Core::option_write_policy( $row, $merged_mods );
         if ( $policy !== true ) {
-          $r['error'] = [ 'code' => -32600, 'message' => $policy ];
+          $r = $this->error( $r, $policy, -32600 );
           break;
         }
         set_theme_mod( $key, $value );

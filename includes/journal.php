@@ -837,9 +837,12 @@ class GMCP_Journal {
           $restore = self::refill( $restore, get_option( (string) $entry['key'] ), $kept );
         }
 
-        $refusals = GMCP_Core::unwritable_options();
+        // Undoing a creation deletes the row, so it asks the deletion policy, the same one
+        // wp_delete_option asks. Composing the answer here from unwritable_options() alone
+        // missed every rule that lives inside the write policy, an audit log's rows and the
+        // role definitions among them.
         $policy = $absent
-          ? ( $refusals[ strtolower( (string) $entry['key'] ) ] ?? true )
+          ? GMCP_Core::option_delete_policy( (string) $entry['key'] )
           : GMCP_Core::option_write_policy( (string) $entry['key'], $restore );
         if ( $policy !== true ) {
           return [ 'ok' => false, 'message' => 'That change cannot be reverted. ' . $policy ];
