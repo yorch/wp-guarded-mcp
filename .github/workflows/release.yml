@@ -1,0 +1,76 @@
+name: Release
+
+# Pushing a tag v* builds the package, checks it, attests its provenance and publishes a
+# GitHub Release with the zips and their checksums.
+
+on:
+  push:
+    tags: ['v*']
+
+# Nothing is granted by default; the release job asks for what it needs.
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the release
+      id-token: write      # sign the attestation
+      attestations: write  # store the attestation
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      # Third-party actions are pinned to major version tags, not commit SHAs: SHAs could
+      # not be verified offline when this was written. Pin them before relying on this
+      # for supply-chain guarantees.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tag $TAG ($GITHUB_SHA) is not reachable from origin/main; refusing to release." >&2
+            exit 1
+          fi
+
+      - name: Version strings agree with the tag
+        run: .dev/check-release.sh version "$TAG"
+
+      - name: Build
+        run: .dev/build.sh
+
+      - name: Check the zip
+        run: .dev/check-release.sh zip tmp/guarded-mcp-*.zip
+
+      - name: Prepare release files
+        working-directory: tmp
+        run: |
+          VERSIONED=$(ls guarded-mcp-*.zip)
+          [ "$(printf '%s\n' "$VERSIONED" | wc -l)" -eq 1 ] || { echo "expected exactly one zip" >&2; exit 1; }
+          cp "$VERSIONED" guarded-mcp.zip
+          sha256sum "$VERSIONED" > "$VERSIONED.sha256"
+          sha256sum guarded-mcp.zip > guarded-mcp.zip.sha256
+          sha256sum -c "$VERSIONED.sha256" guarded-mcp.zip.sha256
+          ls -l
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            tmp/guarded-mcp-*.zip
+            tmp/guarded-mcp.zip
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          flags=()
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" \
+            --verify-tag \
+            --generate-notes \
+            --title "$TAG" \
+            "${flags[@]}" \
+            tmp/guarded-mcp-*.zip tmp/guarded-mcp-*.zip.sha256 \
+            tmp/guarded-mcp.zip tmp/guarded-mcp.zip.sha256
