@@ -1020,6 +1020,20 @@ call tr_wdel "{\"jsonrpc\":\"2.0\",\"id\":132,\"method\":\"tools/call\",\"params
 check "a widget embed with no shortcode is caught too" \
   "$(py "import json,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print('rendering nothing' in t and 'Embedding page' in t)" tr_wdel)" "True"
 
+# The route with no page at all. An Elementor Pro header or footer renders by its display
+# conditions, so neither search finds a reference and the site's header was deletable.
+# Seeded in both of Pro's stores, one template each, since a guard reading only one would
+# pass this block half the time. Pro is not needed for the conditions to be live data.
+TR_COND=$(docker compose exec -T cli wp eval '$t=wp_insert_post(["post_title"=>"Site header","post_type"=>"elementor_library","post_status"=>"publish"]); update_post_meta($t,"_elementor_conditions",["include/general"]); echo $t;' 2>/dev/null | tr -d '\r\n')
+TR_COND2=$(docker compose exec -T cli wp eval '$t=wp_insert_post(["post_title"=>"Site footer","post_type"=>"elementor_library","post_status"=>"publish"]); $c=get_option("elementor_pro_theme_builder_conditions",[]); $c=is_array($c)?$c:[]; $c["footer"][$t]=["include/general"]; update_option("elementor_pro_theme_builder_conditions",$c); echo $t;' 2>/dev/null | tr -d '\r\n')
+call tr_cdel "{\"jsonrpc\":\"2.0\",\"id\":136,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$TR_COND,\"force\":true}}}"
+call tr_cdel2 "{\"jsonrpc\":\"2.0\",\"id\":137,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$TR_COND2,\"force\":true}}}"
+check "a template shown by display conditions is not deletable, from either store" \
+  "$(docker compose exec -T cli wp eval "echo (get_post($TR_COND)?'h':'-') . (get_post($TR_COND2)?'f':'-');" 2>/dev/null | tr -d '\r\n')" "hf"
+check "and the refusal says why" \
+  "$(py "import json,sys;print('display conditions' in json.load(sys.stdin)['result']['content'][0]['text'])" tr_cdel)" "True"
+docker compose exec -T cli wp eval "wp_delete_post($TR_COND,true); wp_delete_post($TR_COND2,true); \$c=get_option('elementor_pro_theme_builder_conditions',[]); if (is_array(\$c) && isset(\$c['footer'])) { unset(\$c['footer'][$TR_COND2]); if (!\$c['footer']) unset(\$c['footer']); } if (\$c) update_option('elementor_pro_theme_builder_conditions',\$c); else delete_option('elementor_pro_theme_builder_conditions');" >/dev/null 2>&1
+
 # The guard must not be blanket, or it becomes something to route around rather than read.
 TR_FREE=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Unreferenced template","post_type"=>"elementor_library","post_status"=>"publish"]);' 2>/dev/null | tr -d '\r\n')
 call tr_free "{\"jsonrpc\":\"2.0\",\"id\":133,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$TR_FREE,\"force\":true}}}"

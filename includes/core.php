@@ -861,14 +861,32 @@ class GMCP_Core {
     if ( $post_id <= 0 || get_post_type( $post_id ) !== 'elementor_library' ) {
       return true;
     }
+
+    // The third route, and the one with no page to name. An Elementor Pro header, footer,
+    // single or archive template is rendered through its display conditions ("Entire
+    // Site", "All posts"), with no shortcode and no template_id anywhere, so the two
+    // searches below find nothing and deleting the site's header went through. Read from
+    // Pro's own two stores, the template's _elementor_conditions meta and the
+    // elementor_pro_theme_builder_conditions option that caches them by location, and
+    // asked whether or not Pro is active right now: conditions on a template are live the
+    // moment Pro is, and a guard that waved the delete through while Pro was briefly off
+    // would leave the site headerless when it came back.
+    $conditions = self::theme_builder_conditions( $post_id );
+    if ( $conditions ) {
+      return $verb . ' template #' . $post_id . ' would remove a theme-builder template that Elementor Pro shows by its display conditions ('
+        . implode( ', ', array_slice( $conditions, 0, 5 ) ) . ( count( $conditions ) > 5 ? ', …' : '' ) . '), not by any page that names it. '
+        . 'A header, footer or archive applied this way disappears from every page it covers, with no error and nothing in any log. '
+        . 'Remove its display conditions in Theme Builder first, or pass despite_references true to go ahead anyway.';
+    }
+
     if ( !class_exists( 'GMCP_Tools_Elementor' ) ) {
       return true;
     }
 
-    // Both routes a reference takes, because a page can embed a template through the
-    // shortcode or through a widget's template_id inside _elementor_data, and a guard that
-    // knew only one would refuse half the cases and wave the other half through with the
-    // same confidence.
+    // The two routes a page takes to embed a template: the shortcode, or a widget's
+    // template_id inside _elementor_data. A guard that knew only one would refuse half the
+    // cases and wave the other half through with the same confidence. Display conditions,
+    // the route with no page at all, are checked above.
     $rows = [];
     foreach ( [ 'shortcode_references', 'data_references' ] as $route ) {
       $found = GMCP_Tools_Elementor::$route( $post_id, 25 );
@@ -905,6 +923,37 @@ class GMCP_Core {
       . 'There is no error on those pages when it happens and nothing in any log. '
       . 'Point them elsewhere first, ask elementor_template_references for the full picture, '
       . 'or pass despite_references true to go ahead anyway.';
+  }
+
+  /**
+  * The display conditions Elementor Pro holds for a template, from either of its stores.
+  *
+  * Defensive throughout, because the shapes are Pro's and not this plugin's: the meta is
+  * normally a list of strings such as "include/general", and the option maps a location to
+  * template id => conditions. Anything that is not that shape is ignored rather than
+  * trusted, and nothing here needs Pro to be loaded.
+  *
+  * @return string[] The conditions, or the locations it is assigned to, empty when none.
+  */
+  public static function theme_builder_conditions( int $post_id ): array {
+    $found = [];
+    $meta = get_post_meta( $post_id, '_elementor_conditions', true );
+    if ( is_array( $meta ) ) {
+      foreach ( $meta as $condition ) {
+        if ( is_string( $condition ) && $condition !== '' && strpos( $condition, 'exclude/' ) !== 0 ) {
+          $found[] = $condition;
+        }
+      }
+    }
+    $cache = get_option( 'elementor_pro_theme_builder_conditions' );
+    if ( is_array( $cache ) ) {
+      foreach ( $cache as $location => $templates ) {
+        if ( is_array( $templates ) && array_key_exists( $post_id, $templates ) ) {
+          $found[] = 'location ' . ( is_string( $location ) ? $location : 'unknown' );
+        }
+      }
+    }
+    return array_values( array_unique( $found ) );
   }
 
   /**
