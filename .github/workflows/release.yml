@@ -13,6 +13,11 @@ permissions: {}
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Names a deployment environment so required reviewers can be put in front of a release
+    # (Settings, Environments). Without that setting the environment gates nothing: the
+    # check below only tests where the tag points, and a tag pushed from a branch carries
+    # that branch's copy of this file.
+    environment: release
     permissions:
       contents: write      # create the release
       id-token: write      # sign the attestation
@@ -20,16 +25,20 @@ jobs:
     env:
       TAG: ${{ github.ref_name }}
     steps:
-      # Third-party actions are pinned to major version tags, not commit SHAs: SHAs could
-      # not be verified offline when this was written. Pin them before relying on this
-      # for supply-chain guarantees.
-      - uses: actions/checkout@v4
+      # Actions are pinned to commit SHAs (resolved with git ls-remote against the release
+      # tags noted beside each). Bump them deliberately; a moving tag in a job that can sign
+      # and publish would let someone else's push change what this repository releases.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          # All branches, so origin/main exists for the ancestry check below.
           fetch-depth: 0
+          # Nothing after this step needs git credentials; do not leave the token in .git/config.
+          persist-credentials: false
 
       - name: Tagged commit is on main
         run: |
-          git fetch --no-tags origin main
+          # origin/main comes from the full checkout above. If it is missing, merge-base
+          # fails and this refuses, which is the safe direction.
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
             echo "Tag $TAG ($GITHUB_SHA) is not reachable from origin/main; refusing to release." >&2
             exit 1
@@ -55,7 +64,7 @@ jobs:
           sha256sum -c "$VERSIONED.sha256" guarded-mcp.zip.sha256
           ls -l
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
             tmp/guarded-mcp-*.zip
