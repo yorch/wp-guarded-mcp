@@ -336,6 +336,22 @@ class GMCP_Journal {
       'call' => (string) ( $change['call'] ?? '' ),
     ];
 
+    // The row an addition created, so undo can remove that row and not every row of the
+    // key. A key holding several rows is ordinary: _wp_old_slug gains one per rename.
+    if ( $op === 'created' && !empty( $change['mid'] ) ) {
+      $entry['mid'] = (int) $change['mid'];
+    }
+
+    // What is kept for a deletion, and for an update of a key holding more than one row, is
+    // every row it touched, by meta id. A single value restored with update_post_meta()
+    // overwrote every sibling with it, and never re-added a row that was deleted while
+    // others of the key remained. A single-row update keeps the single value, as before.
+    $rows = isset( $change['rows'] ) && is_array( $change['rows'] ) ? $change['rows'] : null;
+    if ( $rows !== null && ( $op === 'deleted' || count( $rows ) > 1 ) ) {
+      $change['previous'] = [ self::META_ROWS => $rows ];
+      $entry['rows'] = count( $rows );
+    }
+
     // A key whose NAME looks like a credential, or a value that holds one, is recorded as
     // changed and its previous value is not kept. Same functions as the option side, so the
     // journal cannot protect a secret in an option and copy the same secret out of a meta
@@ -829,19 +845,51 @@ class GMCP_Journal {
     if ( $entry['kind'] === 'meta' ) {
       $meta_post = (int) $entry['ID'];
       $meta_key = (string) $entry['key'];
-      if ( !empty( $entry['absent'] ) ) {
-        // It was not there before, so putting it back means removing it. Every row for
-        // the key goes, which is what "absent" described.
-        delete_post_meta( $meta_post, $meta_key );
+      if ( !empty( $entry['absent'] ) && !empty( $entry['mid'] ) ) {
+        // The one row the addition created, and only if it is still that row: same post,
+        // same key. Its siblings were there before and stay.
+        $row = get_metadata_by_mid( 'post', (int) $entry['mid'] );
+        if ( $row && (int) $row->post_id === $meta_post && (string) $row->meta_key === $meta_key ) {
+          if ( !delete_metadata_by_mid( 'post', (int) $entry['mid'] ) ) {
+            return [ 'ok' => false, 'message' => 'Removing the added custom field "' . $meta_key . '" row from post ' . $meta_post . ' failed. Nothing was marked as reverted.' ];
+          }
+        }
+        $done = 'The custom field "' . $meta_key . '" row this change added to post ' . $meta_post . ' was removed; any other rows of that key were left alone.';
+      }
+      elseif ( !empty( $entry['absent'] ) ) {
+        // An entry recorded before additions carried their row id. It was not there before,
+        // so putting it back means removing it: every row for the key goes.
+        delete_post_meta( $meta_post, wp_slash( $meta_key ) );
         $done = 'Custom field "' . $meta_key . '" removed from post ' . $meta_post . ', which is what it was before.';
       }
       else {
-        // wp_slash for the reason prepare_meta_value() gives: update_post_meta()
-        // unslashes what it is handed, so restoring a JSON or regex value without this
-        // puts back a corrupted copy of what was recorded correctly.
         $meta_value = self::snapshot_for( (string) $entry['id'] );
-        update_post_meta( $meta_post, $meta_key, wp_slash( $meta_value ) );
-        $done = 'Custom field "' . $meta_key . '" on post ' . $meta_post . ' restored to its previous value.';
+        if ( is_array( $meta_value ) && array_key_exists( self::META_ROWS, $meta_value ) && is_array( $meta_value[ self::META_ROWS ] ) ) {
+          // Row by row. A row that is still there gets its old value back by id, which
+          // leaves its siblings alone; a row that is gone, because this change deleted it,
+          // is added back. update_metadata_by_mid() does not unslash, add_post_meta() does.
+          $restored_rows = 0;
+          foreach ( $meta_value[ self::META_ROWS ] as $mid => $old ) {
+            $row = get_metadata_by_mid( 'post', (int) $mid );
+            if ( $row && (int) $row->post_id === $meta_post && (string) $row->meta_key === $meta_key ) {
+              if ( maybe_serialize( $row->meta_value ) !== maybe_serialize( $old ) ) {
+                update_metadata_by_mid( 'post', (int) $mid, $old );
+              }
+            }
+            else {
+              add_post_meta( $meta_post, wp_slash( $meta_key ), wp_slash( $old ) );
+            }
+            $restored_rows++;
+          }
+          $done = 'Custom field "' . $meta_key . '" on post ' . $meta_post . ': ' . $restored_rows . ' row' . ( $restored_rows === 1 ? '' : 's' ) . ' put back as they were.';
+        }
+        else {
+          // wp_slash for the reason prepare_meta_value() gives: update_post_meta()
+          // unslashes what it is handed, so restoring a JSON or regex value without this
+          // puts back a corrupted copy of what was recorded correctly.
+          update_post_meta( $meta_post, wp_slash( $meta_key ), wp_slash( $meta_value ) );
+          $done = 'Custom field "' . $meta_key . '" on post ' . $meta_post . ' restored to its previous value.';
+        }
       }
       clean_post_cache( $meta_post );
     }
@@ -939,6 +987,13 @@ class GMCP_Journal {
 
     return [ 'ok' => true, 'message' => $done ];
   }
+
+  /** Wraps the rows a multi-row meta snapshot holds, so a revert can tell them from a value. */
+  //
+  // Deliberately not prefixed gmcp_: field_looks_secret() honours option_guard(), which
+  // refuses that prefix, so a wrapper named after this plugin read as a credential and every
+  // multi-row snapshot was discarded as one.
+  const META_ROWS = '__meta_rows_by_id';
 
   /** A default no stored option can hold, so "absent" and "stored as false" stay distinct. */
   const ABSENT = '__gmcp_option_absent__';

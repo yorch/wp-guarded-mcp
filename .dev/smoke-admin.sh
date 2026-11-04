@@ -2563,6 +2563,40 @@ check "and a restored value keeps its backslashes" \
       \$v = get_post_meta($JM_ID, 'jm_slash', true);
       echo is_array( \$v ) && \$v['sl'] === 'C:' . chr(92) . 'path' ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
 
+# A key can hold several rows, and undo used to treat every key as one value: it recorded
+# the first row, restored it with update_post_meta() over all of them, and undid an
+# addition by deleting every row of the key. core adds a _wp_old_slug row on every rename,
+# so undoing one rename deleted the redirects from all the earlier ones.
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+docker compose exec -T cli wp eval "
+  delete_post_meta($JM_ID,'jm_multi'); delete_post_meta($JM_ID,'_wp_old_slug');
+  add_post_meta($JM_ID,'jm_multi','ra'); add_post_meta($JM_ID,'jm_multi','rb'); add_post_meta($JM_ID,'jm_multi','rc');
+  add_post_meta($JM_ID,'_wp_old_slug','old-one'); add_post_meta($JM_ID,'_wp_old_slug','old-two');" >/dev/null 2>&1
+jm_rows() { docker compose exec -T cli wp eval "\$v=get_post_meta($JM_ID,'$1'); sort(\$v); echo implode(',',\$v);" 2>/dev/null | tr -d '\r\n'; }
+jm_undo_key() { # jm_undo_key <file> <id> <substring of what>
+  call "$1_l" '{"jsonrpc":"2.0","id":320,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":40}}}'
+  local jid; jid=$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next((r['id'] for r in rows if '$3' in r['what']),''))" "$1_l")
+  call "$1" "{\"jsonrpc\":\"2.0\",\"id\":$2,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$jid\"}}}"
+}
+check "CONTROL: the multi-row key was seeded with three rows" "$(jm_rows jm_multi)" "ra,rb,rc"
+jm_call jm_mu 321 "{\"ID\":$JM_ID,\"key\":\"jm_multi\",\"value\":\"ZZ\"}"
+check "CONTROL: the update rewrote every row" "$(jm_rows jm_multi)" "ZZ,ZZ,ZZ"
+jm_undo_key jm_mu_undo 322 '"jm_multi" changed'
+check "undoing an update of a multi-row key puts every row back" "$(jm_rows jm_multi)" "ra,rb,rc"
+call jm_md "{\"jsonrpc\":\"2.0\",\"id\":323,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post_meta\",\"arguments\":{\"ID\":$JM_ID,\"key\":\"jm_multi\",\"value\":\"rb\"}}}"
+check "CONTROL: deleting one value left its siblings" "$(jm_rows jm_multi)" "ra,rc"
+jm_undo_key jm_md_undo 324 '"jm_multi" removed'
+check "undoing it re-adds that row without overwriting the others" "$(jm_rows jm_multi)" "ra,rb,rc"
+# A published post, because core keeps no old slugs for pages or drafts.
+JM_SP=$(docker compose exec -T cli wp eval '$p=wp_insert_post(["post_title"=>"Slug history probe","post_name"=>"slug-history-probe","post_status"=>"publish"]); add_post_meta($p,"_wp_old_slug","old-one"); add_post_meta($p,"_wp_old_slug","old-two"); echo $p;' 2>/dev/null | tr -d '\r\n')
+slug_rows() { docker compose exec -T cli wp eval "\$v=get_post_meta($JM_SP,'_wp_old_slug'); sort(\$v); echo implode(',',\$v);" 2>/dev/null | tr -d '\r\n'; }
+call jm_ren "{\"jsonrpc\":\"2.0\",\"id\":325,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$JM_SP,\"post_name\":\"slug-history-renamed\"}}}"
+check "CONTROL: the rename added a redirect row for the old slug" "$(slug_rows)" "old-one,old-two,slug-history-probe"
+jm_undo_key jm_ren_undo 326 '"_wp_old_slug" added'
+check "undoing that addition removes only the row it added" "$(slug_rows)" "old-one,old-two"
+docker compose exec -T cli wp post delete "$JM_SP" --force >/dev/null 2>&1
+docker compose exec -T cli wp eval "delete_post_meta($JM_ID,'jm_multi');" >/dev/null 2>&1
+
 echo "-- one call, one unit of undo --"
 # A single call routinely changes several things and they read as unrelated events without
 # a shared id.

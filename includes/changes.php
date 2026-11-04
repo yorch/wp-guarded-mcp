@@ -500,15 +500,62 @@ class GMCP_Changes {
     return 'meta:' . (int) $object_id . ':' . $meta_key;
   }
 
+  /**
+  * Every row a post holds under one key, by meta_id, read straight from the table.
+  *
+  * A key can hold several rows, and the journal has to put back the rows a write touched
+  * rather than "the value": get_post_meta( ..., true ) answers with the first row only,
+  * so recording that and restoring it with update_post_meta() overwrote every sibling with
+  * one value, and undoing an add deleted every row of the key. core's
+  * wp_check_for_changed_slugs() adds a _wp_old_slug row on every rename, so undoing one
+  * rename deleted the redirects from all the earlier ones.
+  *
+  * @param int[] $only Restrict to these meta ids; empty for all.
+  * @return array<int,mixed> meta_id => unserialized value, oldest first.
+  */
+  private static function meta_rows( int $post_id, string $meta_key, array $only = [] ): array {
+    global $wpdb;
+    $rows = $wpdb->get_results( $wpdb->prepare(
+      "SELECT meta_id, meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s ORDER BY meta_id ASC",
+      $post_id,
+      $meta_key
+    ) );
+    $only = array_map( 'intval', $only );
+    $out = [];
+    foreach ( (array) $rows as $row ) {
+      $mid = (int) $row->meta_id;
+      if ( $only && !in_array( $mid, $only, true ) ) {
+        continue;
+      }
+      $out[ $mid ] = maybe_unserialize( $row->meta_value );
+    }
+    return $out;
+  }
+
+  /**
+  * Before an update. update_metadata() fires this once per row it is about to change, all
+  * of them before its query and the matching post-hooks after it, so the rows are read on
+  * the first call of a batch and the later ones only note that they belong to it. A meta id
+  * already noted means a new write of the same key has begun, and the rows are read again.
+  */
   public function meta_before( $meta_id, $object_id, $meta_key, $meta_value ): void {
     if ( $this->skip_meta( $object_id, $meta_key ) ) {
       return;
     }
-    // Read before the write, because afterwards it is gone. single = true matches how
-    // update_post_meta() without a prior value behaves and how undo will write it back.
-    self::$before[ $this->meta_stash_key( $object_id, $meta_key ) ] = [
-      'value' => get_post_meta( (int) $object_id, $meta_key, true ),
-      'existed' => metadata_exists( 'post', (int) $object_id, $meta_key ),
+    $stash = $this->meta_stash_key( $object_id, $meta_key );
+    $mid = (int) $meta_id;
+    if ( isset( self::$before[ $stash ] ) && !in_array( $mid, self::$before[ $stash ]['seen'], true ) ) {
+      self::$before[ $stash ]['seen'][] = $mid;
+      return;
+    }
+    // Read before the write, because afterwards it is gone.
+    $rows = self::meta_rows( (int) $object_id, (string) $meta_key );
+    self::$before[ $stash ] = [
+      // The first row, as get_post_meta( ..., true ) would answer, for the audit summary.
+      'value' => $rows ? reset( $rows ) : '',
+      'existed' => (bool) $rows,
+      'rows' => $rows,
+      'seen' => [ $mid ],
     ];
   }
 
@@ -518,25 +565,37 @@ class GMCP_Changes {
     }
     $stash = self::$before[ $this->meta_stash_key( $object_id, $meta_key ) ] ?? null;
     unset( self::$before[ $this->meta_stash_key( $object_id, $meta_key ) ] );
-    $this->record_meta( (int) $object_id, $meta_key, 'updated', $stash['value'] ?? null, !empty( $stash['existed'] ) );
+    // One record per write, not one per row. The first post-hook of a batch consumed the
+    // stash; the others have nothing to add, and recording them as before, with no previous
+    // value, said the key had been absent and made undo delete every row of it.
+    if ( $stash === null ) {
+      return;
+    }
+    $this->record_meta( (int) $object_id, $meta_key, 'updated', $stash['value'], !empty( $stash['existed'] ), [ 'rows' => $stash['rows'] ] );
   }
 
   public function meta_added( $meta_id, $object_id, $meta_key, $meta_value ): void {
     if ( $this->skip_meta( $object_id, $meta_key ) ) {
       return;
     }
-    // Nothing was there. Recorded as a distinct state rather than as "was empty", or undo
-    // leaves a row behind that the post never had.
-    $this->record_meta( (int) $object_id, $meta_key, 'created', null, false );
+    // This row was not there. Recorded as a distinct state rather than as "was empty", or
+    // undo leaves a row behind that the post never had. The meta id names the one row
+    // added, so undo removes that row and leaves any siblings the key already had.
+    $this->record_meta( (int) $object_id, $meta_key, 'created', null, false, [ 'mid' => (int) $meta_id ] );
   }
 
   public function meta_delete_before( $meta_ids, $object_id, $meta_key, $meta_value ): void {
     if ( $this->skip_meta( $object_id, $meta_key ) ) {
       return;
     }
+    // Only the rows about to go, by id. A delete with a value removes some rows of a key and
+    // leaves the others, and undo must put back exactly those.
+    $rows = self::meta_rows( (int) $object_id, (string) $meta_key, (array) $meta_ids );
     self::$before[ $this->meta_stash_key( $object_id, $meta_key ) ] = [
-      'value' => get_post_meta( (int) $object_id, $meta_key, true ),
-      'existed' => metadata_exists( 'post', (int) $object_id, $meta_key ),
+      'value' => $rows ? reset( $rows ) : '',
+      'existed' => (bool) $rows,
+      'rows' => $rows,
+      'seen' => [],
     ];
   }
 
@@ -546,12 +605,17 @@ class GMCP_Changes {
     }
     $stash = self::$before[ $this->meta_stash_key( $object_id, $meta_key ) ] ?? null;
     unset( self::$before[ $this->meta_stash_key( $object_id, $meta_key ) ] );
-    $this->record_meta( (int) $object_id, $meta_key, 'deleted', $stash['value'] ?? null, !empty( $stash['existed'] ) );
+    $this->record_meta( (int) $object_id, $meta_key, 'deleted', $stash['value'] ?? null, !empty( $stash['existed'] ), [ 'rows' => $stash['rows'] ?? [] ] );
   }
 
-  private function record_meta( int $post_id, string $meta_key, string $op, $previous, bool $existed ): void {
+  /**
+  * @param array $extra 'rows' (meta_id => previous value, for updates and deletions) or
+  *                     'mid' (the row an addition created). Carried for the journal, which
+  *                     restores by row; the audit summary reads 'previous' as before.
+  */
+  private function record_meta( int $post_id, string $meta_key, string $op, $previous, bool $existed, array $extra = [] ): void {
     $post = get_post( $post_id );
-    $this->record( [
+    $this->record( $extra + [
       'kind' => 'meta',
       'op' => $op,
       'id' => $post_id,
