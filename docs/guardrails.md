@@ -632,6 +632,118 @@ subscription is built without a payment gateway, and a manual subscription repor
 gateway feature as supported. So the gateway-dependent branches are unreachable here, and
 the suite says so rather than implying coverage it does not have.
 
+## Rank Math and All in One SEO
+
+Every statement here about how those plugins store their data was written from memory of
+their source, on a machine where neither could be installed, and is marked UNVERIFIED in
+`includes/tools-seo.php`. It needs checking against a running copy before it is believed.
+
+- **The two plugins keep the data in different places, and that decides how each is
+  written.** Rank Math keeps per-post SEO in ordinary post meta (`rank_math_title`,
+  `rank_math_robots` and so on) and reads it from there, so a meta write is its own write and
+  there is no stale index of the kind Yoast keeps. All in One SEO keeps it in its own table,
+  `{prefix}aioseo_posts`, which no generic tool reaches, and which the change journal does
+  not watch.
+- **So an All in One SEO write cannot be undone with `wp_undo_change`, and the reply says
+  so.** It carries the previous value of every field it changed, which is the only copy.
+  A Rank Math write is journalled, with one exception worth knowing: the journal withholds
+  the old value of any meta key whose name looks credential-shaped, and
+  `rank_math_focus_keyword` contains the word "key". Its old value is in the reply and
+  nowhere else. The argument is called `focus_phrase` for the same reason, so the audit log
+  does not redact it.
+- **Every write is read back from storage and fails if it differs.** Rank Math rows are read
+  straight from `wp_postmeta`, not through the cache `update_post_meta()` has just refreshed;
+  the All in One SEO row is read from its table, not from the model that was just saved.
+  What is not checked is the rendered page, a page cache or the sitemap, and the reply says
+  so rather than implying it.
+- **`noindex` and a canonical URL are higher impact than a title, and the writers are still
+  `write` level.** The reasoning, which is the thing to attack: for Rank Math the same effect
+  is already one `wp_update_post_meta` call away at `write`, because the generic meta tool
+  has no policy on `rank_math_robots`, so a higher level would move the request to a tool
+  with fewer guards and not remove it; and a key that can edit a post's content and publish
+  it can already do more to its search presence than any field here. The honest remainder is
+  All in One SEO: its table is reachable only through this group, so a `write` key gains a
+  capability it did not have. That is accepted, not denied. What narrows it: `robots` is a
+  three-way enum (`index`, `noindex`, `default`) with no free-text directives, other robots
+  directives on the post are left exactly as found, and a canonical must be on this site
+  unless the site names another host through `gmcp_seo_canonical_hosts`. A canonical on
+  another host hands the page's ranking to that host, which is the one field in the group
+  with an attacker-shaped use.
+- **The commerce post guard applies**, and is asked before the "is this a public post type"
+  check, so on a site where a filter has made an order type viewable the policy about the
+  object is still what answers. No tool here writes an option, so the option write policy is
+  not bypassed because it is never reached; site-wide SEO settings are options and stay
+  behind it.
+- **No nofollow, noarchive, snippet-length, schema or redirect controls, and the All in One
+  SEO focus keyphrase is read but not written.** Each of the first is another way to change
+  how a page is shown that no fix needs. The keyphrase lives in a JSON column the model
+  encodes itself; writing a string there would store a double-encoded value the plugin then
+  fails to parse, and a read-back that catches it would catch it after it was stored.
+- **A text field is not run through `sanitize_text_field()`.** It deletes every `%xx` pair,
+  and both plugins' template variables are percent-delimited, so `%date%` would be stored as
+  `%`. Tags are stripped and whitespace collapsed instead.
+
+## Form submissions (Contact Form 7, Fluent Forms, Ninja Forms)
+
+Read only, and the absence of a write is the design. As with Gravity Forms, a submission is
+the one record on the site a member of the public wrote. Unlike Gravity Forms there is no
+tool here that edits, trashes, marks as spam or deletes one, because nothing in this plugin
+can verify such a write against these three plugins and there is no restore tool behind it.
+As with the other groups, the storage described below is from memory and marked UNVERIFIED in
+`includes/tools-forms.php`; the suite `smoke-forms.sh` was written and not run.
+
+- **The three briefings are `read` and return counts only; every tool that returns a
+  submission is `admin`.** Same split as `gf_forms_briefing` against `gf_list_entries`. A
+  read-level key additionally gets a recency bucket for "newest" rather than a time.
+- **Every reply carries a `log_state` block, because a zero from these plugins has four
+  meanings.** None arrived; the plugin that stores them is not there (Contact Form 7 alone
+  stores nothing at all, so a count from it is meaningless); a table was never created; or a
+  form is set not to store. The block says which, and when there is nothing readable the
+  counts are `null`, not `0`. A failed query is never read as an empty result: the query
+  helper returns the database error as a string, and a caller that mistook it for a list of
+  zero rows would be the false "none" this block exists to prevent.
+- **What is returned of an answer is an allowlist built from the form's own definition.** A
+  value comes back only if the field is in the form's current schema, its type is a
+  plain-input type, and its name does not look credential-shaped by the same
+  `GMCP_Core::field_looks_secret()` the journal and the audit log ask. Password and
+  file-upload fields fail by not being on the list, and are named in a `withheld` list so the
+  absence is visible. A field that was answered but has since been removed from the form is
+  withheld, because nothing says what it was. If the definition cannot be read, no answer is
+  returned. This is the shape the WP Activity Log group arrived at after a denylist returned
+  a credential, and it costs the same: a legitimate field is occasionally withheld, because
+  its name contains `pass`, `key` or `auth`. That is the right way round.
+- **No IP address, user agent or referring URL is returned, at any level.** They are in the
+  plugins' storage and are never selected: the Fluent and Ninja queries name their columns,
+  and the Flamingo reader takes only `_field_*` meta, never the `_meta` row that holds them.
+- **No search over answers.** A text search over submissions is an oracle: "does any entry
+  contain `diff@`" confirms a value no tool will print, one guess at a time. Filters are by
+  form, status and date only. This is the reason Gravity Forms' own search was rebuilt
+  rather than passed through.
+- **The generic post readers refuse the post types Flamingo and Ninja Forms store
+  submissions under.** This is the part that is not in the new file, and it is there because
+  without it the rest is a sentence about the tool and not about the data: Flamingo and Ninja
+  Forms keep a submission as a post, `wp_get_post_meta` is a `read`-level tool that returns
+  any key on any post (its own source says post meta reads are ungated), and a read-only key
+  could therefore read every answer, and for Flamingo the visitor's IP address, through the
+  tool beside the admin-only ones. `GMCP_Core::personal_data_post_guard()` is asked, ahead of
+  the dispatch switch, by `wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`,
+  `wp_read_post_meta_chunk` and, for the post type it names, `wp_get_posts`. It is on whether
+  or not the forms group is. The type list is filterable through
+  `gmcp_personal_data_post_types`.
+- **What that guard does not cover.** It is a list of readers, not a property of the data,
+  and the same weakness the commerce guard has: a reader added later has to be added to it.
+  Not covered today: `wp_get_post_terms` (channel terms only), the REST-route tools when that
+  group is on and a plugin exposes the type through REST, the change journal (which records a
+  changed meta key, and withholds values that look credential-shaped), and every route to the
+  database that is not a post reader. WooCommerce orders stored as posts are in the same
+  position, and are not added to this list: that is a broader decision about generic
+  post-meta reads and is not made here.
+- **Fluent Forms and Ninja Forms tables are checked for existence before a count.**
+  Fluent stores answers as one JSON document per submission and the schema as JSON on the
+  form; a schema that does not parse means no answers. Ninja Forms is told whether each form
+  has an active action that records submissions: a form without one cannot have any, so its
+  zero is "not kept", and `null` is reported where that could not be determined.
+
 ## Theme mods
 
 Theme mods are the customizer's storage, and four generic tools cover them:

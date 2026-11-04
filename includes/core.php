@@ -73,6 +73,14 @@ class GMCP_Core {
     // there is no write tool here and the option writer that could reach the log's own
     // settings refuses them (see option_write_policy()).
     'mcp_tools_wp_activity_log' => false,
+    // Rank Math and All in One SEO: per-post SEO metadata. Its own switch, separate from
+    // Yoast's, so a site is not handed a writer for a plugin it has not chosen. Readers at
+    // read, writers at write; see the header of tools-seo.php for why write.
+    'mcp_tools_seo' => false,
+    // Contact Form 7 (through Flamingo), Fluent Forms and Ninja Forms: form submissions,
+    // READ ONLY. Submissions are personal data a member of the public wrote, so the tools
+    // that return one are admin and the briefings are counts at read.
+    'mcp_tools_forms' => false,
     'mcp_debug_mode' => false,
     // Keep a short history of tool calls, including refused ones, for the settings
     // screen. An agent otherwise operates with no visible record at all.
@@ -936,6 +944,20 @@ class GMCP_Core {
     // an operator needs when the log has stopped recording.
     if ( $this->get_option( 'mcp_tools_wp_activity_log' ) ) {
       new GMCP_Tools_Wsal();
+    }
+
+    // Rank Math and All in One SEO. Each tool is offered only while its plugin is loaded
+    // (checked at listing and again per call in GMCP_Tools_Seo), so switching the group on
+    // for a site with neither registers nothing rather than four tools that can only fail.
+    if ( $this->get_option( 'mcp_tools_seo' ) ) {
+      new GMCP_Tools_Seo();
+    }
+
+    // Form submissions, read only. Same per-plugin registration as the SEO group, and the
+    // generic post readers refuse the post types Flamingo and Ninja Forms store submissions
+    // under (GMCP_Core::personal_data_post_guard()), whether or not this switch is on.
+    if ( $this->get_option( 'mcp_tools_forms' ) ) {
+      new GMCP_Tools_Forms();
     }
   }
 

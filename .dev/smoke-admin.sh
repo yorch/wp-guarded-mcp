@@ -2265,7 +2265,8 @@ tc_groups() { # tc_groups <admin 0|1> <woo 0|1>
 # that are always present. Every optional group belongs in the list below: leave one out and
 # the count moves with whatever happens to be installed, which is the drift the table exists
 # to catch. Current prefixes: elementor_ (free and Pro), kirki_, yoast_, acf_, wsal_, gf_
-# (Gravity Forms), ld_ (LearnDash). WooCommerce Subscriptions is wcs_ and is deliberately not
+# (Gravity Forms), ld_ (LearnDash), rankmath_ and aioseo_ (includes/tools-seo.php), cf7_,
+# fluentform_ and ninjaform_ (includes/tools-forms.php). WooCommerce Subscriptions is wcs_ and is deliberately not
 # listed, because this block never switches that group on.
 tc_count() { # tc_count <secret>
   curl -sS -X POST "$URL" -H "Authorization: Bearer $1" \
@@ -2277,7 +2278,7 @@ try:
     t = json.load(sys.stdin)['result']['tools']
 except Exception:
     print('unreadable'); raise SystemExit
-print(len([x for x in t if not x['name'].startswith('elementor_') and not x['name'].startswith('kirki_') and not x['name'].startswith('yoast_') and not x['name'].startswith('acf_') and not x['name'].startswith('wsal_') and not x['name'].startswith('gf_') and not x['name'].startswith('ld_')]))"
+print(len([x for x in t if not x['name'].startswith('elementor_') and not x['name'].startswith('kirki_') and not x['name'].startswith('yoast_') and not x['name'].startswith('acf_') and not x['name'].startswith('wsal_') and not x['name'].startswith('gf_') and not x['name'].startswith('ld_') and not x['name'].startswith('rankmath_') and not x['name'].startswith('aioseo_') and not x['name'].startswith('cf7_') and not x['name'].startswith('fluentform_') and not x['name'].startswith('ninjaform_')]))"
 }
 # The expected numbers come from the table itself, so the check fails whichever side moved.
 tc_doc() { # tc_doc <level> <column index, 1-3>
