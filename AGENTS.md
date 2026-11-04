@@ -133,8 +133,9 @@ destructive. `smoke-woo.sh` covers the shop tools, `smoke-elementor.sh` covers t
 `smoke-acf.sh` covers the ACF tools, `smoke-gravityforms.sh` covers the Gravity Forms tools,
 `smoke-learndash.sh` covers the LearnDash tools, `smoke-elementor-pro.sh` covers the
 Elementor Pro tools, `smoke-woo-subscriptions.sh` covers the Subscriptions tools, and
-`smoke-wsal.sh` covers the WP Activity Log tools. Run all
-fourteen before committing. The last eleven need
+`smoke-wsal.sh` covers the WP Activity Log tools, `smoke-redirection.sh` covers the
+Redirection tools, and `smoke-polylang.sh` covers the Polylang tools. Run all
+fourteen before committing. The last twelve need
 their plugin installed and say so and exit rather than reporting failures against a site that
 simply does not have it.
 

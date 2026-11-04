@@ -73,7 +73,7 @@ An access level belongs to a named key. OAuth callers always act as the administ
 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
 nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO,
-ACF, Gravity Forms, LearnDash, Elementor Pro and WP Activity Log are not counted: their tools
+ACF, Gravity Forms, LearnDash, Elementor Pro, WP Activity Log, Redirection and Polylang are not counted: their tools
 are optional groups that come and go with a plugin, so folding them in would make the table
 depend on what
 happens to be installed.
@@ -207,6 +207,40 @@ an IP list is a behavioural record of an identifiable person and this group take
 list could feed; a per-user activity ranking is profiling, and also wrong, because REST
 actions are recorded against whichever user the bearer key borrows. Each is a deliberate
 absence, not an omission to be helpfully filled in.
+
+**Redirection**, off by default, and the switch only appears when the Redirection plugin is
+installed. Five tools: list and get at `write`, and create, update and switch on/off at
+`admin`. A redirect is the one change that can both hand your visitors to someone else's site
+and lock you out of your own, so the tools keep a policy of their own. The **target** must be
+a path on this site or a URL on this site's own host; an `https` URL on any other host is
+refused unless the site lists that host through the `gmcp_redirect_allowed_hosts` filter,
+which is empty by default (exact host names, default port, no userinfo, no wildcard). The
+**source** must be a literal path; regular-expression sources are refused unless the site opts
+in through `gmcp_redirect_allow_regex`, and are then still refused if the pattern matches a
+protected path. A source on `wp-login.php`, `wp-admin`, the REST API, this plugin's endpoint or
+the OAuth discovery documents is refused however it is spelled (case, percent-encoding,
+`..` segments, `index.php/`, a `rest_route` query, a site in a subdirectory). Only the plain
+URL match with the plain redirect action is managed: the conditional match types (agent,
+referrer, cookie, IP, login status) decide what to show based on who is asking, which is how
+a redirect gets hidden from the owner. The policy runs on the **stored** row as well as the
+request. Every write is read back and a row that fails is switched off, and **enabling** an
+existing redirect re-checks it first, so a redirect made in the Redirection screen cannot be
+switched on through here without passing. There is **no delete tool**: switching a redirect
+off is the reversible removal, while a deletion also discards its hit count and cannot be put
+back. The change journal does not cover these rows, because they live in Redirection's own
+tables; the audit log records each call. List size is capped at 50. Replies carry a
+`log_state` block (loaded, tables present, count) so "no redirects" is not confused with
+"Redirection was never set up".
+
+**Polylang**, off by default, and the switch only appears when Polylang is installed. Read
+only: `pll_list_languages` at `read` and `pll_get_post_translations` at `write` (a translation
+group can include drafts and private posts; it returns IDs, languages, statuses and post
+types, never titles or content). Both answer through Polylang's own `pll_*` functions and
+keep three empty answers apart: Polylang with no languages defined (`not_configured`), a post
+with no language or of a post type Polylang does not manage, and a post with a language and no
+siblings (`no_translations`). There is no tool that links posts or assigns a language. WPML is
+not covered and is deferred: its data model and its "not configured" states are different,
+and a reader written without it installed is how a confident "no translations" is produced.
 
 **REST API tools**, off by default: tools generated from the site's own REST API routes.
 Generated once and cached for a day; the cache is thrown away on the first request after
@@ -382,15 +416,16 @@ docker run --rm -v "$PWD":/app -w /app php:8.1-cli sh -c 'for f in includes/*.ph
 ```
 
 A throwaway WordPress for testing lives in `.dev/` (see that directory's README). It carries
-twelve suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
+fourteen suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
 previews; `smoke-admin.sh` for the administration tools, the change journal, named keys and
 every guard around them, which rebuilds `.htaccess` partway through and is the destructive
 one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor tools;
 `smoke-kirki.sh` for the Kirki tools; `smoke-yoast.sh` for the Yoast SEO tools;
 `smoke-acf.sh` for the ACF tools; `smoke-gravityforms.sh` for the Gravity Forms tools;
 `smoke-learndash.sh` for the LearnDash tools; `smoke-elementor-pro.sh` for the Elementor Pro
-tools; `smoke-woo-subscriptions.sh` for the Subscriptions tools; and `smoke-wsal.sh` for the
-WP Activity Log tools. The last ten need their plugin installed.
+tools; `smoke-woo-subscriptions.sh` for the Subscriptions tools; `smoke-wsal.sh` for the
+WP Activity Log tools; `smoke-redirection.sh` for the Redirection tools; and `smoke-polylang.sh`
+for the Polylang tools. The last twelve need their plugin installed.
 
 Never run `wp plugin install --force` against that stack. Its plugin directory is a bind
 mount of this repository, and WordPress deletes the old plugin directory before unpacking
