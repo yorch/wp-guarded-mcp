@@ -1017,6 +1017,12 @@ class GMCP_Tools_Core {
   * @return int|WP_Error The new post ID.
   */
   private function create_one_post( array $a, string $tool ) {
+    // Asked here, in the one implementation both create tools share, so neither can mint
+    // an order or a subscription by naming its type. @see GMCP_Core::commerce_post_guard().
+    $commerce = GMCP_Core::commerce_post_guard( 0, 'Creating', sanitize_key( $a['post_type'] ?? 'post' ) );
+    if ( $commerce !== true ) {
+      return new WP_Error( 'gmcp_commerce_post', $commerce );
+    }
     $ins = [
       'post_title' => sanitize_text_field( $a['post_title'] ),
       'post_status' => sanitize_key( $a['post_status'] ?? 'draft' ),
@@ -2486,6 +2492,16 @@ class GMCP_Tools_Core {
     // cannot fall through into the real handler by way of a missed early return in one
     // of forty case blocks.
     if ( !empty( $a['preview'] ) && isset( self::PREVIEWABLE[ $tool ] ) ) {
+      // A preview of a write the real call would refuse is answered with the refusal. The
+      // preview of an update prints the fields it would change, which for an order is the
+      // customer's note and address, so previewing must not become the way round either
+      // the write guard or the read guard.
+      if ( in_array( $tool, [ 'wp_update_post', 'wp_alter_post', 'wp_delete_post' ], true ) ) {
+        $commerce = GMCP_Core::commerce_post_guard( (int) ( $a['ID'] ?? 0 ), 'Previewing a change to' );
+        if ( $commerce !== true ) {
+          return $this->error( $r, $commerce, -32600 );
+        }
+      }
       return $this->preview( $tool, $a, $r );
     }
 
@@ -3518,6 +3534,13 @@ class GMCP_Tools_Core {
           if ( empty( $item['post_title'] ) ) {
             $unfit[] = 'item ' . $i . ' has no post_title';
           }
+          // The same question create_one_post() asks, asked before anything is written so a
+          // refused item cannot leave the ones before it behind. It is a refusal the single
+          // create also makes, so this is not a guard the batch has and the single lacks.
+          $item_commerce = GMCP_Core::commerce_post_guard( 0, 'Creating', sanitize_key( (string) ( $item['post_type'] ?? 'post' ) ) );
+          if ( $item_commerce !== true ) {
+            $unfit[] = 'item ' . $i . ': ' . $item_commerce;
+          }
         }
         if ( $unfit ) {
           $r = $this->error( $r, 'Nothing was created. ' . count( $unfit ) . ' of ' . count( $items )
@@ -3673,6 +3696,11 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'Post ' . $wb_id . ' not found.', -32602 );
           break;
         }
+        $commerce = GMCP_Core::commerce_post_guard( $wb_id, 'Writing blocks to' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
         // Some MCP clients send arrays as JSON strings.
         $wb_blocks = $a['blocks'] ?? null;
         if ( is_string( $wb_blocks ) ) {
@@ -3770,6 +3798,11 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'Post ' . $bp_id . ' not found.', -32602 );
           break;
         }
+        $commerce = GMCP_Core::commerce_post_guard( $bp_id, 'Inserting a pattern into' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
         $bp_mode = in_array( $a['mode'] ?? 'append', [ 'replace', 'append', 'prepend' ], true ) ? ( $a['mode'] ?? 'append' ) : 'append';
         if ( $bp_mode === 'replace' ) {
           $bp_new = $bp_markup;
@@ -3829,6 +3862,17 @@ class GMCP_Tools_Core {
         foreach ( $topLevelFields as $fk ) {
           if ( array_key_exists( $fk, $a ) && !array_key_exists( $fk, $fields ) ) {
             $fields[ $fk ] = $a[ $fk ];
+          }
+        }
+
+        // The guard at the top judged the type the post HAS. A write that sets post_type
+        // decides the type it will have, and turning an ordinary draft into a subscription
+        // is the same harm reached from the other side.
+        if ( array_key_exists( 'post_type', $fields ) ) {
+          $retype = GMCP_Core::commerce_post_guard( $post_id, 'Updating', is_scalar( $fields['post_type'] ) ? (string) $fields['post_type'] : '' );
+          if ( $retype !== true ) {
+            $r = $this->error( $r, $retype, -32600 );
+            break;
           }
         }
 
@@ -4063,6 +4107,11 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'Post not found', -32602 );
           break;
         }
+        $commerce = GMCP_Core::commerce_post_guard( $post_id, 'Altering' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
 
         $content = $post->$field;
         $count = 0;
@@ -4243,6 +4292,14 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'No target post with ID ' . $to_id . '.', -32602 );
           break;
         }
+        // The target is the post that is written. Copying a crafted _billing_period from an
+        // ordinary draft onto a subscription is a meta write on the subscription, however
+        // innocent the source.
+        $commerce = GMCP_Core::commerce_post_guard( $to_id, 'Copying meta to' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
         // Some MCP clients send arrays as JSON strings.
         $copy_keys = $a['keys'] ?? [];
         if ( is_string( $copy_keys ) ) {
@@ -4285,6 +4342,13 @@ class GMCP_Tools_Core {
         }
         if ( !$chunk_pid || !get_post( $chunk_pid ) ) {
           $r = $this->error( $r, 'No post with ID ' . $chunk_pid . '.', -32602 );
+          break;
+        }
+        // On every chunk, not only the final one, so nothing is staged for a target the
+        // write would be refused on, and a post retyped between chunks is still caught.
+        $commerce = GMCP_Core::commerce_post_guard( $chunk_pid, 'Setting meta on' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
           break;
         }
         $chunk_why = $this->meta_key_allowed( $chunk_key );
@@ -4511,6 +4575,11 @@ class GMCP_Tools_Core {
           break;
         }
         $post_id = intval( $a['post_id'] );
+        $commerce = GMCP_Core::commerce_post_guard( $post_id, 'Setting the featured image of' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
         $media_id = isset( $a['media_id'] ) ? intval( $a['media_id'] ) : 0;
         if ( $media_id ) {
           $done = set_post_thumbnail( $post_id, $media_id );
@@ -4640,6 +4709,11 @@ class GMCP_Tools_Core {
         // Handle JSON strings (some MCP clients send arrays as JSON strings)
         if ( is_string( $terms ) ) {
           $terms = json_decode( $terms, true ) ?? [];
+        }
+        $commerce = GMCP_Core::commerce_post_guard( intval( $a['ID'] ), 'Setting terms on' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
         }
         $tax = sanitize_key( $a['taxonomy'] ?? 'category' );
         $append = !isset( $a['append'] ) || $a['append'];

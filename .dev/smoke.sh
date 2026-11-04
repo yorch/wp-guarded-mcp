@@ -516,6 +516,83 @@ call ch_b "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{
 # reusing an id would interleave their bytes into one value and neither would know.
 check "a session started on one target is refused on another" "$(verdict ch_b)" "error"
 
+echo "-- the commerce guard reaches every generic post and meta writer --"
+# An order and a subscription are wp_posts rows when HPOS is off, and their status, billing
+# period and next payment date live in that row and its meta. commerce_post_guard() was
+# asked by five writers while four others wrote the same rows unasked, and it judged only
+# the type a post HAD, so creating one or retyping a draft into one sailed through. Seeded
+# as bare rows: the guard reads get_post_type() and nothing else, so WooCommerce need not
+# be active for the harm or for the refusal.
+#
+# Every check reads the row back. Read, call, read back, and the fixture is deleted at the
+# end whatever happened, so a missing guard leaves nothing for the next block to trip on.
+CG=$(docker compose exec -T cli wp eval '
+  $sub = wp_insert_post(["post_title"=>"Commerce probe sub","post_type"=>"shop_subscription","post_status"=>"wc-active","post_content"=>"SUBBODY"]);
+  update_post_meta($sub,"_billing_period","month");
+  $draft = wp_insert_post(["post_title"=>"Commerce probe draft","post_status"=>"draft"]);
+  update_post_meta($draft,"_billing_period","day");
+  $att = wp_insert_attachment(["post_title"=>"Commerce probe media","post_mime_type"=>"image/png","post_status"=>"inherit"], false, 0);
+  update_post_meta($att,"_wp_attached_file","commerce-probe.png");
+  echo $sub, " ", $draft, " ", $att;' 2>/dev/null | tr -d '\r\n')
+read -r CG_SUB CG_DRAFT CG_ATT <<< "$CG"
+cg() { # cg <file> <id> <tool> <arguments json>
+  call "$1" "{\"jsonrpc\":\"2.0\",\"id\":$2,\"method\":\"tools/call\",\"params\":{\"name\":\"$3\",\"arguments\":$4}}"
+}
+cg_meta() { docker compose exec -T cli wp eval "echo get_post_meta($CG_SUB,'_billing_period',true);" 2>/dev/null | tr -d '\r\n'; }
+# Control first: the guard recognises the seeded row. Without this every refusal below
+# could be the row failing to exist rather than the guard working.
+cg cg_ctl 400 wp_update_post_meta "{\"ID\":$CG_SUB,\"key\":\"_billing_period\",\"value\":\"year\"}"
+check "CONTROL: the long-standing guard refuses the seeded subscription" "$(verdict cg_ctl)" "error"
+cg cg_copy 401 wp_copy_post_meta "{\"from_id\":$CG_DRAFT,\"to_id\":$CG_SUB,\"keys\":[\"_billing_period\"],\"overwrite\":true}"
+check "wp_copy_post_meta cannot copy meta onto a subscription" "$(cg_meta)" "month"
+cg cg_chunk 402 wp_write_post_meta_chunk "{\"session\":\"cgprobe\",\"ID\":$CG_SUB,\"key\":\"_billing_period\",\"data\":\"year\",\"final\":true}"
+check "wp_write_post_meta_chunk cannot write one" "$(cg_meta)" "month"
+cg cg_alter 403 wp_alter_post "{\"ID\":$CG_SUB,\"field\":\"post_content\",\"search\":\"SUBBODY\",\"replace\":\"ALTERED\"}"
+cg cg_blocks 404 wp_write_blocks "{\"ID\":$CG_SUB,\"blocks\":[{\"type\":\"paragraph\",\"text\":\"BLOCKS\"}]}"
+check "wp_alter_post and wp_write_blocks cannot rewrite its body" \
+  "$(docker compose exec -T cli wp post get "$CG_SUB" --field=post_content 2>/dev/null | tr -d '\r\n')" "SUBBODY"
+cg cg_thumb 405 wp_set_featured_image "{\"post_id\":$CG_SUB,\"media_id\":$CG_ATT}"
+cg cg_terms 406 wp_add_post_terms "{\"ID\":$CG_SUB,\"terms\":[1],\"taxonomy\":\"category\"}"
+check "nor can the featured-image writer" \
+  "$(docker compose exec -T cli wp eval "echo metadata_exists('post',$CG_SUB,'_thumbnail_id')?'set':'untouched';" 2>/dev/null | tr -d '\r\n')" "untouched"
+check "nor the term writer" \
+  "$(docker compose exec -T cli wp eval "echo wp_get_object_terms($CG_SUB,'category',['fields'=>'ids'])?'set':'untouched';" 2>/dev/null | tr -d '\r\n')" "untouched"
+# The featured-image refusal above is only worth something if the same call can set one:
+# set_post_thumbnail() quietly declines an attachment it cannot render.
+cg cg_thumb_ok 416 wp_set_featured_image "{\"post_id\":$CG_DRAFT,\"media_id\":$CG_ATT}"
+check "CONTROL: the same attachment can be set on an ordinary post" \
+  "$(docker compose exec -T cli wp eval "echo (int) get_post_thumbnail_id($CG_DRAFT) === $CG_ATT ? 'set' : 'not set';" 2>/dev/null | tr -d '\r\n')" "set"
+cg cg_prev 407 wp_update_post "{\"ID\":$CG_SUB,\"preview\":true,\"post_title\":\"x\"}"
+check "a preview of the refused write is refused too" "$(verdict cg_prev)" "error"
+# The type a write LEAVES, not only the type it found.
+cg cg_retype 408 wp_update_post "{\"ID\":$CG_DRAFT,\"fields\":{\"post_type\":\"shop_subscription\"}}"
+cg cg_retype2 409 wp_update_post "{\"ID\":$CG_DRAFT,\"post_type\":\"Shop_Order\"}"
+check "wp_update_post cannot retype a draft into a subscription or an order" \
+  "$(docker compose exec -T cli wp post get "$CG_DRAFT" --field=post_type 2>/dev/null | tr -d '\r\n')" "post"
+CG_SUBS_BEFORE=$(docker compose exec -T cli wp eval 'global $wpdb; echo (int) $wpdb->get_var("SELECT COUNT(*) FROM $wpdb->posts WHERE post_type IN (\"shop_subscription\",\"shop_order\")");' 2>/dev/null | tr -d '\r\n')
+cg cg_create 410 wp_create_post "{\"post_title\":\"Minted sub\",\"post_type\":\"shop_subscription\",\"post_status\":\"wc-active\",\"meta_input\":{\"_customer_user\":1}}"
+cg cg_batch 411 wp_create_posts "{\"items\":[{\"post_title\":\"Batch ok probe\"},{\"post_title\":\"Batch order probe\",\"post_type\":\"shop_order\"}]}"
+check "wp_create_post and wp_create_posts cannot mint one" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb; echo (int) $wpdb->get_var("SELECT COUNT(*) FROM $wpdb->posts WHERE post_type IN (\"shop_subscription\",\"shop_order\")");' 2>/dev/null | tr -d '\r\n')" "$CG_SUBS_BEFORE"
+check "and the batch refused before writing its ordinary item either" \
+  "$(docker compose exec -T cli wp eval 'echo count(get_posts(["title"=>"Batch ok probe","post_status"=>"any","numberposts"=>-1,"fields"=>"ids"]));' 2>/dev/null | tr -d '\r\n')" "0"
+# Control: the same tools still write an ordinary post, so the refusals above are about
+# the type and not a broken tool.
+cg cg_ok 412 wp_copy_post_meta "{\"from_id\":$CG_SUB,\"to_id\":$CG_DRAFT,\"keys\":[\"_billing_period\"],\"overwrite\":true}"
+check "CONTROL: copying FROM a subscription onto an ordinary post still works" \
+  "$(docker compose exec -T cli wp eval "echo get_post_meta($CG_DRAFT,'_billing_period',true);" 2>/dev/null | tr -d '\r\n')" "month"
+# Undo is a generic writer too. Journal an ordinary edit, retype the post underneath it the
+# way an order saved by WooCommerce is a post, and ask for the undo.
+cg cg_j1 413 wp_update_post "{\"ID\":$CG_DRAFT,\"post_title\":\"Commerce probe edited\"}"
+call cg_jl '{"jsonrpc":"2.0","id":414,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":10}}}'
+CG_JID=$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next((r['id'] for r in rows if 'Commerce probe edited' in r['what'] or 'Commerce probe draft' in r['what']),''))" cg_jl)
+check "CONTROL: the ordinary edit was journalled" "$([ -n "$CG_JID" ] && echo yes || echo no)" "yes"
+docker compose exec -T cli wp eval "set_post_type($CG_DRAFT,'shop_order');" >/dev/null 2>&1
+call cg_undo "{\"jsonrpc\":\"2.0\",\"id\":415,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$CG_JID\"}}}"
+check "and wp_undo_change will not put an order back with a plain post write" \
+  "$(docker compose exec -T cli wp post get "$CG_DRAFT" --field=post_title 2>/dev/null | tr -d '\r\n')" "Commerce probe edited"
+docker compose exec -T cli wp eval "foreach ([$CG_SUB,$CG_DRAFT,$CG_ATT] as \$i) { wp_delete_post(\$i, true); } foreach (get_posts(['title'=>'Batch ok probe','post_status'=>'any','numberposts'=>-1,'fields'=>'ids']) as \$i) { wp_delete_post(\$i, true); } global \$wpdb; foreach (\$wpdb->get_col(\"SELECT ID FROM \$wpdb->posts WHERE post_title IN ('Minted sub','Batch order probe')\") as \$i) { wp_delete_post((int) \$i, true); }" >/dev/null 2>&1
+
 echo "-- the everyday meta tool keeps backslashes --"
 # update_post_meta() unslashes what it is given, so a value carrying backslashes arrives
 # stripped: a JSON payload stops parsing, a regex stops matching and a Windows path loses

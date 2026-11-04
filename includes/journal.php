@@ -312,6 +312,12 @@ class GMCP_Journal {
     if ( $post_id <= 0 || $meta_key === '' ) {
       return;
     }
+    // An entry this journal will never undo is not worth a place on a forty-entry list:
+    // a shop tool saving one order writes a dozen meta rows, and journalling them would push
+    // the agent's real, reversible changes off the end. The audit log still records them.
+    if ( !GMCP_Changes::undoable_post( $post_id ) ) {
+      return;
+    }
 
     $verb = [ 'created' => 'added', 'updated' => 'changed', 'deleted' => 'removed' ][ $op ] ?? null;
     if ( $verb === null ) {
@@ -402,6 +408,11 @@ class GMCP_Journal {
   */
   private function observe_post( array $change ): void {
     if ( ( $change['op'] ?? '' ) !== 'updated' ) {
+      return;
+    }
+    // Same reason as observe_meta(): an order or a subscription is never put back from
+    // here, so recording one would only evict entries that can be.
+    if ( !GMCP_Changes::undoable_post( (int) ( $change['id'] ?? 0 ) ) ) {
       return;
     }
     $changed = array_keys( (array) ( $change['fields'] ?? [] ) );
@@ -582,7 +593,7 @@ class GMCP_Journal {
         return 'The post no longer exists.';
       }
       if ( !GMCP_Changes::undoable_post( (int) $entry['ID'] ) ) {
-        return 'It belongs to a ' . self::post_type_label( (int) $entry['ID'] ) . ', whose writes this journal does not record or revert. Putting a subscription back with a plain post write leaves the site and the payment gateway disagreeing.';
+        return self::commerce_refusal( (int) $entry['ID'] );
       }
       if ( !empty( $entry['redacted'] ) ) {
         return 'The previous value looked like it held a credential, so it was never stored.';
@@ -604,7 +615,7 @@ class GMCP_Journal {
         return 'The post no longer exists.';
       }
       if ( !GMCP_Changes::undoable_post( (int) $entry['ID'] ) ) {
-        return 'It belongs to a ' . self::post_type_label( (int) $entry['ID'] ) . ', whose writes this journal does not record or revert. Putting a subscription back with a plain post write leaves the site and the payment gateway disagreeing.';
+        return self::commerce_refusal( (int) $entry['ID'] );
       }
       foreach ( (array) ( $entry['previous'] ?? [] ) as $value ) {
         if ( !self::too_large( $value ) ) {
@@ -614,6 +625,19 @@ class GMCP_Journal {
       return 'Every previous value was too large to keep.';
     }
     return 'Unknown change type.';
+  }
+
+  /**
+  * Why an order or a subscription is not put back, in one sentence both entry kinds share.
+  *
+  * The same rule GMCP_Core::commerce_post_guard() applies to the generic writers, because
+  * an undo is one of them: it puts a status or a meta row back with a plain post write,
+  * which skips every transition, stock and payment hook the shop runs.
+  */
+  private static function commerce_refusal( int $post_id ): string {
+    return 'It belongs to a ' . self::post_type_label( $post_id ) . ', which the generic post tools do not write and this journal does not revert. '
+      . 'Putting an order or a subscription back with a plain post write skips every status transition, stock and payment hook the shop runs, so the site and the payment gateway would disagree. '
+      . 'Use the WooCommerce tools to change it.';
   }
 
   /** The post type of an entry's target, for naming it in a refusal. */

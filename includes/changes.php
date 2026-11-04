@@ -30,12 +30,11 @@ if ( !defined( 'ABSPATH' ) ) {
 *
 * Two deliberate omissions.
 *
-* POST META IS NOT WATCHED. It looks like the obvious next listener and it is not. Every
-* post save writes _edit_lock and _edit_last, every block editor save writes more, and a
-* handful of plugins write their own on save_post. An audit entry for one title change
-* would arrive with a dozen meta rows attached and the one line worth reading would be
-* buried. If a tool that edits meta deliberately arrives later, give it its own listener
-* rather than watching everything.
+* POST META IS WATCHED, BUT FILTERED. Every post save writes _edit_lock and _edit_last,
+* every block editor save writes more, and a handful of plugins write their own on
+* save_post, so meta_noise_keys() drops the bookkeeping rows before anything is recorded.
+* What is left is the meta a page builder or a custom-field tool actually changed, which
+* on those sites is the work itself.
 *
 * VALUES ARE HELD, NOT WRITTEN. The records carry the real before and after values,
 * because the journal needs them to revert. Nothing here writes them anywhere: summarise()
@@ -362,7 +361,14 @@ class GMCP_Changes {
   }
 
   /**
-  * Posts the journal refuses to record, and therefore refuses to undo.
+  * Posts this class refuses to record at all.
+  *
+  * Narrower than GMCP_Core::commerce_post_types() on purpose, and not a copy of it. That
+  * list is the policy (which posts no generic tool may write, and which the journal will
+  * not undo) and undoable_post() below asks it. This one is about NOISE: which posts write
+  * rows nobody asked for while merely being read. Orders do not, and their recorded
+  * changes are what lets the audit log say "processing to completed" for a shop tool, so
+  * they stay recorded here and are refused at the journal instead.
   *
   * A subscription is a post when HPOS is off, and its status is that post's post_status
   * while its dates are meta rows on the same post. Recording it would offer a
@@ -401,7 +407,13 @@ class GMCP_Changes {
     if ( !$post ) {
       return false;
     }
-    return !in_array( $post->post_type, self::UNRECORDED_POST_TYPES, true );
+    // The shared list, not UNRECORDED_POST_TYPES. Undo is a raw wp_update_post or meta
+    // write, and with the private list it was offered for every shop_order: with HPOS off,
+    // WooCommerce saves an order's status through wp_update_post(), so a write-level key
+    // could revert a completed order to processing with no transition hooks, no stock or
+    // email side effects reversed and the linked subscription never told.
+    return !GMCP_Core::is_commerce_post_type( $post->post_type )
+      && !in_array( $post->post_type, self::UNRECORDED_POST_TYPES, true );
   }
 
   public function post_changed( $post_id, $after, $before ): void {
