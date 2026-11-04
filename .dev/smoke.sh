@@ -157,6 +157,36 @@ check "control: the reply says something about restoring at all" \
   "$(py 'import json,sys;print("restore" in json.load(sys.stdin)["result"]["content"][0]["text"])' d_notrash)" "True"
 docker compose exec -T cli wp config delete EMPTY_TRASH_DAYS >/dev/null 2>&1
 
+echo "-- a nested id cannot choose which record is written --"
+# Every guard in these handlers is asked about the top-level ID, and `fields` is an open
+# object that was merged over the write array key by key, "ID" included. So the guards
+# judged one record and WordPress wrote another. Each check reads the DECOY and the TARGET
+# back from the database; the reply named the target and said nothing was wrong.
+RT_A=$(docker compose exec -T cli wp post create --post_title='retarget decoy' --post_status=draft --porcelain 2>/dev/null | tr -d '\r\n')
+RT_B=$(docker compose exec -T cli wp post create --post_title='retarget victim' --post_status=draft --porcelain 2>/dev/null | tr -d '\r\n')
+call rt_post "{\"jsonrpc\":\"2.0\",\"id\":65,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$RT_A,\"fields\":{\"ID\":$RT_B,\"post_title\":\"retargeted\"}}}}"
+check "wp_update_post: fields.ID does not move the write to another post" \
+  "$(docker compose exec -T cli wp post get "$RT_B" --field=post_title 2>/dev/null | tr -d '\r\n')" "retarget victim"
+check "control: the post the call named is the one written" \
+  "$(docker compose exec -T cli wp post get "$RT_A" --field=post_title 2>/dev/null | tr -d '\r\n')" "retargeted"
+RT_U=$(docker compose exec -T cli wp eval 'echo wp_insert_user(["user_login"=>"rt_decoy","user_pass"=>wp_generate_password(),"display_name"=>"Decoy"]);' 2>/dev/null | tr -d '\r\n')
+RT_V=$(docker compose exec -T cli wp eval 'echo wp_insert_user(["user_login"=>"rt_victim","user_pass"=>wp_generate_password(),"display_name"=>"Victim"]);' 2>/dev/null | tr -d '\r\n')
+call rt_user "{\"jsonrpc\":\"2.0\",\"id\":66,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_user\",\"arguments\":{\"ID\":$RT_U,\"fields\":{\"ID\":$RT_V,\"display_name\":\"Retargeted\"}}}}"
+check "wp_update_user: fields.ID does not move the write to another account" \
+  "$(docker compose exec -T cli wp user get "$RT_V" --field=display_name 2>/dev/null | tr -d '\r\n')" "Victim"
+check "control: the account the call named is the one written" \
+  "$(docker compose exec -T cli wp user get "$RT_U" --field=display_name 2>/dev/null | tr -d '\r\n')" "Retargeted"
+RT_C1=$(docker compose exec -T cli wp comment create --comment_post_ID="$RT_A" --comment_content='decoy comment' --porcelain 2>/dev/null | tr -d '\r\n')
+RT_C2=$(docker compose exec -T cli wp comment create --comment_post_ID="$RT_A" --comment_content='victim comment' --porcelain 2>/dev/null | tr -d '\r\n')
+call rt_comment "{\"jsonrpc\":\"2.0\",\"id\":67,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_comment\",\"arguments\":{\"comment_ID\":$RT_C1,\"fields\":{\"comment_ID\":$RT_C2,\"comment_content\":\"retargeted\"}}}}"
+check "wp_update_comment: fields.comment_ID does not move the write" \
+  "$(docker compose exec -T cli wp comment get "$RT_C2" --field=comment_content 2>/dev/null | tr -d '\r\n')" "victim comment"
+# wp_update_comment() returns 1 or 0, not an id, and the reply printed that number.
+check "and the reply names the comment written, not a row count" \
+  "$(py 'import sys,json;print(json.load(sys.stdin)["result"]["content"][0]["text"])' rt_comment)" "Comment #$RT_C1 updated"
+docker compose exec -T cli wp post delete "$RT_A" "$RT_B" --force >/dev/null 2>&1
+docker compose exec -T cli wp user delete "$RT_U" "$RT_V" --yes >/dev/null 2>&1
+
 echo "-- preview: say what would happen, change nothing --"
 # A preview that quietly performs the write is worse than no preview, so every check
 # here asserts the stored state afterwards rather than trusting the wording.

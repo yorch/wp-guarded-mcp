@@ -2581,6 +2581,15 @@ class GMCP_Tools_Core {
             break;
           }
         }
+        // Forced back last, immediately before the write. Every check above was made about
+        // $target_id, and `fields` is an open object: a caller could put an "ID" in it and
+        // the merge copied it over the authorised one, so edit_user and promote_user were
+        // asked about the caller's own account and wp_update_user() then wrote whichever
+        // account the nested ID named. On multisite that reopened exactly the Network Owner
+        // takeover the edit_user check above was added to close. Re-asserting the id here
+        // rather than skipping the key during the merge is deliberate: anything added to
+        // $upd later is covered too, without having to remember this.
+        $upd['ID'] = $target_id;
         $u = wp_update_user( $upd );
         if ( is_wp_error( $u ) ) {
           $r = $this->error( $r, $u->get_error_message(), $u->get_error_code() );
@@ -2670,12 +2679,25 @@ class GMCP_Tools_Core {
             $c[ $k ] = ( $k === 'comment_content' ) ? $this->clean_html( $v ) : sanitize_text_field( $v );
           }
         }
+        // The id the caller named at the top level, forced back after the merge for the
+        // same reason wp_update_post and wp_update_user do it: `fields` is open, and a
+        // nested comment_ID would otherwise decide which comment is written.
+        $comment_id = intval( $a['comment_ID'] );
+        $c['comment_ID'] = $comment_id;
         $cid = wp_update_comment( $c, true );
         if ( is_wp_error( $cid ) ) {
           $r = $this->error( $r, $cid->get_error_message(), $cid->get_error_code() );
         }
+        elseif ( $cid === false ) {
+          $r = $this->error( $r, 'Comment #' . $comment_id . ' could not be updated.', -32603 );
+        }
         else {
-          $this->add_result_text( $r, 'Comment #' . $cid . ' updated' );
+          // wp_update_comment() returns the number of rows changed, 1 or 0, never the id.
+          // Printing it read "Comment #1 updated" for every comment, and "#0" for a no-op,
+          // which hid that nothing had changed.
+          $this->add_result_text( $r, $cid
+            ? 'Comment #' . $comment_id . ' updated'
+            : 'Comment #' . $comment_id . ' unchanged: it already held those values.' );
         }
         break;
 
@@ -3921,6 +3943,12 @@ class GMCP_Tools_Core {
 
         // Update post fields if any
         if ( $has_fields ) {
+          // The authorised id, forced back immediately before the write. `fields` is an
+          // open object and the merge above copies every key in it, "ID" included, so a
+          // nested ID replaced the one commerce_post_guard() and template_reference_guard()
+          // had just been asked about: the guards judged one post and this wrote another,
+          // and the meta below followed $u to the same place.
+          $c['ID'] = $post_id;
           $u = wp_update_post( wp_slash( $c ), true );
           if ( is_wp_error( $u ) ) {
             $r = $this->error( $r, $u->get_error_message(), $u->get_error_code() );
