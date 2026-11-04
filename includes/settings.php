@@ -1311,7 +1311,7 @@ class GMCP_Settings {
               <?php endif; ?>
               <label>
                 <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>
-                <?php esc_html_e( 'Generate tools from this site\'s REST API routes', 'guarded-mcp' ); ?>
+                <?php esc_html_e( 'Generate create, read, update and delete tools for posts, pages and media from the REST API', 'guarded-mcp' ); ?>
               </label>
             </fieldset>
             <p class="description">

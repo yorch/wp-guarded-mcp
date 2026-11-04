@@ -641,6 +641,22 @@ check "and a create reports the id of what it made" \
   "$(py 'import json,sys;t=json.load(sys.stdin,strict=False)["result"]["content"][0]["text"];print("id" in json.loads(t))' sh_create)" "True"
 docker compose exec -T cli wp post delete "$SH_MEDIA" --force >/dev/null 2>&1
 
+# The generated create and update tools go through the core REST controller as the key's
+# user, an administrator, and the controller stores content verbatim for anyone holding
+# unfiltered_html. wp_create_post sanitises everything an agent writes; these did not, so a
+# script tag the core tool refuses was published through create_pages. Compared against the
+# STORED post_content, not the reply. The control is the same call carrying harmless markup,
+# which must survive, so a probe that stored nothing cannot pass.
+call rs_create '{"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"create_pages","arguments":{"title":"Sanitise probe <b>t</b>","status":"draft","content":"<p>kept paragraph</p><script>alert(1)</script>","excerpt":"<em>kept</em><script>alert(2)</script>"}}}'
+RS_ID=$(py 'import json,sys;t=json.load(sys.stdin,strict=False)["result"]["content"][0]["text"];print(json.loads(t)["id"])' rs_create)
+check "CONTROL: the REST create stored the page"   "$(docker compose exec -T cli wp eval "echo get_post($RS_ID) ? 'stored' : 'MISSING';" 2>/dev/null | tr -d '\r\n')" "stored"
+check "CONTROL: harmless markup in it survives"   "$(docker compose exec -T cli wp eval "echo strpos(get_post($RS_ID)->post_content, '<p>kept paragraph</p>') !== false ? 'kept' : 'LOST';" 2>/dev/null | tr -d '\r\n')" "kept"
+check "a script tag written through create_pages is not stored"   "$(docker compose exec -T cli wp eval "echo stripos(get_post($RS_ID)->post_content, '<script') === false ? 'clean' : 'SCRIPT STORED';" 2>/dev/null | tr -d '\r\n')" "clean"
+check "nor in the excerpt"   "$(docker compose exec -T cli wp eval "echo stripos(get_post($RS_ID)->post_excerpt, '<script') === false ? 'clean' : 'SCRIPT STORED';" 2>/dev/null | tr -d '\r\n')" "clean"
+call rs_update "{\"jsonrpc\":\"2.0\",\"id\":104,\"method\":\"tools/call\",\"params\":{\"name\":\"update_pages\",\"arguments\":{\"id\":$RS_ID,\"content\":{\"raw\":\"<p>second</p><script>alert(3)</script>\"}}}}"
+check "and update_pages, which takes the object form, is held to it too"   "$(docker compose exec -T cli wp eval "\$c = get_post($RS_ID)->post_content; echo strpos(\$c, '<p>second</p>') !== false && stripos(\$c, '<script') === false ? 'clean' : 'WRONG: ' . \$c;" 2>/dev/null | tr -d '\r\n')" "clean"
+docker compose exec -T cli wp post delete "$RS_ID" --force >/dev/null 2>&1
+
 # The generated tools are cached in a transient for a day and nothing ever removed it, so
 # an upgrade that added or reshaped one was not merely unlisted for twenty-four hours: the
 # handler refuses a tool absent from that transient, so it was uncallable, and the caller
