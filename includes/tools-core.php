@@ -1689,7 +1689,7 @@ class GMCP_Tools_Core {
       ],
       'wp_write_blocks' => [
         'name' => 'wp_write_blocks',
-        'description' => 'Build a valid Gutenberg (block editor) layout on an existing post or page from a simple block spec, so the result opens cleanly in the editor with no "invalid content" warnings. Create the post first with wp_create_post, then pass its ID plus "blocks", an ordered array of specs like {"type":"heading","level":2,"content":"..."}. Supported types: paragraph (content), heading (content, level 1-6), list (items[], ordered), quote (content, citation), image (url, alt, caption), buttons (buttons[] of {text,url}), group (blocks[]), columns (columns[] of block-spec arrays), separator, spacer (height px), code (content), html (content, raw HTML escape hatch). content fields accept inline HTML. mode replaces (default), appends, or prepends. For prose you do not need to lay out visually, plain wp_create_post/wp_update_post with Markdown is simpler; use this when you want real, editable blocks.',
+        'description' => 'Build a valid Gutenberg (block editor) layout on an existing post or page from a simple block spec, so the result opens cleanly in the editor with no "invalid content" warnings. Create the post first with wp_create_post, then pass its ID plus either "blocks", an ordered array of specs like {"type":"heading","level":2,"content":"..."}, or "markdown", a Markdown string converted to the same kind of blocks. Supported types: paragraph (content), heading (content, level 1-6), list (items[], ordered), quote (content, citation), image (url, alt, caption), buttons (buttons[] of {text,url}), group (blocks[]), columns (columns[] of block-spec arrays), separator, spacer (height px), code (content), html (content, raw HTML escape hatch). content fields accept inline HTML. Markdown supports headings, paragraphs, bulleted and numbered lists, blockquotes, fenced code, bold, italic, code spans, links and images (http, https or mailto only); HTML written in markdown is shown as text, not run. mode replaces (default), appends, or prepends. For prose you do not need to lay out visually, plain wp_create_post/wp_update_post with Markdown is simpler; use this when you want real, editable blocks.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1699,9 +1699,10 @@ class GMCP_Tools_Core {
               'description' => 'Ordered array of block specs. Each item is an object with a "type" and the fields for that type (see the tool description).',
               'items' => [ 'type' => 'object', 'additionalProperties' => true ],
             ],
+            'markdown' => [ 'type' => 'string', 'description' => 'Markdown to convert to blocks, instead of "blocks". Supports a small subset: # headings, paragraphs, - or 1. lists, > blockquotes, ``` fenced code, **bold**, *italic*, `code`, [text](url) and ![alt](url) with http(s) URLs. Anything else is shown as text, and HTML is escaped rather than kept.' ],
             'mode' => [ 'type' => 'string', 'enum' => [ 'replace', 'append', 'prepend' ], 'description' => 'replace (default) overwrites post_content; append/prepend add the blocks to the existing content.' ],
           ],
-          'required' => [ 'ID', 'blocks' ],
+          'required' => [ 'ID' ],
         ],
         'accessLevel' => 'write',
       ],
@@ -1967,6 +1968,8 @@ class GMCP_Tools_Core {
       'wp_upload_media' => [
         'name' => 'wp_upload_media',
         'description' => 'Upload a file to the WordPress Media Library. Provide either a url (WordPress will download it) or base64-encoded content with a filename. Base64 mode is useful for local files but doubles the payload size — keep files under a few MB to avoid memory or timeout issues.',
+        // A url makes WordPress fetch from outside the site, so this one is open-world.
+        'annotations' => [ 'openWorldHint' => true ],
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -2050,34 +2053,12 @@ class GMCP_Tools_Core {
     // All 36 core tools enabled and tested with ChatGPT.
     // Automatic validation in mcp.php fixes problematic type definitions.
 
-    // Add category and annotations to each tool
+    // Add category to each tool. Annotations are not set here: GMCP_Server derives them
+    // for every tool from its access level, and a second, name-based guess made here would
+    // answer first and contradict it (it called wp_update_post non-destructive).
     foreach ( $tools as &$tool ) {
       if ( !isset( $tool['category'] ) ) {
         $tool['category'] = 'WordPress';
-      }
-
-      // Add MCP tool annotations based on tool name/behavior
-      if ( !isset( $tool['annotations'] ) ) {
-        $name = $tool['name'];
-
-        // Read-only tools (safe, no modifications)
-        $is_readonly = (
-          strpos( $name, 'wp_get_' ) === 0 ||
-          strpos( $name, 'wp_list_' ) === 0 ||
-          strpos( $name, 'wp_count_' ) === 0
-        );
-
-        // Destructive tools (can delete/destroy data)
-        $is_destructive = (
-          strpos( $name, 'wp_delete_' ) === 0 ||
-          $name === 'wp_update_user' // Can change passwords/roles
-        );
-
-        $tool['annotations'] = [
-          'readOnlyHint' => $is_readonly,
-          'destructiveHint' => !$is_readonly && $is_destructive,
-          'openWorldHint' => false, // All operate on closed WordPress system
-        ];
       }
     }
 
@@ -3942,15 +3923,42 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $drafts, -32600 );
           break;
         }
-        // Some MCP clients send arrays as JSON strings.
-        $wb_blocks = $a['blocks'] ?? null;
-        if ( is_string( $wb_blocks ) ) {
-          $wb_blocks = json_decode( $wb_blocks, true );
-        }
-        list( $wb_markup, $wb_err ) = $this->blocks_to_markup( $wb_blocks );
-        if ( $wb_err !== null ) {
-          $r = $this->error( $r, $wb_err, -32602 );
+        // Exactly one of blocks and markdown. Both or neither is ambiguous, and an
+        // ambiguous write is refused rather than guessed at.
+        $wb_has_blocks = array_key_exists( 'blocks', $a ) && $a['blocks'] !== null;
+        $wb_has_md = array_key_exists( 'markdown', $a ) && $a['markdown'] !== null;
+        if ( $wb_has_blocks === $wb_has_md ) {
+          $r = $this->error( $r, $wb_has_blocks ? 'Pass either "blocks" or "markdown", not both.' : 'Pass "blocks" (an array of block specs) or "markdown" (a string).', -32602 );
           break;
+        }
+        if ( $wb_has_md ) {
+          if ( !is_string( $a['markdown'] ) ) {
+            $r = $this->error( $r, '"markdown" must be a string.', -32602 );
+            break;
+          }
+          list( $wb_markup, $wb_err, $wb_count ) = GMCP_Markdown_Blocks::to_markup( $a['markdown'] );
+          if ( $wb_err !== null ) {
+            $r = $this->error( $r, $wb_err, -32602 );
+            break;
+          }
+          // Markdown output is block markup, so it takes the same sanitising path as any
+          // other post HTML: store_html() honours gmcp_allow_unfiltered_post_html and
+          // otherwise runs kses over each block. The converter escapes source HTML, so
+          // this is a second layer, not the only one.
+          $wb_markup = $this->store_html( $wb_markup );
+        }
+        else {
+          // Some MCP clients send arrays as JSON strings.
+          $wb_blocks = $a['blocks'];
+          if ( is_string( $wb_blocks ) ) {
+            $wb_blocks = json_decode( $wb_blocks, true );
+          }
+          list( $wb_markup, $wb_err ) = $this->blocks_to_markup( $wb_blocks );
+          if ( $wb_err !== null ) {
+            $r = $this->error( $r, $wb_err, -32602 );
+            break;
+          }
+          $wb_count = count( $wb_blocks );
         }
         $wb_mode = in_array( $a['mode'] ?? 'replace', [ 'replace', 'append', 'prepend' ], true ) ? ( $a['mode'] ?? 'replace' ) : 'replace';
         if ( $wb_mode === 'append' ) {
@@ -3968,7 +3976,7 @@ class GMCP_Tools_Core {
           break;
         }
         $this->bust_post_cache( $wb_id, [ 'tool' => 'wp_write_blocks' ] );
-        $this->add_result_text( $r, 'Wrote ' . count( $wb_blocks ) . ' block(s) to post ' . $wb_id . ' (mode: ' . $wb_mode . ').' );
+        $this->add_result_text( $r, 'Wrote ' . $wb_count . ' block(s) to post ' . $wb_id . ' (mode: ' . $wb_mode . ').' );
         break;
 
         /* ===== Block patterns: list ===== */

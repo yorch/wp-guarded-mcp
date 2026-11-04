@@ -120,6 +120,27 @@ and carry their own guards:
   entities, and kses does not recognise such a delimiter comment: it escapes the
   opener and destroys the block. Only the rendered HTML inside each block is
   filtered, and the attributes round-trip as JSON.
+- Markdown given to `wp_write_blocks` is converted to blocks by
+  `GMCP_Markdown_Blocks`, which escapes every piece of HTML in the source instead of
+  passing it through, and accepts links only for `http`, `https` and `mailto`, and
+  images only for `http` and `https`. The converted markup then goes through the same
+  `store_html()` path as block markup written directly, so the rules above apply to
+  it too. Neither layer is trusted alone: the converter is the one that knows what the
+  source meant, and the filter is the one that knows what the editor will render.
+- Tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
+  `openWorldHint`) are advisory and are not a guard. Clients may use them to decide
+  whether to ask first, so a wrong hint costs a prompt or skips one; it does not
+  change what the server allows. They are derived from the access level, with
+  `readOnlyHint` also set by a read verb directly after the group prefix, because
+  about two dozen admin-level tools only read (some of them personal data, such as
+  form entries and customers; others options and theme mods). A `readOnlyHint` on a
+  `read`-level tool is only as good as the tool's own code, and a read that writes
+  is a defect, not something the hint covers. Refusal and two-step confirmation are
+  enforced by the tools, whatever the hint says.
+- The server's `instructions` text tells the model that content read from the site
+  is data and not instructions. That is guidance, not a control: it is the reason
+  the guards exist, and it must not be the only thing standing between a comment and
+  an action.
 - The default role for public registration is checked by construction: a role
   granting anything beyond a subscriber is refused, rather than checking a list
   of capabilities that would never stay complete.

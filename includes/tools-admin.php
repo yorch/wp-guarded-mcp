@@ -911,12 +911,11 @@ class GMCP_Tools_Admin {
     foreach ( $tools as &$tool ) {
       $tool['category'] = 'WordPress Admin';
       $name = $tool['name'];
-      $readonly = strpos( $name, 'wp_list_' ) === 0 || strpos( $name, 'wp_get_' ) === 0;
+      // Only the one hint this group knows and GMCP_Server cannot: installers and updaters
+      // reach wordpress.org. readOnlyHint and destructiveHint are derived from accessLevel
+      // in GMCP_Server::derive_annotations(), so they are not restated here, where a
+      // name-based guess would override them key by key.
       $tool['annotations'] = [
-        'readOnlyHint' => $readonly,
-        // Named as well as prefixed: unscheduling an event destroys something the
-        // journal cannot put back, so the naming convention is not enough to catch it.
-        'destructiveHint' => strpos( $name, 'wp_delete_' ) === 0 || $name === 'wp_unschedule_cron_event',
         'openWorldHint' => strpos( $name, 'wp_install_' ) === 0 || strpos( $name, 'wp_update_' ) === 0,
       ];
     }

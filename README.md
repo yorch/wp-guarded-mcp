@@ -121,7 +121,9 @@ post meta, site options, post types, block patterns, and theme mods. `wp_copy_po
 and `wp_duplicate_post` copy inside PHP so a large design never leaves the server;
 `wp_write_post_meta_chunk` and `wp_read_post_meta_chunk` stage a value across several
 calls. `wp_create_posts` creates up to twenty in one call. `wp_site_briefing` answers
-"what am I looking at" in one call.
+"what am I looking at" in one call. `wp_write_blocks` takes either a list of block specs or
+a Markdown string (headings, paragraphs, lists, blockquotes, fenced code, emphasis, links
+and images); Markdown HTML is shown as text, not run.
 
 **Site administration**, off by default: installing, activating, updating and deleting
 plugins and themes; navigation menus and their items; widgets and widget areas; the
@@ -389,6 +391,7 @@ Other hooks:
 | `gmcp_allow_remote_install` | Permit installs from a URL rather than the wordpress.org repository |
 | `gmcp_allow_unfiltered_post_html` | Store post HTML unfiltered |
 | `gmcp_allow_unfiltered_widget_html` | Store widget HTML unfiltered |
+| `gmcp_instructions` | The text a client shows its model at session start. Receives the default and the site URL; return a string to replace it |
 
 ## Security notes
 

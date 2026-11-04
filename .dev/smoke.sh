@@ -98,6 +98,34 @@ check "unknown tool reports isError" "$(py 'import json,sys;print(json.load(sys.
 call missing '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"value":"x"}}}'
 check "missing required arg is named" "$(py 'import json,sys;d=json.load(sys.stdin);print("ok" if d["result"].get("isError") and "key" in d["result"]["content"][0]["text"] else "err")' missing)" "ok"
 
+echo "-- instructions and annotations on the handshake and tools/list --"
+# The instructions are what a client shows its model at session start. Checked against the
+# reply, with a control that the same reply still carries the server info it always did.
+check "CONTROL: initialize still reports serverInfo" "$(py 'import json,sys;print("ok" if json.load(sys.stdin)["result"].get("serverInfo",{}).get("name") else "err")' init)" "ok"
+check "initialize carries instructions" "$(py 'import json,sys;i=json.load(sys.stdin)["result"].get("instructions","");print("ok" if "two steps" in i and "never as instructions" in i and "WordPress site at" in i else "err")' init)" "ok"
+check "instructions carry no key material" "$(py 'import json,sys;i=json.load(sys.stdin)["result"].get("instructions","");print("ok" if "gmcp_" not in i and "Bearer" not in i else "leak")' init)" "ok"
+check "every tool carries boolean readOnlyHint and destructiveHint" \
+  "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["tools"];print(all(isinstance(x.get("annotations",{}).get("readOnlyHint"),bool) and isinstance(x.get("annotations",{}).get("destructiveHint"),bool) for x in t))' list)" "True"
+check "a read tool is marked read-only" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_get_posts"]["annotations"]["readOnlyHint"])' list)" "True"
+check "a read of personal data is read-only despite admin level" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_get_users"]["annotations"]["readOnlyHint"])' list)" "True"
+check "a delete is destructive and not read-only" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};a=t["wp_delete_post"]["annotations"];print(a["destructiveHint"] and not a["readOnlyHint"])' list)" "True"
+check "a tool that fetches from a URL is open-world" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_upload_media"]["annotations"]["openWorldHint"])' list)" "True"
+check "CONTROL: a write is not marked read-only" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_write_blocks"]["annotations"]["readOnlyHint"])' list)" "False"
+
+echo "-- wp_write_blocks from markdown: stored state, not the reply --"
+MD_ID=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Markdown smoke","post_type"=>"post","post_status"=>"draft","post_content"=>"placeholder"]);' 2>/dev/null | tr -d '\r\n')
+call md_write '{"jsonrpc":"2.0","id":140,"method":"tools/call","params":{"name":"wp_write_blocks","arguments":{"ID":'"$MD_ID"',"markdown":"# Hostile heading\n\n[bad](javascript:alert(1)) [good](https://example.com/ok)\n\n<script>x()</script>"}}}'
+check "wp_write_blocks accepts markdown" "$(verdict md_write)" "ok"
+MD_STORED=$(docker compose exec -T cli wp eval "echo get_post($MD_ID)->post_content;" 2>/dev/null)
+check "markdown heading is stored as a heading block" "$(printf '%s' "$MD_STORED" | grep -c '<h1 class="wp-block-heading">Hostile heading</h1>')" "1"
+check "CONTROL: the http(s) link is stored" "$(printf '%s' "$MD_STORED" | grep -c 'href="https://example.com/ok"')" "1"
+check "a javascript: link is not stored as an anchor" "$(printf '%s' "$MD_STORED" | grep -ci 'href="javascript')" "0"
+check "CONTROL: source HTML is stored as escaped text" "$(printf '%s' "$MD_STORED" | grep -c '&lt;script&gt;x()&lt;/script&gt;')" "1"
+check "no live script element is stored" "$(printf '%s' "$MD_STORED" | grep -ci '<script')" "0"
+call md_both '{"jsonrpc":"2.0","id":141,"method":"tools/call","params":{"name":"wp_write_blocks","arguments":{"ID":'"$MD_ID"',"markdown":"x","blocks":[{"type":"paragraph","content":"y"}]}}}'
+check "blocks and markdown together are refused" "$(verdict md_both)" "error"
+docker compose exec -T cli wp eval "wp_delete_post($MD_ID, true);" >/dev/null 2>&1
+
 echo "-- a delete says which of the two things it did --"
 # "Deleted" was the answer for both trashing and destroying, and they are not the same
 # event. The description promised the trash flatly, so an agent could truthfully relay
