@@ -50,7 +50,8 @@ class GMCP_Tools_Woo {
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
-            'search' => [ 'type' => 'string', 'description' => 'Match against name, sku and description.' ],
+            'search' => [ 'type' => 'string', 'description' => 'Text match against name, excerpt and description. It does not match SKUs; use sku for that.' ],
+            'sku' => [ 'type' => 'string', 'description' => 'Products whose SKU matches this.' ],
             'status' => [ 'type' => 'string', 'description' => 'publish, draft, pending or private. Default any.' ],
             'stock_status' => [ 'type' => 'string', 'description' => 'instock, outofstock or onbackorder.' ],
             'category' => [ 'type' => 'string', 'description' => 'Product category slug.' ],
@@ -104,7 +105,7 @@ class GMCP_Tools_Woo {
             'description' => [ 'type' => 'string' ],
             'short_description' => [ 'type' => 'string' ],
             'sku' => [ 'type' => 'string' ],
-            'status' => [ 'type' => 'string' ],
+            'status' => [ 'type' => 'string', 'description' => 'publish, draft, pending or private. To trash a product use wp_delete_post, which keeps it restorable.' ],
             'preview' => [ 'type' => 'boolean', 'description' => 'Describe what would change and change nothing.' ],
           ],
           'required' => [ 'id' ],
@@ -113,7 +114,7 @@ class GMCP_Tools_Woo {
       ],
       'wc_set_stock' => [
         'name' => 'wc_set_stock',
-        'description' => 'Set or adjust the stock quantity of a product or variation. Pass quantity for an absolute figure, or delta to add or subtract. Turns stock management on if it is off.',
+        'description' => 'Set or adjust the stock quantity of a product or variation. Pass quantity for an absolute figure, or delta to add or subtract; both are applied in the database in one statement, so they do not lose a sale that lands at the same moment. Turns stock management on if it is off.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -153,7 +154,7 @@ class GMCP_Tools_Woo {
       ],
       'wc_update_order_status' => [
         'name' => 'wc_update_order_status',
-        'description' => 'Move an order to another status. This often emails the customer, and the reply says exactly who WooCommerce wrote to, measured during the change rather than guessed from the status. A plugin that bypasses wp_mail entirely is invisible to that measurement. Setting "refunded" marks the order as refunded and does NOT move any money; use your payment provider for an actual refund.',
+        'description' => 'Move an order to another status. This often emails the customer, and the reply says who WooCommerce wrote to, measured during the change rather than guessed from the status. Two things the measurement cannot see: a plugin that bypasses wp_mail entirely, and a shop that defers its transactional emails to after the request (WooCommerce can, and some plugins turn it on). On such a shop the reply says that mail may follow and that the recipients cannot be reported. Setting "refunded" marks the order as refunded and does NOT move any money; use your payment provider for an actual refund.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -168,7 +169,7 @@ class GMCP_Tools_Woo {
       ],
       'wc_add_order_note' => [
         'name' => 'wc_add_order_note',
-        'description' => 'Add a note to an order. Private by default. A customer note is emailed to the customer, so it reaches a real person.',
+        'description' => 'Add a note to an order. Private by default. A customer note normally emails the customer, so it reaches a real person; the reply reports what was measured, and says so when the shop defers its emails and the recipient cannot be reported.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -195,7 +196,7 @@ class GMCP_Tools_Woo {
       ],
       'wc_sales_summary' => [
         'name' => 'wc_sales_summary',
-        'description' => 'Revenue, order count, average order value and the best-selling products over a period. Counts only orders that actually earned money: processing, completed and on-hold.',
+        'description' => 'Revenue, order count, average order value and the best-selling products over a rolling period. Counts only orders that actually earned money: processing, completed and on-hold. Revenue is gross order totals, not reduced by refunds, and is reported per currency. Looks at no more than 3000 orders and says when it stopped early.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -206,7 +207,7 @@ class GMCP_Tools_Woo {
       ],
       'wc_store_briefing' => [
         'name' => 'wc_store_briefing',
-        'description' => 'Orient on this shop in one call: currency, product and order counts by status, what needs attention now (orders awaiting processing, products out of stock or low), and the last 30 days of takings.',
+        'description' => 'Orient on this shop in one call: currency, product and order counts by status, what needs attention now (orders awaiting processing, products out of stock or low), and the last 30 days of takings (gross, and from at most 3000 orders).',
         'inputSchema' => [ 'type' => 'object', 'properties' => [] ],
         'accessLevel' => 'read',
       ],
@@ -367,6 +368,9 @@ class GMCP_Tools_Woo {
     if ( !empty( $a['search'] ) ) {
       $query['s'] = sanitize_text_field( $a['search'] );
     }
+    if ( !empty( $a['sku'] ) ) {
+      $query['sku'] = sanitize_text_field( $a['sku'] );
+    }
     if ( !empty( $a['stock_status'] ) ) {
       $query['stock_status'] = sanitize_key( $a['stock_status'] );
     }
@@ -502,6 +506,23 @@ class GMCP_Tools_Woo {
       return $this->error( $r, 'No product with id ' . (int) ( $a['id'] ?? 0 ) . '.' );
     }
 
+    // Status is validated here because WC_Product::set_status() is a bare property
+    // assignment: it accepted 'trash', 'auto-draft' or any string and wrote it to
+    // post_status. 'trash' that way skips wp_trash_post(), so the product has no trash
+    // bookkeeping, Restore brings it back as a draft, and nothing purges it. 'future' is
+    // refused too: it needs a post_date in the future, which this tool cannot set, and
+    // WordPress turns a 'future' post with a past date straight into a published one.
+    if ( array_key_exists( 'status', $a ) ) {
+      $status = strtolower( trim( (string) $a['status'] ) );
+      if ( $status === 'trash' ) {
+        return $this->error( $r, 'This tool does not trash products. Use wp_delete_post, which moves it to the trash properly and can be undone.' );
+      }
+      if ( !in_array( $status, [ 'publish', 'draft', 'pending', 'private' ], true ) ) {
+        return $this->error( $r, 'Unknown product status "' . sanitize_text_field( (string) $a['status'] ) . '". Use publish, draft, pending or private. Nothing was changed.' );
+      }
+      $a['status'] = $status;
+    }
+
     $fields = [ 'name', 'regular_price', 'sale_price', 'sku', 'status', 'description', 'short_description' ];
     $changes = [];
     foreach ( $fields as $field ) {
@@ -561,14 +582,37 @@ class GMCP_Tools_Woo {
       return $this->error( $r, 'Pass quantity for an absolute figure, or delta to add or subtract.' );
     }
 
-    $was = $product->get_manage_stock() ? (int) $product->get_stock_quantity() : null;
-    $product->set_manage_stock( true );
-    $new = isset( $a['quantity'] ) ? (int) $a['quantity'] : (int) $was + (int) $a['delta'];
-    $product->set_stock_quantity( $new );
-    // Set explicitly rather than left to WooCommerce: a product whose quantity drops to
-    // zero while its status still says instock stays purchasable.
-    $product->set_stock_status( $new > 0 ? 'instock' : 'outofstock' );
-    $product->save();
+    $managed = $product->managing_stock();
+    $was = $managed ? (int) $product->get_stock_quantity() : null;
+    $quantity = isset( $a['quantity'] ) ? (int) $a['quantity'] : null;
+    $delta = $quantity === null ? (int) $a['delta'] : 0;
+
+    // A relative change is a read-modify-write if done on the object: it reads the stock,
+    // adds, and writes the sum, so a sale that lands in between is silently overwritten.
+    // WooCommerce's own order stock reduction uses wc_update_product_stock(), which does
+    // the arithmetic in one UPDATE, so the same function is used for both the relative
+    // and the absolute case whenever the stock is already managed. When it is not, there
+    // is no stock figure to race with, and the object path below turns management on.
+    if ( $managed && function_exists( 'wc_update_product_stock' ) ) {
+      if ( $quantity !== null ) {
+        wc_update_product_stock( $product, $quantity, 'set' );
+      }
+      elseif ( $delta !== 0 ) {
+        wc_update_product_stock( $product, abs( $delta ), $delta > 0 ? 'increase' : 'decrease' );
+      }
+      // Re-read: the function updates the row, and the object in hand may be the parent's.
+      $product = wc_get_product( $product->get_id() ) ?: $product;
+    }
+    else {
+      $product->set_manage_stock( true );
+      $product->set_stock_quantity( $quantity ?? ( (int) $was + $delta ) );
+      // WooCommerce derives the stock status from the quantity on save (validate_props),
+      // and with backorders allowed that is 'onbackorder' rather than 'outofstock', so the
+      // status in the reply below is what was stored and not what this code would choose.
+      $product->save();
+      $product = wc_get_product( $product->get_id() ) ?: $product;
+    }
+    $new = (int) $product->get_stock_quantity();
 
     $from = $was === null ? 'unmanaged' : (string) $was;
     return $this->text( $r, 'Stock for "' . $product->get_name() . '" is now ' . $new
@@ -625,9 +669,13 @@ class GMCP_Tools_Woo {
   }
 
   private function get_order( array $a, array $r ): array {
-    $order = wc_get_order( (int) ( $a['id'] ?? 0 ) );
-    if ( !$order ) {
-      return $this->error( $r, 'No order with id ' . (int) ( $a['id'] ?? 0 ) . '.' );
+    $id = (int) ( $a['id'] ?? 0 );
+    // wc_get_order() also resolves a refund id, and a refund is a WC_Order_Refund, which
+    // extends WC_Abstract_Order and not WC_Order: get_address() and get_customer_note()
+    // below do not exist on it. A subscription is a WC_Order and stays readable here.
+    $order = $id > 0 ? wc_get_order( $id ) : null;
+    if ( !$order instanceof \WC_Order ) {
+      return $this->not_an_order( $id, $r );
     }
 
     $items = [];
@@ -710,7 +758,10 @@ class GMCP_Tools_Woo {
 
   /** The sentence a refusal gives when the id resolves to something that is not an order. */
   private function not_an_order( int $id, array $r ): array {
-    $thing = wc_get_order( $id );
+    $thing = $id > 0 ? wc_get_order( $id ) : null;
+    if ( $thing && !$thing instanceof \WC_Order ) {
+      return $this->error( $r, '#' . $id . ' is a ' . $thing->get_type() . ', not an order, so this tool will not touch it.' );
+    }
     if ( $thing instanceof \WC_Order ) {
       return $this->error( $r, '#' . $id . ' is a ' . $thing->get_type() . ', not an order, so this tool will not touch it. These tools act on ordinary orders only. A subscription has its own rules for which status changes are allowed and its own date bookkeeping, and writing it as though it were an order silently records a status that was not set' . ( class_exists( 'WC_Subscription' ) ? '; use the subscriptions tools instead.' : '.' ) );
     }
@@ -785,18 +836,9 @@ class GMCP_Tools_Woo {
     // Any list would also go stale. Shops add statuses, and plugins add mail to
     // transitions that had none. Reporting who was written to cannot go stale.
     $sent = [];
-    $capture = function ( $args ) use ( &$sent ) {
-      foreach ( (array) ( $args['to'] ?? [] ) as $to ) {
-        foreach ( explode( ',', (string) $to ) as $one ) {
-          $one = strtolower( trim( $one ) );
-          if ( $one !== '' ) {
-            $sent[] = $one;
-          }
-        }
-      }
-      return $args;
-    };
+    $capture = $this->mail_capture( $sent );
     add_filter( 'wp_mail', $capture, PHP_INT_MAX );
+    $deferred = $this->emails_deferred();
 
     // A private note goes through set_status. A customer note has to be added
     // separately, because set_status records whatever it is given privately and the
@@ -810,7 +852,7 @@ class GMCP_Tools_Woo {
     remove_filter( 'wp_mail', $capture, PHP_INT_MAX );
 
     return $this->text( $r, 'Order #' . $order->get_id() . ' moved from ' . $was . ' to ' . $status . '.'
-      . ' ' . $this->describe_mail( $sent, $order ) );
+      . ' ' . $this->describe_mail( $sent, $order, $deferred ) );
   }
 
   /**
@@ -831,17 +873,74 @@ class GMCP_Tools_Woo {
   * deduplicating for no gain. A plugin that bypasses wp_mail altogether is outside what
   * this can see, and the tool description says so rather than implying otherwise.
   */
-  private function describe_mail( array $sent, $order ): string {
-    if ( !$sent ) {
-      return 'No email was sent.';
-    }
+  private function describe_mail( array $sent, $order, bool $deferred = false ): string {
     $sent = array_values( array_unique( $sent ) );
+    // Deferral changes what silence means. With transactional emails queued for the end of
+    // the request (or a later Action Scheduler run) the send happens after this function
+    // has stopped listening, so an empty list is "not measurable", and "No email was sent"
+    // would be a statement about the past that the future then contradicts.
+    $later = $deferred
+      ? ' This shop defers its transactional emails until after the request, so any notification is sent later and its recipients cannot be reported here. Do not assume the customer was not written to.'
+      : '';
+    if ( !$sent ) {
+      return $deferred ? 'No email went out during the change itself.' . $later : 'No email was sent.';
+    }
     $customer = strtolower( trim( (string) $order->get_billing_email() ) );
     if ( $customer !== '' && in_array( $customer, $sent, true ) ) {
       return 'WooCommerce sent the customer notification for this change to ' . $customer
-        . '. Treat that as having reached a real person: it cannot be taken back.';
+        . '. Treat that as having reached a real person: it cannot be taken back.' . $later;
     }
-    return count( $sent ) . ' notification(s) went out, none of them to the customer.';
+    return count( $sent ) . ' notification(s) went out, none of them to the customer.' . $later;
+  }
+
+  /**
+  * A wp_mail filter that records every recipient into $sent.
+  *
+  * Recipients are reduced to the bare address: some mail plugins and filters rewrite them
+  * to "Name <a@b.com>", which never equals the billing email and made the reply say the
+  * customer had not been written to when they had.
+  */
+  private function mail_capture( array &$sent ): \Closure {
+    return function ( $args ) use ( &$sent ) {
+      foreach ( (array) ( is_array( $args ) ? ( $args['to'] ?? [] ) : [] ) as $to ) {
+        foreach ( explode( ',', (string) $to ) as $one ) {
+          $one = trim( $one );
+          if ( preg_match( '/<([^<>]+)>/', $one, $m ) ) {
+            $one = trim( $m[1] );
+          }
+          $one = strtolower( $one );
+          if ( $one !== '' ) {
+            $sent[] = $one;
+          }
+        }
+      }
+      return $args;
+    };
+  }
+
+  /**
+  * Whether WooCommerce is queueing its transactional emails for later.
+  *
+  * The decision is taken once, when WC_Emails registers its listeners, from the
+  * woocommerce_defer_transactional_emails filter (default: the deferred_transactional_
+  * emails feature). So the reliable question is which listener is attached, and the
+  * filter and the feature flag are only the fallback for a build without that method.
+  */
+  private function emails_deferred(): bool {
+    if ( class_exists( 'WC_Emails' ) && method_exists( 'WC_Emails', 'queue_transactional_email' ) ) {
+      foreach ( [ 'woocommerce_order_status_pending_to_processing', 'woocommerce_order_status_completed', 'woocommerce_order_status_on-hold' ] as $hook ) {
+        if ( has_action( $hook, [ 'WC_Emails', 'queue_transactional_email' ] ) !== false ) {
+          return true;
+        }
+      }
+      return false;
+    }
+    $default = false;
+    $features = 'Automattic\\WooCommerce\\Utilities\\FeaturesUtil';
+    if ( class_exists( $features ) && method_exists( $features, 'feature_is_enabled' ) ) {
+      $default = (bool) $features::feature_is_enabled( 'deferred_transactional_emails' );
+    }
+    return (bool) apply_filters( 'woocommerce_defer_transactional_emails', $default );
   }
 
   private function add_order_note( array $a, array $r ): array {
@@ -859,11 +958,25 @@ class GMCP_Tools_Woo {
       return $this->error( $r, 'note cannot be empty.' );
     }
     $customer_note = !empty( $a['customer_note'] );
+    // Measured, as in update_order_status: whether the customer is mailed depends on the
+    // order having a billing address and on the New customer note email being enabled, so
+    // "emailed to the customer" was a claim and not an observation.
+    $sent = [];
+    $capture = $this->mail_capture( $sent );
+    add_filter( 'wp_mail', $capture, PHP_INT_MAX );
+    $deferred = $customer_note && $this->emails_deferred();
     $order->add_order_note( $note, $customer_note ? 1 : 0, false );
+    remove_filter( 'wp_mail', $capture, PHP_INT_MAX );
 
-    return $this->text( $r, $customer_note
-      ? 'Note added to order #' . $order->get_id() . ' and emailed to the customer.'
-      : 'Private note added to order #' . $order->get_id() . '. The customer was not told.' );
+    if ( !$customer_note ) {
+      return $this->text( $r, 'Private note added to order #' . $order->get_id() . '. The customer was not told.' );
+    }
+    $customer = strtolower( trim( (string) $order->get_billing_email() ) );
+    $reached = $customer !== '' && in_array( $customer, $sent, true );
+    return $this->text( $r, 'Customer note added to order #' . $order->get_id() . ' (shown to the customer on their order page). '
+      . ( $reached
+        ? 'WooCommerce emailed it to ' . $customer . '.'
+        : $this->describe_mail( $sent, $order, $deferred ) ) );
   }
 
   #endregion
@@ -898,52 +1011,135 @@ class GMCP_Tools_Woo {
     return $this->json( $r, $out );
   }
 
+  /** The most orders a read-level report will walk, and how many ids it fetches at a time. */
+  const REPORT_ORDER_CAP = 3000;
+  const REPORT_PAGE = 200;
+
+  /**
+  * Walk the paid orders created since $since, a page of ids at a time.
+  *
+  * This used to be wc_get_orders( limit -1 ), which builds every order, with its items, in
+  * memory at once, at read level, on every briefing. A shop with tens of thousands of
+  * orders in the window ran out of memory in a fatal that no JSON-RPC handler can catch.
+  * Ids are fetched a page at a time and each order is dropped before the next page, so
+  * memory is bounded by the page and work by the cap. The total comes from the first
+  * query, so a truncated answer can say how much it left out.
+  *
+  * Revenue is the gross order total in the order's own currency, keyed by currency, because
+  * adding USD to EUR under one label is not a number. Refunds are not deducted.
+  *
+  * @return array{orders:int,counted:int,total:int,truncated:bool,revenue:array<string,float>,products:array}
+  */
+  private function paid_window( int $since, bool $with_items ): array {
+    // Filterable so a very large shop can trade completeness for speed, and so the
+    // truncation path can be exercised without seeding thousands of orders.
+    $cap = max( 1, (int) apply_filters( 'gmcp_woo_report_order_cap', self::REPORT_ORDER_CAP ) );
+    $base = [
+      'status' => $this->paid_statuses(),
+      'date_created' => '>=' . $since,
+      'return' => 'ids',
+      'orderby' => 'date',
+      'order' => 'DESC',
+      'limit' => min( self::REPORT_PAGE, $cap ),
+    ];
+    $revenue = [];
+    $products = [];
+    $counted = 0;
+    $total = 0;
+    $page = 1;
+    do {
+      $res = wc_get_orders( $base + [ 'paginate' => true, 'paged' => $page ] );
+      $ids = is_object( $res ) ? (array) $res->orders : [];
+      if ( $page === 1 ) {
+        $total = is_object( $res ) ? (int) $res->total : 0;
+      }
+      foreach ( $ids as $oid ) {
+        $order = wc_get_order( $oid );
+        if ( !$order instanceof \WC_Order ) {
+          continue;
+        }
+        $counted++;
+        $cur = (string) $order->get_currency();
+        $revenue[ $cur ] = ( $revenue[ $cur ] ?? 0.0 ) + (float) $order->get_total();
+        if ( $with_items ) {
+          foreach ( $order->get_items() as $item ) {
+            $pid = method_exists( $item, 'get_product_id' ) ? (int) $item->get_product_id() : 0;
+            $key = $pid ? 'p' . $pid : 'n' . $item->get_name();
+            if ( !isset( $products[ $key ] ) ) {
+              $products[ $key ] = [ 'product_id' => $pid ?: null, 'name' => $item->get_name(), 'quantity' => 0, 'revenue' => 0.0 ];
+            }
+            $products[ $key ]['quantity'] += $item->get_quantity();
+            $products[ $key ]['revenue'] += (float) $item->get_total();
+          }
+        }
+      }
+      unset( $order, $res );
+      $page++;
+    } while ( $ids && $counted < $cap && $counted < $total );
+
+    return [
+      'orders' => $total,
+      'counted' => $counted,
+      'total' => $total,
+      'truncated' => $counted < $total,
+      'revenue' => $revenue,
+      'products' => $products,
+    ];
+  }
+
+  /** The figures every report states about its own reach, so none of them forgets one. */
+  private function window_notes( array $w ): array {
+    $notes = [
+      'revenue_basis' => 'gross order totals; refunds are not deducted',
+    ];
+    if ( $w['truncated'] ) {
+      $notes['truncated'] = 'Only the newest ' . $w['counted'] . ' of ' . $w['total'] . ' orders were totalled, so revenue, average and best sellers understate the period. "orders" is the full count.';
+    }
+    return $notes;
+  }
+
   private function sales_summary( array $a, array $r ): array {
     $days = max( 1, min( 365, isset( $a['days'] ) ? (int) $a['days'] : 30 ) );
-    $from = gmdate( 'Y-m-d', time() - ( $days * DAY_IN_SECONDS ) );
+    // A timestamp, not a date: a bare Y-m-d is read in the site's timezone, and the window
+    // was built in UTC, so it began up to a day away from where it said it did.
+    $since = time() - ( $days * DAY_IN_SECONDS );
+    $w = $this->paid_window( $since, true );
 
-    $orders = wc_get_orders( [
-      'limit' => -1,
-      'status' => $this->paid_statuses(),
-      'date_created' => '>=' . $from,
-    ] );
-
-    $revenue = 0.0;
-    $products = [];
-    foreach ( $orders as $order ) {
-      $revenue += (float) $order->get_total();
-      foreach ( $order->get_items() as $item ) {
-        $name = $item->get_name();
-        if ( !isset( $products[ $name ] ) ) {
-          $products[ $name ] = [ 'name' => $name, 'quantity' => 0, 'revenue' => 0.0 ];
-        }
-        $products[ $name ]['quantity'] += $item->get_quantity();
-        $products[ $name ]['revenue'] += (float) $item->get_total();
-      }
-    }
+    $shop = (string) get_woocommerce_currency();
+    $products = array_values( $w['products'] );
     usort( $products, function ( $x, $y ) { return $y['quantity'] <=> $x['quantity']; } );
+    $by_currency = array_map( function ( $v ) { return round( $v, 2 ); }, $w['revenue'] );
+    $in_shop = (float) ( $w['revenue'][ $shop ] ?? 0.0 );
+    // The average is only meaningful in one currency, so it is the shop's own.
+    $shop_orders = $w['counted'] && count( $w['revenue'] ) === 1 && isset( $w['revenue'][ $shop ] ) ? $w['counted'] : null;
 
     return $this->json( $r, [
-      'period' => 'the last ' . $days . ' days, from ' . $from,
-      'currency' => get_woocommerce_currency(),
-      'orders' => count( $orders ),
-      'revenue' => round( $revenue, 2 ),
-      'average_order_value' => $orders ? round( $revenue / count( $orders ), 2 ) : 0,
+      'period' => 'the last ' . $days . ' days, from ' . wp_date( 'Y-m-d H:i', $since ),
+      'currency' => $shop,
+      'orders' => $w['orders'],
+      'revenue' => round( $in_shop, 2 ),
+      'revenue_by_currency' => $by_currency,
+      'average_order_value' => $shop_orders ? round( $in_shop / $shop_orders, 2 ) : ( $w['counted'] ? null : 0 ),
       'counted_statuses' => 'processing, completed and on-hold. Cancelled, failed and refunded orders are left out.',
-      'best_sellers' => array_slice( array_values( $products ), 0, 10 ),
-    ] );
+      'best_sellers' => array_slice( $products, 0, 10 ),
+    ] + $this->window_notes( $w ) );
+  }
+
+  /** How many orders have a status, without loading any of them. */
+  private function order_count_for( string $key ): int {
+    if ( function_exists( 'wc_orders_count' ) ) {
+      // Cached by WooCommerce and aware of HPOS. It strips and adds the wc- prefix itself.
+      return (int) wc_orders_count( $this->bare_status( $key ) );
+    }
+    $res = wc_get_orders( [ 'limit' => 1, 'status' => $key, 'return' => 'ids', 'paginate' => true ] );
+    return is_object( $res ) ? (int) $res->total : 0;
   }
 
   /** The shop equivalent of wp_site_briefing: one call instead of six. */
   private function store_briefing( array $a, array $r ): array {
     $order_counts = [];
     foreach ( wc_get_order_statuses() as $key => $label ) {
-      $count = 0;
-      $counts = function_exists( 'wc_get_order_count' ) ? wc_get_order_count( $key ) : null;
-      if ( $counts === null ) {
-        $counts = count( wc_get_orders( [ 'limit' => -1, 'status' => $key, 'return' => 'ids' ] ) );
-      }
-      $count = (int) $counts;
+      $count = $this->order_count_for( $key );
       if ( $count ) {
         $order_counts[ $this->bare_status( $key ) ] = $count;
       }
@@ -958,15 +1154,12 @@ class GMCP_Tools_Woo {
       }
     }
 
-    $recent = wc_get_orders( [ 'limit' => -1, 'status' => $this->paid_statuses(), 'date_created' => '>=' . gmdate( 'Y-m-d', time() - 30 * DAY_IN_SECONDS ) ] );
-    $revenue = 0.0;
-    foreach ( $recent as $order ) {
-      $revenue += (float) $order->get_total();
-    }
+    $w = $this->paid_window( time() - 30 * DAY_IN_SECONDS, false );
+    $shop = (string) get_woocommerce_currency();
 
     return $this->json( $r, [
       'store' => [
-        'currency' => get_woocommerce_currency(),
+        'currency' => $shop,
         'country' => WC()->countries ? WC()->countries->get_base_country() : null,
         'woocommerce_version' => defined( 'WC_VERSION' ) ? WC_VERSION : null,
       ],
@@ -984,9 +1177,11 @@ class GMCP_Tools_Woo {
         'pending_payment' => $order_counts['pending'] ?? 0,
       ],
       'last_30_days' => [
-        'orders' => count( $recent ),
-        'revenue' => round( $revenue, 2 ),
-      ],
+        'orders' => $w['orders'],
+        'revenue' => round( (float) ( $w['revenue'][ $shop ] ?? 0.0 ), 2 ),
+        'currency' => $shop,
+        'revenue_by_currency' => array_map( function ( $v ) { return round( $v, 2 ); }, $w['revenue'] ),
+      ] + $this->window_notes( $w ),
     ] );
   }
 
