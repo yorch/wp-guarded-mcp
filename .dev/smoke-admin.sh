@@ -632,6 +632,22 @@ docker compose exec -T cli wp post delete "$DRAFT_ID" --force >/dev/null 2>&1
 call m_list '{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"wp_get_menu_items","arguments":{"menu":"Smoke Menu"}}}'
 check "item is published, not draft" \
   "$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(len(t["items"])==1)' m_list)" "True"
+# A parent from another menu is stored without complaint and the item never renders.
+# wp_update_menu_item has refused that since may_reparent() was written; adding was the
+# neighbouring tool that did not ask.
+docker compose exec -T cli wp menu create "Smoke Other" >/dev/null 2>&1
+OTHER_ITEM=$(docker compose exec -T cli wp menu item add-custom "Smoke Other" "Elsewhere" "https://example.test/" --porcelain 2>/dev/null | tr -d '\r\n')
+HOME_ITEM=$(py 'import json,sys;t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(t["items"][0]["item_id"])' m_list)
+menu_count() { docker compose exec -T cli wp menu item list "Smoke Menu" --format=count 2>/dev/null | tr -d '\r\n'; }
+check "CONTROL: the other menu's item exists" "$([ -n "$OTHER_ITEM" ] && echo yes)" "yes"
+call m_xparent "{\"jsonrpc\":\"2.0\",\"id\":59,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_menu_item\",\"arguments\":{\"menu\":\"Smoke Menu\",\"title\":\"Orphan\",\"type\":\"custom\",\"url\":\"https://example.test/o\",\"parent_id\":$OTHER_ITEM}}}"
+XP_COUNT=$(menu_count)
+call m_parent "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_menu_item\",\"arguments\":{\"menu\":\"Smoke Menu\",\"title\":\"Child\",\"type\":\"custom\",\"url\":\"https://example.test/c\",\"parent_id\":$HOME_ITEM}}}"
+OK_COUNT=$(menu_count)
+docker compose exec -T cli wp menu delete "Smoke Other" >/dev/null 2>&1
+check "a parent from another menu is refused" "$(verdict m_xparent)" "error"
+check "and no item was added" "$XP_COUNT" "1"
+check "CONTROL: a parent in the same menu is accepted, and adds one item" "$(verdict m_parent),$((OK_COUNT - XP_COUNT))" "ok,1"
 call m_loc '{"jsonrpc":"2.0","id":55,"method":"tools/call","params":{"name":"wp_assign_menu_location","arguments":{"location":"nope","menu":"Smoke Menu"}}}'
 check "unknown menu location refused" "$(verdict m_loc)" "error"
 call m_del '{"jsonrpc":"2.0","id":56,"method":"tools/call","params":{"name":"wp_delete_menu","arguments":{"menu":"Smoke Menu"}}}'

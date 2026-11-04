@@ -2721,12 +2721,22 @@ class GMCP_Tools_Admin {
       }
     }
 
+    // The same check wp_update_menu_item makes. A parent in another menu, or an id that
+    // is not a menu item, is stored without complaint and the new item never renders,
+    // under a reply carrying its item_id. The cycle half of may_reparent() cannot fire
+    // for an item that does not exist yet, which is why 0 is passed as its id.
+    $parent_id = isset( $a['parent_id'] ) ? (int) $a['parent_id'] : 0;
+    $reparent = $this->may_reparent( 0, $parent_id, (int) $menu->term_id, (string) $menu->name );
+    if ( $reparent !== true ) {
+      return $this->error( $r, $reparent );
+    }
+
     $item = [
       'menu-item-title' => $title,
       'menu-item-type' => $type,
       'menu-item-object' => $object,
       'menu-item-object-id' => $object_id,
-      'menu-item-parent-id' => isset( $a['parent_id'] ) ? (int) $a['parent_id'] : 0,
+      'menu-item-parent-id' => $parent_id,
       // Without this the item is created as a draft and simply never renders, which
       // looks exactly like the call having silently done nothing.
       'menu-item-status' => 'publish',
