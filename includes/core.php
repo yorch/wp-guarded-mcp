@@ -1421,7 +1421,31 @@ class GMCP_Core {
       'orderby' => 'ID',
       'order' => 'ASC',
     ] );
-    return !empty( $users ) ? $users[0] : null;
+    if ( !empty( $users ) ) {
+      return $users[0];
+    }
+    // A site with the role renamed or removed, or a network sub-site run only by super
+    // admins, has no "administrator" here, and the caller then ran as user 0 or refused an
+    // upload with "No administrator account". Asked by capability instead, which is what
+    // the role was standing in for. The capability argument is WordPress 5.9+.
+    $users = get_users( [
+      'capability' => 'manage_options',
+      'number' => 1,
+      'orderby' => 'ID',
+      'order' => 'ASC',
+    ] );
+    if ( !empty( $users ) ) {
+      return $users[0];
+    }
+    if ( is_multisite() ) {
+      foreach ( (array) get_super_admins() as $login ) {
+        $user = get_user_by( 'login', $login );
+        if ( $user ) {
+          return $user;
+        }
+      }
+    }
+    return null;
   }
 
   public function markdown_to_html( $content ) {
