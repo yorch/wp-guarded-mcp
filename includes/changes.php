@@ -67,6 +67,19 @@ class GMCP_Changes {
   /** Term and comment diffs need the row as it was, which only a pre-write hook has. */
   private static $before = [];
 
+  /**
+  * True between wp_insert_post_data and wp_insert_post for a post that is being CREATED.
+  *
+  * Creating a post assigns it the default category (and any tax_input) before the
+  * wp_insert_post action fires. Those are the post's first terms, not an edit to put back,
+  * and journalling them would add an entry per created post and push real edits off the
+  * 40-entry log. Creations are outside what the journal can undo.
+  */
+  private static $inserting = false;
+
+  /** Taxonomies whose object relationships are never recorded as a term assignment. */
+  const UNRECORDED_TAXONOMIES = [ 'nav_menu' ];
+
   /** Records kept per call. A bulk tool can write hundreds; nobody reads hundreds. */
   const MAX_RECORDS = 40;
 
@@ -127,6 +140,11 @@ class GMCP_Changes {
     add_action( 'set_user_role', [ $this, 'user_role_changed' ], 10, 3 );
     add_action( 'deleted_user', [ $this, 'user_deleted' ], 10, 3 );
 
+    // Which terms a post carries. Recorded so the journal can put a set of terms back, which
+    // it could not do from term_changed (that is the term row, not the relationship).
+    add_filter( 'wp_insert_post_data', [ $this, 'insert_begins' ], 99999, 2 );
+    add_action( 'set_object_terms', [ $this, 'terms_set' ], 10, 6 );
+
     add_action( 'created_term', [ $this, 'term_created' ], 10, 3 );
     add_action( 'edit_term', [ $this, 'term_before' ], 10, 3 );
     add_action( 'edited_term', [ $this, 'term_changed' ], 10, 3 );
@@ -166,10 +184,12 @@ class GMCP_Changes {
     self::$seen = [];
     self::$overflow = 0;
     self::$before = [];
+    self::$inserting = false;
   }
 
   public function stop(): void {
     self::$recording = false;
+    self::$inserting = false;
   }
 
   /**
@@ -348,6 +368,11 @@ class GMCP_Changes {
     if ( $post->post_type === 'nav_menu_item' ) {
       return 'menu item';
     }
+    if ( $post->post_type === 'custom_css' ) {
+      // The Customizer's Additional CSS is a post of this type, one per theme, titled with
+      // the stylesheet name. Its edits are post_content changes the journal already puts back.
+      return 'additional CSS';
+    }
     $object = get_post_type_object( $post->post_type );
     return $object ? strtolower( $object->labels->singular_name ) : $post->post_type;
   }
@@ -426,6 +451,7 @@ class GMCP_Changes {
   }
 
   public function post_inserted( $post_id, $post, $update ): void {
+    self::$inserting = false;
     if ( !self::$recording || $update || !( $post instanceof WP_Post ) || $this->skip_post( $post ) ) {
       return;
     }
@@ -662,6 +688,103 @@ class GMCP_Changes {
 
   #endregion
 
+  #region Which terms a post carries
+
+  /** Marks the start of a creation. Passes the row through untouched. */
+  public function insert_begins( $data, $postarr = [] ) {
+    if ( self::$recording && is_array( $postarr ) && empty( $postarr['ID'] ) ) {
+      self::$inserting = true;
+    }
+    return $data;
+  }
+
+  /**
+  * The term ids an object holds in a taxonomy, read from the table.
+  *
+  * Read from the database rather than through wp_get_object_terms(): the action that calls
+  * this fires inside wp_set_object_terms(), and whether the relationship cache has been
+  * cleared by then is not something to build a recorded "before" and "after" on.
+  *
+  * @return int[] Sorted.
+  */
+  public static function term_ids_of( int $object_id, string $taxonomy ): array {
+    global $wpdb;
+    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+    $ids = $wpdb->get_col( $wpdb->prepare(
+      "SELECT tt.term_id FROM {$wpdb->term_relationships} tr INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_taxonomy_id = tr.term_taxonomy_id WHERE tr.object_id = %d AND tt.taxonomy = %s",
+      $object_id,
+      $taxonomy
+    ) );
+    $ids = array_map( 'intval', (array) $ids );
+    sort( $ids );
+    return $ids;
+  }
+
+  /** @param int[] $tt_ids term_taxonomy ids @return int[] term ids, sorted */
+  private static function term_ids_from_tt( array $tt_ids ): array {
+    global $wpdb;
+    $tt_ids = array_values( array_filter( array_map( 'intval', $tt_ids ) ) );
+    if ( !$tt_ids ) {
+      return [];
+    }
+    $marks = implode( ',', array_fill( 0, count( $tt_ids ), '%d' ) );
+    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+    $ids = $wpdb->get_col( $wpdb->prepare( "SELECT term_id FROM {$wpdb->term_taxonomy} WHERE term_taxonomy_id IN ({$marks})", $tt_ids ) );
+    $ids = array_map( 'intval', (array) $ids );
+    sort( $ids );
+    return $ids;
+  }
+
+  /**
+  * Whether two sets of term ids are different sets. Order is not a difference.
+  *
+  * Pure, so it can be exercised without WordPress.
+  *
+  * @param int[] $a
+  * @param int[] $b
+  */
+  public static function term_sets_differ( array $a, array $b ): bool {
+    $a = array_values( array_unique( array_map( 'intval', $a ) ) );
+    $b = array_values( array_unique( array_map( 'intval', $b ) ) );
+    sort( $a );
+    sort( $b );
+    return $a !== $b;
+  }
+
+  /**
+  * A post's terms in one taxonomy were set.
+  *
+  * Fires on every save, usually with exactly what was already there, so only a real change
+  * is recorded. The "after" is the whole set as stored rather than the argument: an append
+  * passes only what it added.
+  */
+  public function terms_set( $object_id, $terms, $tt_ids, $taxonomy, $append, $old_tt_ids ): void {
+    if ( !self::$recording || self::$inserting || !is_string( $taxonomy )
+      || in_array( $taxonomy, self::UNRECORDED_TAXONOMIES, true ) ) {
+      return;
+    }
+    $post = get_post( (int) $object_id );
+    if ( !( $post instanceof WP_Post ) || $post->post_type === 'nav_menu_item' || $this->skip_post( $post ) ) {
+      return;
+    }
+    $from = self::term_ids_from_tt( (array) $old_tt_ids );
+    $to = self::term_ids_of( (int) $object_id, $taxonomy );
+    if ( !self::term_sets_differ( $from, $to ) ) {
+      return;
+    }
+    $this->record( [
+      'kind' => 'termrel',
+      'op' => 'updated',
+      'id' => (int) $object_id,
+      'taxonomy' => $taxonomy,
+      'subject' => $this->post_subject( $post ),
+      'label' => $this->post_label( $post ),
+      'fields' => [ $taxonomy . ' terms' => [ 'from' => $from, 'to' => $to ] ],
+    ] );
+  }
+
+  #endregion
+
   #region Terms
 
   /** A navigation menu is a term in the nav_menu taxonomy, and nobody calls it that. */
@@ -719,6 +842,8 @@ class GMCP_Changes {
       'kind' => 'term',
       'op' => 'updated',
       'id' => (int) $term_id,
+      // The journal needs the taxonomy to address the term again: wp_update_term takes it.
+      'taxonomy' => (string) $taxonomy,
       'subject' => self::taxonomy_subject( (string) $taxonomy ),
       'label' => (string) $after->name,
       'fields' => $changed,

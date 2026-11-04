@@ -24,11 +24,26 @@ if ( !defined( 'ABSPATH' ) ) {
 * are recorded. A human saving a settings page is not the agent's doing and is not the
 * agent's to undo.
 *
-* Of the kinds the capture layer reports, this takes options and posts and ignores the
-* rest. Users, terms, comments, plugins and themes are recorded in the audit log because
-* a reader wants to know about them; they are absent here because nothing in this file
-* could put them back, and an undo list full of entries that cannot be undone is worse
-* than one that is honest about its reach.
+* Of the kinds the capture layer reports, this takes options, posts, post meta, term edits
+* (name, slug, description, parent), which terms a post carries, and individual theme
+* settings, and ignores the rest. Users, comments, plugins and themes are recorded in the
+* audit log because a reader wants to know about them; they are absent here because
+* nothing in this file could put them back, and an undo list full of entries that cannot
+* be undone is worse than one that is honest about its reach.
+*
+* CREATIONS AND DELETIONS ARE OUT, on purpose, for posts, terms, menus, menu items and
+* users alike. Putting back a deletion means recreating a thing with its old id, children,
+* relationships and meta, and putting back a creation means deleting one; neither is the
+* same write in reverse, and the plugin keeps deletion behind its own confirmation steps
+* rather than behind an undo. A menu item's edit IS covered, because it is a post and
+* some meta rows; adding or deleting one is not.
+*
+* AN UNDO IS ITSELF A CHANGE. Reverting records a new entry whose "previous" is what the
+* revert overwrote and which names the entry it reversed, so reverting the revert puts the
+* edit back. That second step refuses when the target has changed since the first, because
+* it would otherwise overwrite work done after the undo with a copy taken before it. The
+* first step (undoing an ordinary entry) has never carried that refusal and still does not:
+* it restores the recorded fields and leaves everything else alone.
 *
 * Two things it deliberately will not record:
 *
@@ -60,6 +75,12 @@ class GMCP_Journal {
   const MAX_VALUE = 64000;
   /** And the whole row stays under this, however few entries that turns out to be. */
   const MAX_TOTAL = 512000;
+  /**
+  * A change to a theme-mods row naming more keys than this is recorded as one whole-row
+  * entry instead of one entry per key, so a single wp_update_option on the row cannot fill
+  * the 40-entry log by itself.
+  */
+  const THEMOD_MAX_KEYS = 10;
 
   /**
   * Post meta gets a table of its own rather than a place in the option row above.
@@ -193,14 +214,21 @@ class GMCP_Journal {
     if ( !is_array( $change ) ) {
       return;
     }
-    if ( ( $change['kind'] ?? '' ) === 'meta' ) {
+    $kind = (string) ( $change['kind'] ?? '' );
+    if ( $kind === 'meta' ) {
       $this->observe_meta( $change );
     }
-    if ( ( $change['kind'] ?? '' ) === 'option' ) {
+    if ( $kind === 'option' ) {
       $this->observe_option( $change );
     }
-    elseif ( ( $change['kind'] ?? '' ) === 'post' ) {
+    elseif ( $kind === 'post' ) {
       $this->observe_post( $change );
+    }
+    elseif ( $kind === 'term' ) {
+      $this->observe_term( $change );
+    }
+    elseif ( $kind === 'termrel' ) {
+      $this->observe_termrel( $change );
     }
   }
 
@@ -238,7 +266,7 @@ class GMCP_Journal {
     if ( ( $change['op'] ?? '' ) === 'created' ) {
       // "Previously absent" has to be a distinct state from "previously empty", or undo
       // leaves a row behind that WordPress never had.
-      $this->record( [
+      self::record( [
         'kind' => 'option',
         'key' => $key,
         'what' => "Option \"{$key}\" created",
@@ -249,6 +277,9 @@ class GMCP_Journal {
       return;
     }
     if ( ( $change['op'] ?? '' ) !== 'updated' ) {
+      return;
+    }
+    if ( strpos( $key, 'theme_mods_' ) === 0 && $this->observe_themod( $change, $key ) ) {
       return;
     }
     $old = $change['fields']['value']['from'] ?? null;
@@ -275,7 +306,7 @@ class GMCP_Journal {
       // answer and stays one.
       [ $can_snapshot, $clean ] = GMCP_Core::redact_reversible( $old );
       if ( $can_snapshot ) {
-        $entry['previous'] = $this->storable( $clean );
+        $entry['previous'] = self::storable( $clean );
         $entry['partly_redacted'] = true;
       }
       else {
@@ -284,9 +315,9 @@ class GMCP_Journal {
       }
     }
     else {
-      $entry['previous'] = $this->storable( $old );
+      $entry['previous'] = self::storable( $old );
     }
-    $this->record( $entry );
+    self::record( $entry );
   }
 
   /**
@@ -330,38 +361,53 @@ class GMCP_Journal {
       'call' => (string) ( $change['call'] ?? '' ),
     ];
 
-    // A key whose NAME looks like a credential, or a value that holds one, is recorded as
-    // changed and its previous value is not kept. Same functions as the option side, so the
-    // journal cannot protect a secret in an option and copy the same secret out of a meta
-    // row. The one difference is how far the value is walked, and it is a difference in
-    // reach rather than in what counts: this path finds a credential the option side gives
-    // up before reaching. @see SNAPSHOT_CREDENTIAL_DEPTH.
-    $previous = $change['previous'] ?? null;
+    self::record( self::meta_body( $entry, $change['previous'] ?? null ) );
+  }
+
+  /**
+  * Everything a meta entry carries beyond its address, decided in one place.
+  *
+  * Shared by the recorder and by undo's own record of what it overwrote, so the two cannot
+  * disagree about what counts as a secret, a value too large to keep, or a key that was not
+  * there. Writes the snapshot row when there is one to write.
+  *
+  * A key whose NAME looks like a credential, or a value that holds one, is recorded as
+  * changed and its previous value is not kept. Same functions as the option side, so the
+  * journal cannot protect a secret in an option and copy the same secret out of a meta
+  * row. The one difference is how far the value is walked, and it is a difference in
+  * reach rather than in what counts: this path finds a credential the option side gives
+  * up before reaching. @see SNAPSHOT_CREDENTIAL_DEPTH.
+  *
+  * @param array $entry    kind, ID, key, what, absent, tool, call
+  * @param mixed $previous The value to keep, ignored when the entry says absent.
+  */
+  private static function meta_body( array $entry, $previous ): array {
+    $post_id = (int) $entry['ID'];
+    $meta_key = (string) $entry['key'];
     if ( GMCP_Core::field_looks_secret( $meta_key )
       || GMCP_Core::holds_credential( $previous, 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
       $entry['redacted'] = true;
-      $this->record( $entry );
-      return;
+      return $entry;
     }
 
     // Nothing to keep for a key that was not there. The absent flag is the whole record.
     if ( !empty( $entry['absent'] ) ) {
       $entry['snapshot'] = 0;
-      $this->record( $entry );
-      return;
+      return $entry;
     }
 
     $serialized = maybe_serialize( $previous );
     $bytes = strlen( (string) $serialized );
     if ( $bytes > self::SNAP_MAX_VALUE ) {
       $entry['too_large'] = $bytes;
-      $this->record( $entry );
-      return;
+      return $entry;
     }
 
     // The id is minted before the row is written so the snapshot can carry it, which is
     // what lets a pruned snapshot be told apart from an entry that never had one.
-    $entry['id'] = bin2hex( random_bytes( 5 ) );
+    if ( empty( $entry['id'] ) ) {
+      $entry['id'] = bin2hex( random_bytes( 5 ) );
+    }
     global $wpdb;
     $wpdb->insert( self::snapshot_table(), [
       'entry_id' => $entry['id'],
@@ -373,7 +419,7 @@ class GMCP_Journal {
       'bytes' => $bytes,
     ] );
     $entry['snapshot'] = (int) $wpdb->insert_id;
-    $this->record( $entry );
+    return $entry;
   }
 
   /** The stored previous value for an entry, or null when there is no usable snapshot. */
@@ -394,6 +440,145 @@ class GMCP_Journal {
       "SELECT COUNT(*) FROM " . self::snapshot_table() . " WHERE entry_id = %s",
       $entry_id
     ) ) > 0;
+  }
+
+  /**
+  * One theme setting, rather than the whole row it lives in.
+  *
+  * theme_mods_<stylesheet> holds every Customizer value for a theme in one array, and so
+  * does the menu-location assignment (nav_menu_locations is one key inside it). Recording
+  * the row as an option entry meant undoing one setting wrote back the whole array and
+  * threw away any other setting changed after it. One entry per changed key puts back that
+  * key alone.
+  *
+  * Returns false when the row cannot be read as two arrays or too many keys moved at once,
+  * and the caller then records the row whole as it always did.
+  */
+  private function observe_themod( array $change, string $row ): bool {
+    $diff = self::themod_diff( $change['fields']['value']['from'] ?? null, $change['fields']['value']['to'] ?? null );
+    if ( $diff === null ) {
+      return false;
+    }
+    $theme = substr( $row, strlen( 'theme_mods_' ) );
+    foreach ( $diff as $one ) {
+      $verb = $one['absent'] ? 'added' : ( $one['removed'] ? 'removed' : 'changed' );
+      $entry = [
+        'kind' => 'themod',
+        'row' => $row,
+        'key' => $one['key'],
+        'what' => 'Theme setting "' . mb_substr( $one['key'], 0, 60 ) . '" of "' . mb_substr( $theme, 0, 60 ) . '" ' . $verb,
+        'absent' => $one['absent'],
+        'tool' => (string) ( $change['tool'] ?? '' ),
+        'call' => (string) ( $change['call'] ?? '' ),
+      ];
+      if ( GMCP_Core::field_looks_secret( $one['key'] )
+        || GMCP_Core::holds_credential( $one['from'], 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+        // The same two tests as a meta value. The key is not restorable and says why; the
+        // rest of the row is unaffected, which the whole-row entry could not offer.
+        $entry['redacted'] = true;
+      }
+      elseif ( !$one['absent'] ) {
+        $entry['previous'] = self::storable( $one['from'] );
+      }
+      self::record( $entry );
+    }
+    return true;
+  }
+
+  /**
+  * Which keys of a theme-mods row differ, and what each held.
+  *
+  * Pure, so it can be exercised without WordPress.
+  *
+  * @param mixed $old The row before.
+  * @param mixed $new The row after.
+  * @return array|null One element per key: key, absent (not in the old row), removed (not in
+  *                    the new row), from (the old value). Null when either side is not an
+  *                    array or more than THEMOD_MAX_KEYS keys differ.
+  */
+  public static function themod_diff( $old, $new ): ?array {
+    if ( !is_array( $old ) || !is_array( $new ) ) {
+      return null;
+    }
+    $out = [];
+    foreach ( array_unique( array_merge( array_keys( $old ), array_keys( $new ) ) ) as $k ) {
+      $had = array_key_exists( $k, $old );
+      $has = array_key_exists( $k, $new );
+      if ( $had && $has && $old[ $k ] === $new[ $k ] ) {
+        continue;
+      }
+      $out[] = [ 'key' => (string) $k, 'absent' => !$had, 'removed' => !$has, 'from' => $had ? $old[ $k ] : null ];
+    }
+    return count( $out ) > self::THEMOD_MAX_KEYS ? null : $out;
+  }
+
+  /** The row with one key put back (or taken out again, when it was not there before). Pure. */
+  public static function themod_apply( array $row, string $key, bool $absent, $value ): array {
+    if ( $absent ) {
+      unset( $row[ $key ] );
+    }
+    else {
+      $row[ $key ] = $value;
+    }
+    return $row;
+  }
+
+  /** The term fields an edit is recorded for, and that undo may write. */
+  const TERM_FIELDS = [ 'name', 'slug', 'description', 'parent' ];
+
+  /**
+  * An edited term. A menu is a term in the nav_menu taxonomy, so renaming or re-slugging
+  * one arrives here as well. Creations and deletions go past.
+  */
+  private function observe_term( array $change ): void {
+    $taxonomy = (string) ( $change['taxonomy'] ?? '' );
+    if ( ( $change['op'] ?? '' ) !== 'updated' || $taxonomy === '' ) {
+      return;
+    }
+    $fields = array_values( array_intersect( array_keys( (array) ( $change['fields'] ?? [] ) ), self::TERM_FIELDS ) );
+    if ( !$fields ) {
+      return;
+    }
+    $previous = [];
+    foreach ( $fields as $field ) {
+      $previous[ $field ] = $change['fields'][ $field ]['from'] ?? null;
+    }
+    $entry = [
+      'kind' => 'term',
+      'ID' => (int) ( $change['id'] ?? 0 ),
+      'taxonomy' => $taxonomy,
+      'what' => ucfirst( (string) ( $change['subject'] ?? 'term' ) ) . ' "'
+        . mb_substr( (string) ( $change['label'] ?? '' ), 0, 60 ) . '" changed: ' . implode( ', ', $fields ),
+      'fields' => $fields,
+      'tool' => (string) ( $change['tool'] ?? '' ),
+      'call' => (string) ( $change['call'] ?? '' ),
+    ];
+    if ( GMCP_Core::holds_credential( $previous, 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+      $entry['redacted'] = true;
+    }
+    else {
+      $entry['previous'] = $previous;
+    }
+    self::record( $entry );
+  }
+
+  /** Which terms a post carried in one taxonomy, before a call changed them. */
+  private function observe_termrel( array $change ): void {
+    $taxonomy = (string) ( $change['taxonomy'] ?? '' );
+    $pair = (array) reset( $change['fields'] );
+    if ( ( $change['op'] ?? '' ) !== 'updated' || $taxonomy === '' || !isset( $pair['from'] ) ) {
+      return;
+    }
+    self::record( [
+      'kind' => 'termrel',
+      'ID' => (int) ( $change['id'] ?? 0 ),
+      'taxonomy' => $taxonomy,
+      'what' => ucfirst( (string) ( $change['subject'] ?? 'post' ) ) . ' "'
+        . mb_substr( (string) ( $change['label'] ?? '' ), 0, 60 ) . '" terms in "' . $taxonomy . '" changed',
+      'previous' => self::storable( array_values( array_map( 'intval', (array) $pair['from'] ) ) ),
+      'tool' => (string) ( $change['tool'] ?? '' ),
+      'call' => (string) ( $change['call'] ?? '' ),
+    ] );
   }
 
   /**
@@ -420,12 +605,12 @@ class GMCP_Journal {
       'call' => (string) ( $change['call'] ?? '' ),
     ];
     foreach ( $change['fields'] as $field => $pair ) {
-      $entry['previous'][ $field ] = $this->storable( $pair['from'] ?? null );
+      $entry['previous'][ $field ] = self::storable( $pair['from'] ?? null );
     }
-    if ( $this->oversized( $entry['previous'] ) ) {
+    if ( self::oversized( $entry['previous'] ) ) {
       $entry['note'] = 'Part of the previous version was too large to keep, so reverting will restore only what fits.';
     }
-    $this->record( $entry );
+    self::record( $entry );
   }
 
   /**
@@ -469,7 +654,7 @@ class GMCP_Journal {
   }
 
   /** Big previous values are described rather than copied, so the option stays small. */
-  private function storable( $value ) {
+  private static function storable( $value ) {
     $size = strlen( maybe_serialize( $value ) );
     if ( $size > self::MAX_VALUE ) {
       return [ '__gmcp_too_large' => $size ];
@@ -482,7 +667,7 @@ class GMCP_Journal {
     return is_array( $value ) && isset( $value['__gmcp_too_large'] );
   }
 
-  private function oversized( array $values ): bool {
+  private static function oversized( array $values ): bool {
     foreach ( $values as $value ) {
       if ( self::too_large( $value ) ) {
         return true;
@@ -491,7 +676,7 @@ class GMCP_Journal {
     return false;
   }
 
-  private function record( array $entry ): void {
+  private static function record( array $entry ): void {
     $entry['t'] = time();
     $entry['tool'] = (string) ( $entry['tool'] ?? '' );
     $entry['call'] = (string) ( $entry['call'] ?? GMCP_Changes::call_id() );
@@ -538,6 +723,11 @@ class GMCP_Journal {
         'what' => $entry['what'] ?? '',
         'reversible' => self::reversible( $entry ) === true,
       ];
+      // An undo is an entry too. Naming what it reversed is what lets a caller see that
+      // reverting THIS one puts the original change back.
+      if ( !empty( $entry['undoes'] ) ) {
+        $row['undoes'] = (string) $entry['undoes'];
+      }
       $why = self::reversible( $entry );
       if ( $why !== true ) {
         $row['not_reversible_because'] = $why;
@@ -554,10 +744,35 @@ class GMCP_Journal {
     return $out;
   }
 
-  /** @return true|string True if it can be put back, otherwise why not. */
+  /**
+  * @return true|string True if it can be put back, otherwise why not.
+  *
+  * Two layers. The kind decides whether the thing can be put back at all. An entry that is
+  * itself the record of an undo carries after_state, the state its target was left in, and
+  * is refused when the target has moved since: its copy predates whatever happened next, and
+  * restoring it would silently discard that.
+  */
   private static function reversible( array $entry ) {
+    $why = self::reversible_kind( $entry );
+    if ( $why !== true ) {
+      return $why;
+    }
+    if ( isset( $entry['after_state'] ) && self::state_of( $entry ) !== $entry['after_state'] ) {
+      return 'It has changed since that undo was made, so putting the earlier copy back would discard the newer change. Read the current value and make the edit again if it is still wanted.';
+    }
+    return true;
+  }
+
+  /** Why a post may not be touched by an undo because a shop owns it, or null. */
+  private static function commerce_refusal( int $post_id ): ?string {
+    $guard = GMCP_Core::commerce_post_guard( $post_id, 'Reverting a change to' );
+    return $guard === true ? null : (string) $guard;
+  }
+
+  private static function reversible_kind( array $entry ) {
     if ( !empty( $entry['undone'] ) ) {
-      return 'It has already been reverted.';
+      return 'It has already been reverted.'
+        . ( !empty( $entry['undone_by'] ) ? ' Reverting entry ' . $entry['undone_by'] . ' puts the change back.' : '' );
     }
     foreach ( self::gates( $entry ) as $tool ) {
       if ( !apply_filters( 'gmcp_can_call_tool', false, $tool ) ) {
@@ -577,9 +792,55 @@ class GMCP_Journal {
         ? true
         : 'That option is protected.';
     }
+    if ( ( $entry['kind'] ?? '' ) === 'themod' ) {
+      if ( !empty( $entry['redacted'] ) ) {
+        return 'The previous value looked like it held a credential, so it was never stored.';
+      }
+      if ( empty( $entry['absent'] ) && self::too_large( $entry['previous'] ?? null ) ) {
+        return 'The previous value was too large to keep.';
+      }
+      if ( GMCP_Core::option_guard( (string) $entry['row'] ) !== true ) {
+        return 'That option is protected.';
+      }
+      return is_array( get_option( (string) $entry['row'], [] ) )
+        ? true
+        : 'The theme settings row is no longer an array, so one setting cannot be put back into it.';
+    }
+    if ( ( $entry['kind'] ?? '' ) === 'term' ) {
+      if ( !taxonomy_exists( (string) $entry['taxonomy'] ) ) {
+        return 'The taxonomy is no longer registered.';
+      }
+      if ( !( get_term( (int) $entry['ID'], (string) $entry['taxonomy'] ) instanceof WP_Term ) ) {
+        return 'The term no longer exists.';
+      }
+      if ( !empty( $entry['redacted'] ) ) {
+        return 'The previous value looked like it held a credential, so it was never stored.';
+      }
+      return self::too_large( $entry['previous'] ?? null ) ? 'The previous value was too large to keep.' : true;
+    }
+    if ( ( $entry['kind'] ?? '' ) === 'termrel' ) {
+      if ( !get_post( (int) $entry['ID'] ) ) {
+        return 'The post no longer exists.';
+      }
+      if ( !GMCP_Changes::undoable_post( (int) $entry['ID'] ) ) {
+        return 'It belongs to a ' . self::post_type_label( (int) $entry['ID'] ) . ', whose writes this journal does not record or revert.';
+      }
+      $owned = self::commerce_refusal( (int) $entry['ID'] );
+      if ( $owned !== null ) {
+        return $owned;
+      }
+      if ( !taxonomy_exists( (string) $entry['taxonomy'] ) ) {
+        return 'The taxonomy is no longer registered.';
+      }
+      return self::too_large( $entry['previous'] ?? null ) ? 'The previous set of terms was too large to keep.' : true;
+    }
     if ( ( $entry['kind'] ?? '' ) === 'meta' ) {
       if ( !get_post( (int) $entry['ID'] ) ) {
         return 'The post no longer exists.';
+      }
+      $owned = self::commerce_refusal( (int) $entry['ID'] );
+      if ( $owned !== null ) {
+        return $owned;
       }
       if ( !GMCP_Changes::undoable_post( (int) $entry['ID'] ) ) {
         return 'It belongs to a ' . self::post_type_label( (int) $entry['ID'] ) . ', whose writes this journal does not record or revert. Putting a subscription back with a plain post write leaves the site and the payment gateway disagreeing.';
@@ -602,6 +863,10 @@ class GMCP_Journal {
     if ( ( $entry['kind'] ?? '' ) === 'post' ) {
       if ( !get_post( (int) $entry['ID'] ) ) {
         return 'The post no longer exists.';
+      }
+      $owned = self::commerce_refusal( (int) $entry['ID'] );
+      if ( $owned !== null ) {
+        return $owned;
       }
       if ( !GMCP_Changes::undoable_post( (int) $entry['ID'] ) ) {
         return 'It belongs to a ' . self::post_type_label( (int) $entry['ID'] ) . ', whose writes this journal does not record or revert. Putting a subscription back with a plain post write leaves the site and the payment gateway disagreeing.';
@@ -648,6 +913,13 @@ class GMCP_Journal {
       // in flight. Putting a meta row back is a meta write, and a caller who cannot make
       // one has no business making it backwards.
       'meta' => 'wp_update_post_meta',
+      // A term edit is wp_update_term backwards, a set of terms is wp_add_post_terms
+      // backwards, and one theme setting is wp_set_theme_mod backwards. The tool that was in
+      // flight is still required as well, so a menu rename made through an admin-level menu
+      // tool is not reversible by a caller who can only edit ordinary terms.
+      'term' => 'wp_update_term',
+      'termrel' => 'wp_add_post_terms',
+      'themod' => 'wp_set_theme_mod',
     ];
     $tools = [];
     $kind = (string) ( $entry['kind'] ?? '' );
@@ -735,7 +1007,7 @@ class GMCP_Journal {
     $log = get_option( self::OPTION, [] );
     $log = is_array( $log ) ? $log : [];
 
-    foreach ( $log as $index => $entry ) {
+    foreach ( $log as $entry ) {
       if ( ( $entry['id'] ?? '' ) !== $id ) {
         continue;
       }
@@ -765,109 +1037,396 @@ class GMCP_Journal {
         }
       }
 
-      // A revert writes options and posts like anything else, and recording it would
-      // put the change back on the list as though the agent had made it.
+      // A revert writes options and posts like anything else, and recording it through the
+      // capture layer would put the change back on the list as though the agent had made it.
+      // The undo is recorded below instead, deliberately and with a link to what it undid.
+      //
+      // Resumed in a finally. The policy refusals inside apply() return early, and an early
+      // return that skipped the resume left recording switched off for the rest of the request.
       $was = GMCP_Changes::pause();
-
-      $done = '';
-      if ( $entry['kind'] === 'meta' ) {
-        $meta_post = (int) $entry['ID'];
-        $meta_key = (string) $entry['key'];
-        if ( !empty( $entry['absent'] ) ) {
-          // It was not there before, so putting it back means removing it. Every row for
-          // the key goes, which is what "absent" described.
-          delete_post_meta( $meta_post, $meta_key );
-          $done = 'Custom field "' . $meta_key . '" removed from post ' . $meta_post . ', which is what it was before.';
-        }
-        else {
-          // wp_slash for the reason prepare_meta_value() gives: update_post_meta()
-          // unslashes what it is handed, so restoring a JSON or regex value without this
-          // puts back a corrupted copy of what was recorded correctly.
-          $meta_value = self::snapshot_for( (string) $entry['id'] );
-          update_post_meta( $meta_post, $meta_key, wp_slash( $meta_value ) );
-          $done = 'Custom field "' . $meta_key . '" on post ' . $meta_post . ' restored to its previous value.';
-        }
-        clean_post_cache( $meta_post );
+      try {
+        $result = self::apply( $entry );
       }
-      elseif ( $entry['kind'] === 'option' ) {
-        // An undo is still a write, and the same policy applies to it. Being able to
-        // call wp_update_option is not the same as being allowed to make this write:
-        // a site whose default_role was already an editing role would otherwise have
-        // that value restorable by reverting the change that closed it, which is the
-        // refusal arriving one call late.
-        //
-        // Removing an option writes no value, so only the outright refusals can apply
-        // to it. Running the value checks over a deletion would refuse it for failing
-        // to be a valid value, which is true and beside the point.
-        $absent = !empty( $entry['absent'] );
-
-        // What will actually be written, worked out before the policy is asked about it.
-        // A partly redacted snapshot is not the value that goes to disk: the blanked
-        // leaves take whatever the option holds now, because writing the marker over a
-        // live credential would destroy the thing the blanking protected. Asking the
-        // policy about the snapshot instead would be asking about a value that is never
-        // written.
-        $kept = 0;
-        $restore = $entry['previous'] ?? null;
-        if ( !$absent && !empty( $entry['partly_redacted'] ) ) {
-          $restore = self::refill( $restore, get_option( (string) $entry['key'] ), $kept );
-        }
-
-        $refusals = GMCP_Core::unwritable_options();
-        $policy = $absent
-          ? ( $refusals[ strtolower( (string) $entry['key'] ) ] ?? true )
-          : GMCP_Core::option_write_policy( (string) $entry['key'], $restore );
-        if ( $policy !== true ) {
-          return [ 'ok' => false, 'message' => 'That change cannot be reverted. ' . $policy ];
-        }
-        if ( $absent ) {
-          delete_option( $entry['key'] );
-          $done = "Option \"{$entry['key']}\" removed, which is what it was before.";
-        }
-        else {
-          update_option( $entry['key'], $restore );
-          $done = "Option \"{$entry['key']}\" restored to its previous value.";
-          if ( $kept > 0 ) {
-            $done .= ' ' . $kept . ' field' . ( $kept === 1 ? '' : 's' )
-              . ' looked like a credential and was never recorded, so '
-              . ( $kept === 1 ? 'it was' : 'they were' ) . ' left exactly as found rather than overwritten.';
-          }
-        }
+      finally {
+        GMCP_Changes::resume( $was );
       }
-      else {
-        $post_id = (int) $entry['ID'];
-        $restored = [];
-        $fields = [ 'ID' => $post_id ];
-        foreach ( (array) ( $entry['fields'] ?? [] ) as $field ) {
-          if ( !array_key_exists( $field, (array) $entry['previous'] ) ) {
-            continue;
-          }
-          $value = $entry['previous'][ $field ];
-          if ( self::too_large( $value ) ) {
-            continue;
-          }
-          $fields[ $field ] = $value;
-          $restored[] = str_replace( 'post_', '', $field );
-        }
-        if ( count( $fields ) > 1 ) {
-          wp_update_post( $fields );
-        }
-        $done = $restored
-          ? 'Restored the ' . implode( ', ', array_unique( $restored ) ) . ' of post ' . $post_id . '.'
-          : 'Nothing was left to restore on post ' . $post_id . '.';
+      if ( empty( $result['ok'] ) ) {
+        return [ 'ok' => false, 'message' => (string) $result['message'] ];
       }
 
-      GMCP_Changes::resume( $was );
+      // The undo is itself a change: what it overwrote is kept, so reverting it puts the
+      // edit back. Recorded before the original is marked, and the mark re-reads the log,
+      // because recording rewrites the row and a copy loaded above would erase the new entry.
+      $by = '';
+      if ( !empty( $result['redo'] ) ) {
+        $by = self::record_undo( $entry, $result['redo'] );
+      }
+      self::mark_undone( $id, $by );
 
-      // Marked rather than removed, so the history still shows that it happened and
-      // that it was put back. A revert cannot be double-applied.
-      $log[ $index ]['undone'] = time();
-      update_option( self::OPTION, $log, false );
-
-      return [ 'ok' => true, 'message' => $done ];
+      return [
+        'ok' => true,
+        'message' => $result['message'] . ( $by !== '' ? ' This undo is itself on record as entry ' . $by . ', and reverting that entry puts the edit back.' : '' ),
+      ];
     }
 
     return [ 'ok' => false, 'message' => "No recorded change with id \"{$id}\". Call wp_list_changes to see what is on record." ];
+  }
+
+  /**
+  * Mark one entry reverted in a copy of the log. Pure.
+  *
+  * Marked rather than removed, so the history still shows that it happened and that it was
+  * put back. A revert cannot be double-applied; the way back is the entry named in by.
+  */
+  public static function mark_in_log( array $log, string $id, int $when, string $by ): array {
+    foreach ( $log as $index => $entry ) {
+      if ( ( $entry['id'] ?? '' ) === $id ) {
+        $log[ $index ]['undone'] = $when;
+        if ( $by !== '' ) {
+          $log[ $index ]['undone_by'] = $by;
+        }
+      }
+    }
+    return $log;
+  }
+
+  private static function mark_undone( string $id, string $by ): void {
+    $log = get_option( self::OPTION, [] );
+    $log = is_array( $log ) ? $log : [];
+    update_option( self::OPTION, self::mark_in_log( $log, $id, time(), $by ), false );
+  }
+
+  /**
+  * The entry for an undo, saying how to put back what the undo overwrote.
+  *
+  * It carries the original's tool, not wp_undo_change, so gates() asks for the same
+  * permissions to reverse it as the original needed. after_state is measured from the
+  * stored target after the write rather than computed from what was meant to be written, so
+  * the staleness test compares like with like.
+  *
+  * @return string The new entry's id.
+  */
+  private static function record_undo( array $original, array $redo ): string {
+    $label = (string) ( $original['what'] ?? '' );
+    while ( strpos( $label, 'Undo of: ' ) === 0 ) {
+      $label = substr( $label, strlen( 'Undo of: ' ) );
+    }
+    $redo['what'] = 'Undo of: ' . mb_substr( $label, 0, 140 );
+    $redo['undoes'] = (string) ( $original['id'] ?? '' );
+    $redo['tool'] = (string) ( $original['tool'] ?? '' );
+    if ( empty( $redo['id'] ) ) {
+      $redo['id'] = bin2hex( random_bytes( 5 ) );
+    }
+    $redo['after_state'] = self::state_of( $redo );
+    self::record( $redo );
+    return (string) $redo['id'];
+  }
+
+  /**
+  * A comparable fingerprint of what an entry's target holds right now.
+  *
+  * Not a copy of anything: a hash, so it can be stored for every kind without a size
+  * budget and without a second place for a value to leak from. 'absent' is its own state.
+  */
+  private static function state_of( array $entry ): string {
+    $kind = (string) ( $entry['kind'] ?? '' );
+    if ( $kind === 'option' ) {
+      $none = '__gmcp_absent__' . bin2hex( random_bytes( 4 ) );
+      $value = get_option( (string) $entry['key'], $none );
+      return self::state_hash( $value !== $none, $value );
+    }
+    if ( $kind === 'meta' ) {
+      $exists = metadata_exists( 'post', (int) $entry['ID'], (string) $entry['key'] );
+      return self::state_hash( $exists, $exists ? get_post_meta( (int) $entry['ID'], (string) $entry['key'], true ) : null );
+    }
+    if ( $kind === 'post' ) {
+      $values = [];
+      foreach ( (array) ( $entry['fields'] ?? [] ) as $field ) {
+        $value = get_post_field( (string) $field, (int) $entry['ID'], 'raw' );
+        $values[ $field ] = is_scalar( $value ) ? (string) $value : $value;
+      }
+      return self::state_hash( true, $values );
+    }
+    if ( $kind === 'themod' ) {
+      $row = get_option( (string) $entry['row'], [] );
+      $row = is_array( $row ) ? $row : [];
+      $key = (string) $entry['key'];
+      return self::state_hash( array_key_exists( $key, $row ), $row[ $key ] ?? null );
+    }
+    if ( $kind === 'term' ) {
+      $term = get_term( (int) $entry['ID'], (string) $entry['taxonomy'] );
+      if ( !( $term instanceof WP_Term ) ) {
+        return 'gone';
+      }
+      $values = [];
+      foreach ( (array) ( $entry['fields'] ?? [] ) as $field ) {
+        $values[ $field ] = is_scalar( $term->$field ) ? (string) $term->$field : $term->$field;
+      }
+      return self::state_hash( true, $values );
+    }
+    if ( $kind === 'termrel' ) {
+      return self::state_hash( true, GMCP_Changes::term_ids_of( (int) $entry['ID'], (string) $entry['taxonomy'] ) );
+    }
+    return 'unknown';
+  }
+
+  /** The fingerprint itself. Pure. */
+  public static function state_hash( bool $exists, $value ): string {
+    return $exists ? 'v:' . md5( serialize( $value ) ) : 'absent';
+  }
+
+  /**
+  * Perform the write an entry describes, and describe what it overwrote.
+  *
+  * The caller has already established that the entry is reversible and that the caller may
+  * make the write, and has paused the capture layer.
+  *
+  * @return array{ok:bool,message:string,redo?:array} redo is the kind-specific body of the
+  *         entry that reverses this write, without its bookkeeping.
+  */
+  private static function apply( array $entry ): array {
+    $kind = (string) ( $entry['kind'] ?? '' );
+    $fail = function ( string $message ): array {
+      return [ 'ok' => false, 'message' => 'That change cannot be reverted. ' . $message ];
+    };
+
+    if ( $kind === 'meta' ) {
+      $meta_post = (int) $entry['ID'];
+      $meta_key = (string) $entry['key'];
+      // What is about to be overwritten, read before the write.
+      $had = metadata_exists( 'post', $meta_post, $meta_key );
+      $current = $had ? get_post_meta( $meta_post, $meta_key, true ) : null;
+      if ( !empty( $entry['absent'] ) ) {
+        // It was not there before, so putting it back means removing it. Every row for
+        // the key goes, which is what "absent" described.
+        delete_post_meta( $meta_post, $meta_key );
+        $done = 'Custom field "' . $meta_key . '" removed from post ' . $meta_post . ', which is what it was before.';
+      }
+      else {
+        // wp_slash for the reason prepare_meta_value() gives: update_post_meta()
+        // unslashes what it is handed, so restoring a JSON or regex value without this
+        // puts back a corrupted copy of what was recorded correctly.
+        $meta_value = self::snapshot_for( (string) $entry['id'] );
+        update_post_meta( $meta_post, $meta_key, wp_slash( $meta_value ) );
+        $done = 'Custom field "' . $meta_key . '" on post ' . $meta_post . ' restored to its previous value.';
+      }
+      clean_post_cache( $meta_post );
+      return [
+        'ok' => true,
+        'message' => $done,
+        'redo' => self::meta_body( [ 'kind' => 'meta', 'ID' => $meta_post, 'key' => $meta_key, 'absent' => !$had ], $current ),
+      ];
+    }
+
+    if ( $kind === 'option' ) {
+      // An undo is still a write, and the same policy applies to it. Being able to
+      // call wp_update_option is not the same as being allowed to make this write:
+      // a site whose default_role was already an editing role would otherwise have
+      // that value restorable by reverting the change that closed it, which is the
+      // refusal arriving one call late.
+      //
+      // Removing an option writes no value, so only the outright refusals can apply
+      // to it. Running the value checks over a deletion would refuse it for failing
+      // to be a valid value, which is true and beside the point.
+      $absent = !empty( $entry['absent'] );
+
+      // What will actually be written, worked out before the policy is asked about it.
+      // A partly redacted snapshot is not the value that goes to disk: the blanked
+      // leaves take whatever the option holds now, because writing the marker over a
+      // live credential would destroy the thing the blanking protected. Asking the
+      // policy about the snapshot instead would be asking about a value that is never
+      // written.
+      $kept = 0;
+      $restore = $entry['previous'] ?? null;
+      if ( !$absent && !empty( $entry['partly_redacted'] ) ) {
+        $restore = self::refill( $restore, get_option( (string) $entry['key'] ), $kept );
+      }
+
+      $refusals = GMCP_Core::unwritable_options();
+      $policy = $absent
+        ? ( $refusals[ strtolower( (string) $entry['key'] ) ] ?? true )
+        : GMCP_Core::option_write_policy( (string) $entry['key'], $restore );
+      if ( $policy !== true ) {
+        return $fail( $policy );
+      }
+
+      $none = '__gmcp_absent__' . bin2hex( random_bytes( 4 ) );
+      $current = get_option( (string) $entry['key'], $none );
+      $redo = [ 'kind' => 'option', 'key' => (string) $entry['key'] ];
+      if ( $current === $none ) {
+        $redo['previous'] = null;
+        $redo['absent'] = true;
+      }
+      elseif ( GMCP_Core::holds_credential( $current ) ) {
+        // What the undo is about to overwrite holds a credential. It is not copied, for the
+        // reason an ordinary entry does not copy one, so this undo cannot itself be undone.
+        $redo['previous'] = null;
+        $redo['redacted'] = true;
+      }
+      else {
+        $redo['previous'] = self::storable( $current );
+      }
+
+      if ( $absent ) {
+        delete_option( $entry['key'] );
+        $done = "Option \"{$entry['key']}\" removed, which is what it was before.";
+      }
+      else {
+        update_option( $entry['key'], $restore );
+        $done = "Option \"{$entry['key']}\" restored to its previous value.";
+        if ( $kept > 0 ) {
+          $done .= ' ' . $kept . ' field' . ( $kept === 1 ? '' : 's' )
+            . ' looked like a credential and was never recorded, so '
+            . ( $kept === 1 ? 'it was' : 'they were' ) . ' left exactly as found rather than overwritten.';
+        }
+      }
+      return [ 'ok' => true, 'message' => $done, 'redo' => $redo ];
+    }
+
+    if ( $kind === 'themod' ) {
+      $row = (string) $entry['row'];
+      $key = (string) $entry['key'];
+      $absent = !empty( $entry['absent'] );
+      $current_row = get_option( $row, [] );
+      if ( !is_array( $current_row ) ) {
+        return $fail( 'The theme settings row is no longer an array.' );
+      }
+      $candidate = self::themod_apply( $current_row, $key, $absent, $entry['previous'] ?? null );
+      // The row is what gets written, so the row is what the policy is asked about.
+      $policy = GMCP_Core::option_write_policy( $row, $candidate );
+      if ( $policy !== true ) {
+        return $fail( $policy );
+      }
+      $had = array_key_exists( $key, $current_row );
+      $redo = [ 'kind' => 'themod', 'row' => $row, 'key' => $key, 'absent' => !$had ];
+      if ( $had ) {
+        if ( GMCP_Core::field_looks_secret( $key )
+          || GMCP_Core::holds_credential( $current_row[ $key ], 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+          $redo['redacted'] = true;
+        }
+        else {
+          $redo['previous'] = self::storable( $current_row[ $key ] );
+        }
+      }
+      update_option( $row, $candidate );
+      return [
+        'ok' => true,
+        'message' => $absent
+          ? 'Theme setting "' . $key . '" removed, which is what it was before.'
+          : 'Theme setting "' . $key . '" restored to its previous value.',
+        'redo' => $redo,
+      ];
+    }
+
+    if ( $kind === 'term' ) {
+      $term_id = (int) $entry['ID'];
+      $taxonomy = (string) $entry['taxonomy'];
+      $term = get_term( $term_id, $taxonomy );
+      if ( !( $term instanceof WP_Term ) ) {
+        return $fail( 'The term no longer exists.' );
+      }
+      $args = [];
+      $skipped = [];
+      foreach ( (array) ( $entry['fields'] ?? [] ) as $field ) {
+        if ( !in_array( $field, self::TERM_FIELDS, true ) || !array_key_exists( $field, (array) $entry['previous'] ) ) {
+          continue;
+        }
+        $value = $entry['previous'][ $field ];
+        // A parent that has since been deleted cannot be put back, and WordPress would
+        // store the dangling id rather than refuse it.
+        if ( $field === 'parent' && (int) $value > 0 && !term_exists( (int) $value, $taxonomy ) ) {
+          $skipped[] = 'parent';
+          continue;
+        }
+        $args[ $field ] = $value;
+      }
+      if ( !$args ) {
+        return $fail( 'Nothing was left to restore on term ' . $term_id . '.' );
+      }
+      $redo_previous = [];
+      foreach ( array_keys( $args ) as $field ) {
+        $redo_previous[ $field ] = $term->$field;
+      }
+      $result = wp_update_term( $term_id, $taxonomy, $args );
+      if ( is_wp_error( $result ) ) {
+        return $fail( 'WordPress refused to put the term back: ' . $result->get_error_message() );
+      }
+      $done = 'Restored the ' . implode( ', ', array_keys( $args ) ) . ' of term ' . $term_id . '.';
+      if ( $skipped ) {
+        $done .= ' The previous parent no longer exists, so the parent was left as it is.';
+      }
+      return [
+        'ok' => true,
+        'message' => $done,
+        'redo' => [
+          'kind' => 'term', 'ID' => $term_id, 'taxonomy' => $taxonomy,
+          'fields' => array_keys( $args ), 'previous' => $redo_previous,
+        ],
+      ];
+    }
+
+    if ( $kind === 'termrel' ) {
+      $post_id = (int) $entry['ID'];
+      $taxonomy = (string) $entry['taxonomy'];
+      $wanted = array_values( array_map( 'intval', (array) ( $entry['previous'] ?? [] ) ) );
+      $present = [];
+      foreach ( $wanted as $term_id ) {
+        if ( term_exists( $term_id, $taxonomy ) ) {
+          $present[] = $term_id;
+        }
+      }
+      $gone = count( $wanted ) - count( $present );
+      $current = GMCP_Changes::term_ids_of( $post_id, $taxonomy );
+      $result = wp_set_object_terms( $post_id, $present, $taxonomy, false );
+      if ( is_wp_error( $result ) ) {
+        return $fail( 'WordPress refused to put the terms back: ' . $result->get_error_message() );
+      }
+      $done = 'Restored the "' . $taxonomy . '" terms of post ' . $post_id . '.';
+      if ( $gone > 0 ) {
+        $done .= ' ' . $gone . ' of the earlier term' . ( $gone === 1 ? ' has' : 's have' ) . ' since been deleted and could not be restored.';
+      }
+      return [
+        'ok' => true,
+        'message' => $done,
+        'redo' => [ 'kind' => 'termrel', 'ID' => $post_id, 'taxonomy' => $taxonomy, 'previous' => $current ],
+      ];
+    }
+
+    if ( $kind === 'post' ) {
+      $post_id = (int) $entry['ID'];
+      $restored = [];
+      $redo_fields = [];
+      $redo_previous = [];
+      $fields = [ 'ID' => $post_id ];
+      foreach ( (array) ( $entry['fields'] ?? [] ) as $field ) {
+        if ( !array_key_exists( $field, (array) $entry['previous'] ) ) {
+          continue;
+        }
+        $value = $entry['previous'][ $field ];
+        if ( self::too_large( $value ) ) {
+          continue;
+        }
+        $fields[ $field ] = $value;
+        $restored[] = str_replace( 'post_', '', $field );
+        $redo_fields[] = $field;
+        $redo_previous[ $field ] = self::storable( get_post_field( $field, $post_id, 'raw' ) );
+      }
+      if ( count( $fields ) > 1 ) {
+        wp_update_post( $fields );
+      }
+      $done = $restored
+        ? 'Restored the ' . implode( ', ', array_unique( $restored ) ) . ' of post ' . $post_id . '.'
+        : 'Nothing was left to restore on post ' . $post_id . '.';
+      return [
+        'ok' => true,
+        'message' => $done,
+        'redo' => $redo_fields
+          ? [ 'kind' => 'post', 'ID' => $post_id, 'fields' => $redo_fields, 'previous' => $redo_previous ]
+          : null,
+      ];
+    }
+
+    return $fail( 'Unknown change type.' );
   }
 
   public static function clear(): void {

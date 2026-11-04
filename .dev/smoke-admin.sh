@@ -2482,6 +2482,170 @@ check "passing both id and call is refused" \
   "$(py "import json,sys;print('not both' in json.load(sys.stdin)['result']['content'][0]['text'])" jm_both)" "True"
 docker compose exec -T cli wp post delete "$JM_ID" --force >/dev/null 2>&1
 
+echo "-- journal: terms, theme settings, menus, and undoing an undo --"
+# UNRUN. Written without a Docker daemon, so none of this has executed against WordPress. The
+# pure-PHP half of the same logic is .dev/journal-pure.php, which has run. Run this block
+# once on a real stack before relying on it, and expect to correct fixtures rather than code
+# on the first pass.
+#
+# Every state below is read back from the database with wp eval, never taken from a reply.
+# Fixtures that must be journalled are written through the plugin's own tools; fixtures
+# that must NOT be (a person's edit, which the journal ignores) are written with wp eval.
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+jn_find() { # jn_find <file> <python predicate on x> -> id of the newest matching entry, or MISSING
+  py "import json,sys
+rows = json.loads(json.load(sys.stdin)['result']['content'][0]['text'])
+hit = [x for x in rows if $2]
+print(hit[0]['id'] if hit else 'MISSING')" "$1"
+}
+jn_list() { call "$1" '{"jsonrpc":"2.0","id":400,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":40}}}'; }
+jn_undo() { call "$1" "{\"jsonrpc\":\"2.0\",\"id\":401,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"$2\":\"$3\"}}}"; }
+
+# --- a term edit ---
+call jn_mk '{"jsonrpc":"2.0","id":402,"method":"tools/call","params":{"name":"wp_create_term","arguments":{"taxonomy":"category","term_name":"Journal term","slug":"journal-term","description":"orig desc"}}}'
+JN_T=$(py "import json,sys,re;print(re.search(r'\d+', json.load(sys.stdin)['result']['content'][0]['text']).group())" jn_mk)
+check "control: the fixture term exists" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->name;" 2>/dev/null | tr -d '\r\n')" "Journal term"
+call jn_ut "{\"jsonrpc\":\"2.0\",\"id\":403,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_term\",\"arguments\":{\"term_id\":$JN_T,\"taxonomy\":\"category\",\"name\":\"Journal renamed\",\"description\":\"new desc\"}}}"
+check "control: the edit is stored" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->name;" 2>/dev/null | tr -d '\r\n')" "Journal renamed"
+jn_list jn_l1
+JN_E1=$(jn_find jn_l1 "'Journal renamed' in x['what'] and x['tool']=='wp_update_term'")
+check "the term edit is journalled and reversible" "$([ "$JN_E1" != MISSING ] && echo yes || echo no)" "yes"
+# The creation of the term is not an entry: there is no undo for a creation, and a list
+# that offered one would be promising a deletion. The control above proves the probe works.
+check "the term creation is not journalled" \
+  "$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in rows if 'created' in x['what'] and 'Journal term' in x['what']))" jn_l1)" "0"
+jn_undo jn_u1 id "$JN_E1"
+check "undoing a term edit restores the name" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->name;" 2>/dev/null | tr -d '\r\n')" "Journal term"
+check "and the description" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->description;" 2>/dev/null | tr -d '\r\n')" "orig desc"
+check "and leaves the slug, which the edit never touched" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->slug;" 2>/dev/null | tr -d '\r\n')" "journal-term"
+# The undo is itself an entry, and reverting it puts the edit back.
+jn_list jn_l2
+JN_U1=$(jn_find jn_l2 "x.get('undoes')=='$JN_E1'")
+check "the undo is on record, naming the entry it reversed" "$([ "$JN_U1" != MISSING ] && echo yes || echo no)" "yes"
+check "the original cannot be applied a second time" "$(jn_undo jn_u1b id "$JN_E1"; verdict jn_u1b)" "error"
+jn_undo jn_u2 id "$JN_U1"
+check "undoing the undo puts the edit back" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->name;" 2>/dev/null | tr -d '\r\n')" "Journal renamed"
+# Staleness: a person edits the term after the second step, so the third would overwrite
+# their work with an older copy. A person's own edit is not journalled, which is why this
+# is wp eval and not a tool.
+jn_list jn_l3
+JN_U2=$(jn_find jn_l3 "x.get('undoes')=='$JN_U1'")
+docker compose exec -T cli wp eval "wp_update_term($JN_T,'category',['name'=>'Edited by hand']);" >/dev/null 2>&1
+jn_undo jn_u3 id "$JN_U2"
+check "an undo is refused when the term changed since" "$(verdict jn_u3)" "error"
+check "and says it changed since" "$(refusal jn_u3 | grep -c 'changed since')" "1"
+check "and the person's edit is intact" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->name;" 2>/dev/null | tr -d '\r\n')" "Edited by hand"
+
+# --- the gate on a term undo ---
+# A key allowed to undo but not to update terms must not reach a term edit through undo,
+# for the reason the option gate above exists.
+call jn_ut2 "{\"jsonrpc\":\"2.0\",\"id\":404,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_term\",\"arguments\":{\"term_id\":$JN_T,\"taxonomy\":\"category\",\"name\":\"Gate subject\"}}}"
+jn_list jn_l4
+JN_E2=$(jn_find jn_l4 "'Gate subject' in x['what']")
+K_TU=$(docker compose exec -T cli wp eval '$a=GMCP_Tokens::create("Deploy","readwrite",0,["wp_list_changes","wp_undo_change"]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+kcall jn_gate "$K_TU" "{\"jsonrpc\":\"2.0\",\"id\":405,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$JN_E2\"}}}"
+check "a key without wp_update_term cannot undo a term edit" "$(verdict jn_gate)" "error"
+check "and the term is unchanged" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->name;" 2>/dev/null | tr -d '\r\n')" "Gate subject"
+check "and the refusal names wp_update_term" "$(refusal jn_gate | grep -c wp_update_term)" "1"
+gmcp_clear_other_keys "smoke suite"
+
+# --- which terms a post carries ---
+call jn_cp '{"jsonrpc":"2.0","id":406,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Journal term post","post_status":"draft"}}}'
+JN_P=$(py "import json,sys,re;print(re.search(r'\d+', json.load(sys.stdin)['result']['content'][0]['text']).group())" jn_cp)
+JN_BEFORE=$(docker compose exec -T cli wp eval "echo implode(',', wp_get_post_terms($JN_P,'category',['fields'=>'ids']));" 2>/dev/null | tr -d '\r\n')
+call jn_at "{\"jsonrpc\":\"2.0\",\"id\":407,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_post_terms\",\"arguments\":{\"ID\":$JN_P,\"taxonomy\":\"category\",\"terms\":[$JN_T],\"append\":false}}}"
+check "control: the new term set is stored" \
+  "$(docker compose exec -T cli wp eval "echo implode(',', wp_get_post_terms($JN_P,'category',['fields'=>'ids']));" 2>/dev/null | tr -d '\r\n')" "$JN_T"
+jn_list jn_l5
+check "exactly one term entry for the post: the assignment, not the creation's default category" \
+  "$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in rows if 'Journal term post' in x['what'] and 'terms in' in x['what']))" jn_l5)" "1"
+JN_TE=$(jn_find jn_l5 "'Journal term post' in x['what'] and 'terms in' in x['what']")
+jn_undo jn_u5 id "$JN_TE"
+check "undoing a term assignment restores the earlier set" \
+  "$(docker compose exec -T cli wp eval "echo implode(',', wp_get_post_terms($JN_P,'category',['fields'=>'ids']));" 2>/dev/null | tr -d '\r\n')" "$JN_BEFORE"
+call jn_dp "{\"jsonrpc\":\"2.0\",\"id\":408,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$JN_P,\"force\":true}}}"
+docker compose exec -T cli wp term delete category "$JN_T" >/dev/null 2>&1
+
+# --- one theme setting, and the others left alone ---
+docker compose exec -T cli wp eval 'set_theme_mod("jn_a","orig-a"); set_theme_mod("jn_b","orig-b");' >/dev/null 2>&1
+call jn_tm '{"jsonrpc":"2.0","id":409,"method":"tools/call","params":{"name":"wp_set_theme_mod","arguments":{"key":"jn_a","value":"tool-a"}}}'
+check "control: the tool wrote the setting" \
+  "$(docker compose exec -T cli wp eval 'echo get_theme_mod("jn_a");' 2>/dev/null | tr -d '\r\n')" "tool-a"
+# A person changes a different setting afterwards. Restoring the whole row, which is what
+# an option-level entry did, would throw this away.
+docker compose exec -T cli wp eval 'set_theme_mod("jn_b","later-b");' >/dev/null 2>&1
+jn_list jn_l6
+JN_TM=$(jn_find jn_l6 "x['tool']=='wp_set_theme_mod' and 'jn_a' in x['what']")
+check "the setting is journalled by name" "$([ "$JN_TM" != MISSING ] && echo yes || echo no)" "yes"
+jn_undo jn_u6 id "$JN_TM"
+check "undoing it puts that setting back" \
+  "$(docker compose exec -T cli wp eval 'echo get_theme_mod("jn_a");' 2>/dev/null | tr -d '\r\n')" "orig-a"
+check "and leaves the other setting at its later value" \
+  "$(docker compose exec -T cli wp eval 'echo get_theme_mod("jn_b");' 2>/dev/null | tr -d '\r\n')" "later-b"
+jn_list jn_l7
+JN_TU=$(jn_find jn_l7 "x.get('undoes')=='$JN_TM'")
+jn_undo jn_u7 id "$JN_TU"
+check "and the undo of it re-applies the tool's value" \
+  "$(docker compose exec -T cli wp eval 'echo get_theme_mod("jn_a");' 2>/dev/null | tr -d '\r\n')" "tool-a"
+docker compose exec -T cli wp eval 'remove_theme_mod("jn_a"); remove_theme_mod("jn_b");' >/dev/null 2>&1
+
+# --- a credential-shaped theme setting is recorded as changed and never copied ---
+docker compose exec -T cli wp eval 'set_theme_mod("jn_api_key","JN-LIVE-SECRET-1");' >/dev/null 2>&1
+call jn_ts '{"jsonrpc":"2.0","id":410,"method":"tools/call","params":{"name":"wp_set_theme_mod","arguments":{"key":"jn_api_key","value":"JN-ROTATED-2"}}}'
+jn_list jn_l8
+check "a credential-shaped setting is refused for undo, with the reason" \
+  "$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);h=[x for x in rows if 'jn_api_key' in x['what']];print('credential' in h[0].get('not_reversible_because','') if h else 'MISSING')" jn_l8)" "True"
+check "and neither value is in the journal row" \
+  "$(docker compose exec -T cli wp eval 'echo strpos(serialize(get_option("gmcp_journal")),"JN-LIVE-SECRET")===false && strpos(serialize(get_option("gmcp_journal")),"JN-ROTATED")===false ? "clean" : "leaked";' 2>/dev/null | tr -d '\r\n')" "clean"
+check "CONTROL: the journal row does hold other entries, so the scan could have found a leak" \
+  "$(docker compose exec -T cli wp eval 'echo strpos(serialize(get_option("gmcp_journal")),"jn_api_key")!==false ? "present" : "empty";' 2>/dev/null | tr -d '\r\n')" "present"
+docker compose exec -T cli wp eval 'remove_theme_mod("jn_api_key");' >/dev/null 2>&1
+
+# --- menus: a location assignment and a menu item edit ---
+JN_LOC=$(docker compose exec -T cli wp eval 'echo (string) array_key_first( get_registered_nav_menus() );' 2>/dev/null | tr -d '\r\n')
+if [ -z "$JN_LOC" ]; then
+  echo "  SKIP  the active theme registers no menu location, so the menu checks cannot run here"
+else
+  call jn_m1 '{"jsonrpc":"2.0","id":411,"method":"tools/call","params":{"name":"wp_create_menu","arguments":{"name":"Journal menu A","slug":"journal-menu-a"}}}'
+  call jn_m2 '{"jsonrpc":"2.0","id":412,"method":"tools/call","params":{"name":"wp_create_menu","arguments":{"name":"Journal menu B","slug":"journal-menu-b"}}}'
+  JN_MA=$(docker compose exec -T cli wp eval 'echo wp_get_nav_menu_object("journal-menu-a")->term_id;' 2>/dev/null | tr -d '\r\n')
+  JN_MB=$(docker compose exec -T cli wp eval 'echo wp_get_nav_menu_object("journal-menu-b")->term_id;' 2>/dev/null | tr -d '\r\n')
+  call jn_as1 "{\"jsonrpc\":\"2.0\",\"id\":413,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_assign_menu_location\",\"arguments\":{\"location\":\"$JN_LOC\",\"menu\":\"journal-menu-a\"}}}"
+  call jn_as2 "{\"jsonrpc\":\"2.0\",\"id\":414,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_assign_menu_location\",\"arguments\":{\"location\":\"$JN_LOC\",\"menu\":\"journal-menu-b\"}}}"
+  check "control: the second assignment is stored" \
+    "$(docker compose exec -T cli wp eval "echo get_nav_menu_locations()['$JN_LOC'];" 2>/dev/null | tr -d '\r\n')" "$JN_MB"
+  jn_list jn_l9
+  JN_LE=$(jn_find jn_l9 "x['tool']=='wp_assign_menu_location' and 'nav_menu_locations' in x['what']")
+  jn_undo jn_u9 id "$JN_LE"
+  check "undoing a location assignment puts the previous menu back" \
+    "$(docker compose exec -T cli wp eval "echo get_nav_menu_locations()['$JN_LOC'];" 2>/dev/null | tr -d '\r\n')" "$JN_MA"
+
+  call jn_ai "{\"jsonrpc\":\"2.0\",\"id\":415,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_menu_item\",\"arguments\":{\"menu\":\"journal-menu-a\",\"title\":\"Journal item\",\"type\":\"custom\",\"url\":\"https://example.test/a\"}}}"
+  JN_I=$(docker compose exec -T cli wp eval "echo wp_get_nav_menu_items($JN_MA)[0]->ID;" 2>/dev/null | tr -d '\r\n')
+  jn_item() { docker compose exec -T cli wp eval "\$i = wp_setup_nav_menu_item( get_post( $JN_I ) ); echo \$i->title . '|' . \$i->url;" 2>/dev/null | tr -d '\r\n'; }
+  check "control: the item starts as added" "$(jn_item)" "Journal item|https://example.test/a"
+  call jn_ui "{\"jsonrpc\":\"2.0\",\"id\":416,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_menu_item\",\"arguments\":{\"item_id\":$JN_I,\"title\":\"Renamed item\",\"url\":\"https://example.test/b\"}}}"
+  check "control: the edit is stored" "$(jn_item)" "Renamed item|https://example.test/b"
+  jn_list jn_l10
+  JN_CALL=$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);h=[x for x in rows if x['tool']=='wp_update_menu_item'];print(h[0]['call'] if h else 'MISSING')" jn_l10)
+  check "the menu item edit is journalled under a call" "$([ "$JN_CALL" != MISSING ] && echo yes || echo no)" "yes"
+  jn_undo jn_u10 call "$JN_CALL"
+  check "undoing the call puts the item's title and url back" "$(jn_item)" "Journal item|https://example.test/a"
+  # Adding an item is not asserted either way here. Its custom fields are written as part of
+  # the creation and the journal has always recorded those as added fields; the item itself
+  # is not an entry, so nothing in the list offers to remove it.
+  docker compose exec -T cli wp eval "wp_delete_nav_menu($JN_MA); wp_delete_nav_menu($JN_MB);" >/dev/null 2>&1
+fi
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+
 echo "-- uninstall leaves nothing behind --"
 # Last, because it empties the plugin out from under everything above. Run through the
 # real uninstall.php rather than `wp plugin uninstall`, which deletes the plugin directory
