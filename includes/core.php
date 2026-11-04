@@ -526,6 +526,53 @@ class GMCP_Core {
   }
 
   /**
+  * Capabilities that make an account one whose creation or takeover needs a person's say.
+  *
+  * The same reasoning as default_role_objection()'s backstop and a near relative of its
+  * list: these are what an account needs to change who else can do what, to run code, or
+  * to change the site's configuration. Judged by capability rather than by role name,
+  * because a hand-made role holding manage_options is an administrator in everything but
+  * name.
+  */
+  public static function privileged_capabilities(): array {
+    return (array) apply_filters( 'gmcp_privileged_capabilities', [
+      'manage_options', 'promote_users', 'edit_users', 'create_users', 'delete_users',
+      'activate_plugins', 'install_plugins', 'edit_plugins', 'delete_plugins', 'update_plugins',
+      'install_themes', 'edit_themes', 'delete_themes', 'switch_themes', 'edit_files',
+      'update_core', 'unfiltered_upload', 'manage_network', 'manage_network_users', 'manage_sites',
+    ] );
+  }
+
+  /** Whether a role grants any of privileged_capabilities(). Unknown roles answer false. */
+  public static function role_is_privileged( string $role_name ): bool {
+    $role = get_role( $role_name );
+    if ( !$role ) {
+      return false;
+    }
+    $granted = array_keys( array_filter( (array) $role->capabilities ) );
+    return (bool) array_intersect( $granted, self::privileged_capabilities() );
+  }
+
+  /**
+  * Whether an existing account holds any of privileged_capabilities(), by any route: a
+  * role, a capability granted to the user directly, or super admin on a network.
+  */
+  public static function user_is_privileged( int $user_id ): bool {
+    if ( $user_id <= 0 ) {
+      return false;
+    }
+    if ( is_multisite() && is_super_admin( $user_id ) ) {
+      return true;
+    }
+    $user = get_userdata( $user_id );
+    if ( !$user ) {
+      return false;
+    }
+    $granted = array_keys( array_filter( (array) $user->allcaps ) );
+    return (bool) array_intersect( $granted, self::privileged_capabilities() );
+  }
+
+  /**
   * Field names that mark a value as credential-shaped.
   *
   * Lives here rather than in one subsystem because two of them need to agree: the change

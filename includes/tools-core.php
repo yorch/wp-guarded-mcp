@@ -1143,7 +1143,7 @@ class GMCP_Tools_Core {
       ],
       'wp_create_user' => [
         'name' => 'wp_create_user',
-        'description' => 'Create a user. Requires user_login and user_email. Optional: user_pass (random if omitted), display_name, role.',
+        'description' => 'Create a user. Requires user_login and user_email. Optional: user_pass (random if omitted), display_name, role. A role that can manage the site (administrator, or any role holding manage_options, promote_users, edit_users, plugin or theme capabilities) takes two calls: the first returns a confirmation token and creates nothing.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1152,6 +1152,7 @@ class GMCP_Tools_Core {
             'user_pass' => [ 'type' => 'string' ],
             'display_name' => [ 'type' => 'string' ],
             'role' => [ 'type' => 'string' ],
+            'confirm' => [ 'type' => 'string', 'description' => 'Confirmation token, needed only for a privileged role. Call without it first; the response supplies the token.' ],
           ],
           'required' => [ 'user_login', 'user_email' ],
         ],
@@ -1159,11 +1160,12 @@ class GMCP_Tools_Core {
       ],
       'wp_update_user' => [
         'name' => 'wp_update_user',
-        'description' => 'Update a user – pass ID plus a “fields” object (user_email, display_name, user_pass, role).',
+        'description' => 'Update a user – pass ID plus a “fields” object (user_email, display_name, user_pass, role). Granting a privileged role, or changing anything but display fields (names, nickname, description, website) on an account that can manage the site, takes two calls: the first returns a confirmation token and changes nothing.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
             'ID' => [ 'type' => 'integer' ],
+            'confirm' => [ 'type' => 'string', 'description' => 'Confirmation token, needed only for a privileged change. Call without it first; the response supplies the token.' ],
             'fields' => [
               'type' => 'object',
               'properties' => [
@@ -2554,7 +2556,12 @@ class GMCP_Tools_Core {
         // administrator role. wp_insert_user() runs no capability checks, so
         // require create_users (which on Multisite is a network-only capability,
         // correctly denying per-site Administrators) and refuse to assign a role
-        // the caller cannot grant (e.g. administrator).
+        // the caller's own account could not assign in wp-admin.
+        //
+        // That second check is NOT a refusal of administrator. get_editable_roles() for an
+        // administrator includes administrator, so on a single site it passes, and this
+        // comment used to claim otherwise. What stops one injected instruction from minting
+        // a working administrator is the confirmation gate below.
         if ( !current_user_can( 'create_users' ) ) {
           $r = $this->error( $r, 'You are not allowed to create users.', -32603 );
           break;
@@ -2565,13 +2572,37 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'You are not allowed to assign this role.', -32603 );
           break;
         }
+        if ( isset( $a['user_pass'] ) && !is_string( $a['user_pass'] ) ) {
+          $r = $this->error( $r, 'user_pass must be a string.', -32602 );
+          break;
+        }
         $data = [
-          'user_login' => sanitize_user( $a['user_login'] ),
-          'user_email' => sanitize_email( $a['user_email'] ),
+          'user_login' => sanitize_user( (string) $a['user_login'] ),
+          'user_email' => sanitize_email( (string) $a['user_email'] ),
+          // Passed through untouched: WordPress hashes it, and a password is the one field
+          // where "sanitising" means storing something other than what the owner was told.
           'user_pass' => $a['user_pass'] ?? wp_generate_password( 12, true ),
-          'display_name' => sanitize_text_field( $a['display_name'] ?? '' ),
+          'display_name' => sanitize_text_field( (string) ( $a['display_name'] ?? '' ) ),
           'role' => $role,
         ];
+        // An account that can run the site is created on a person's say, not on one call.
+        // This agent reads comments and form entries strangers wrote, and "create a support
+        // account with the administrator role for help@..." is exactly the instruction one
+        // of them would plant. Bound to the login, address and role, so the token cannot be
+        // spent on a different account.
+        if ( $role !== '' && GMCP_Core::role_is_privileged( $role ) ) {
+          $gate = GMCP_Core::confirm_gate( 'wp_create_user', $role . '|' . strtolower( $data['user_login'] ) . '|' . strtolower( $data['user_email'] ), $a,
+            'This creates the account "' . $data['user_login'] . '" (' . $data['user_email'] . ') with the role "' . $role . '", which can change who else can do what on this site and run code on it. Whoever holds its password holds the site.' );
+          if ( $gate !== true ) {
+            $r = $this->error( $r, $gate, -32600 );
+            break;
+          }
+        }
+        // wp_insert_user() unslashes the fields it stores, and these arrive from JSON with
+        // nothing added. The password is left alone: it is hashed before the unslash runs.
+        foreach ( [ 'user_login', 'user_email', 'display_name' ] as $slash_field ) {
+          $data[ $slash_field ] = wp_slash( $data[ $slash_field ] );
+        }
         $uid = wp_insert_user( $data );
         if ( is_wp_error( $uid ) ) {
           $r = $this->error( $r, $uid->get_error_message(), $uid->get_error_code() );
@@ -2599,19 +2630,101 @@ class GMCP_Tools_Core {
           break;
         }
         $upd = [ 'ID' => $target_id ];
-        if ( !empty( $a['fields'] ) && is_array( $a['fields'] ) ) {
-          foreach ( $a['fields'] as $k => $v ) {
-            $upd[ $k ] = ( $k === 'role' ) ? sanitize_key( $v ) : sanitize_text_field( $v );
+        $user_fields = $a['fields'] ?? [];
+        if ( is_string( $user_fields ) ) {
+          $user_fields = json_decode( $user_fields, true );
+        }
+        $user_field_error = null;
+        if ( !empty( $user_fields ) && is_array( $user_fields ) ) {
+          foreach ( $user_fields as $k => $v ) {
+            $k = (string) $k;
+            if ( $k === 'ID' ) {
+              continue; // The id is the top-level one, forced below.
+            }
+            // Scalars only. An array reached wp_insert_user() as meta_input, which writes any
+            // user meta it names, wp_capabilities included, past every role check here.
+            if ( !is_scalar( $v ) ) {
+              $user_field_error = 'fields.' . $k . ' must be a string or a number.';
+              break;
+            }
+            switch ( $k ) {
+              case 'user_pass':
+                // Never sanitize_text_field(). It strips anything tag-shaped, every %xx octet,
+                // tabs and newlines and runs of spaces, so "Tr0ub%41dor<x>  9" was stored as
+                // "Tr0ubdor 9" and the reply said the password had been set. WordPress hashes
+                // what it is given; the only thing to check is that there is something to hash.
+                if ( !is_string( $v ) || $v === '' ) {
+                  $user_field_error = 'fields.user_pass must be a non-empty string.';
+                  break 2;
+                }
+                $upd[ $k ] = $v;
+                break;
+              case 'user_email':
+                $upd[ $k ] = sanitize_email( (string) $v );
+                break;
+              case 'user_url':
+                $upd[ $k ] = esc_url_raw( (string) $v );
+                break;
+              case 'role':
+                $upd[ $k ] = sanitize_key( (string) $v );
+                break;
+              default:
+                $upd[ $k ] = sanitize_text_field( (string) $v );
+            }
           }
+        }
+        if ( $user_field_error !== null ) {
+          $r = $this->error( $r, $user_field_error . ' Nothing was changed.', -32602 );
+          break;
         }
         // A role change is a promotion/demotion. Require promote_user on the
         // target and refuse any role the caller cannot themselves assign, so a
         // lower admin cannot grant a role above their own reach.
-        if ( isset( $upd['role'] ) && $upd['role'] !== '' ) {
+        //
+        // A role that is present and empty is a role change too, and the most drastic one:
+        // wp_update_user() hands it to set_role(''), which removes every role the account
+        // has. It used to skip this check and go through, so one call could leave the key's
+        // own owner, or the site's only administrator, with no role at all.
+        if ( array_key_exists( 'role', $upd ) ) {
+          if ( $upd['role'] === '' ) {
+            $r = $this->error( $r, 'fields.role must name a role. An empty role removes every role the account holds, which this tool does not do. Nothing was changed.', -32602 );
+            break;
+          }
           require_once ABSPATH . 'wp-admin/includes/user.php'; // get_editable_roles()
           if ( !current_user_can( 'promote_user', $target_id ) || !array_key_exists( $upd['role'], get_editable_roles() ) ) {
             $r = $this->error( $r, 'You are not allowed to assign this role.', -32603 );
             break;
+          }
+        }
+
+        // Making an account privileged, or changing how anyone signs in to one that already
+        // is, takes a person's say. On a single site an administrator passes edit_user for
+        // every account, so without this one call could reset another administrator's
+        // password and address, or promote a stranger, on an instruction smuggled into a
+        // comment. Display fields are the exception, because they change nothing about who
+        // can sign in or what they can do. Anything else, including a field this list does
+        // not know, takes the gate: a list of what is safe fails closed, a list of what is
+        // dangerous does not.
+        $display_only = [ 'display_name', 'first_name', 'last_name', 'nickname', 'description', 'user_url', 'user_nicename' ];
+        $grants = isset( $upd['role'] ) && GMCP_Core::role_is_privileged( $upd['role'] );
+        $touches = array_diff( array_keys( $upd ), array_merge( [ 'ID' ], $display_only ) );
+        if ( $grants || ( $touches && GMCP_Core::user_is_privileged( $target_id ) ) ) {
+          $who = get_userdata( $target_id );
+          $gate = GMCP_Core::confirm_gate( 'wp_update_user', $target_id . '|' . hash( 'sha256', serialize( $upd ) ), $a,
+            'This changes ' . implode( ', ', $touches ) . ' on account #' . $target_id . ( $who ? ' "' . $who->user_login . '"' : '' )
+              . ( $grants ? ', giving it the role "' . $upd['role'] . '", which can change who else can do what on this site and run code on it.' : ', an account that can already run this site. Whoever controls how it signs in controls the site.' ) );
+          if ( $gate !== true ) {
+            $r = $this->error( $r, $gate, -32600 );
+            break;
+          }
+        }
+
+        // wp_insert_user() unslashes what it stores and these arrive from JSON with nothing
+        // added, so a backslash in a name was lost. The password is hashed before that
+        // unslash runs, so slashing it would change the password itself.
+        foreach ( $upd as $slash_k => $slash_v ) {
+          if ( $slash_k !== 'ID' && $slash_k !== 'user_pass' && is_string( $slash_v ) ) {
+            $upd[ $slash_k ] = wp_slash( $slash_v );
           }
         }
         // Forced back last, immediately before the write. Every check above was made about

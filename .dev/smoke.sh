@@ -187,6 +187,48 @@ check "and the reply names the comment written, not a row count" \
 docker compose exec -T cli wp post delete "$RT_A" "$RT_B" --force >/dev/null 2>&1
 docker compose exec -T cli wp user delete "$RT_U" "$RT_V" --yes >/dev/null 2>&1
 
+echo "-- an account that can run the site takes two calls --"
+# One injected instruction could mint a working administrator or reset another one's
+# password: get_editable_roles() includes administrator for an administrator, which the code
+# comment claimed it did not, and edit_user passes for every account on a single site.
+ucall() { call "$1" "{\"jsonrpc\":\"2.0\",\"id\":450,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$3}}"; }
+docker compose exec -T cli wp user delete gate_admin --yes >/dev/null 2>&1
+ucall ua_create wp_create_user '{"user_login":"gate_admin","user_email":"gate_admin@example.test","role":"administrator"}'
+check "creating an administrator in one call creates nothing" \
+  "$(docker compose exec -T cli wp eval 'echo username_exists("gate_admin") ? "created" : "absent";' 2>/dev/null | tr -d '\r\n')" "absent"
+UA_TOKEN=$(py 'import json,sys,re;m=re.search(r"confirm set to \"([0-9a-f]+)\"",json.load(sys.stdin)["result"]["content"][0]["text"]);print(m.group(1) if m else "")' ua_create)
+ucall ua_create2 wp_create_user "{\"user_login\":\"gate_admin\",\"user_email\":\"gate_admin@example.test\",\"role\":\"administrator\",\"confirm\":\"$UA_TOKEN\"}"
+check "CONTROL: the second call with the token creates it" \
+  "$(docker compose exec -T cli wp eval 'echo username_exists("gate_admin") ? "created" : "absent";' 2>/dev/null | tr -d '\r\n')" "created"
+UA_ID=$(docker compose exec -T cli wp eval 'echo username_exists("gate_admin");' 2>/dev/null | tr -d '\r\n')
+UA_HASH=$(docker compose exec -T cli wp eval "echo get_userdata($UA_ID)->user_pass;" 2>/dev/null | tr -d '\r\n')
+ucall ua_pass wp_update_user "{\"ID\":$UA_ID,\"fields\":{\"user_pass\":\"taken-over\",\"user_email\":\"attacker@example.test\"}}"
+check "resetting an administrator's password and address in one call changes nothing" \
+  "$(docker compose exec -T cli wp eval "\$u=get_userdata($UA_ID); echo \$u->user_pass === '$UA_HASH' && \$u->user_email === 'gate_admin@example.test' ? 'unchanged' : 'changed';" 2>/dev/null | tr -d '\r\n')" "unchanged"
+ucall ua_name wp_update_user "{\"ID\":$UA_ID,\"fields\":{\"display_name\":\"Gate Admin\"}}"
+check "CONTROL: a display field on the same account needs no token" \
+  "$(docker compose exec -T cli wp user get "$UA_ID" --field=display_name 2>/dev/null | tr -d '\r\n')" "Gate Admin"
+docker compose exec -T cli wp user delete gate_admin --yes >/dev/null 2>&1
+# A password is hashed, never "sanitised": sanitize_text_field stored "Tr0ubdor 9" for
+# "Tr0ub%41dor<x>  9 " and the reply said the password had been set.
+UP=$(docker compose exec -T cli wp eval 'echo wp_insert_user(["user_login"=>"gate_sub","user_pass"=>wp_generate_password(),"role"=>"subscriber"]);' 2>/dev/null | tr -d '\r\n')
+python3 - "$OUT" "$UP" <<'PYPW'
+import json, sys
+out, uid = sys.argv[1], int(sys.argv[2])
+open(out + '/up.json', 'w').write(json.dumps({"jsonrpc": "2.0", "id": 451, "method": "tools/call", "params": {"name": "wp_update_user",
+  "arguments": {"ID": uid, "fields": {"user_pass": "Tr0ub%41dor<x>  9 \\z", "display_name": "C:\\Users\\x"}}}}))
+PYPW
+curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' -d @"$OUT/up.json" -o "$OUT/up"
+check "the password stored is the password sent" \
+  "$(docker compose exec -T cli wp eval "echo wp_check_password('Tr0ub%41dor<x>  9 ' . chr(92) . 'z', get_userdata($UP)->user_pass, $UP) ? 'exact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "exact"
+check "and a backslash in a name survives" \
+  "$(docker compose exec -T cli wp eval "echo get_userdata($UP)->display_name === 'C:' . chr(92) . 'Users' . chr(92) . 'x' ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
+ucall up_role wp_update_user "{\"ID\":$UP,\"fields\":{\"role\":\"\"}}"
+check "an empty role does not strip every role from the account" \
+  "$(docker compose exec -T cli wp user get "$UP" --field=roles 2>/dev/null | tr -d '\r\n')" "subscriber"
+docker compose exec -T cli wp user delete "$UP" --yes >/dev/null 2>&1
+
 echo "-- preview: say what would happen, change nothing --"
 # A preview that quietly performs the write is worse than no preview, so every check
 # here asserts the stored state afterwards rather than trusting the wording.
