@@ -51,6 +51,12 @@ because the credential patterns are written for field names inside a value,
 where `key` signals a secret, and at the top level of a call it is the name of
 the thing being changed.
 
+One credential has no field name to give it away: a draft preview link, whose
+token rides in a URL. `redact()` therefore also scrubs the `gmcp_preview`
+parameter out of any string it is handed, and the reply text the entry keeps is
+scrubbed the same way, so the tool that hands a link out does not also write it
+into the log.
+
 ### What was called is not what changed
 
 An entry saying `wp_update_post` ran on post 12 with certain arguments does not

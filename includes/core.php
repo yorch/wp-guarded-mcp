@@ -672,6 +672,22 @@ class GMCP_Core {
   }
 
   /**
+  * A preview link's token, cut out of a string.
+  *
+  * A link made by wp_create_preview_link is a bearer credential for an unpublished post, and
+  * it travels in a URL, so no field NAME says it is secret: it is a value under "url" or
+  * inside a reply. The one place that can recognise it is the parameter it rides in. Used by
+  * redact() for every string leaf (which is what the audit log and the debug log both ask)
+  * and by the audit log for the reply text it keeps.
+  */
+  public static function scrub_preview_tokens( string $text ): string {
+    if ( strpos( $text, 'gmcp_preview' ) === false ) {
+      return $text;
+    }
+    return (string) preg_replace( '/(gmcp_preview(?:=|%3D))[A-Za-z0-9_-]+/i', '$1[redacted]', $text );
+  }
+
+  /**
   * A copy of a value with anything credential-shaped replaced.
   *
   * Unlike holds_credential() above, which refuses the whole value if any part of it
@@ -689,6 +705,9 @@ class GMCP_Core {
     }
     if ( is_object( $value ) ) {
       $value = get_object_vars( $value );
+    }
+    if ( is_string( $value ) ) {
+      return self::scrub_preview_tokens( $value );
     }
     if ( !is_array( $value ) ) {
       return $value;
@@ -795,6 +814,9 @@ class GMCP_Core {
 
     if ( $this->get_option( 'mcp_tools_admin' ) ) {
       new GMCP_Tools_Admin( $this );
+      // Same switch, and the preview-link check it carries runs on the public front end, so
+      // turning the group off ends every link it ever issued rather than leaving them live.
+      new GMCP_Tools_Diagnostics( $this );
     }
 
     if ( $this->get_option( 'mcp_tools_rest' ) ) {

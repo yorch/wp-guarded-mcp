@@ -22,6 +22,7 @@ delete_option( 'gmcp_audit_hash_boundary' );
 delete_option( 'gmcp_journal' );
 delete_option( 'gmcp_journal_db_version' );
 delete_option( 'gmcp_tokens' );
+delete_option( 'gmcp_preview_links' );
 delete_option( 'gmcp_audit_last_full_verify' );
 delete_option( 'gmcp_tools_revision' );
 delete_option( 'gmcp_version' );
