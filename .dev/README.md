@@ -219,6 +219,16 @@ written, and the build fails if any of the four files derived from AI Engine has
 its upstream notice, because that per-file attribution is what GPLv2 section 2(a)
 requires.
 
+CI runs this same script: the release workflow on each `v*` tag, and on every PR and push to
+main to upload the zip as a workflow artifact. The unversioned `guarded-mcp.zip`, the
+checksums and the attestation are added by that workflow, not by `build.sh`.
+
+`build.sh` refuses to build when the package tree holds a symlink, because `zip` would follow
+it and ship the target as an ordinary file. `check-release.sh zip` then checks the result
+against an allowlist of what the plugin contains; a new top-level file or folder has to be
+added to it, and it fails closed until it is. `check-release.sh version` is the same check on
+the version strings that CI runs.
+
 Never install the result over the bind-mounted plugin directory of this stack. See the
 warning above.
 

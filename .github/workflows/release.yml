@@ -1,0 +1,85 @@
+name: Release
+
+# Pushing a tag v* builds the package, checks it, attests its provenance and publishes a
+# GitHub Release with the zips and their checksums.
+
+on:
+  push:
+    tags: ['v*']
+
+# Nothing is granted by default; the release job asks for what it needs.
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Names a deployment environment so required reviewers can be put in front of a release
+    # (Settings, Environments). Without that setting the environment gates nothing: the
+    # check below only tests where the tag points, and a tag pushed from a branch carries
+    # that branch's copy of this file.
+    environment: release
+    permissions:
+      contents: write      # create the release
+      id-token: write      # sign the attestation
+      attestations: write  # store the attestation
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      # Actions are pinned to commit SHAs (resolved with git ls-remote against the release
+      # tags noted beside each). Bump them deliberately; a moving tag in a job that can sign
+      # and publish would let someone else's push change what this repository releases.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # All branches, so origin/main exists for the ancestry check below.
+          fetch-depth: 0
+          # Nothing after this step needs git credentials; do not leave the token in .git/config.
+          persist-credentials: false
+
+      - name: Tagged commit is on main
+        run: |
+          # origin/main comes from the full checkout above. If it is missing, merge-base
+          # fails and this refuses, which is the safe direction.
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tag $TAG ($GITHUB_SHA) is not reachable from origin/main; refusing to release." >&2
+            exit 1
+          fi
+
+      - name: Version strings agree with the tag
+        run: .dev/check-release.sh version "$TAG"
+
+      - name: Build
+        run: .dev/build.sh
+
+      - name: Check the zip
+        run: .dev/check-release.sh zip tmp/guarded-mcp-*.zip
+
+      - name: Prepare release files
+        working-directory: tmp
+        run: |
+          VERSIONED=$(ls guarded-mcp-*.zip)
+          [ "$(printf '%s\n' "$VERSIONED" | wc -l)" -eq 1 ] || { echo "expected exactly one zip" >&2; exit 1; }
+          cp "$VERSIONED" guarded-mcp.zip
+          sha256sum "$VERSIONED" > "$VERSIONED.sha256"
+          sha256sum guarded-mcp.zip > guarded-mcp.zip.sha256
+          sha256sum -c "$VERSIONED.sha256" guarded-mcp.zip.sha256
+          ls -l
+
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            tmp/guarded-mcp-*.zip
+            tmp/guarded-mcp.zip
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          flags=()
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" \
+            --verify-tag \
+            --generate-notes \
+            --title "$TAG" \
+            "${flags[@]}" \
+            tmp/guarded-mcp-*.zip tmp/guarded-mcp-*.zip.sha256 \
+            tmp/guarded-mcp.zip tmp/guarded-mcp.zip.sha256

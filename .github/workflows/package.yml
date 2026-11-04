@@ -1,0 +1,40 @@
+name: Package
+
+# Builds the installable zip on every push and pull request and checks its shape, so a
+# change that would break the release (version drift, a wrong folder name, development
+# files leaking into the package) is caught before a tag is pushed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned to commit SHAs (resolved with git ls-remote against the release
+      # tags noted beside each). Bump them deliberately; a moving tag in a job that can sign
+      # and publish would let someone else's push change what this repository releases.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Version strings agree
+        run: .dev/check-release.sh version
+
+      - name: Build
+        run: .dev/build.sh
+
+      - name: Check the zip
+        run: .dev/check-release.sh zip tmp/guarded-mcp-*.zip
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: guarded-mcp-zip
+          path: tmp/guarded-mcp-*.zip
+          if-no-files-found: error
+          retention-days: 14

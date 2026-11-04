@@ -20,8 +20,12 @@ DIRTY=0
 # from it through plugin_basename(), and the guard that stops an agent deactivating or
 # deleting the plugin mid-call compares against that, so under any other name the
 # self-protection silently stops matching.
-VERSION=$(sed -n 's/^Version: *//p' "$SLUG.php" | head -1)
+# Trim both ends (a CRLF checkout leaves a \r that would end up in the file name) and
+# insist on a plain version, so a header that is merely odd cannot name the zip.
+VERSION=$(sed -n 's/^Version:[[:space:]]*//p' "$SLUG.php" | head -1 | sed 's/[[:space:]]*$//')
 [ -n "$VERSION" ] || { echo "could not read Version from $SLUG.php" >&2; exit 1; }
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
+  || { echo "Version '$VERSION' in $SLUG.php is not MAJOR.MINOR.PATCH[-suffix]" >&2; exit 1; }
 
 if [ "$DIRTY" = "0" ] && ! git diff-index --quiet HEAD --; then
   echo "The working tree has uncommitted changes." >&2
@@ -55,6 +59,12 @@ fi
 # languages/.gitkeep is a git placeholder to keep the empty directory; the directory
 # itself ships so WordPress.org's translation system can populate it.
 rm -f "$STAGE/$SLUG/languages/.gitkeep"
+
+# A symlink in the tree would be followed by zip and its target packaged as an ordinary
+# file: an absolute link into the build machine would ship that machine's files. Nothing
+# in this plugin needs one, so refuse rather than guess.
+links=$(find "$STAGE/$SLUG" -type l)
+[ -z "$links" ] || { echo "symlinks in the package tree, refusing to build:" >&2; echo "$links" >&2; exit 1; }
 
 for required in "$SLUG.php" readme.txt LICENSE uninstall.php; do
   [ -f "$required" ] || { echo "missing from the source tree: $required" >&2; exit 1; }
@@ -94,7 +104,7 @@ mkdir -p tmp
 OUT="tmp/$SLUG-$VERSION.zip"
 [ "$DIRTY" = "1" ] && OUT="tmp/$SLUG-$VERSION-dirty.zip"
 rm -f "$OUT"
-( cd "$STAGE" && zip -qr "$OLDPWD/$OUT" "$SLUG" -x '*.DS_Store' )
+( cd "$STAGE" && zip -qry "$OLDPWD/$OUT" "$SLUG" -x '*.DS_Store' )
 
 echo
 echo "  $OUT"
