@@ -35,6 +35,7 @@ spl_autoload_register( function ( $class ) {
     'GMCP_Changes' => '/includes/changes.php',
     'GMCP_Journal' => '/includes/journal.php',
     'GMCP_Tokens' => '/includes/tokens.php',
+    'GMCP_Markdown_Blocks' => '/includes/markdown-blocks.php',
     'GMCP_SelfTest' => '/includes/selftest.php',
     'GMCP_Prompts' => '/includes/prompts.php',
     'GMCP_Resources' => '/includes/resources.php',

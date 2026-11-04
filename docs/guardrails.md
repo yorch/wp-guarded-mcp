@@ -120,6 +120,13 @@ and carry their own guards:
   entities, and kses does not recognise such a delimiter comment: it escapes the
   opener and destroys the block. Only the rendered HTML inside each block is
   filtered, and the attributes round-trip as JSON.
+- Markdown given to `wp_write_blocks` is converted to blocks by
+  `GMCP_Markdown_Blocks`, which escapes every piece of HTML in the source instead of
+  passing it through, and accepts links only for `http`, `https` and `mailto`, and
+  images only for `http` and `https`. The converted markup then goes through the same
+  `store_html()` path as block markup written directly, so the rules above apply to
+  it too. Neither layer is trusted alone: the converter is the one that knows what the
+  source meant, and the filter is the one that knows what the editor will render.
 - Tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
   `openWorldHint`) are advisory and are not a guard. Clients may use them to decide
   whether to ask first, so a wrong hint costs a prompt or skips one; it does not

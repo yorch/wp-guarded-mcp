@@ -112,6 +112,20 @@ check "a delete is destructive and not read-only" "$(py 'import json,sys;t={x["n
 check "a tool that fetches from a URL is open-world" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_upload_media"]["annotations"]["openWorldHint"])' list)" "True"
 check "CONTROL: a write is not marked read-only" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_write_blocks"]["annotations"]["readOnlyHint"])' list)" "False"
 
+echo "-- wp_write_blocks from markdown: stored state, not the reply --"
+MD_ID=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Markdown smoke","post_type"=>"post","post_status"=>"draft","post_content"=>"placeholder"]);' 2>/dev/null | tr -d '\r\n')
+call md_write '{"jsonrpc":"2.0","id":140,"method":"tools/call","params":{"name":"wp_write_blocks","arguments":{"ID":'"$MD_ID"',"markdown":"# Hostile heading\n\n[bad](javascript:alert(1)) [good](https://example.com/ok)\n\n<script>x()</script>"}}}'
+check "wp_write_blocks accepts markdown" "$(verdict md_write)" "ok"
+MD_STORED=$(docker compose exec -T cli wp eval "echo get_post($MD_ID)->post_content;" 2>/dev/null)
+check "markdown heading is stored as a heading block" "$(printf '%s' "$MD_STORED" | grep -c '<h1 class="wp-block-heading">Hostile heading</h1>')" "1"
+check "CONTROL: the http(s) link is stored" "$(printf '%s' "$MD_STORED" | grep -c 'href="https://example.com/ok"')" "1"
+check "a javascript: link is not stored as an anchor" "$(printf '%s' "$MD_STORED" | grep -ci 'href="javascript')" "0"
+check "CONTROL: source HTML is stored as escaped text" "$(printf '%s' "$MD_STORED" | grep -c '&lt;script&gt;x()&lt;/script&gt;')" "1"
+check "no live script element is stored" "$(printf '%s' "$MD_STORED" | grep -ci '<script')" "0"
+call md_both '{"jsonrpc":"2.0","id":141,"method":"tools/call","params":{"name":"wp_write_blocks","arguments":{"ID":'"$MD_ID"',"markdown":"x","blocks":[{"type":"paragraph","content":"y"}]}}}'
+check "blocks and markdown together are refused" "$(verdict md_both)" "error"
+docker compose exec -T cli wp eval "wp_delete_post($MD_ID, true);" >/dev/null 2>&1
+
 echo "-- a delete says which of the two things it did --"
 # "Deleted" was the answer for both trashing and destroying, and they are not the same
 # event. The description promised the trash flatly, so an agent could truthfully relay
