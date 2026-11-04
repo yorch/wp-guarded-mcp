@@ -1,0 +1,44 @@
+name: PR title
+
+# Versions come from commit messages, so a mislabelled one means a wrong release number: a
+# "chore:" that is really a fix ships nothing, a "feat:" that is really a fix over-bumps.
+#
+# What this does and does not cover. This repository squash-merges with the PR description as
+# the commit body, so release-please reads the title AND the description: a BREAKING CHANGE or
+# Release-As footer, or a line shaped like a commit, in the description changes the version
+# too. The title is checked; the description is only warned about. And the check is advisory
+# unless the ruleset lists it as a required status check, and direct pushes to main bypass it.
+# Rebase merges keep each commit's own message, which is not looked at here.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Title is a Conventional Commit
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          re='^(feat|fix|perf|revert|docs|style|refactor|test|build|ci|chore)(\([a-z0-9._/-]+\))?!?: .+'
+          # Control: the pattern must accept a known-good title and refuse a known-bad one.
+          [[ "fix(build): x" =~ $re ]] || { echo "internal: pattern rejects a valid title" >&2; exit 1; }
+          [[ "Update stuff" =~ $re ]] && { echo "internal: pattern accepts an invalid title" >&2; exit 1; }
+          if ! [[ "$TITLE" =~ $re ]]; then
+            echo "PR title is not a Conventional Commit: $TITLE" >&2
+            echo "Use type(scope): subject. feat bumps the minor version, fix the patch, ! or a BREAKING CHANGE footer the major." >&2
+            exit 1
+          fi
+          # Footers in the description that move the version. Warn, do not fail: they are
+          # sometimes exactly what is wanted (a deliberate Release-As).
+          if printf '%s\n' "$BODY" | grep -qE '^(BREAKING[ -]CHANGE|Release-As):'; then
+            echo "::warning::The PR description has a BREAKING CHANGE or Release-As footer. It will set the release version when squash-merged."
+          fi
+          if printf '%s\n' "$BODY" | grep -qE '^(feat|fix|perf|revert)(\([a-z0-9._/-]+\))?!?: '; then
+            echo "::warning::A line in the PR description looks like a commit message and may be read as a separate change by release-please."
+          fi

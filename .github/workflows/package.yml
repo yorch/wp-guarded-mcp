@@ -2,7 +2,7 @@ name: Package
 
 # Builds the installable zip on every push and pull request and checks its shape, so a
 # change that would break the release (version drift, a wrong folder name, development
-# files leaking into the package) is caught before a tag is pushed.
+# files leaking into the package) is caught before a release PR is merged.
 
 on:
   push:

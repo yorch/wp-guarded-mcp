@@ -19,6 +19,10 @@ on:
   pull_request:
     branches: [main]
 
+# Read-only: this workflow only inspects the tree.
+permissions:
+  contents: read
+
 jobs:
   plugin-check:
     runs-on: ubuntu-latest
@@ -39,7 +43,11 @@ jobs:
           --health-retries=20
 
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to a commit SHA like the other workflows; credentials are not persisted, because
+      # the checkout is mounted into the container below and nothing here needs to push.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Run Plugin Check
         run: |
@@ -92,7 +100,7 @@ jobs:
               # publication.
               wp-mem plugin check guarded-mcp \
                 --exclude-directories=.dev,.github,tmp \
-                --exclude-files=.gitignore,AGENTS.md,CLAUDE.md,README.md \
+                --exclude-files=.gitignore,AGENTS.md,CLAUDE.md,README.md,CHANGELOG.md,release-please-config.json,.release-please-manifest.json \
                 --ignore-codes=hidden_files,github_directory \
                 --format=table \
                 --allow-root
