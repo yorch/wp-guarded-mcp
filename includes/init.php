@@ -30,6 +30,8 @@ spl_autoload_register( function ( $class ) {
     'GMCP_Tools_Wsal' => '/includes/tools-wsal.php',
     'GMCP_Tools_Redirection' => '/includes/tools-redirection.php',
     'GMCP_Tools_Polylang' => '/includes/tools-polylang.php',
+    'GMCP_Tools_Seo' => '/includes/tools-seo.php',
+    'GMCP_Tools_Forms' => '/includes/tools-forms.php',
     'GMCP_Tools_Admin' => '/includes/tools-admin.php',
     'GMCP_Audit' => '/includes/audit.php',
     'GMCP_Audit_Table' => '/includes/audit-table.php',

@@ -93,7 +93,8 @@ An access level belongs to a named key, or to an OAuth grant. A key carries the 
 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
 nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO,
-ACF, Gravity Forms, LearnDash, Elementor Pro, WP Activity Log, Redirection and Polylang are not counted: their tools
+ACF, Gravity Forms, LearnDash, Elementor Pro, WP Activity Log, Redirection, Polylang, Rank Math and All in One SEO,
+and the form-submission tools are not counted: their tools
 are optional groups that come and go with a plugin, so folding them in would make the table
 depend on what
 happens to be installed.
@@ -148,6 +149,38 @@ clearing, and config export.
 
 **Yoast SEO**, off by default, and the switch only appears when Yoast SEO is installed:
 per-post SEO metadata read/write through the Surfaces API, and indexable rebuild.
+
+**Rank Math and All in One SEO**, off by default, on one switch that appears when either is
+installed. Per-post SEO title, meta description, canonical URL, `index` / `noindex` / default,
+and the social (OpenGraph) title and description, read at `read` and written at `write`. Each
+plugin's tools are offered only while that plugin is loaded. Rank Math keeps this in post
+meta and its writes are journalled; All in One SEO keeps it in its own table, which the
+change journal does not watch, so **a change there cannot be undone with `wp_undo_change`**
+and the reply carries the previous values instead. Every write is read back from storage and
+fails if it differs; the rendered page, page caches and sitemaps are not checked. `noindex`
+and a canonical URL change how a page appears in search, so a canonical must be on this site
+(another host needs the `gmcp_seo_canonical_hosts` filter), `robots` accepts only the three
+values, and orders are refused. The write level is a judgement, argued in
+[docs/guardrails.md](docs/guardrails.md#rank-math-and-all-in-one-seo), and it is weaker for
+All in One SEO because no generic tool reaches its table. The All in One SEO focus keyphrase
+is readable and not writable. How each plugin stores its data was written without an installed
+copy to check and is flagged in the source.
+
+**Form submissions**, off by default, on one switch that appears when Contact Form 7 or
+Flamingo, Fluent Forms or Ninja Forms is installed. **Read only: nothing can be edited,
+trashed or deleted.** A counts-only briefing per plugin at `read`; listing and reading
+individual submissions at `admin`, because a submission is personal data a member of the
+public wrote. Only fields present in the form's current definition and of a plain-input type
+are returned (an allowlist), password and file-upload answers are named but never returned,
+and IP addresses, user agents and referring URLs are never returned at any level. There is
+no search over answers, because a text search over submissions is an oracle for the values
+withheld. Every reply carries a `log_state` block that separates "none arrived" from "the
+plugin that stores them is not installed", "its table is missing" and, for Ninja Forms, "this
+form records nothing" — Contact Form 7 alone stores nothing, so it is Flamingo that is read.
+Because Flamingo and Ninja Forms keep a submission as a post, the generic post readers
+(`wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`, `wp_read_post_meta_chunk`,
+`wp_get_posts`) now refuse those post types, whether or not this group is on. That guard is a
+list of readers, and the guardrails page says what it does not cover.
 
 **Advanced Custom Fields**, off by default, and the switch only appears when ACF is
 installed: custom field discovery, value get/set through `update_field`/`get_field` with
@@ -460,8 +493,11 @@ one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor t
 `smoke-acf.sh` for the ACF tools; `smoke-gravityforms.sh` for the Gravity Forms tools;
 `smoke-learndash.sh` for the LearnDash tools; `smoke-elementor-pro.sh` for the Elementor Pro
 tools; `smoke-woo-subscriptions.sh` for the Subscriptions tools; `smoke-wsal.sh` for the
-WP Activity Log tools; `smoke-redirection.sh` for the Redirection tools; and `smoke-polylang.sh`
-for the Polylang tools. The last twelve need their plugin installed.
+WP Activity Log tools; `smoke-redirection.sh` for the Redirection tools; `smoke-polylang.sh`
+for the Polylang tools; `smoke-seo.sh` for the Rank Math and All in One SEO tools; and
+`smoke-forms.sh` for the form-submission tools. `smoke-seo.sh` and `smoke-forms.sh` were
+written without a running stack and have not been run. All but the first two need their
+plugin installed.
 
 Never run `wp plugin install --force` against that stack. Its plugin directory is a bind
 mount of this repository, and WordPress deletes the old plugin directory before unpacking

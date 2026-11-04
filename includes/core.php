@@ -79,6 +79,14 @@ class GMCP_Core {
     'mcp_tools_redirection' => false,
     // Polylang (free): read only. Languages and a post's translation group.
     'mcp_tools_polylang' => false,
+    // Rank Math and All in One SEO: per-post SEO metadata. Its own switch, separate from
+    // Yoast's, so a site is not handed a writer for a plugin it has not chosen. Readers at
+    // read, writers at write; see the header of tools-seo.php for why write.
+    'mcp_tools_seo' => false,
+    // Contact Form 7 (through Flamingo), Fluent Forms and Ninja Forms: form submissions,
+    // READ ONLY. Submissions are personal data a member of the public wrote, so the tools
+    // that return one are admin and the briefings are counts at read.
+    'mcp_tools_forms' => false,
     'mcp_debug_mode' => false,
     // Keep a short history of tool calls, including refused ones, for the settings
     // screen. An agent otherwise operates with no visible record at all.
@@ -1122,6 +1130,48 @@ class GMCP_Core {
   #endregion
 
   /**
+  * Post types that are form submissions, which the generic post READERS must not return.
+  *
+  * Flamingo (the message store behind Contact Form 7) and Ninja Forms keep a submission as a
+  * post, with the answers, and for Flamingo the visitor's IP address and user agent, in post
+  * meta. wp_get_post_meta is a read-level tool that returns any key on any post, so without
+  * this the admin-level submission tools of the forms group would stand beside a read-level
+  * door to the same rows, and "personal data is admin level" would be a sentence about the
+  * tool and not about the data. As elsewhere in this class, the policy belongs to the post
+  * type and is asked by each reader.
+  *
+  * The names are Flamingo's and Ninja Forms' own post types (UNVERIFIED: written from memory
+  * of their source). A site with another form store that uses posts adds its type through
+  * gmcp_personal_data_post_types.
+  *
+  * Reads only. Writing one of these rows is not what this guards, and no tool in this plugin
+  * writes a submission.
+  *
+  * @return string[]
+  */
+  public static function personal_data_post_types(): array {
+    return (array) apply_filters( 'gmcp_personal_data_post_types', [
+      'flamingo_inbound', 'flamingo_contact', 'flamingo_outbound', 'nf_sub',
+    ] );
+  }
+
+  /**
+  * @param int    $post_id The post a read is aimed at.
+  * @param string $type    A post type named directly, for a listing that names no post.
+  * @return true|string True when the read is allowed, otherwise the refusal.
+  */
+  public static function personal_data_post_guard( int $post_id, string $type = '' ) {
+    if ( $type === '' ) {
+      $type = $post_id > 0 ? (string) get_post_type( $post_id ) : '';
+    }
+    if ( $type === '' || !in_array( $type, self::personal_data_post_types(), true ) ) {
+      return true;
+    }
+    return 'A ' . $type . ' is a form submission: personal data a member of the public typed, stored as a post. The generic post readers do not return it, because they are available to a read-only key and a submission is admin-level data. '
+      . 'Use the form tools for that plugin (cf7_, fluentform_ or ninjaform_), which return it at admin level, never return passwords, file uploads, IP addresses or user agents, and report whether the store is there at all.';
+  }
+
+  /**
   * Whether a post is an Elementor library template something still renders, and the
   * sentence to refuse with.
   *
@@ -1608,6 +1658,19 @@ class GMCP_Core {
     }
     if ( $this->get_option( 'mcp_tools_polylang' ) ) {
       new GMCP_Tools_Polylang();
+    }
+    // Rank Math and All in One SEO. Each tool is offered only while its plugin is loaded
+    // (checked at listing and again per call in GMCP_Tools_Seo), so switching the group on
+    // for a site with neither registers nothing rather than four tools that can only fail.
+    if ( $this->get_option( 'mcp_tools_seo' ) ) {
+      new GMCP_Tools_Seo();
+    }
+
+    // Form submissions, read only. Same per-plugin registration as the SEO group, and the
+    // generic post readers refuse the post types Flamingo and Ninja Forms store submissions
+    // under (GMCP_Core::personal_data_post_guard()), whether or not this switch is on.
+    if ( $this->get_option( 'mcp_tools_forms' ) ) {
+      new GMCP_Tools_Forms();
     }
   }
 

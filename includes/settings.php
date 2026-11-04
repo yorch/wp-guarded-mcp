@@ -337,6 +337,8 @@ class GMCP_Settings {
       'mcp_tools_wp_activity_log' => 'bool',
       'mcp_tools_redirection' => 'bool',
       'mcp_tools_polylang' => 'bool',
+      'mcp_tools_seo' => 'bool',
+      'mcp_tools_forms' => 'bool',
       'mcp_debug_mode' => 'bool',
       'mcp_activity_log' => 'bool',
       'mcp_audit_days' => 'days',
@@ -1231,6 +1233,16 @@ class GMCP_Settings {
     $redirection = defined( 'REDIRECTION_VERSION' ) && class_exists( 'Red_Item' ) && method_exists( 'Red_Item', 'get_by_id' ) && method_exists( 'Red_Item', 'create' ) && method_exists( 'Red_Item', 'get_filtered' );
     // Polylang (free or Pro): its version constant plus the functions the tools call.
     $polylang = defined( 'POLYLANG_VERSION' ) && function_exists( 'pll_languages_list' ) && function_exists( 'pll_get_post_translations' );
+    // Rank Math and All in One SEO: the same version-constant-plus-accessor signal each tool
+    // group checks per call. One switch covers whichever of the two is present.
+    $seo = ( defined( 'RANK_MATH_VERSION' ) && function_exists( 'rank_math' ) )
+      || ( defined( 'AIOSEO_VERSION' ) && function_exists( 'aioseo' ) && class_exists( '\AIOSEO\Plugin\Common\Models\Post' ) );
+    // Form stores: Contact Form 7 or Flamingo, Fluent Forms, Ninja Forms. Presence only; the
+    // tools themselves report whether a store or table exists.
+    $forms = ( defined( 'WPCF7_VERSION' ) && class_exists( 'WPCF7_ContactForm' ) )
+      || defined( 'FLAMINGO_VERSION' )
+      || defined( 'FLUENTFORM_VERSION' )
+      || ( class_exists( 'Ninja_Forms' ) && function_exists( 'Ninja_Forms' ) );
     // Subscriptions has no version constant in 7.7.0, so presence is the classes plus a
     // function a tool here calls. WC_Subscription alone is not enough: a gateway bundling
     // the subscriptions core library provides it without WooCommerce Subscriptions.
@@ -1278,6 +1290,12 @@ class GMCP_Settings {
     }
     if ( $polylang ) {
       $keys[] = 'mcp_tools_polylang';
+    }
+    if ( $seo ) {
+      $keys[] = 'mcp_tools_seo';
+    }
+    if ( $forms ) {
+      $keys[] = 'mcp_tools_forms';
     }
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'Which groups of tools an agent is offered. A group that is off is not merely hidden: its tools are refused if asked for by name.', 'guarded-mcp' ); ?></p>
@@ -1374,6 +1392,18 @@ class GMCP_Settings {
                   <?php esc_html_e( 'Polylang (read the configured languages and a post\'s translation group; read only)', 'guarded-mcp' ); ?>
                 </label>
               <?php endif; ?>
+              <?php if ( $seo ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_seo" value="1" <?php checked( !empty( $options['mcp_tools_seo'] ) ); ?>>
+                  <?php esc_html_e( 'Rank Math / All in One SEO (per-post title, description, canonical, index or noindex, social tags)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
+              <?php if ( $forms ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_forms" value="1" <?php checked( !empty( $options['mcp_tools_forms'] ) ); ?>>
+                  <?php esc_html_e( 'Form submissions, read only (Contact Form 7 with Flamingo, Fluent Forms, Ninja Forms)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
               <label>
                 <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>
                 <?php esc_html_e( 'Generate create, read, update and delete tools for posts, pages and media from the REST API', 'guarded-mcp' ); ?>
@@ -1435,6 +1465,16 @@ class GMCP_Settings {
             <?php if ( $ld ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The LearnDash tools exist because enrolment is stored as user meta and a course\'s structure is LearnDash\'s own tree, so the generic tools answer neither question correctly. They distinguish "enrolled" from "can view the course": an open course, or one whose join setting is empty, can be viewed by anyone with nobody enrolled. The tools that return or change student data are admin-level, and removing an enrolment takes a two-step confirmation and refuses when the access actually comes from a LearnDash Group.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $seo ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The Rank Math and All in One SEO tools set a post\'s SEO title, description, canonical URL, index or noindex, and social title and description, at write level. noindex removes a page from search results and a canonical elsewhere moves its ranking, so a canonical must be on this site, the robots field accepts only index, noindex or default, and every reply says what the value was before. Rank Math\'s settings are post meta and are recorded by the change journal. All in One SEO keeps them in its own table, which the journal does not watch, so a change there cannot be undone with wp_undo_change.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $forms ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The form tools only read. They answer how many submissions exist at read level, and return individual submissions at admin level, because a submission is personal data a member of the public wrote. Password and file-upload answers, IP addresses and user agents are never returned, there is no search over answers, and nothing can be edited or deleted. Every reply says whether the store is there at all, so "none arrived" is not confused with "nothing is being kept".', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
             <p class="description">

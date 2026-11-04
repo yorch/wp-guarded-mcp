@@ -142,8 +142,10 @@ destructive. `smoke-woo.sh` covers the shop tools, `smoke-elementor.sh` covers t
 `smoke-learndash.sh` covers the LearnDash tools, `smoke-elementor-pro.sh` covers the
 Elementor Pro tools, `smoke-woo-subscriptions.sh` covers the Subscriptions tools, and
 `smoke-wsal.sh` covers the WP Activity Log tools, `smoke-redirection.sh` covers the
-Redirection tools, and `smoke-polylang.sh` covers the Polylang tools. Run all
-fourteen before committing. The last twelve need
+Redirection tools, `smoke-polylang.sh` covers the Polylang tools, `smoke-seo.sh` covers the Rank Math and
+All in One SEO tools, and `smoke-forms.sh` covers the form-submission tools (Contact Form 7 with
+Flamingo, Fluent Forms, Ninja Forms; its first block needs no form plugin). Run all
+sixteen before committing. All but the first two need
 their plugin installed and say so and exit rather than reporting failures against a site that
 simply does not have it.
 
