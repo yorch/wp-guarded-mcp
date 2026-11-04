@@ -223,6 +223,9 @@ CI runs this same script: the release workflow on each `v*` tag, and on every PR
 main to upload the zip as a workflow artifact. The unversioned `guarded-mcp.zip`, the
 checksums and the attestation are added by that workflow, not by `build.sh`.
 
+The workflow artifact is uploaded with `archive: false`. Otherwise the Actions download is a
+zip holding the plugin zip, and WordPress rejects that with "No valid plugins were found".
+
 `build.sh` refuses to build when the package tree holds a symlink, because `zip` would follow
 it and ship the target as an ordinary file. `check-release.sh zip` then checks the result
 against an allowlist of what the plugin contains; a new top-level file or folder has to be
