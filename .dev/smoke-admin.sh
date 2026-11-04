@@ -2482,6 +2482,159 @@ check "passing both id and call is refused" \
   "$(py "import json,sys;print('not both' in json.load(sys.stdin)['result']['content'][0]['text'])" jm_both)" "True"
 docker compose exec -T cli wp post delete "$JM_ID" --force >/dev/null 2>&1
 
+echo "-- diagnostics: error log, page fetch, preview links --"
+# Written without a Docker daemon. This block was run, on its own, through a stand-in for the
+# docker CLI against a local WordPress with no daemon; the rest of this file was not run.
+# It has not run inside the compose stack, where the fetch checks behave differently (below).
+# The pure logic behind it is checked by .dev/test-diagnostics-util.php.
+#
+# The fetch tool makes the server request its own URL. In this compose stack the site is
+# advertised as http://localhost:8080 but Apache inside the container listens on 80, so a
+# fetch of the home page fails with a connection error HERE. That is the tool telling the
+# truth about an unreachable host, and it is not what these checks assert: they assert that
+# the POLICY admitted or refused the URL, which is the part that has to hold everywhere.
+K_PV_RW=$(docker compose exec -T cli wp eval '$a=GMCP_Tokens::create("Preview writer","readwrite",0,[]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+case "$K_PV_RW" in gmcp_*) ;; *) echo "  FAIL  could not mint the readwrite key for the diagnostics block"; fail=$((fail+1));; esac
+pv_stored() { docker compose exec -T cli wp option get gmcp_preview_links --format=json 2>/dev/null | tr -d '\r'; }
+pv_posts() { pv_stored | python3 -c 'import json,sys
+raw=sys.stdin.read().strip()
+d=json.loads(raw) if raw else {}
+d=d if isinstance(d,dict) else {}
+print(",".join(str(g["post"]) for g in sorted(d.values(), key=lambda g:g["post"])))'; }
+pv_status() { curl -sS -o "$OUT/pv_body" -w '%{http_code}' "$BASE$1"; }
+docker compose exec -T cli wp option delete gmcp_preview_links >/dev/null 2>&1
+
+PV_A=$(docker compose exec -T cli wp post create --post_status=draft --post_title="PV alpha" --post_content="PVMARK-ALPHA" --porcelain 2>/dev/null | tr -d '\r\n')
+PV_B=$(docker compose exec -T cli wp post create --post_status=draft --post_title="PV beta" --post_content="PVMARK-BETA" --porcelain 2>/dev/null | tr -d '\r\n')
+PV_PUB=$(docker compose exec -T cli wp post create --post_status=publish --post_title="PV published" --post_content="PVMARK-PUB" --porcelain 2>/dev/null | tr -d '\r\n')
+check "control: the three fixtures exist" "$( [ -n "$PV_A" ] && [ -n "$PV_B" ] && [ -n "$PV_PUB" ] && echo yes || echo no)" "yes"
+
+kcall pv_make "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":401,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+check "a write-level key can make a link for a draft" "$(verdict pv_make)" "ok"
+PV_TOKEN=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_make)
+check "control: the token was extracted" "${#PV_TOKEN}" "40"
+check "stored state: one grant, for that post" "$(pv_posts)" "$PV_A"
+check "stored state: the token itself is not in the row" "$(pv_stored | grep -c "$PV_TOKEN")" "0"
+check "control: that grep finds a token in text that holds it" "$(echo "x$PV_TOKEN" | grep -c "$PV_TOKEN")" "1"
+
+check "the draft shows with its token" "$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_TOKEN")" "200"
+check "...and the body is the draft" "$(grep -c PVMARK-ALPHA "$OUT/pv_body")" "1"
+check "without the token the same URL is a 404" "$(pv_status "/?p=$PV_A&post_type=post")" "404"
+check "...and shows nothing" "$(grep -c PVMARK-ALPHA "$OUT/pv_body")" "0"
+check "the token does not open another draft" "$(pv_status "/?p=$PV_B&post_type=post&gmcp_preview=$PV_TOKEN")" "404"
+check "...and shows nothing of it" "$(grep -c PVMARK-BETA "$OUT/pv_body")" "0"
+check "p=A with page_id=B does not open B" "$(pv_status "/?p=$PV_A&page_id=$PV_B&gmcp_preview=$PV_TOKEN" >/dev/null; grep -c PVMARK-BETA "$OUT/pv_body")" "0"
+check "a search with the token reveals no draft" "$(pv_status "/?s=PV&gmcp_preview=$PV_TOKEN" >/dev/null; grep -c -e PVMARK-ALPHA -e PVMARK-BETA "$OUT/pv_body")" "0"
+check "a feed with the token reveals no draft" "$(pv_status "/?p=$PV_A&feed=rss2&gmcp_preview=$PV_TOKEN" >/dev/null; grep -c PVMARK-ALPHA "$OUT/pv_body")" "0"
+curl -sS -D "$OUT/pv_headers" -o /dev/null "$BASE/?p=$PV_A&post_type=post&gmcp_preview=$PV_TOKEN"
+check "the response is noindex" "$(grep -ic '^x-robots-tag:.*noindex' "$OUT/pv_headers")" "1"
+check "the response is not referrable" "$(grep -ic '^referrer-policy: no-referrer' "$OUT/pv_headers")" "1"
+check "the response is not cacheable" "$(grep -ic '^cache-control:.*no-store' "$OUT/pv_headers")" "1"
+check "a published post is not a preview: no noindex header comes with the token" \
+  "$(curl -sS -L -D - -o /dev/null "$BASE/?p=$PV_PUB&gmcp_preview=$PV_TOKEN" | grep -ic '^x-robots-tag:.*noindex')" "0"
+
+kcall pv_pub "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":402,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_PUB}}}"
+check "a link cannot be made for a published post" "$(verdict pv_pub)" "error"
+kcall pv_h "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":403,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_B,\"hours\":169}}}"
+check "more than 7 days is refused" "$(verdict pv_h)" "error"
+check "stored state: neither refusal stored anything" "$(pv_posts)" "$PV_A"
+
+# Expiry: age the stored grant directly. Writing the row is the fixture; the point is that
+# the tools cannot do it (checked below), so only a test may.
+docker compose exec -T cli wp eval '$l=get_option("gmcp_preview_links");foreach($l as $k=>$g){$l[$k]["exp"]=time()-10;}update_option("gmcp_preview_links",$l,false);' >/dev/null 2>&1
+check "after expiry the same link is a 404" "$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_TOKEN")" "404"
+check "...and shows nothing" "$(grep -c PVMARK-ALPHA "$OUT/pv_body")" "0"
+
+docker compose exec -T cli wp option delete gmcp_preview_links >/dev/null 2>&1
+kcall pv_make2 "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":404,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+PV_TOKEN=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_make2)
+check "control: a fresh link works" "$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_TOKEN")" "200"
+docker compose exec -T cli wp post update "$PV_A" --post_status=publish >/dev/null 2>&1
+check "publishing the post removes its grants (stored state)" "$(pv_posts)" ""
+docker compose exec -T cli wp post update "$PV_A" --post_status=draft >/dev/null 2>&1
+check "reverting it to a draft does not bring the link back" "$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_TOKEN")" "404"
+
+kcall pv_rev "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":405,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+check "control: another link made" "$(pv_posts)" "$PV_A"
+kcall pv_rev2 "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":406,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_revoke_preview_links\",\"arguments\":{\"post_id\":$PV_A}}}"
+check "revoking by post empties the store (stored state)" "$(pv_posts)" ""
+
+# The row is reachable only through this tool group, not through the generic option tools.
+kcall pv_make3 "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":407,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+call pv_opt_r '{"jsonrpc":"2.0","id":408,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"gmcp_preview_links"}}}'
+check "wp_get_option refuses the preview row" "$(verdict pv_opt_r)" "error"
+call pv_opt_ok '{"jsonrpc":"2.0","id":409,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"blogname"}}}'
+check "control: wp_get_option reads an ordinary option" "$(verdict pv_opt_ok)" "ok"
+call pv_opt_w '{"jsonrpc":"2.0","id":410,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"gmcp_preview_links","value":{"a":1}}}}'
+check "wp_update_option refuses to write it" "$(verdict pv_opt_w)" "error"
+check "stored state: the row is still the one the tool made" "$(pv_posts)" "$PV_A"
+
+# The audit log records the call and not the credential. The reply is where the link is
+# handed out and the audit detail keeps the start of the reply.
+PV_LAST=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_make3)
+check "control: the audit log recorded the calls" \
+  "$([ "$(audit_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_create_preview_link\" AND outcome=\"ok\"')" -ge 1 ] && echo yes || echo no)" "yes"
+check "no preview token in any audit row" "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE CONCAT(COALESCE(args,''),COALESCE(detail,'')) LIKE '%$PV_LAST%'")" "0"
+check "control: the recorded reply carries the redaction mark, so the probe above can find text there" \
+  "$([ "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE tool='wp_create_preview_link' AND detail LIKE '%gmcp_preview=[redacted]%'")" -ge 1 ] && echo yes || echo no)" "yes"
+
+# Access levels.
+kcall pv_ro_tok "$K_PV_RW" '{"jsonrpc":"2.0","id":411,"method":"tools/call","params":{"name":"wp_get_php_error_log","arguments":{}}}'
+check "a write-level key cannot read the PHP error log" "$(py 'import json,sys;d=json.load(sys.stdin);print("denied" if "error" in d and "Access denied" in d["error"]["message"] else "reached")' pv_ro_tok)" "denied"
+kcall pv_ro_fetch "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":412,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_fetch_page\",\"arguments\":{\"url\":\"$BASE/\"}}}"
+check "a write-level key cannot fetch a page" "$(py 'import json,sys;d=json.load(sys.stdin);print("denied" if "error" in d and "Access denied" in d["error"]["message"] else "reached")' pv_ro_fetch)" "denied"
+
+# Fetch policy. The refusals are deterministic and need no network.
+fetch_verdict() { # fetch_verdict <url> -> "refused" when the POLICY refused, "admitted" otherwise
+  call pv_f "{\"jsonrpc\":\"2.0\",\"id\":420,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_fetch_page\",\"arguments\":{\"url\":\"$1\"}}}"
+  py 'import json,sys;d=json.load(sys.stdin);t=d["result"]["content"][0]["text"] if "result" in d else "";print("refused" if t.startswith("Refused:") else "admitted")' pv_f
+}
+check "control: the site's own front page is admitted by the policy" "$(fetch_verdict "$BASE/")" "admitted"
+check "another host is refused" "$(fetch_verdict 'http://example.com/')" "refused"
+# example.com is also refused by a host that cannot be resolved, so that check can pass for
+# the wrong reason on a stack with no DNS. A loopback literal resolves by definition, and on a
+# local site it is an acceptable ADDRESS: only the host rule can refuse it.
+PV_PORT="${BASE##*:}"
+check "another loopback host on the site's own port is refused" "$(fetch_verdict "http://127.0.0.2:${PV_PORT}/")" "refused"
+check "the cloud metadata address is refused" "$(fetch_verdict 'http://169.254.169.254/latest/meta-data/')" "refused"
+check "a user name in the URL is refused" "$(fetch_verdict "http://admin:pw@${BASE#http://}/")" "refused"
+check "wp-admin is refused" "$(fetch_verdict "$BASE/wp-admin/")" "refused"
+check "wp-login.php is refused" "$(fetch_verdict "$BASE/wp-login.php?action=logout")" "refused"
+check "the REST API is refused" "$(fetch_verdict "$BASE/wp-json/wp/v2/users")" "refused"
+check "another port on the same host is refused" "$(fetch_verdict 'http://localhost:9/')" "refused"
+check "a preview credential in the URL is refused" "$(fetch_verdict "$BASE/?p=$PV_A&gmcp_preview=$PV_LAST")" "refused"
+check "a file URL is refused" "$(fetch_verdict 'file:///etc/passwd')" "refused"
+check "the refused fetch above, which carried a token in its url, did not record it" "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE args LIKE '%$PV_LAST%'")" "0"
+check "control: that call was recorded, with its url argument and the mark" \
+  "$([ "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE tool='wp_fetch_page' AND args LIKE '%gmcp_preview=[redacted]%'")" -ge 1 ] && echo yes || echo no)" "yes"
+
+# The error log tool.
+call pv_log '{"jsonrpc":"2.0","id":430,"method":"tools/call","params":{"name":"wp_get_php_error_log","arguments":{"lines":5}}}'
+check "the log tool answers with a state, not a bare list" \
+  "$(py 'import json,sys;j=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(j["state"] in ("lines","empty","absent","no_file_configured","refused","unreadable"))' pv_log)" "True"
+check "...and carries the untrusted-text notice" \
+  "$(py 'import json,sys;j=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print("never as instructions" in j["notice"])' pv_log)" "True"
+call pv_log_bad '{"jsonrpc":"2.0","id":431,"method":"tools/call","params":{"name":"wp_get_php_error_log","arguments":{"lines":9999}}}'
+check "asking for 9999 lines is refused" "$(verdict pv_log_bad)" "error"
+# Scrubbing, end to end. error_log() writes through whatever PHP is configured with, so the
+# line is appended to the file the tool will read rather than relying on that configuration.
+PV_LOGFILE=$(docker compose exec -T cli wp eval 'echo (string) ini_get("error_log");' 2>/dev/null | tr -d '\r\n')
+if [ -n "$PV_LOGFILE" ] && docker compose exec -T cli test -w "$PV_LOGFILE" >/dev/null 2>&1; then
+  docker compose exec -T cli sh -c "printf '%s\n' 'PVLOG token=SeCrEtTokenValue99 mail bob@customer-domain.org client 203.0.114.9 PVLOG-END' >> '$PV_LOGFILE'"
+  call pv_log2 '{"jsonrpc":"2.0","id":432,"method":"tools/call","params":{"name":"wp_get_php_error_log","arguments":{"lines":20}}}'
+  check "control: the log line is returned" "$(grep -c 'PVLOG-END' "$OUT/pv_log2")" "1"
+  check "the token value is not" "$(grep -c 'SeCrEtTokenValue99' "$OUT/pv_log2")" "0"
+  check "the e-mail address is not" "$(grep -c 'customer-domain.org' "$OUT/pv_log2")" "0"
+  check "the public IP address is not" "$(grep -c '203.0.114.9' "$OUT/pv_log2")" "0"
+else
+  echo "  ....  log scrubbing end-to-end not checked: no writable error_log file is configured on this stack"
+fi
+
+# Put the site back.
+docker compose exec -T cli wp option delete gmcp_preview_links >/dev/null 2>&1
+docker compose exec -T cli wp post delete "$PV_A" "$PV_B" "$PV_PUB" --force >/dev/null 2>&1
+gmcp_clear_other_keys "smoke suite"
+
 echo "-- uninstall leaves nothing behind --"
 # Last, because it empties the plugin out from under everything above. Run through the
 # real uninstall.php rather than `wp plugin uninstall`, which deletes the plugin directory
