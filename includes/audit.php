@@ -246,7 +246,7 @@ class GMCP_Audit {
   const IDENTIFIER_ARGS = [ 'key', 'meta_key', 'option_key' ];
 
   /** Arguments as they will be stored: redacted, size-capped, and honest about both. */
-  private function storable_args( array $args ): string {
+  public static function storable_args( array $args ): string {
     foreach ( self::NEVER_RECORD as $field ) {
       if ( array_key_exists( $field, $args ) ) {
         $args[ $field ] = '[redacted]';
@@ -296,7 +296,6 @@ class GMCP_Audit {
     if ( !is_array( $call ) || empty( $call['tool'] ) ) {
       return;
     }
-    global $wpdb;
 
     // At a hard bound, refuse to write rather than write into a log that will have its
     // recent rows deleted to make room. The row this would have added is lost either way;
@@ -325,13 +324,25 @@ class GMCP_Audit {
       'target' => $this->target( $args ),
       'outcome' => $failed ? 'refused' : 'ok',
       'ms' => (int) ( $call['duration_ms'] ?? 0 ),
-      'args' => $this->storable_args( $args ),
+      'args' => self::storable_args( $args ),
       'changes' => class_exists( 'GMCP_Changes' )
         ? GMCP_Changes::summarise( GMCP_Changes::captured(), self::MAX_CHANGES )
         : null,
       'detail' => $this->detail( $call, $failed ),
     ];
 
+    self::append( $row );
+  }
+
+  /**
+  * Chain a finished row onto the log and write it.
+  *
+  * Shared by record() and record_event() so the hash chain has exactly one writer. Two
+  * insert paths would be two places to get the previous hash wrong, and a row that does
+  * not chain is reported as tampering.
+  */
+  private static function append( array $row ): void {
+    global $wpdb;
     // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant, not user input
     $prev = (string) $wpdb->get_var( "SELECT hash FROM " . self::table() . " ORDER BY id DESC LIMIT 1" );
     $row['prev_hash'] = $prev;
@@ -357,6 +368,48 @@ class GMCP_Audit {
       error_log( '[Guarded MCP] audit entry NOT recorded for ' . $row['tool'] . ': '
         . ( $wpdb->last_error ?: 'the database reported no error' ) );
     }
+  }
+
+  /**
+  * Write a row that is not a tool call.
+  *
+  * The approval queue has events no tool call describes: a person approving a request
+  * from wp-admin, a request expiring, a replay being refused. They belong in the same
+  * hash chain as the calls they concern, or the log would tell the story of a request
+  * and omit the only part a person did.
+  *
+  * Arguments are taken as already redacted and are redacted again here, so a caller that
+  * forgets cannot put a credential in the table. Does nothing when the log is switched
+  * off or at a hard bound, for the same reasons record() does not.
+  *
+  * @param array $fields tool (an event name), actor, client, auth_method, target, outcome,
+  *                      args (array), detail
+  */
+  public static function record_event( array $fields ): void {
+    $core = $GLOBALS['gmcp_core'] ?? null;
+    if ( !$core || !$core->get_option( 'mcp_activity_log' ) ) {
+      return;
+    }
+    if ( self::over_bound() ) {
+      return;
+    }
+    $actor = (int) ( $fields['actor'] ?? 0 );
+    $args = GMCP_Core::redact( is_array( $fields['args'] ?? null ) ? $fields['args'] : [] );
+    $json = wp_json_encode( $args, JSON_UNESCAPED_SLASHES );
+    self::append( [
+      'ts' => gmdate( 'Y-m-d H:i:s' ),
+      'actor' => $actor,
+      'actor_name' => $actor ? (string) ( get_userdata( $actor )->user_login ?? '' ) : '',
+      'client' => mb_substr( (string) ( $fields['client'] ?? '' ), 0, 191 ),
+      'auth_method' => mb_substr( (string) ( $fields['auth_method'] ?? '' ), 0, 32 ),
+      'tool' => mb_substr( (string) ( $fields['tool'] ?? '' ), 0, 64 ),
+      'target' => mb_substr( (string) ( $fields['target'] ?? '' ), 0, 191 ),
+      'outcome' => ( $fields['outcome'] ?? 'ok' ) === 'refused' ? 'refused' : 'ok',
+      'ms' => 0,
+      'args' => $json === false ? '{}' : mb_substr( $json, 0, self::MAX_ARGS ),
+      'changes' => null,
+      'detail' => mb_substr( wp_strip_all_tags( (string) ( $fields['detail'] ?? '' ) ), 0, 1000 ),
+    ] );
   }
 
   /**
