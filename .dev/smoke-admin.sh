@@ -3217,6 +3217,396 @@ fi
 docker compose exec -T cli wp option delete gmcp_preview_links >/dev/null 2>&1
 docker compose exec -T cli wp post delete "$PV_A" "$PV_B" "$PV_PUB" --force >/dev/null 2>&1
 gmcp_clear_other_keys "smoke suite"
+echo "-- human approval queue (out-of-band approval) --"
+# NOT YET RUN. Written on a machine with no Docker daemon, so none of this block has
+# executed against a stack. Run it, read every failure as either a code defect or a typo
+# in this block, and delete this note once it has passed once.
+#
+# What it asserts, in the order the risks were thought of:
+#   1. a gated call does NOT run, and the stored state proves it (the post is still there);
+#   2. an agent cannot approve: no tool does, at any level, and no credential but a real
+#      wp-admin session moves a request out of 'pending';
+#   3. an approval is for one key, one tool, one set of arguments, once, for fifteen
+#      minutes, and a request lapses after an hour;
+#   4. credential-shaped arguments are in neither the queue, the page nor the audit log;
+#   5. the two-step still applies inside an approved call and one approval covers both legs.
+#
+# Every "did not run" is read from the database, never from the reply. Every absence has a
+# control that proves the probe can see a present one.
+ap_eval() { docker compose exec -T cli wp eval "$1" 2>/dev/null | tr -d '\r\n'; }
+ap_q() { ap_eval "global \$wpdb; echo (string) \$wpdb->get_var(\"$1\");"; }
+ap_mode() { docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_approval_mode"]="'"$1"'";update_option("gmcp_options",$o,false);' >/dev/null 2>&1; }
+ap_stored_mode() { ap_eval 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "(unset)";'; }
+ap_status() { ap_q 'SELECT status FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$1"; }
+ap_events() { ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"approval:'"$1"'\"'; }
+ap_call() { # ap_call <file> <tool> <args-json> [token]
+  curl -sS -X POST "$URL" -H "Authorization: Bearer ${4:-$TOK}" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":900,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$3}}" -o "$OUT/$1"
+}
+ap_text() { py 'import json,sys;d=json.load(sys.stdin);print(d["result"]["content"][0]["text"])' "$1"; }
+ap_state() { py 'import json,sys;d=json.load(sys.stdin);print(d["result"].get("data",{}).get("status","-"))' "$1"; }
+ap_rid() { py 'import json,sys;d=json.load(sys.stdin);print(d["result"].get("data",{}).get("request_id","-"))' "$1"; }
+ap_post() { docker compose exec -T cli wp post create --post_title="$1" --post_status=draft --porcelain 2>/dev/null | tr -d '\r\n'; }
+ap_post_state() { ap_eval 'echo get_post_status('"$1"') ?: "gone";'; }
+ap_key() { # ap_key <label> <level>
+  docker compose exec -T cli wp eval '
+    foreach ( GMCP_Tokens::all() as $k ) { if ( ( $k["label"] ?? "" ) === "'"$1"'" ) { GMCP_Tokens::revoke( $k["id"] ); } }
+    $a = get_users( [ "role" => "administrator", "number" => 1, "orderby" => "ID", "order" => "ASC" ] );
+    $r = GMCP_Tokens::create( "'"$1"'", "'"$2"'", 0, [], $a ? $a[0]->ID : 0 );
+    echo $r["secret"];' 2>/dev/null | tr -d '\r\n'
+}
+AP_ADMIN_ID=$(ap_eval 'echo get_users(["role"=>"administrator","number"=>1,"orderby"=>"ID","order"=>"ASC"])[0]->ID;')
+
+# Start from nothing. Rows are cleared with the plugin's own table name rather than by
+# dropping the table, so the schema under test is the one the plugin installed.
+ap_eval 'global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_approvals");' >/dev/null
+ap_mode never
+check "CONTROL: the mode switch took" "$(ap_stored_mode)" "never"
+
+echo "   -- off means off, and what is not gated is not held --"
+AP_A=$(ap_post "AP control A")
+ap_call ap_c1 wp_delete_post "{\"ID\":$AP_A,\"force\":true}"
+check "mode never: a destructive call simply runs" "$(ap_post_state "$AP_A")" "gone"
+check "mode never: nothing was queued" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "0"
+
+ap_mode deletes
+AP_B=$(ap_post "AP victim B")
+ap_call ap_c2 wp_update_post "{\"ID\":$AP_B,\"post_title\":\"AP content edit\"}"
+check "mode deletes: a content edit is not held" \
+  "$(ap_eval 'echo get_the_title('"$AP_B"');')" "AP content edit"
+
+echo "   -- a gated call waits and does nothing --"
+ap_call ap_h1 wp_delete_post "{\"ID\":$AP_B,\"force\":true}"
+AP_R1=$(ap_rid ap_h1)
+check "the held call is not an error" "$(verdict ap_h1)" "ok"
+check "the reply says it is awaiting human approval" "$(ap_state ap_h1)" "awaiting_human_approval"
+check "and tells the agent so in words" "$(ap_text ap_h1 | grep -ci 'waiting for human approval')" "1"
+check "the victim is still there (read from the database, not the reply)" "$(ap_post_state "$AP_B")" "draft"
+check "exactly one request is pending" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals WHERE status=\"pending\"')" "1"
+check "stored against the key that asked" \
+  "$(ap_q 'SELECT identity LIKE \"key:%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R1")" "1"
+check "and the stored arguments name the victim, so a person can read what they approve" \
+  "$(ap_q 'SELECT args_view LIKE \"%'"$AP_B"'%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R1")" "1"
+# Polling must not grow the queue: an agent that retries every turn would otherwise bury
+# the one request a person needs to read.
+ap_call ap_h1b wp_delete_post "{\"ID\":$AP_B,\"force\":true}"
+check "retrying while pending returns the same request id" "$(ap_rid ap_h1b)" "$AP_R1"
+check "and does not add a row" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "1"
+# Key order is not part of the call's identity; a value is.
+ap_call ap_h1c wp_delete_post "{\"force\":true,\"ID\":$AP_B}"
+check "argument order does not make a new request" "$(ap_rid ap_h1c)" "$AP_R1"
+ap_call ap_h2 wp_delete_post "{\"ID\":$AP_B,\"force\":false}"
+AP_R2=$(ap_rid ap_h2)
+check "different arguments are a different request" "$([ "$AP_R2" != "$AP_R1" ] && [ "$AP_R2" != "-" ] && echo yes || echo no)" "yes"
+check "and the victim is still there" "$(ap_post_state "$AP_B")" "draft"
+# The held call is not recorded as a success: nothing happened.
+check "the audit log records the held call as refused" \
+  "$(ap_q 'SELECT COUNT(*)>0 FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_delete_post\" AND outcome=\"refused\" AND detail LIKE \"%waiting for human approval%\"')" "1"
+check "the request is in the audit log" "$([ "$(ap_events requested)" -ge 2 ] && echo yes || echo no)" "yes"
+
+echo "   -- no tool can approve, at any access level --"
+AP_K_RW=$(ap_key "ap rw" readwrite)
+AP_K_RO=$(ap_key "ap ro" readonly)
+ap_names() { # ap_names <token> -> every tool name this key is offered
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $1" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":901,"method":"tools/list"}' \
+  | python3 -c "
+import json,sys
+try:
+    t=[x['name'] for x in json.load(sys.stdin)['result']['tools']]
+except Exception:
+    print('unreadable'); raise SystemExit
+print(' '.join(t))"
+}
+ap_has() { # ap_has <names> <regex>
+  python3 -c "import re,sys;print('yes' if re.search(sys.argv[2], sys.argv[1]) else 'no')" "$1" "$2"
+}
+AP_NAMES_ADMIN=$(ap_names "$TOK"); AP_NAMES_RW=$(ap_names "$AP_K_RW"); AP_NAMES_RO=$(ap_names "$AP_K_RO")
+# Controls first: a regex that is wrong, or a listing that is unreadable, finds nothing
+# either way.
+check "CONTROL: the admin listing is readable and has a destructive tool in it" "$(ap_has "$AP_NAMES_ADMIN" '(^| )wp_delete_post( |$)')" "yes"
+check "CONTROL: the readwrite listing is readable" "$(ap_has "$AP_NAMES_RW" '(^| )wp_update_post( |$)')" "yes"
+check "CONTROL: the readonly listing is readable" "$(ap_has "$AP_NAMES_RO" '(^| )wp_get_post( |$)')" "yes"
+check "CONTROL: the pattern does find a name that is there" "$(ap_has "$AP_NAMES_ADMIN" 'wp_delete')" "yes"
+AP_NOPE='approv|decline|pending|queue|human'
+check "no approval tool at admin level" "$(ap_has "$AP_NAMES_ADMIN" "$AP_NOPE")" "no"
+check "none at readwrite" "$(ap_has "$AP_NAMES_RW" "$AP_NOPE")" "no"
+check "none at readonly" "$(ap_has "$AP_NAMES_RO" "$AP_NOPE")" "no"
+# By name, with the gate switched off so the answer measured is "no such tool" and not
+# "held because unregistered names are held". With the gate on, an unregistered name is a
+# pending request, which is asserted separately below.
+ap_mode never
+for n in gmcp_approve_request wp_approve_request wp_decline_request wp_list_approvals wp_get_approvals wp_update_approval wp_delete_approval; do
+  ap_call ap_nope "$n" "{\"id\":$AP_R1,\"request_id\":$AP_R1}"
+  check "calling $n by name is refused" "$(verdict ap_nope)" "error"
+  check "and it is refused as unknown, not for some other reason" "$(refusal ap_nope | grep -ci 'unknown tool')" "1"
+done
+ap_call ap_nopec wp_get_option '{"key":"blogname"}'
+check "CONTROL: with the gate off a real tool answers through the same path" "$(verdict ap_nopec)" "ok"
+ap_mode deletes
+check "and nothing moved while the agent tried" \
+  "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals WHERE status=\"pending\"')" "2"
+# The generic tools must not be a way around it. The setting is in the plugin's own options
+# row and the table is not an option at all; the row is guarded by name.
+ap_call ap_opt wp_update_option '{"key":"gmcp_options","value":{"mcp_approval_mode":"never"}}'
+check "the options row holding the mode cannot be rewritten through wp_update_option" "$(verdict ap_opt)" "error"
+check "and the mode is still deletes" "$(ap_stored_mode)" "deletes"
+ap_call ap_optg wp_get_option '{"key":"gmcp_approvals_db_version"}'
+check "the queue's own bookkeeping is not readable through wp_get_option" "$(verdict ap_optg)" "error"
+ap_call ap_optc wp_get_option '{"key":"blogname"}'
+check "CONTROL: wp_get_option does read an ordinary option" "$(verdict ap_optc)" "ok"
+# A readonly key is held to the same rule it always was: it never reaches a gated tool, so
+# it never creates a request either.
+ap_call ap_ro wp_delete_post "{\"ID\":$AP_B,\"force\":true}" "$AP_K_RO"
+check "a readonly key is refused by its level, not queued" "$(verdict ap_ro)" "error"
+check "and no request was created for it" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "2"
+
+echo "   -- only a real wp-admin session can answer --"
+# The CLI as an administrator: the capability is true and the nonce is valid, and it must
+# still be refused, because there is no logged-in cookie and this is not wp-admin.
+check "an administrator identity with a valid nonce is not enough (wp-cli)" \
+  "$(docker compose exec -T cli wp eval --user="$AP_ADMIN_ID" '[$ok]=GMCP_Approvals::decide('"$AP_R1"',"approve",wp_create_nonce(GMCP_Approvals::nonce_action("approve",'"$AP_R1"')));echo $ok?"approved":"refused";' 2>/dev/null | tr -d '\r\n')" "refused"
+check "and the request is still pending" "$(ap_status "$AP_R1")" "pending"
+# The agent's own credential aimed at the real endpoint. It has no cookie and cannot make
+# a nonce, so this fails at the door; the stored state is what is asserted.
+curl -sS -o /dev/null -X POST "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" \
+  -H "Authorization: Bearer $TOK" \
+  --data-urlencode "gmcp_action=approve_request" --data-urlencode "request_id=$AP_R1" \
+  --data-urlencode "gmcp_approval_nonce=0000000000" --data-urlencode "_wpnonce=0000000000"
+check "a bearer key posting to the approve endpoint changes nothing" "$(ap_status "$AP_R1")" "pending"
+
+AP_JAR=$(mktemp)
+curl -sS -c "$AP_JAR" -b "$AP_JAR" -d 'log=admin&pwd=admin&rememberme=forever&testcookie=1' "$BASE/wp-login.php" -o /dev/null 2>/dev/null
+ap_form() { # ap_form <verdict> <request id> -> "<page nonce>|<request nonce>", empty when no such form
+  curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" | python3 -c '
+import re,sys
+html=sys.stdin.read()
+verdict,rid=sys.argv[1],sys.argv[2]
+for f in re.findall(r"<form.*?</form>",html,re.S):
+    if "value=\""+verdict+"_request\"" in f and re.search(r"name=\"request_id\" value=\""+rid+"\"",f):
+        a=re.search(r"name=\"_wpnonce\" value=\"([^\"]+)\"",f)
+        b=re.search(r"name=\"gmcp_approval_nonce\" value=\"([^\"]+)\"",f)
+        if a and b:
+            print(a.group(1)+"|"+b.group(1))
+        break
+' "$1" "$2"
+}
+ap_decide() { # ap_decide <verdict> <request id> [request-nonce override]
+  local n wn an
+  n=$(ap_form "$1" "$2"); wn=${n%%|*}; an=${n##*|}
+  [ -n "${3:-}" ] && an="$3"
+  curl -sS -b "$AP_JAR" -o /dev/null -X POST "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" \
+    --data-urlencode "_wpnonce=$wn" --data-urlencode "gmcp_action=$1_request" \
+    --data-urlencode "request_id=$2" --data-urlencode "gmcp_approval_nonce=$an"
+}
+if grep -q wordpress_logged_in "$AP_JAR"; then
+  check "the Approvals page renders" \
+    "$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null | grep -o '<h1>[^<]*</h1>' | head -n 1)" "<h1>Approvals</h1>"
+  check "CONTROL: the form parser finds the Approve form for a pending request" \
+    "$([ -n "$(ap_form approve "$AP_R1")" ] && echo found || echo MISSING)" "found"
+  AP_PAGE=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null)
+  check "the page lists the pending call with its tool" \
+    "$([ "$(printf '%s' "$AP_PAGE" | grep -c 'wp_delete_post')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "CONTROL: it offers Approve and Decline per request" \
+    "$([ "$(printf '%s' "$AP_PAGE" | grep -c '>Approve<')" -ge 2 ] && [ "$(printf '%s' "$AP_PAGE" | grep -c '>Decline<')" -ge 2 ] && echo yes || echo no)" "yes"
+  # No bulk anything. A select-all box next to Approve is a button pressed without reading.
+  check "the page has no checkboxes, so no bulk selection" "$(printf '%s' "$AP_PAGE" | grep -c 'type="checkbox"')" "0"
+  check "CONTROL: that probe can see form controls (the mode is radio buttons)" \
+    "$([ "$(printf '%s' "$AP_PAGE" | grep -c 'type="radio"')" -ge 3 ] && echo yes || echo no)" "yes"
+
+  echo "   -- a session is necessary and not sufficient: the nonce binds request and verdict --"
+  ap_decide approve "$AP_R1" "badnonce"
+  check "a wrong request nonce answers nothing" "$(ap_status "$AP_R1")" "pending"
+  AP_N2=$(ap_form approve "$AP_R2"); AP_N2=${AP_N2##*|}
+  ap_decide approve "$AP_R1" "$AP_N2"
+  check "another request's nonce answers nothing" "$(ap_status "$AP_R1")" "pending"
+  AP_NDEC=$(ap_form decline "$AP_R1"); AP_NDEC=${AP_NDEC##*|}
+  ap_decide approve "$AP_R1" "$AP_NDEC"
+  check "a decline nonce does not approve" "$(ap_status "$AP_R1")" "pending"
+
+  echo "   -- the approved retry runs once, for that key and those arguments only --"
+  ap_decide approve "$AP_R1"
+  check "a signed-in administrator approves it" "$(ap_status "$AP_R1")" "approved"
+  check "the decision names the person" \
+    "$(ap_q 'SELECT decided_by FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R1")" "$AP_ADMIN_ID"
+  check "valid for fifteen minutes" \
+    "$(ap_q 'SELECT approved_until-decided_at FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R1")" "900"
+  check "approval alone ran nothing" "$(ap_post_state "$AP_B")" "draft"
+  # Different arguments are not covered.
+  ap_call ap_x1 wp_delete_post "{\"ID\":$AP_B,\"force\":false}"
+  check "a different argument set is still held" "$(ap_state ap_x1)" "awaiting_human_approval"
+  check "and still did nothing" "$(ap_post_state "$AP_B")" "draft"
+  # Another key is another caller.
+  AP_K_OTHER=$(ap_key "ap other" admin)
+  ap_call ap_x2 wp_delete_post "{\"ID\":$AP_B,\"force\":true}" "$AP_K_OTHER"
+  check "another key cannot spend this key's approval" "$(ap_state ap_x2)" "awaiting_human_approval"
+  check "and a request of its own was opened for it" "$([ "$(ap_rid ap_x2)" != "$AP_R1" ] && echo yes || echo no)" "yes"
+  check "the victim is still there" "$(ap_post_state "$AP_B")" "draft"
+  # A different tool with the same arguments is not covered either.
+  ap_call ap_x3 wp_delete_media "{\"ID\":$AP_B,\"force\":true}"
+  check "the same arguments to a different tool are held" "$(ap_state ap_x3)" "awaiting_human_approval"
+  check "and did nothing" "$(ap_post_state "$AP_B")" "draft"
+
+  ap_call ap_run wp_delete_post "{\"ID\":$AP_B,\"force\":true}"
+  check "the identical retry from the approved key runs" "$(ap_post_state "$AP_B")" "gone"
+  check "the approval is spent" "$(ap_status "$AP_R1")" "used"
+  check "and the use is in the audit log" "$([ "$(ap_events used)" -ge 1 ] && echo yes || echo no)" "yes"
+  ap_call ap_replay wp_delete_post "{\"ID\":$AP_B,\"force\":true}"
+  check "repeating it is held again, not run twice" "$(ap_state ap_replay)" "awaiting_human_approval"
+  check "exactly one approval has been used" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals WHERE status=\"used\" AND tool=\"wp_delete_post\"')" "1"
+  check "the refused replay is in the audit log" "$([ "$(ap_events replay_refused)" -ge 1 ] && echo yes || echo no)" "yes"
+
+  echo "   -- declining, and the lapse of requests and approvals --"
+  AP_C=$(ap_post "AP victim C")
+  ap_call ap_d1 wp_delete_post "{\"ID\":$AP_C,\"force\":true}"
+  AP_R3=$(ap_rid ap_d1)
+  ap_decide decline "$AP_R3"
+  check "a declined request is stored as declined" "$(ap_status "$AP_R3")" "declined"
+  ap_call ap_d2 wp_delete_post "{\"ID\":$AP_C,\"force\":true}"
+  check "the same call is then refused as an error" "$(verdict ap_d2)" "error"
+  check "saying why" "$(ap_text ap_d2 | grep -ci 'declined')" "1"
+  check "and nothing ran" "$(ap_post_state "$AP_C")" "draft"
+  check "declining is in the audit log" "$([ "$(ap_events declined)" -ge 1 ] && echo yes || echo no)" "yes"
+
+  # A request nobody answers lapses. The clock is moved on the row the plugin itself
+  # wrote, so the code under test is the real one and only the date is faked.
+  AP_E=$(ap_post "AP victim E")
+  ap_call ap_e1 wp_delete_post "{\"ID\":$AP_E,\"force\":true}"
+  AP_R4=$(ap_rid ap_e1)
+  ap_eval 'global $wpdb; $wpdb->update($wpdb->prefix."gmcp_approvals",["expires"=>time()-1],["id"=>'"$AP_R4"']);' >/dev/null
+  ap_decide approve "$AP_R4"
+  check "an expired request is not offered for approval and is stored as expired" "$(ap_status "$AP_R4")" "expired"
+  check "lapsing is in the audit log" "$([ "$(ap_events expired)" -ge 1 ] && echo yes || echo no)" "yes"
+  ap_call ap_e2 wp_delete_post "{\"ID\":$AP_E,\"force\":true}"
+  AP_R5=$(ap_rid ap_e2)
+  check "asking again after a lapse opens a new request" "$([ "$AP_R5" != "$AP_R4" ] && [ "$AP_R5" != "-" ] && echo yes || echo no)" "yes"
+  ap_decide approve "$AP_R5"
+  check "CONTROL: the new request approves" "$(ap_status "$AP_R5")" "approved"
+  ap_eval 'global $wpdb; $wpdb->update($wpdb->prefix."gmcp_approvals",["approved_until"=>time()-1],["id"=>'"$AP_R5"']);' >/dev/null
+  ap_call ap_e3 wp_delete_post "{\"ID\":$AP_E,\"force\":true}"
+  check "an approval older than fifteen minutes does not run the call" "$(ap_post_state "$AP_E")" "draft"
+  check "and is held again" "$(ap_state ap_e3)" "awaiting_human_approval"
+  check "and is stored as expired" "$(ap_status "$AP_R5")" "expired"
+
+  echo "   -- the two-step still applies inside an approved call, on one approval --"
+  ap_call ap_mk wp_create_menu '{"name":"AP Menu"}'
+  check "CONTROL: the menu fixture exists (creating a menu is not held in mode deletes)" \
+    "$(ap_eval 'echo wp_get_nav_menu_object("AP Menu") ? "present" : "absent";')" "present"
+  ap_call ap_m1 wp_delete_menu '{"menu":"AP Menu"}'
+  AP_R6=$(ap_rid ap_m1)
+  check "deleting a menu is held" "$(ap_state ap_m1)" "awaiting_human_approval"
+  ap_decide approve "$AP_R6"
+  ap_call ap_m2 wp_delete_menu '{"menu":"AP Menu"}'
+  check "the approved call reaches the two-step, which changes nothing" \
+    "$(ap_text ap_m2 | grep -ci 'nothing has been changed')" "1"
+  check "so the menu is still there" "$(ap_eval 'echo wp_get_nav_menu_object("AP Menu") ? "present" : "absent";')" "present"
+  check "and the approval was not spent on a call that did nothing" "$(ap_status "$AP_R6")" "approved"
+  AP_TOKEN=$(ap_text ap_m2 | grep -o 'confirm set to "[0-9a-f]*"' | grep -o '[0-9a-f]\{16\}')
+  check "CONTROL: a confirmation token was extracted" "$([ -n "$AP_TOKEN" ] && echo yes || echo no)" "yes"
+  ap_call ap_m3 wp_delete_menu "{\"menu\":\"AP Menu\",\"confirm\":\"$AP_TOKEN\"}"
+  check "the second leg runs under the same approval" \
+    "$(ap_eval 'echo wp_get_nav_menu_object("AP Menu") ? "present" : "absent";')" "absent"
+  check "and spends it" "$(ap_status "$AP_R6")" "used"
+
+  echo "   -- credentials never reach the queue, the page or the log --"
+  ap_mode site
+  ap_call ap_pw wp_create_user '{"user_login":"apuser","user_email":"ap@example.test","user_pass":"APPLAINTEXTMUSTNOTAPPEAR","role":"subscriber"}'
+  AP_R7=$(ap_rid ap_pw)
+  check "creating a user is held in the wider mode" "$(ap_state ap_pw)" "awaiting_human_approval"
+  check "the user was not created" "$(ap_eval 'echo username_exists("apuser") ? "exists" : "absent";')" "absent"
+  check "CONTROL: the stored arguments carry the harmless fields" \
+    "$(ap_q 'SELECT args_view LIKE \"%apuser%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R7")" "1"
+  check "the password is not in the stored arguments" \
+    "$(ap_q 'SELECT args_view LIKE \"%APPLAINTEXTMUSTNOTAPPEAR%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R7")" "0"
+  # The binding hash covers the password, so it must not be a plain digest of it: with the
+  # row in hand, hashing guesses would confirm one offline. The control is that the stored
+  # value DOES equal the keyed form, so the comparison below is measuring the right thing.
+  AP_PW_JSON='{"user_login":"apuser","user_email":"ap@example.test","user_pass":"APPLAINTEXTMUSTNOTAPPEAR","role":"subscriber"}'
+  AP_MAC_CMD='global $wpdb; $a=json_decode(base64_decode("'"$(printf '%s' "$AP_PW_JSON" | base64 | tr -d '\n')"'"),true);
+    $m=(string)$wpdb->get_var("SELECT args_mac FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R7"'");
+    $j=GMCP_Approvals::canonical_json($a);'
+  check "CONTROL: the stored hash equals the keyed form of the arguments" \
+    "$(ap_eval "$AP_MAC_CMD"' echo $m === hash_hmac("sha256","wp_create_user\x1f".$j,wp_salt("auth")) ? "keyed" : "DIFFERENT";')" "keyed"
+  check "and is not a plain digest of them" \
+    "$(ap_eval "$AP_MAC_CMD"' echo $m === hash("sha256","wp_create_user\x1f".$j) ? "PLAIN" : "keyed-only";')" "keyed-only"
+  AP_PAGE=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null)
+  check "CONTROL: the page shows the request" \
+    "$([ "$(printf '%s' "$AP_PAGE" | grep -c 'apuser')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "the page does not show the password" "$(printf '%s' "$AP_PAGE" | grep -c 'APPLAINTEXTMUSTNOTAPPEAR')" "0"
+  check "the audit log does not hold it" "$(leaked_audit APPLAINTEXTMUSTNOTAPPEAR)" "0"
+  check "CONTROL: the audit scan does see a harmless argument of the same call" "$(leaked_audit ap@example.test)" "1"
+  ap_decide decline "$AP_R7"
+  check "(cleanup) the user request is declined" "$(ap_status "$AP_R7")" "declined"
+
+  echo "   -- the setting fails closed --"
+  AP_PN=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null \
+    | python3 -c '
+import re,sys
+html=sys.stdin.read()
+for f in re.findall(r"<form.*?</form>",html,re.S):
+    if "mcp_approval_mode" in f and "gmcp_fields" in f:
+        m=re.search(r"name=\"_wpnonce\" value=\"([^\"]+)\"",f)
+        if m: print(m.group(1))
+        break')
+  check "CONTROL: the settings form nonce was found" "$([ -n "$AP_PN" ] && echo yes || echo no)" "yes"
+  curl -sS -b "$AP_JAR" -o /dev/null -X POST "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" \
+    --data-urlencode "_wpnonce=$AP_PN" --data-urlencode "gmcp_action=save" \
+    --data-urlencode "gmcp_fields=mcp_approval_mode" --data-urlencode "mcp_approval_mode=bogus"
+  check "an unknown mode is stored as the strictest, not as never" "$(ap_stored_mode)" "site"
+  curl -sS -b "$AP_JAR" -o /dev/null -X POST "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" \
+    --data-urlencode "_wpnonce=$AP_PN" --data-urlencode "gmcp_action=save" \
+    --data-urlencode "gmcp_fields=mcp_approval_mode"
+  check "and so is a form that names the field and sends no value" "$(ap_stored_mode)" "site"
+  curl -sS -b "$AP_JAR" -o /dev/null -X POST "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" \
+    --data-urlencode "_wpnonce=$AP_PN" --data-urlencode "gmcp_action=save" \
+    --data-urlencode "gmcp_fields=mcp_approval_mode" --data-urlencode "mcp_approval_mode=never"
+  check "CONTROL: a valid value is accepted" "$(ap_stored_mode)" "never"
+else
+  echo "  ....  approval answers not checked: no wp-admin login (admin/admin) on this stack"
+fi
+
+echo "   -- classification fails closed --"
+check "a tool with no definition is unknown" "$(ap_eval 'echo GMCP_Approvals::classify(null);')" "unknown"
+check "a tool that declares no access level is unknown" \
+  "$(ap_eval 'echo GMCP_Approvals::classify(["name"=>"x_y"]);')" "unknown"
+check "CONTROL: a tool that does declare one is classified" \
+  "$(ap_eval 'echo GMCP_Approvals::classify(["name"=>"wp_delete_post","accessLevel"=>"admin"]);')" "destructive"
+# The classifier trusts the README's definition of the write level ("create and update, no
+# destructive tools"). This is where that trust is checked against the real registered
+# tools, so a destructive tool filed under write fails here instead of passing ungated.
+AP_CONTRACT='do_action("rest_api_init"); $bad=[]; $seen=[]; $n=0;
+  foreach ( apply_filters("gmcp_tools",[]) as $t ) { $n++; $c=GMCP_Approvals::classify($t); $seen[$c]=1;
+    $l=$t["accessLevel"]??null;
+    if ( in_array($l,["read","write"],true) && $c==="destructive" ) { $bad[]=$t["name"]; }
+    if ( $l===null ) { $bad[]=$t["name"]." (no level)"; } }'
+check "CONTROL: the registered tools were enumerated and every class that gates is represented" \
+  "$(ap_eval "$AP_CONTRACT"' echo $n>20 && isset($seen["destructive"],$seen["site"],$seen["read"],$seen["content"]) ? "enumerated" : "NOT ($n)";')" "enumerated"
+check "no read- or write-level tool is destructive, and none lacks a level" \
+  "$(ap_eval "$AP_CONTRACT"' echo $bad ? implode(",",$bad) : "none";')" "none"
+check "a nonsense stored mode is read as the strictest" \
+  "$(ap_mode bogus; ap_eval 'echo GMCP_Approvals::mode();')" "site"
+AP_F=$(ap_post "AP victim F")
+ap_call ap_f1 wp_delete_post "{\"ID\":$AP_F,\"force\":true}"
+check "and under it a destructive call is held, not run" "$(ap_state ap_f1)" "awaiting_human_approval"
+check "the victim is still there" "$(ap_post_state "$AP_F")" "draft"
+ap_call ap_f3 wp_no_such_tool_at_all '{}'
+check "an unregistered tool name is held rather than passed through" "$(ap_state ap_f3)" "awaiting_human_approval"
+ap_mode never
+ap_call ap_f2 wp_delete_post "{\"ID\":$AP_F,\"force\":true}"
+check "CONTROL: with the mode put back to never the same call runs" "$(ap_post_state "$AP_F")" "gone"
+
+echo "   -- the audit chain survived all of it --"
+check "the hash chain still verifies end to end" \
+  "$(ap_eval 'echo GMCP_Audit::verify("all")["ok"] ? "intact" : "BROKEN";')" "intact"
+
+# Put the site back: mode off, queue empty, fixtures gone.
+ap_mode never
+ap_eval 'global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_approvals");' >/dev/null
+docker compose exec -T cli wp post delete "$AP_B" "$AP_C" "$AP_E" --force >/dev/null 2>&1
+docker compose exec -T cli wp user delete apuser --yes >/dev/null 2>&1
+gmcp_clear_other_keys "smoke suite"
+rm -f "$AP_JAR"
 
 echo "-- uninstall leaves nothing behind --"
 # Last, because it empties the plugin out from under everything above. Run through the
@@ -3232,6 +3622,7 @@ docker compose exec -T cli wp eval '
   GMCP_Tokens::create( "uninstall probe", "admin", 0, [], $a ? $a[0]->ID : 0 );
   GMCP_Journal::install();
   GMCP_Audit::install();
+  GMCP_Approvals::install();
   update_option( "gmcp_audit_last_full_verify", [ "at" => time() ], false );' >/dev/null 2>&1
 # The control. Without it, a site that wrote nothing would pass the two checks below by
 # having nothing to leave behind, which is the shape that has produced false passes here
@@ -3239,7 +3630,7 @@ docker compose exec -T cli wp eval '
 UN_OPTS=$(docker compose exec -T cli wp db query "SELECT COUNT(*) FROM ${TABLE_PREFIX:-wp_}options WHERE option_name LIKE 'gmcp\\_%' AND option_name NOT LIKE 'gmcp\\_smoke\\_%'" --skip-column-names 2>/dev/null | tr -d '\r\n')
 UN_TABS=$(docker compose exec -T cli wp db query "SHOW TABLES LIKE '${TABLE_PREFIX:-wp_}gmcp%'" --skip-column-names 2>/dev/null | tr -d '\r' | grep -c .)
 check "CONTROL: the plugin has rows and tables to leave behind" \
-  "$( [ "${UN_OPTS:-0}" -gt 3 ] && [ "${UN_TABS:-0}" -ge 4 ] && echo present || echo "NOTHING TO TEST ($UN_OPTS opts, $UN_TABS tables)" )" "present"
+  "$( [ "${UN_OPTS:-0}" -gt 3 ] && [ "${UN_TABS:-0}" -ge 5 ] && echo present || echo "NOTHING TO TEST ($UN_OPTS opts, $UN_TABS tables)" )" "present"
 # Captured BEFORE the uninstall, which is the whole point: uninstall.php deletes this row
 # along with everything else, so reading it afterwards saves an empty array and restores
 # nothing. The first version of this did exactly that and the restore check below caught it.

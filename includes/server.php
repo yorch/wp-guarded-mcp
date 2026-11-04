@@ -65,6 +65,9 @@ class GMCP_Server {
   private $token_tools = null;
   private $token_id = '';
   private $tool_access_levels = [];
+  // The registered definition per tool (name, access level, annotations, schema), kept so
+  // the approval gate classifies a tool from what it declared and not from a list here.
+  private $tool_definitions = [];
   // Required argument names per tool, taken from each tool's own inputSchema.
   private $tool_required_args = [];
   // Placeholder for OAuth integration. Currently unused and kept for
@@ -1213,6 +1216,14 @@ class GMCP_Server {
     foreach ( $filtered_tools as $tool ) {
       if ( isset( $tool['name'] ) ) {
         $this->tool_access_levels[ $tool['name'] ] = $tool['accessLevel'] ?? 'admin';
+        // accessLevel is copied as declared, NOT defaulted to 'admin' as above: a tool that
+        // declares none must classify as unknown and be held, not pass as an admin tool.
+        $this->tool_definitions[ $tool['name'] ] = [
+          'name' => $tool['name'],
+          'accessLevel' => $tool['accessLevel'] ?? null,
+          'annotations' => $tool['annotations'] ?? [],
+          'inputSchema' => $tool['inputSchema'] ?? [],
+        ];
         $required = $tool['inputSchema']['required'] ?? [];
         $this->tool_required_args[ $tool['name'] ] = is_array( $required ) ? $required : [];
       }
@@ -1526,11 +1537,42 @@ class GMCP_Server {
     } );
   }
 
+  /**
+  * Who is calling, as the approval queue binds it.
+  *
+  * A named key is its id; an OAuth grant is its client and the account that signed in; a
+  * signed-in browser session is the account. Never empty: a caller this cannot name is
+  * 'anonymous', which matches only other anonymous calls and so cannot borrow an approval
+  * given to a key.
+  */
+  private function approval_caller(): array {
+    $user = get_current_user_id();
+    if ( $this->auth_method === 'bearer' && $this->token_id !== '' ) {
+      $identity = 'key:' . $this->token_id;
+    }
+    elseif ( $this->auth_method === 'oauth' ) {
+      $identity = 'oauth:' . (string) $this->auth_client_id . ':' . $user;
+    }
+    elseif ( $user > 0 ) {
+      $identity = 'user:' . $user;
+    }
+    else {
+      $identity = 'anonymous';
+    }
+    return [
+      'identity' => $identity,
+      'label' => (string) $this->auth_client_name,
+      'auth_method' => (string) $this->auth_method,
+      'user_id' => $user,
+    ];
+  }
+
   private function execute_tool( $tool, $args, $id ) {
     $start = microtime( true );
     $response = null;
     $status = 'error';
     $error_msg = null;
+    $claim = 0;
     $this->arm_fatal_net( $tool, $id );
 
     // Paired with gmcp_tool_called in the finally block below. The change journal uses
@@ -1588,6 +1630,41 @@ class GMCP_Server {
             'content' => [ [ 'type' => 'text', 'text' => $error_msg ] ],
             'isError' => true,
           ],
+        ];
+        return $response;
+      }
+
+      // The human approval gate. Here and not earlier or later, for three reasons.
+      //
+      // It is the one function every tools/call passes through: handle_direct_jsonrpc()
+      // is the only caller, and gmcp_callback, which the tool classes answer, is applied
+      // below it (and by the resource layer, which only borrows read tools). A gate in a
+      // tool class would be one gate per class, which is how the option policy once
+      // protected one writer and not the others.
+      //
+      // It is after the access, key-scope and required-argument checks, so a call that
+      // would have been refused anyway never becomes a request a person has to read, and
+      // a request is only ever for a call that would otherwise have run.
+      //
+      // It is before the dispatch, so a held call has done nothing at all.
+      GMCP_Core::$gate_withheld = false;
+      $held = GMCP_Approvals::gate( (string) $tool, (array) $args, $this->tool_definitions[ $tool ] ?? null, $this->approval_caller() );
+      $claim = (int) ( $held['claim'] ?? 0 );
+      if ( empty( $held['run'] ) ) {
+        // Not an isError reply when it is a wait: the call did not fail, it is pending, and
+        // a client that treats isError as "retry differently" would send the agent hunting
+        // for a workaround. Status is 'held' so the audit log records it as refused rather
+        // than as a call that succeeded: nothing ran.
+        $is_error = !empty( $held['is_error'] );
+        $error_msg = $held['text'];
+        $status = $is_error ? 'error' : 'held';
+        $response = [
+          'jsonrpc' => '2.0',
+          'id' => $id,
+          'result' => [
+            'content' => [ [ 'type' => 'text', 'text' => $held['text'] ] ],
+            'data' => $held['data'],
+          ] + ( $is_error ? [ 'isError' => true ] : [] ),
         ];
         return $response;
       }
@@ -1691,6 +1768,9 @@ class GMCP_Server {
       return $response;
     }
     finally {
+      // Before anything else in here: gives an approval back when the call only issued a
+      // two-step token. @see GMCP_Approvals::finish().
+      GMCP_Approvals::finish( $claim );
       self::$currentToolCall = null;
       $duration_ms = (int) round( ( microtime( true ) - $start ) * 1000 );
       // Fire the action even on access denials and errors so admins can see

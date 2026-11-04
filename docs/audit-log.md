@@ -285,6 +285,19 @@ underneath, that all fifty thousand entries were intact and nothing had changed
 since. A remembered break is kept either way, because it covers rows the window
 cannot reach and the window finding nothing does not answer it.
 
+## Approval events are rows in the same chain
+
+When the human approval queue is on, a person answering a request, a request lapsing
+and a refused replay are not tool calls, so nothing would have recorded them. They are
+written through `GMCP_Audit::record_event()` into the same chain, under the names
+`approval:requested`, `approval:approved`, `approval:declined`, `approval:expired`,
+`approval:used` and `approval:replay_refused`, with the gated tool as the target and the
+request id and calling key as the arguments. The held call itself is recorded as a
+refusal, since nothing ran. If the log is switched off none of this is written; the
+queue keeps its own rows for 30 days either way. The agent can read these rows through
+`wp_get_audit_log` like any other, which tells it nothing it could use to approve: an id
+grants nothing.
+
 ## The agent can read the log
 
 An agent can read the log through `wp_get_audit_log` at `admin` level, filtered

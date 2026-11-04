@@ -28,6 +28,7 @@ function gmcp_uninstall_site() {
   // know to remove it. The key table holds credential hashes, which have the same problem.
   delete_option( 'gmcp_activity' );
   delete_option( 'gmcp_audit_db_version' );
+  delete_option( 'gmcp_approvals_db_version' );
   delete_option( 'gmcp_audit_hash_boundary' );
   delete_option( 'gmcp_audit_stopped' );
   delete_option( 'gmcp_journal' );
@@ -48,7 +49,9 @@ function gmcp_uninstall_site() {
   // page design said before an agent changed it, which is the same reason the journal
   // option above is deleted rather than left to age out.
   $gmcp_snapshots = $wpdb->prefix . 'gmcp_meta_snapshots';
-  $wpdb->query( "DROP TABLE IF EXISTS {$gmcp_tokens}, {$gmcp_clients}, {$gmcp_audit}, {$gmcp_snapshots}" );
+  // Pending approvals hold redacted tool arguments; they go with the rest.
+  $gmcp_approvals = $wpdb->prefix . 'gmcp_approvals';
+  $wpdb->query( "DROP TABLE IF EXISTS {$gmcp_tokens}, {$gmcp_clients}, {$gmcp_audit}, {$gmcp_snapshots}, {$gmcp_approvals}" );
 
   // The prune schedule outlives the plugin files otherwise, and WordPress will keep firing
   // an action nothing listens to until somebody notices.

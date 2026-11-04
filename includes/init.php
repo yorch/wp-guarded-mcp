@@ -38,6 +38,7 @@ spl_autoload_register( function ( $class ) {
     'GMCP_Preview' => '/includes/preview.php',
     'GMCP_Audit' => '/includes/audit.php',
     'GMCP_Audit_Table' => '/includes/audit-table.php',
+    'GMCP_Approvals' => '/includes/approvals.php',
     'GMCP_Backup' => '/includes/backup.php',
     'GMCP_Changes' => '/includes/changes.php',
     'GMCP_Journal' => '/includes/journal.php',
@@ -65,6 +66,7 @@ register_activation_hook( GMCP_ENTRY, function () {
   require_once( GMCP_PATH . '/includes/audit.php' );
   require_once( GMCP_PATH . '/includes/journal.php' );
   GMCP_Audit::install();
+  GMCP_Approvals::install();
   // The journal's meta snapshots. Created here as well as lazily from the journal's own
   // constructor, so a site that has the change journal switched off still has the table
   // waiting rather than creating it on the first request after somebody switches it on.
