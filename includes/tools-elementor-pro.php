@@ -179,7 +179,9 @@ class GMCP_Tools_Elementor_Pro {
   private function table_exists( string $name ): bool {
     global $wpdb;
     $table = $wpdb->prefix . $name;
-    return $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) === $table;
+    // esc_like: an underscore in LIKE matches any character, so wp_e_submissions could
+    // otherwise be satisfied (or preceded in the result) by a different table of that length.
+    return $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) === $table;
   }
 
   /** The Pro form-submission tables that are present, and those that are not. */
@@ -234,7 +236,8 @@ class GMCP_Tools_Elementor_Pro {
       'pro_loaded' => $this->loaded(),
       'pro_version' => defined( 'ELEMENTOR_PRO_VERSION' ) ? (string) ELEMENTOR_PRO_VERSION : null,
       'elementor_version' => defined( 'ELEMENTOR_VERSION' ) ? (string) ELEMENTOR_VERSION : null,
-      'theme_builder_loaded' => (bool) did_action( 'elementor/loaded' ),
+      'elementor_loaded' => (bool) did_action( 'elementor/loaded' ),
+      'theme_builder_loaded' => $this->module_available( 'theme_builder' ),
       'modules' => $modules,
       'library_template_counts' => $library,
       'submissions' => [
@@ -310,11 +313,21 @@ class GMCP_Tools_Elementor_Pro {
     // Counted directly, and by status explicitly. Pro's own count_submissions_by_status()
     // returns a Collection rather than an array, and its totals merge read/unread into
     // "all", so neither is a good source for numbers this specific.
+    // A failed query is not a zero. get_results() answers null on an error (a column an older
+    // Pro schema lacks, a table dropped since the check above), and coercing that to an empty
+    // list would report "no submissions" in the one file whose purpose is never to.
+    $wpdb->last_error = '';
     $rows = $wpdb->get_results(
       "SELECT status, is_read, COUNT(*) AS n FROM `{$table}` GROUP BY status, is_read",
       ARRAY_A
     );
-    $rows = is_array( $rows ) ? $rows : [];
+    if ( !is_array( $rows ) || $wpdb->last_error !== '' ) {
+      return $this->json( $r, [
+        'table_exists' => true,
+        'counts' => null,
+        'note' => 'The submissions table exists but counting it failed (' . ( $wpdb->last_error !== '' ? $wpdb->last_error : 'no rows result' ) . '), so no count is reported. This is not a zero.',
+      ] );
+    }
 
     $all = 0;
     $unread = 0;
