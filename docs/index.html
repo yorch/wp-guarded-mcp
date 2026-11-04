@@ -242,9 +242,11 @@ pre code { color: var(--ink); }
       </div>
       <div class="entry">
         <p class="head"><code>wp_undo_change</code> <span>puts an edit back</span></p>
-        <p>It remembers what a setting or a post said before an agent changed it. Only writes
-        made through the API are recorded, never your own, and reverting needs the same access
-        the original change needed.</p>
+        <p>It remembers what a setting, a post, a custom field, a term, a post's terms or a
+        theme setting said before an agent changed it. Only writes made through the API are
+        recorded, never your own, and reverting needs the same access the original change
+        needed. An undo is recorded too, so it can be undone, unless the thing has changed
+        since. Creations, deletions and users cannot be undone.</p>
       </div>
       <div class="entry refuse">
         <p class="head"><span>no restore tool, at any access level</span></p>

@@ -664,7 +664,10 @@ The critical one is `wp_set_theme_mod`: it uses `set_theme_mod`, which merges on
 key, where `wp_update_option` on the same row does a full-array replace and a
 mistake wipes every other mod. The row passes through the same `option_guard`
 and `option_write_policy` as any other option, and the change journal recognises
-`theme_mods_*` rows, so `wp_undo_change` can put a write back.
+`theme_mods_*` rows, so `wp_undo_change` can put a write back. It does so one
+setting at a time: the row is a single array holding every Customizer value, and
+restoring the whole of it would throw away any other setting changed since. See
+[Undo](#undo).
 
 ## Batch create
 
@@ -708,11 +711,12 @@ the write it was protecting.
 
 ## Undo
 
-`wp_list_changes` and `wp_undo_change` put back a setting or post an agent
-*modified*. The change capture layer listens to WordPress rather than to the
-tools, so it also covers widgets, which live in options, and menu items, which
-are posts. Only writes made during a tool call are recorded, never a person's own
-edits.
+`wp_list_changes` and `wp_undo_change` put back something an agent *modified*:
+an option or setting, a post, a custom field, a term's name, slug, description or
+parent, which terms a post carries, and a single theme setting. The change capture
+layer listens to WordPress rather than to the tools, so it also covers widgets,
+which live in options, and menu items, which are posts with some custom fields.
+Only writes made during a tool call are recorded, never a person's own edits.
 
 That layer is shared with the audit log, which wants the same facts from the
 other side: the journal keeps the previous value so it can put it back, the
@@ -720,13 +724,15 @@ audit log keeps a description of the difference so a reader can see what moved.
 Two copies of the same diff would drift, and the day somebody added a field to
 one list the other would quietly stop mentioning it.
 
-Undo records modifications and not creations or deletions of posts, and that is
-a real limit rather than a nicety. The capture layer reports both and the
-journal declines them: putting back a creation means deleting something, and
-putting back a deletion means recreating it, and neither is the same write in
-reverse. Users, comments, terms, plugins, themes and media are reported too and
-journalled none of them, for the same reason. The audit log has all of it,
-which is the difference between the record and undo. Deleting a post without
+Undo records modifications and not creations or deletions, of posts, terms,
+menus, menu items or users, and that is a real limit rather than a nicety. The
+capture layer reports them and the journal declines them: putting back a
+creation means deleting something, and putting back a deletion means recreating
+it with its old id, its children, its relationships and its meta, and neither is
+the same write in reverse. Adding or deleting a menu item is a creation or a
+deletion in this sense; editing one is not. Users, comments, plugins, themes and
+media are reported too and journalled none of them, for the same reason. The audit
+log has all of it, which is the difference between the record and undo. Deleting a post without
 `force` puts it in the trash, where WordPress can restore it, which covers the
 most common case by accident rather than by design.
 
@@ -739,6 +745,42 @@ this gets used to build. The noise that used to be the argument against it is
 handled by a short filterable list, `gmcp_meta_noise_keys`, holding the keys that
 say who is editing rather than what the post holds and the ones Elementor
 derives from the document and regenerates on demand.
+
+Three more kinds are journalled, each because it is an edit that has an exact
+reverse. A term edit keeps the previous name, slug, description and parent, and
+puts back only the fields the edit changed; a menu is a term, so renaming one is
+covered. A change to which terms a post carries keeps the earlier set of term
+ids and sets it again, which is the reverse of both an append and a replace
+because the entry records the set rather than the argument. The terms a post is
+given while it is being created are not recorded, because they are part of a
+creation, and neither are the `nav_menu` assignments that attach an item to its
+menu. A theme setting keeps the previous value of one key of the
+`theme_mods_<stylesheet>` row and writes that key back into whatever the row
+holds now, so undoing a menu-location assignment cannot discard a colour changed
+afterwards. A change that moves more than ten keys of the row at once is kept as
+one whole-row entry, as it used to be, so a single option write cannot fill the
+log by itself. Credential-shaped keys and values are judged by the same two
+tests as a meta value and are recorded as changed without a copy.
+
+Reverting a post, a custom field or a set of terms also asks
+`commerce_post_guard()`, because an order and a subscription are `wp_posts` rows
+and the policy about them belongs to the post type rather than to the tool that
+is writing it. Revert now enforces that for itself instead of relying on the
+original write having been refused.
+
+An undo is recorded as a change of its own. The entry keeps what the undo
+overwrote, names the entry it reversed, and carries the tool of the original, so
+reverting it needs the same permissions as the original did. Reverting it puts
+the edit back, and that can be done again in turn. The first undo of an ordinary
+entry has never refused because something changed since: it restores the fields
+the entry recorded and leaves everything else alone, which is what lets a title
+be put back on a post that has since been rewritten. The undo of an undo has no
+such excuse, because it restores a whole recorded value taken before whatever
+happened next, so it is refused when the target is no longer in the state the undo
+left it in. That state is stored as a hash measured from the stored value after the
+write, never as a second copy of it. Where the value the undo is about to overwrite
+holds a credential, the undo is recorded as not reversible instead of being copied,
+for the reason the original is not.
 
 Previous meta values live in a table of their own rather than in the journal's
 option row, because `_elementor_data` runs past 100KB and the option's per-value

@@ -1132,7 +1132,7 @@ class GMCP_Tools_Core {
   */
   private function batch_undo_note( bool $wrote_meta ): string {
     $note = 'wp_undo_change cannot remove a created post: the change journal records option'
-      . ' writes, post updates and custom fields, and has no entry for a creation. Delete the'
+      . ' writes, post updates, custom fields, term edits and term assignments, and has no entry for a creation. Delete the'
       . ' ids above with wp_delete_post instead.';
     if ( !$wrote_meta ) {
       return $note . ' This call journalled nothing, so it has no group to revert.';
@@ -1305,7 +1305,7 @@ class GMCP_Tools_Core {
       /* -------- Options -------- */
       'wp_list_changes' => [
         'name' => 'wp_list_changes',
-        'description' => 'List recent changes this API made that can be put back, newest first. Each entry has an id to pass to wp_undo_change. Only writes made through this API are recorded, never changes a person made in wp-admin.',
+        'description' => 'List recent changes this API made that can be put back, newest first. Each entry has an id to pass to wp_undo_change. Covered: setting and option writes (a Customizer theme setting, including a menu-location assignment, is one entry per setting), post edits, custom fields, term edits (name, slug, description, parent, which includes renaming a menu), and which terms a post carries. Menu item edits are covered because a menu item is a post and some custom fields; adding or deleting one is not. NOT covered: creations, deletions and users. An undo is listed as its own entry with an undoes field naming the entry it reversed, and reverting that entry puts the edit back. Only writes made through this API are recorded, never changes a person made in wp-admin.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1316,7 +1316,7 @@ class GMCP_Tools_Core {
       ],
       'wp_undo_change' => [
         'name' => 'wp_undo_change',
-        'description' => 'Put one recorded change back the way it was, by the id from wp_list_changes. Restores only the fields that changed, so later unrelated edits are left alone. Cannot be applied twice. Pass "call" instead of "id" to put back everything one tool call did: a single call routinely changes several things, since writing a page can move an option another plugin keeps in step with it and a page-builder save writes a handful of meta keys, and those arrive as separate entries sharing a call id. Reverting a whole call goes newest first, because two entries can touch the same row and replaying them in the order they happened leaves the value the call set rather than the value it found. Partial success is reported as partial: an individual entry can still be irreversible on its own.',
+        'description' => 'Put one recorded change back the way it was, by the id from wp_list_changes. Restores only the fields that changed, so later unrelated edits are left alone. An entry cannot be applied twice, but the undo is itself recorded as a new entry (named in the reply and shown by wp_list_changes with an undoes field), and reverting THAT entry puts the edit back. That second step is refused if the target has changed since the undo, so it cannot overwrite newer work with an older copy. Covers settings, posts, custom fields, term edits, a post\'s term assignments and individual theme settings; it cannot undo a creation, a deletion or a user change. Pass "call" instead of "id" to put back everything one tool call did: a single call routinely changes several things, since writing a page can move an option another plugin keeps in step with it and a page-builder save writes a handful of meta keys, and those arrive as separate entries sharing a call id. Reverting a whole call goes newest first, because two entries can touch the same row and replaying them in the order they happened leaves the value the call set rather than the value it found. Partial success is reported as partial: an individual entry can still be irreversible on its own.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1394,7 +1394,7 @@ class GMCP_Tools_Core {
       ],
       'wp_set_theme_mod' => [
         'name' => 'wp_set_theme_mod',
-        'description' => 'Set a single theme modification value for the active theme. Uses set_theme_mod(), which merges one key into the theme_mods_<stylesheet> array rather than replacing the whole row, so nav_menu_locations, sidebars_widgets and the other keys in that row are left alone. This is the safe primitive for changing a customizer value: wp_update_option on theme_mods_* does a full-array replace and a mistake wipes every other mod. The write is journalled, so wp_undo_change can put it back.',
+        'description' => 'Set a single theme modification value for the active theme. Uses set_theme_mod(), which merges one key into the theme_mods_<stylesheet> array rather than replacing the whole row, so nav_menu_locations, sidebars_widgets and the other keys in that row are left alone. This is the safe primitive for changing a customizer value: wp_update_option on theme_mods_* does a full-array replace and a mistake wipes every other mod. The write is journalled one setting at a time, so wp_undo_change puts back this key and leaves every other setting as it is now.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1413,7 +1413,7 @@ class GMCP_Tools_Core {
       ],
       'wp_remove_theme_mod' => [
         'name' => 'wp_remove_theme_mod',
-        'description' => 'Remove a single theme modification value for the active theme, so the customizer falls back to its default for that key. Uses remove_theme_mod(), which removes one key from the theme_mods_<stylesheet> array rather than deleting the row. The removal is journalled as an update (the previous value is kept), so wp_undo_change can put it back.',
+        'description' => 'Remove a single theme modification value for the active theme, so the customizer falls back to its default for that key. Uses remove_theme_mod(), which removes one key from the theme_mods_<stylesheet> array rather than deleting the row. The removal is journalled as an update to that one setting (the previous value is kept), so wp_undo_change can put it back without touching the other settings.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1890,7 +1890,7 @@ class GMCP_Tools_Core {
       ],
       'wp_update_term' => [
         'name' => 'wp_update_term',
-        'description' => 'Update a term.',
+        'description' => 'Update a term: its name, slug, description or parent. The previous values are journalled, so wp_undo_change can put them back. Deleting a term is not recorded and cannot be undone.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1934,7 +1934,7 @@ class GMCP_Tools_Core {
       ],
       'wp_add_post_terms' => [
         'name' => 'wp_add_post_terms',
-        'description' => 'Attach or replace terms for a post. By default (append true) the terms are ADDED to the ones the post already has; pass "append": false to REPLACE them all. Terms are term ids; for a hierarchical taxonomy such as category, a name is looked up and refused if it does not exist, and for a flat one such as post_tag a new name creates the tag. The reply lists the term ids the post holds afterwards. Use for categories, tags, or WooCommerce attributes (pa_color, pa_size, etc.).',
+        'description' => 'Attach or replace terms for a post. By default (append true) the terms are ADDED to the ones the post already has; pass "append": false to REPLACE them all. Terms are term ids; for a hierarchical taxonomy such as category, a name is looked up and refused if it does not exist, and for a flat one such as post_tag a new name creates the tag. The reply lists the term ids the post holds afterwards. Use for categories, tags, or WooCommerce attributes (pa_color, pa_size, etc.). The set of terms the post held before is journalled, so wp_undo_change can put it back; the first terms given to a post as it is created are not.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
