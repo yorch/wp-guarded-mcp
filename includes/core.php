@@ -418,7 +418,6 @@ class GMCP_Core {
       'initial_db_version' => 'It records the schema the site was installed at, which upgrade routines read to decide what to skip.',
       'cron' => 'The entire schedule is this one row. Deleting it silently drops every scheduled event on the site: publishing, backups, renewals, WooCommerce actions. Nothing errors; things just stop happening.',
       'admin_email' => 'It is where recovery mail, password resets and fatal-error notices go. Without it nobody is told when the site is in trouble.',
-      'default_role' => 'New accounts take their role from it. Without it, an account created by the registration form or by a plugin gets no role at all.',
     ];
   }
 
