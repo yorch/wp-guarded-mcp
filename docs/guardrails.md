@@ -209,6 +209,117 @@ start of the name would miss the row it most needs to catch. It replaced a list
 of exact names, which had been wrong twice: the change journal was readable until
 somebody named it, and that transient was never on it.
 
+### Diagnostics: the error log, a page as a visitor sees it, and draft preview links
+
+Four tools in the administration group, for the question "why is this page
+broken, and what does the client see". Each is a place where an agent is handed
+something that looks harmless and is not, so each says what it cannot promise.
+
+- **`wp_get_php_error_log`** (`admin`) reads the end of the file PHP is
+  configured to log to and nothing else. There is no path argument, so there is
+  no path to validate: the file is whatever `ini_get('error_log')` says, which
+  WordPress itself points at `wp-content/debug.log` or at the `WP_DEBUG_LOG`
+  path. A configured file is still refused if its name is not log-shaped, if it
+  is a script or a configuration file, or if it is a symbolic link, so a
+  misconfigured or swapped value cannot turn it into a general file reader.
+  It reads from the end of the file, at most 256KB of it, through a handle whose
+  type is checked after it is opened, so a multi-gigabyte log costs what a small
+  one does. It has no search and no pattern argument; the model asks for the last
+  N lines and filters them itself.
+- Every line is scrubbed before it leaves: values under credential-shaped names
+  (the same `gmcp_credential_field_patterns` list the audit log and journal
+  use), bearer and basic credentials, user information in URLs, JWTs, password
+  hashes, this plugin's own keys, long opaque tokens, e-mail addresses, public IP
+  addresses (loopback and private ones stay, because `connect to 127.0.0.1` is
+  the diagnosis), the argument values in stack frames, and the values in a failed
+  SQL query past its first 120 characters. Paths are shown as `[content]/` and
+  `[abspath]/`. This recognises shapes. A secret written into an ordinary
+  sentence survives it, and so does personal data in a message PHP assembled from
+  a form, which is why the tool is `admin` and not `read`.
+- The reply distinguishes the cases that all look like "nothing to see":
+  logging is not going to a file at all, a file is configured and does not exist
+  yet, it exists and is empty, it has lines. It also reports `WP_DEBUG`,
+  `WP_DEBUG_LOG` and `log_errors` next to the answer, and says when the newest
+  entry is a week old and logging looks off. "Empty" is a statement about a
+  file, and the reply says it is not proof that logging is on.
+- **`wp_fetch_page`** (`admin`) makes the server request one URL of its own site
+  and reports status, redirects, title, robots signals, canonical and a bounded
+  excerpt of the visible text, optionally counting an expected string. It is the
+  only tool here that makes an outbound request, so it is built around the one
+  way that goes wrong. The URL must have the same scheme, host and port as the
+  site's address and a path inside the site's own path; it must be plain ASCII
+  with no backslash or user information, and the URL actually sent is rebuilt
+  from the parsed parts, never the string supplied, so a parser disagreement
+  between PHP and the HTTP client has nothing to exploit. The host is resolved
+  here, every address returned must be acceptable (a name with one public and one
+  internal record is refused), and the connection is pinned to the address that
+  was checked, so the answer cannot change between the check and the connect. If
+  the pin cannot be applied (the HTTP transport is not cURL, or another plugin
+  short-circuits the HTTP API) the response is discarded. Link-local, reserved
+  and multicast addresses are refused for every site, which is where the cloud
+  metadata service lives. Private and loopback addresses are accepted only when
+  the site's own host name is local (`localhost`, a bare name, an IP in those
+  ranges, `.test`, `.local` and similar); a production host name that resolves
+  privately is refused unless the site opts in through `gmcp_fetch_allow_private`.
+  Redirects are followed by hand, up to five, and each hop goes through the same
+  check, so a redirect off the site, to another port or to a metadata address is
+  reported and not followed. No cookies and no credentials are sent. The body is
+  cut at 1MB and only HTML is read.
+- Why `admin` and not `read`: the request originates from the server, so it
+  arrives from the one address a site's own IP allowlists and loopback-only
+  handlers trust. `wp-admin`, `wp-json`, `wp-login.php`, `wp-cron.php`,
+  `xmlrpc.php`, any other `.php` file and a short list of query parameters that
+  change state on common plugins (`add-to-cart`, `wc-ajax`, `action` and others)
+  are refused. That list is a list. A front-end route on this site whose GET has
+  a side effect and an unfamiliar name is still reachable, and the tool says so
+  in its description rather than implying otherwise.
+- Page text is somebody else's words. Everything under `page_content_untrusted`
+  was written by whoever controls the page, and the reply says to treat it as
+  data. Elements marked `hidden`, `aria-hidden` or `display:none` inline, and
+  scripts, styles and templates, are left out so the excerpt is what is shown
+  and not what is merely present; a page that hides text with a CSS class cannot
+  be seen through from here and is not claimed to be.
+- **`wp_create_preview_link`** and **`wp_revoke_preview_links`** (`write`)
+  give someone with no account a way to read ONE unpublished post. A link is
+  `?p=ID&gmcp_preview=TOKEN` (`page_id` for a page). The token is 160 random
+  bits, shown once; the site keeps only its hash, the post id and an expiry in an
+  option whose name contains `gmcp_`, so every generic option tool refuses it and
+  an agent cannot lengthen a link by editing the row. Stored rather than signed,
+  because a signature cannot be revoked, carries whatever lifetime it was signed
+  with, and would bring every old link back when a published post is reverted to
+  a draft.
+- Verification happens on the front end, on the MAIN query only. `pre_get_posts`
+  accepts the token only when the request is already a single-post request for
+  exactly the post the token was issued for, and only then lets that query
+  return a draft, pending or scheduled post. `posts_results` empties the result
+  unless it is exactly that post in one of those states, and `template_redirect`
+  checks the queried object and expiry again before sending `X-Robots-Tag:
+  noindex`, `Referrer-Policy: no-referrer` (the token is in the URL, and the
+  Referer header would carry it to every external image on the page) and
+  no-store headers, and switching off canonical redirects that would drop it.
+  The statuses it can ever show are `draft`, `pending` and `future`: on a
+  published, private or trashed post the query matches nothing and the answer is
+  a 404, and publishing, trashing or deleting a post deletes its links so
+  reverting does not revive them. Lifetime is 24 hours by default, at most 168.
+  Feeds, embeds, trackbacks and the REST API never honour a token.
+- The link is a bearer credential and it travels in a URL, where no field name
+  marks it secret. `GMCP_Core::redact()` therefore scrubs the `gmcp_preview`
+  parameter out of every string it is handed, which is what the audit log's
+  arguments and the debug trace both use, and the audit log applies the same
+  scrub to the reply it keeps. Without it the tool that hands the link out would
+  have written it into the audit log in the clear in the same call, which the
+  first test of it showed. The fetch tool refuses a URL carrying the parameter
+  for the same reason: it would be recorded as an argument, and a preview
+  credential has no business being fetched by a tool that cannot show a draft
+  anyway.
+- Not closed, and said so: viewing a link is not logged (only issuing and
+  revoking are); anyone who is given the link can forward it; a link pasted into a
+  post body or a message is outside what the audit log's scrub can see; the
+  window between the address check and the connect is closed by pinning only
+  where the HTTP transport is cURL; and a site that is behind a proxy configured
+  through `WP_PROXY_HOST` has its connection made by the proxy, which pins
+  nothing.
+
 ## WooCommerce
 
 Separate from site administration because the risk is a different shape. The

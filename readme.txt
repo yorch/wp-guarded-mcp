@@ -35,7 +35,7 @@ The guardrails exist because an agent administering your site also reads comment
 
 Content and site data: posts, pages, block content, taxonomies, comments, media, users, post meta, site options, post types and block patterns.
 
-Site administration (off by default): plugins and themes; menus; widgets; General/Reading/Discussion settings; permalinks; scheduled events; Site Health.
+Site administration (off by default): plugins and themes; menus; widgets; General/Reading/Discussion settings; permalinks; scheduled events; Site Health; the PHP error log; a page fetched as a visitor sees it; expiring preview links for unpublished posts.
 
 WooCommerce, WooCommerce Subscriptions, Elementor, Elementor Pro, Kirki, Yoast SEO, Rank Math and All in One SEO, form submissions from Contact Form 7 (through Flamingo), Fluent Forms and Ninja Forms (read only), ACF, Gravity Forms, LearnDash, WP Activity Log, Redirection and Polylang, each on a switch of its own that appears only when the plugin is installed.
 
@@ -134,6 +134,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * MCP prompts for common upkeep jobs, and MCP resources for attaching site content to a conversation.
 * A one-call site briefing, so an agent orients in one request rather than six.
 * Tool failures arrive as results the model can read, with isError set, rather than as JSON-RPC errors a client may discard along with the rest of the response.
+* Three diagnostics in the administration group. The PHP error log can be read from the end, only the file the site itself logs to, with credentials, tokens, e-mail addresses and public IP addresses scrubbed from every line, and with "logging is off", "no file yet" and "the file is empty" kept as three different answers. A page of this site can be fetched the way an anonymous visitor receives it (this site's own host only, GET only, redirects off the site reported and not followed). A draft can be shared through an expiring, non-indexed link that opens that one post and no other, for 24 hours by default and 7 days at most. Viewing a preview link is not logged.
 * Scheduled events can be listed, run and removed, so a cron event Site Health keeps flagging can be diagnosed and cleared. Only events the site already scheduled can be run, and removing one takes a confirmation step.
 * Copy post meta between posts, duplicate a post, and write or read an oversized value across several calls, so a large design never has to pass through a tool argument. A duplicate is a draft unless you ask otherwise.
 * Post meta keeps its backslashes. WordPress unslashes every meta value it stores, which used to turn a regex, a Windows path or a JSON payload into something that no longer meant what was sent, while the tool still reported success. Every meta writer now goes through one function that slashes the value and decodes a JSON string for an array, so an ordinary update no longer needs the chunked writer to survive.

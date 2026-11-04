@@ -1318,7 +1318,7 @@ class GMCP_Settings {
               </label>
               <label>
                 <input type="checkbox" name="mcp_tools_admin" value="1" <?php checked( !empty( $options['mcp_tools_admin'] ) ); ?>>
-                <?php esc_html_e( 'Site administration (plugins, themes, menus, widgets, settings, permalinks, site health)', 'guarded-mcp' ); ?>
+                <?php esc_html_e( 'Site administration (plugins, themes, menus, widgets, settings, permalinks, site health, error log, page fetch, preview links)', 'guarded-mcp' ); ?>
               </label>
               <?php if ( $woo ) : ?>
                 <label>

@@ -131,7 +131,14 @@ plugins and themes; navigation menus and their items; widgets and widget areas; 
 General, Reading and Discussion settings; the permalink structure; the site's scheduled
 events; and a Site Health report. `wp_flush_cache` purges the object cache, expired
 transients, or one post. `wp_purge_url` drops one page from each page cache it can name.
-Options can be deleted, not only set.
+Options can be deleted, not only set. Three diagnostics ride on the same switch:
+`wp_get_php_error_log` reads the end of the file PHP is configured to log to (it takes no
+path, scrubs every line, and says whether logging is off, the file is absent, or it is
+empty); `wp_fetch_page` requests one page of this site the way an anonymous visitor does
+and reports status, redirects, robots signals and a bounded excerpt of the text (this
+site's own host only, `admin` level); and `wp_create_preview_link` /
+`wp_revoke_preview_links` make and end an expiring, non-indexed link to one unpublished
+post, 24 hours by default and 7 days at most. Viewing a preview link is not logged.
 
 **WooCommerce**, off by default, and the switch only appears when the shop is installed:
 products, stock levels, orders, order notes, customers, a sales summary and a store
@@ -462,6 +469,7 @@ Other hooks:
 | `gmcp_backup_providers` | Register an adapter for a backup plugin this one cannot drive |
 | `gmcp_can_call_tool` | Answers whether the caller could call a given tool. The change journal asks it before replaying a write, so this is the gate on undo |
 | `gmcp_allow_remote_install` | Permit installs from a URL rather than the wordpress.org repository |
+| `gmcp_fetch_allow_private` | Let `wp_fetch_page` connect to a private address for a site whose own host name is not obviously a local one. The link-local and reserved ranges cannot be opened this way |
 | `gmcp_allow_unfiltered_post_html` | Store post HTML unfiltered |
 | `gmcp_allow_unfiltered_widget_html` | Store widget HTML unfiltered |
 | `gmcp_instructions` | The text a client shows its model at session start. Receives the default and the site URL; return a string to replace it |
@@ -473,6 +481,8 @@ Other hooks:
 - Keys are stored as a SHA-256 hash and shown once, so the database holds nothing that can be replayed. A key also records the administrator who created it and acts as that account, which is what lets the log name a person; it stops working the moment that account stops holding `manage_options`, so revoking somebody's access revokes their agent with it.
 - No row belonging to this plugin, and no option whose name looks like a credential, can be read or written through the option tools. The change journal additionally inspects the value it is about to record, so a `secret_key` or `pass` field inside a settings array is blanked before the rest of that array is kept, and an undo leaves the live value in place rather than writing the placeholder over it. Strings that parse as JSON or as a serialized array are unpacked and judged too, and blanked whole when they hold one. The check reads field names, not content, so it will not catch a secret held as a bare string under an innocuous option name.
 - Tools do not execute arbitrary PHP or SQL. Every tool is a fixed WordPress operation with a schema.
+- A preview link is a bearer credential for one unpublished post. Only a hash of it is stored, in a row the option tools refuse, and the audit log and debug trace scrub it from arguments and replies. It is shown once. Anyone who is given the link can use it until it expires or the post is published, and viewing it is not logged.
+- `wp_get_php_error_log` and `wp_fetch_page` return text written by other people (visitors, plugins, whoever controls a page). Both label it as data, and both are `admin` level for that reason as well as for what they can reach. The log is scrubbed for credential shapes, not for meaning, so a secret inside an ordinary sentence can survive it.
 - An open stream holds one PHP worker for up to 180 seconds. Size your pool accordingly if several agents connect at once.
 - **The token-in-URL endpoint is gone, and so is the shared bearer token.** If you were connecting over either, connect with a named key in the `Authorization` header instead. An existing shared token is carried over into a key on upgrade, so it keeps working through the header without you doing anything; it is no longer readable back from the screen or the database. If your host strips the header, the fix is the header: re-saving your permalink structure regenerates the `.htaccess` rule that forwards it, and the connection check on the settings screen tells you whether it worked.
 

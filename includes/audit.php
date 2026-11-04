@@ -505,7 +505,11 @@ class GMCP_Audit {
     // margin is wide enough that the second cut, not the first, decides the result for
     // anything but text that is almost entirely markup, where a shorter line is the
     // right answer anyway.
-    return mb_substr( wp_strip_all_tags( mb_substr( $text, 0, 8000 ) ), 0, 1000 );
+    $text = wp_strip_all_tags( mb_substr( $text, 0, 8000 ) );
+    // A preview link is a bearer credential and its tool's reply is where it is handed out.
+    // The reply is recorded here, so the token is cut out of it: an audit log that holds a
+    // working link to an unpublished post is a second place that link can be read from.
+    return mb_substr( GMCP_Core::scrub_preview_tokens( $text ), 0, 1000 );
   }
 
   /**
