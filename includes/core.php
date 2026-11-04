@@ -73,6 +73,11 @@ class GMCP_Core {
     // there is no write tool here and the option writer that could reach the log's own
     // settings refuses them (see option_write_policy()).
     'mcp_tools_wp_activity_log' => false,
+    // Out-of-band human approval. 'never' | 'deletes' | 'site': which tool calls are held
+    // until a logged-in administrator approves them on the Approvals screen. Global rather
+    // than per key, so that a key, an OAuth grant and a key minted next week are all
+    // covered without anyone remembering to switch it on. @see GMCP_Approvals.
+    'mcp_approval_mode' => 'never',
     'mcp_debug_mode' => false,
     // Keep a short history of tool calls, including refused ones, for the settings
     // screen. An agent otherwise operates with no visible record at all.
@@ -80,6 +85,12 @@ class GMCP_Core {
     'mcp_audit_days' => 90,
     'mcp_change_journal' => true,
   ];
+
+  /**
+  * Set when confirm_gate() answered a call with a token instead of letting it proceed.
+  * Reset by the dispatcher before each tool runs and read once after it returns.
+  */
+  public static $gate_withheld = false;
 
   private $options = null;
 
@@ -773,6 +784,11 @@ class GMCP_Core {
       new GMCP_Audit();
     }
 
+    // The queue of calls waiting for a person. Booted unconditionally, like the table check
+    // in the audit log: the mode can be switched to 'never' while requests are still open,
+    // and the screen has to be able to answer them and the daily event to lapse them.
+    GMCP_Approvals::boot();
+
     // How to put back what changed.
     if ( $this->get_option( 'mcp_change_journal' ) ) {
       new GMCP_Journal();
@@ -949,6 +965,10 @@ class GMCP_Core {
 
     $token = bin2hex( random_bytes( 8 ) );
     set_transient( $key, $token, 2 * MINUTE_IN_SECONDS );
+    // Said out loud for the approval queue: this call changed nothing and handed back a
+    // token, so an approval it ran under has not been spent on an effect. @see
+    // GMCP_Approvals::finish().
+    self::$gate_withheld = true;
 
     // The backup situation belongs in the summary rather than in a gate. Whoever reads
     // this is about to approve something irreversible, and "the last backup finished

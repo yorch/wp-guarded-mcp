@@ -21,6 +21,7 @@ class GMCP_Settings {
   const PAGE_SLUG = 'guarded-mcp-settings';
   const PAGE_ACCESS = 'guarded-mcp-access';
   const PAGE_TOOLS = 'guarded-mcp-tools';
+  const PAGE_APPROVALS = 'guarded-mcp-approvals';
   const PAGE_LOGGING = 'guarded-mcp-logging';
   const PAGE_LOGS = 'guarded-mcp-logs';
   const NONCE_ACTION = 'gmcp_save_settings';
@@ -37,12 +38,14 @@ class GMCP_Settings {
     'connect' => self::PAGE_SLUG,
     'access' => self::PAGE_ACCESS,
     'tools' => self::PAGE_TOOLS,
+    'approvals' => self::PAGE_APPROVALS,
     'logging' => self::PAGE_LOGGING,
     'logs' => self::PAGE_LOGS,
   ];
 
   private $core = null;
   private $notice = null;
+  private $notice_failed = false;
 
   public function __construct( $core ) {
     $this->core = $core;
@@ -171,6 +174,18 @@ class GMCP_Settings {
       'manage_options',
       self::PAGE_TOOLS,
       [ $this, 'render_tools_page' ]
+    );
+    // The count is a badge, not a label: a request that waits an hour for somebody to
+    // notice it is a request the agent sat idle through.
+    $waiting = GMCP_Approvals::pending_count();
+    $hooks[] = add_submenu_page(
+      self::PAGE_SLUG,
+      __( 'Approvals', 'guarded-mcp' ),
+      esc_html__( 'Approvals', 'guarded-mcp' ) . ( $waiting > 0
+        ? ' <span class="awaiting-mod">' . (int) $waiting . '</span>' : '' ),
+      'manage_options',
+      self::PAGE_APPROVALS,
+      [ $this, 'render_approvals_page' ]
     );
     $hooks[] = add_submenu_page(
       self::PAGE_SLUG,
@@ -335,6 +350,7 @@ class GMCP_Settings {
       'mcp_tools_gravityforms' => 'bool',
       'mcp_tools_learndash' => 'bool',
       'mcp_tools_wp_activity_log' => 'bool',
+      'mcp_approval_mode' => 'approval_mode',
       'mcp_debug_mode' => 'bool',
       'mcp_activity_log' => 'bool',
       'mcp_audit_days' => 'days',
@@ -419,6 +435,15 @@ class GMCP_Settings {
     elseif ( $action === 'create_key' ) {
       $this->create_key();
     }
+    elseif ( $action === 'approve_request' || $action === 'decline_request' ) {
+      // One request at a time and nothing in bulk, like the audit log: each approval is a
+      // decision about one call, and a button that answers fifty of them is a button that
+      // is pressed without reading. decide() checks the session and its own nonce.
+      $id = isset( $_POST['request_id'] ) ? (int) $_POST['request_id'] : 0;
+      $nonce = isset( $_POST['gmcp_approval_nonce'] ) ? sanitize_text_field( wp_unslash( $_POST['gmcp_approval_nonce'] ) ) : '';
+      [ $ok, $this->notice ] = GMCP_Approvals::decide( $id, $action === 'approve_request' ? 'approve' : 'decline', $nonce );
+      $this->notice_failed = !$ok;
+    }
     elseif ( $action === 'revoke_key' ) {
       $id = isset( $_POST['key_id'] ) ? sanitize_key( wp_unslash( $_POST['key_id'] ) ) : '';
       $this->notice = GMCP_Tokens::revoke( $id )
@@ -435,7 +460,10 @@ class GMCP_Settings {
     $slug = isset( $_REQUEST['page'] ) ? sanitize_key( wp_unslash( $_REQUEST['page'] ) ) : '';
     $page_key = array_search( self::page_for_slug( $slug ), self::PAGES, true );
     $url = add_query_arg(
-      [ 'gmcp_notice' => $this->notice ? rawurlencode( $this->notice ) : null ],
+      [
+        'gmcp_notice' => $this->notice ? rawurlencode( $this->notice ) : null,
+        'gmcp_failed' => $this->notice && $this->notice_failed ? '1' : null,
+      ],
       self::page_url( is_string( $page_key ) ? $page_key : '' )
     );
     wp_safe_redirect( $url );
@@ -687,6 +715,12 @@ class GMCP_Settings {
         $role = isset( $_POST[ $key ] ) ? sanitize_key( wp_unslash( $_POST[ $key ] ) ) : '';
         $options[ $key ] = in_array( $role, [ 'admin', 'readwrite', 'readonly' ], true ) ? $role : 'admin';
       }
+      elseif ( $kinds[ $key ] === 'approval_mode' ) {
+        // A value outside the list is the strictest mode, not 'never': a forged or
+        // truncated field must not be a way to switch the gate off.
+        $mode = isset( $_POST[ $key ] ) ? sanitize_key( wp_unslash( $_POST[ $key ] ) ) : 'site';
+        $options[ $key ] = in_array( $mode, GMCP_Approvals::MODES, true ) ? $mode : 'site';
+      }
       elseif ( $kinds[ $key ] === 'days' ) {
         $options[ $key ] = isset( $_POST[ $key ] ) ? max( 1, min( 3650, (int) $_POST[ $key ] ) ) : 90;
       }
@@ -757,12 +791,13 @@ class GMCP_Settings {
     }
 
     $notice = isset( $_GET['gmcp_notice'] ) ? sanitize_text_field( wp_unslash( $_GET['gmcp_notice'] ) ) : '';
+    $notice_class = !empty( $_GET['gmcp_failed'] ) ? 'notice-error' : 'notice-success';
     ?>
     <div class="wrap">
       <h1><?php echo esc_html( $title ); ?></h1>
 
       <?php if ( $notice !== '' ) : ?>
-        <div class="notice notice-success is-dismissible"><p><?php echo esc_html( $notice ); ?></p></div>
+        <div class="notice <?php echo esc_attr( $notice_class ); ?> is-dismissible"><p><?php echo esc_html( $notice ); ?></p></div>
       <?php endif; ?>
 
       <?php $body(); ?>
@@ -790,6 +825,14 @@ class GMCP_Settings {
     $this->render_page( __( 'Tools', 'guarded-mcp' ), function () {
       $options = $this->core->get_all_options( true );
       $this->render_tools( $options );
+    } );
+  }
+
+  /** The Approvals page. */
+  public function render_approvals_page() {
+    $this->render_page( __( 'Approvals', 'guarded-mcp' ), function () {
+      $options = $this->core->get_all_options( true );
+      $this->render_approvals( $options );
     } );
   }
 
@@ -1451,6 +1494,156 @@ class GMCP_Settings {
     </form>
     <?php
   }
+
+  #region Approvals
+
+  /**
+  * The queue of calls waiting for a person, and the setting that decides what waits.
+  *
+  * Plain forms, no script: every button is its own POST with the page nonce and a nonce
+  * for that one request and that one verdict, so a link cannot be crafted that answers a
+  * request and a form cannot be replayed against a different one. There is no select-all,
+  * no bulk action and no delete. A request leaves the list by being answered or by lapsing.
+  *
+  * Everything shown from a request is escaped, and the arguments are the redacted copy the
+  * queue stored: this screen never holds an unredacted credential to print.
+  */
+  private function render_approvals( array $options ): void {
+    GMCP_Approvals::expire_stale();
+    $mode = in_array( $options['mcp_approval_mode'] ?? 'never', GMCP_Approvals::MODES, true )
+      ? $options['mcp_approval_mode'] : 'site';
+    $pending = GMCP_Approvals::pending();
+    $recent = GMCP_Approvals::recent( 25 );
+    ?>
+    <p class="gmcp-intro"><?php esc_html_e( 'When this is switched on, a tool call that would delete something or change the site does not run. It waits here for you. The agent is told it is waiting and cannot approve it: there is no tool that does, and an approval only counts when it comes from you, signed in to wp-admin. After you approve, the agent repeats the same call and it runs once. An approval is for one key, one tool and exactly those arguments; it lapses after 15 minutes unused, and an unanswered request lapses after an hour. The two-step confirmation on irreversible tools still applies inside an approved call.', 'guarded-mcp' ); ?></p>
+
+    <h2 class="title"><?php esc_html_e( 'Ask before', 'guarded-mcp' ); ?></h2>
+    <form method="post">
+      <?php
+      $this->form_head( 'save' );
+      $this->form_fields( [ 'mcp_approval_mode' ] );
+      ?>
+      <table class="form-table" role="presentation">
+        <tr>
+          <th scope="row"><?php esc_html_e( 'Hold for approval', 'guarded-mcp' ); ?></th>
+          <td>
+            <fieldset class="gmcp-choices">
+              <label><input type="radio" name="mcp_approval_mode" value="never" <?php checked( $mode, 'never' ); ?>>
+                <?php esc_html_e( 'Never: calls run as soon as the key and the tool allow them', 'guarded-mcp' ); ?></label>
+              <label><input type="radio" name="mcp_approval_mode" value="deletes" <?php checked( $mode, 'deletes' ); ?>>
+                <?php esc_html_e( 'Deletes: anything that removes something, and any tool this plugin cannot classify', 'guarded-mcp' ); ?></label>
+              <label><input type="radio" name="mcp_approval_mode" value="site" <?php checked( $mode, 'site' ); ?>>
+                <?php esc_html_e( 'Deletes and site changes: also settings, plugins, themes, users, options and the other administrative writes', 'guarded-mcp' ); ?></label>
+            </fieldset>
+            <p class="description"><?php esc_html_e( "Applies to every key and every connected app, so a key made later is covered too. Which tools count is worked out from each tool's own access level and annotations, not from a list. Content edits at the read and write level never wait. Previews wait like anything else: the setting cannot tell a preview from the call it previews.", 'guarded-mcp' ); ?></p>
+            <?php if ( $mode !== 'never' && empty( $options['mcp_activity_log'] ) ) : ?>
+              <p class="description gmcp-warn"><?php esc_html_e( 'The audit log is switched off, so requests and decisions are kept in this queue for 30 days but not written to the log.', 'guarded-mcp' ); ?></p>
+            <?php endif; ?>
+          </td>
+        </tr>
+      </table>
+      <?php submit_button(); ?>
+    </form>
+
+    <h2 class="title"><?php
+      /* translators: %d: number of requests waiting. */
+      echo esc_html( sprintf( __( 'Waiting for you (%d)', 'guarded-mcp' ), count( $pending ) ) ); ?></h2>
+    <?php if ( !$pending ) : ?>
+      <p class="gmcp-muted"><?php esc_html_e( 'Nothing is waiting.', 'guarded-mcp' ); ?></p>
+    <?php else : ?>
+      <table class="widefat striped gmcp-table">
+        <thead><tr>
+          <th><?php esc_html_e( 'Request', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Asked by', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Call', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Lapses', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Answer', 'guarded-mcp' ); ?></th>
+        </tr></thead>
+        <tbody>
+        <?php foreach ( $pending as $row ) : $rid = (int) $row['id']; ?>
+          <tr>
+            <td class="gmcp-nowrap">#<?php echo (int) $rid; ?><br>
+              <span class="gmcp-detail"><?php echo esc_html( self::ago_for( (int) $row['created'] ) ); ?></span></td>
+            <td><?php echo esc_html( $row['label'] !== '' ? $row['label'] : $row['identity'] ); ?><br>
+              <span class="gmcp-detail"><?php echo esc_html( $row['identity'] ); ?></span></td>
+            <td><code><?php echo esc_html( $row['tool'] ); ?></code>
+              <span class="gmcp-detail">(<?php echo esc_html( $row['tool_class'] ); ?>)</span>
+              <?php echo self::approval_args_html( (string) $row['args_view'] ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- every piece is escaped inside. ?></td>
+            <td class="gmcp-nowrap"><?php echo esc_html( human_time_diff( time(), (int) $row['expires'] ) ); ?></td>
+            <td class="gmcp-nowrap">
+              <?php foreach ( [ 'approve' => __( 'Approve', 'guarded-mcp' ), 'decline' => __( 'Decline', 'guarded-mcp' ) ] as $verdict => $label ) : ?>
+                <form method="post" style="display:inline">
+                  <?php
+                  $this->form_head( $verdict . '_request' );
+                  printf( '<input type="hidden" name="request_id" value="%d">', (int) $rid );
+                  printf( '<input type="hidden" name="gmcp_approval_nonce" value="%s">',
+                    esc_attr( wp_create_nonce( GMCP_Approvals::nonce_action( $verdict, $rid ) ) ) );
+                  ?>
+                  <button type="submit" class="button <?php echo $verdict === 'approve' ? 'button-primary' : ''; ?>"><?php echo esc_html( $label ); ?></button>
+                </form>
+              <?php endforeach; ?>
+            </td>
+          </tr>
+        <?php endforeach; ?>
+        </tbody>
+      </table>
+    <?php endif; ?>
+
+    <h2 class="title"><?php esc_html_e( 'Recently answered or lapsed', 'guarded-mcp' ); ?></h2>
+    <?php if ( !$recent ) : ?>
+      <p class="gmcp-muted"><?php esc_html_e( 'Nothing yet.', 'guarded-mcp' ); ?></p>
+    <?php else : ?>
+      <table class="widefat striped gmcp-table">
+        <thead><tr>
+          <th><?php esc_html_e( 'Request', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Asked by', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Call', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Outcome', 'guarded-mcp' ); ?></th>
+        </tr></thead>
+        <tbody>
+        <?php foreach ( $recent as $row ) :
+          $who = (int) $row['decided_by'] > 0 ? ( get_userdata( (int) $row['decided_by'] )->user_login ?? '' ) : ''; ?>
+          <tr>
+            <td class="gmcp-nowrap">#<?php echo (int) $row['id']; ?><br>
+              <span class="gmcp-detail"><?php echo esc_html( self::ago_for( (int) $row['created'] ) ); ?></span></td>
+            <td><?php echo esc_html( $row['label'] !== '' ? $row['label'] : $row['identity'] ); ?></td>
+            <td><code><?php echo esc_html( $row['tool'] ); ?></code></td>
+            <td><?php echo esc_html( $row['status'] ); ?><?php if ( $who !== '' ) : ?>
+              <span class="gmcp-detail"> <?php echo esc_html( sprintf( /* translators: %s: user login. */ __( 'by %s', 'guarded-mcp' ), $who ) ); ?></span><?php endif; ?></td>
+          </tr>
+        <?php endforeach; ?>
+        </tbody>
+      </table>
+    <?php endif; ?>
+    <?php
+  }
+
+  /**
+  * The stored, redacted arguments as a collapsible block, shortened for display only.
+  *
+  * Shortened rather than refused: a person who cannot see the end of a long argument is
+  * told so, and that the approval covers all of it by hash.
+  */
+  private static function approval_args_html( string $json ): string {
+    $decoded = json_decode( $json, true );
+    $text = json_last_error() === JSON_ERROR_NONE
+      ? wp_json_encode( $decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE )
+      : $json;
+    $text = (string) $text;
+    $note = '';
+    if ( strlen( $text ) > 4000 ) {
+      $note = '<p class="gmcp-detail">' . esc_html( sprintf(
+        /* translators: %d: total size in bytes. */
+        __( 'Shortened here; the full arguments (%d bytes) are what an approval covers. Credential-shaped values are hidden and covered too.', 'guarded-mcp' ),
+        strlen( $text )
+      ) ) . '</p>';
+      $text = mb_substr( $text, 0, 4000 );
+    }
+    return '<details><summary class="gmcp-summary">' . esc_html__( 'Arguments', 'guarded-mcp' ) . '</summary><pre class="gmcp-args">'
+      . esc_html( $text ) . '</pre>' . $note . '</details>';
+  }
+
+  #endregion
 
   /**
   * The record itself: the table, one entry, or the off notice.
