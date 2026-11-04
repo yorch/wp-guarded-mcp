@@ -126,6 +126,7 @@ class GMCP_SelfTest {
     }
     else {
       $code = (int) wp_remote_retrieve_response_code( $registered );
+      self::forget_probe_client( $registered );
       $checks[] = [
         'id' => 'register',
         'status' => ( $code === 200 || $code === 201 ) ? 'ok' : 'fail',
@@ -153,6 +154,30 @@ class GMCP_SelfTest {
     ];
 
     return $checks;
+  }
+
+  /**
+  * Remove the client the registration probe created.
+  *
+  * Registration is the real endpoint, so a successful probe leaves a real client row, and
+  * one is added every time the check runs. It has no grants (it was registered a moment
+  * ago and nobody signed in to it), so deleting it by id removes nothing anyone uses.
+  * Only a row with no token is touched, whatever the response said.
+  */
+  private static function forget_probe_client( $response ): void {
+    global $wpdb;
+    $body = json_decode( wp_remote_retrieve_body( $response ), true );
+    $client_id = is_array( $body ) && is_string( $body['client_id'] ?? null ) ? $body['client_id'] : '';
+    if ( $client_id === '' || ( $body['client_name'] ?? '' ) !== 'Guarded MCP setup check' ) {
+      return;
+    }
+    $clients = $wpdb->prefix . 'gmcp_oauth_clients';
+    $tokens = $wpdb->prefix . 'gmcp_oauth_tokens';
+    // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table names are plugin constants
+    $wpdb->query( $wpdb->prepare(
+      "DELETE c FROM {$clients} c LEFT JOIN {$tokens} t ON t.client_id = c.client_id WHERE c.client_id = %s AND t.id IS NULL",
+      $client_id
+    ) );
   }
 
   /**
@@ -308,7 +333,7 @@ class GMCP_SelfTest {
       return [
         'status' => 'error',
         'summary' => 'The endpoint answered, but not with a valid tool list.',
-        'detail' => 'Something is altering the response body. A plugin that appends output to REST responses will do this. Response began: ' . esc_html( mb_substr( wp_remote_retrieve_body( $response ), 0, 200 ) ),
+        'detail' => 'Something is altering the response body. A plugin that appends output to REST responses will do this. Response began: ' . mb_substr( wp_remote_retrieve_body( $response ), 0, 200 ),
         'tools' => null,
       ];
     }
@@ -337,7 +362,14 @@ class GMCP_SelfTest {
   }
 
   public static function site_health_test(): array {
-    $result = self::run();
+    // Site Health runs its direct tests on every load of its page. The check mints and
+    // revokes a key, adds an audit row and can wait on a loopback call, so the answer is
+    // kept for a few minutes. The setup screen's own button always runs it afresh.
+    $result = get_transient( 'gmcp_site_health_probe' );
+    if ( !is_array( $result ) || !isset( $result['status'], $result['summary'], $result['detail'] ) ) {
+      $result = self::run();
+      set_transient( 'gmcp_site_health_probe', $result, 5 * MINUTE_IN_SECONDS );
+    }
 
     $map = [
       'ok' => [ 'good', 'blue' ],

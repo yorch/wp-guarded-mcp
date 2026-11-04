@@ -326,6 +326,13 @@ class GMCP_Tools_Rest {
       }
     }
     else {
+      // Content goes through the same sanitiser the core tools use before it reaches the
+      // REST controller. The key's user is an administrator, so the controller would
+      // store it verbatim; the sanitising it applies to lesser users never runs.
+      $args = $this->sanitize_write_args( $args );
+      if ( $args === null ) {
+        return $this->error( $id, 'This tool cannot write content on this install: the content sanitiser is not available, so the write was refused rather than stored unfiltered.', 'gmcp_no_sanitiser' );
+      }
       $request->set_body_params( $args );
     }
 
@@ -338,7 +345,9 @@ class GMCP_Tools_Rest {
       return $this->error(
         $id,
         $error_obj->get_error_message(),
-        $error_obj->get_error_code() ?: $response->get_status(),
+        // $response is a WP_Error when the dispatch itself failed, and a WP_Error has no
+        // get_status(). An error with an empty code used to fatal here.
+        $error_obj->get_error_code() ?: ( is_wp_error( $response ) ? 'rest_error' : $response->get_status() ),
         $error_obj->get_error_data()
       );
     }
@@ -347,6 +356,56 @@ class GMCP_Tools_Rest {
 
     // Return just the data - execute_tool will wrap it properly
     return $data;
+  }
+
+  /**
+  * Run the markup in a write through GMCP_Tools_Core's own sanitiser.
+  *
+  * Called, not copied: the post tools and these must not drift apart, which is the same
+  * rule the option and post-type policies in GMCP_Core follow. store_html() is private and
+  * keeps no state (it reads one filter and calls wp_kses_post and the block walker), so an
+  * instance made without its constructor is enough and registers no second set of hooks.
+  *
+  * Fields that hold markup are cleaned as post content; the title is plain text. A REST
+  * field may be a string or an object with a raw member, and both are handled.
+  *
+  * @return array|null the arguments, cleaned; null when the sanitiser cannot be reached,
+  *   so the caller refuses instead of storing unfiltered.
+  */
+  private function sanitize_write_args( array $args ): ?array {
+    try {
+      $core = ( new ReflectionClass( 'GMCP_Tools_Core' ) )->newInstanceWithoutConstructor();
+      $store = new ReflectionMethod( 'GMCP_Tools_Core', 'store_html' );
+      $store->setAccessible( true );
+    }
+    catch ( Throwable $e ) {
+      return null;
+    }
+    $markup = [ 'content', 'excerpt', 'caption', 'description' ];
+    $plain = [ 'title', 'alt_text' ];
+    foreach ( $args as $key => $value ) {
+      if ( !in_array( $key, array_merge( $markup, $plain ), true ) ) {
+        continue;
+      }
+      $clean = function ( $v ) use ( $key, $markup, $core, $store ) {
+        if ( !is_string( $v ) ) {
+          return $v;
+        }
+        return in_array( $key, $markup, true ) ? $store->invoke( $core, $v ) : sanitize_text_field( $v );
+      };
+      if ( is_array( $value ) ) {
+        foreach ( [ 'raw', 'rendered' ] as $member ) {
+          if ( isset( $value[ $member ] ) ) {
+            $value[ $member ] = $clean( $value[ $member ] );
+          }
+        }
+        $args[ $key ] = $value;
+      }
+      else {
+        $args[ $key ] = $clean( $value );
+      }
+    }
+    return $args;
   }
 
   /**
