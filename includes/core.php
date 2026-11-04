@@ -559,6 +559,48 @@ class GMCP_Core {
       . 'Use the WooCommerce tools, which go through WooCommerce, or edit it in wp-admin.';
   }
 
+  /**
+  * Post types that are form submissions, which the generic post READERS must not return.
+  *
+  * Flamingo (the message store behind Contact Form 7) and Ninja Forms keep a submission as a
+  * post, with the answers, and for Flamingo the visitor's IP address and user agent, in post
+  * meta. wp_get_post_meta is a read-level tool that returns any key on any post, so without
+  * this the admin-level submission tools of the forms group would stand beside a read-level
+  * door to the same rows, and "personal data is admin level" would be a sentence about the
+  * tool and not about the data. As elsewhere in this class, the policy belongs to the post
+  * type and is asked by each reader.
+  *
+  * The names are Flamingo's and Ninja Forms' own post types (UNVERIFIED: written from memory
+  * of their source). A site with another form store that uses posts adds its type through
+  * gmcp_personal_data_post_types.
+  *
+  * Reads only. Writing one of these rows is not what this guards, and no tool in this plugin
+  * writes a submission.
+  *
+  * @return string[]
+  */
+  public static function personal_data_post_types(): array {
+    return (array) apply_filters( 'gmcp_personal_data_post_types', [
+      'flamingo_inbound', 'flamingo_contact', 'flamingo_outbound', 'nf_sub',
+    ] );
+  }
+
+  /**
+  * @param int    $post_id The post a read is aimed at.
+  * @param string $type    A post type named directly, for a listing that names no post.
+  * @return true|string True when the read is allowed, otherwise the refusal.
+  */
+  public static function personal_data_post_guard( int $post_id, string $type = '' ) {
+    if ( $type === '' ) {
+      $type = $post_id > 0 ? (string) get_post_type( $post_id ) : '';
+    }
+    if ( $type === '' || !in_array( $type, self::personal_data_post_types(), true ) ) {
+      return true;
+    }
+    return 'A ' . $type . ' is a form submission: personal data a member of the public typed, stored as a post. The generic post readers do not return it, because they are available to a read-only key and a submission is admin-level data. '
+      . 'Use the form tools for that plugin (cf7_, fluentform_ or ninjaform_), which return it at admin level, never return passwords, file uploads, IP addresses or user agents, and report whether the store is there at all.';
+  }
+
   public static function template_reference_guard( int $post_id, string $verb ) {
     if ( $post_id <= 0 || get_post_type( $post_id ) !== 'elementor_library' ) {
       return true;

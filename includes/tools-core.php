@@ -2482,6 +2482,23 @@ class GMCP_Tools_Core {
       }
     }
 
+    // Readers of a single post's content or meta, and the listing, refuse a post type that is a
+    // form submission. One check ahead of the switch rather than one per case, so a reader added
+    // later to this list is the only edit a new route needs. The tool list is explicit: a
+    // tool that is not named here is not covered, and docs/guardrails.md says which.
+    if ( in_array( $tool, [ 'wp_get_post', 'wp_get_post_snapshot', 'wp_get_post_meta', 'wp_read_post_meta_chunk' ], true ) ) {
+      $held = GMCP_Core::personal_data_post_guard( (int) ( $a['ID'] ?? 0 ) );
+      if ( $held !== true ) {
+        return $this->error( $r, $held, -32600 );
+      }
+    }
+    elseif ( $tool === 'wp_get_posts' ) {
+      $held = GMCP_Core::personal_data_post_guard( 0, sanitize_key( $a['post_type'] ?? 'post' ) );
+      if ( $held !== true ) {
+        return $this->error( $r, $held, -32600 );
+      }
+    }
+
     // Say what would happen, change nothing. Placed before the switch so a preview
     // cannot fall through into the real handler by way of a missed early return in one
     // of forty case blocks.
