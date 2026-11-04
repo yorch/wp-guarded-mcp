@@ -516,6 +516,24 @@ class GMCP_Tools_Core {
   }
 
   /**
+  * A meta value as a read tool may hand it out.
+  *
+  * Post meta reads had no credential rule at all: wp_get_post_meta returned an api_key or
+  * a stripe secret stored on a post in full, at the read level, while the option tools
+  * refuse the same shape of row at every level and the audit log and journal blank it.
+  * The answer is the one those subsystems already share, GMCP_Core::field_looks_secret(),
+  * asked of the meta KEY, so the four cannot disagree about what counts.
+  *
+  * Judged by the key and not by walking the value. A value is what a caller reads in order
+  * to write it back, and a design blob with one blanked leaf inside it, written back, would
+  * replace a live credential with the marker. A whole value withheld cannot be mistaken
+  * for the real one.
+  */
+  private function readable_meta( string $key, $value ) {
+    return GMCP_Core::field_looks_secret( $key ) ? GMCP_Core::REDACTION_MARKER : $value;
+  }
+
+  /**
   * Options that may not be deleted, each with what actually breaks if it goes.
   *
   * These are separate from option_guard(), which is about secrecy. These are rows
@@ -2648,6 +2666,11 @@ class GMCP_Tools_Core {
         }
         $list = [];
         foreach ( get_comments( $args ) as $c ) {
+          // Order notes are comments on the order post, and they quote the order: status
+          // changes, refunds, the customer's own note. Same rule as reading the order.
+          if ( (int) $c->comment_post_ID > 0 && GMCP_Core::commerce_post_read_guard( (int) $c->comment_post_ID ) !== true ) {
+            continue;
+          }
           $list[] = [
             'comment_ID' => $c->comment_ID,
             'comment_post_ID' => $c->comment_post_ID,
@@ -3292,6 +3315,11 @@ class GMCP_Tools_Core {
 
         /* ===== Posts: list ===== */
       case 'wp_get_posts':
+        $list_read = GMCP_Core::commerce_post_read_guard( sanitize_key( $a['post_type'] ?? 'post' ) );
+        if ( $list_read !== true ) {
+          $r = $this->error( $r, $list_read, -32600 );
+          break;
+        }
         $q = [
           'post_type' => sanitize_key( $a['post_type'] ?? 'post' ),
           'post_status' => sanitize_key( $a['post_status'] ?? 'publish' ),
@@ -3325,6 +3353,12 @@ class GMCP_Tools_Core {
         }
         $rows = [];
         foreach ( get_posts( $q ) as $p ) {
+          // "any" can still reach a commerce row: WordPress expands it to the registered
+          // types not excluded from search, which says nothing about a type registered by a
+          // plugin that sets it differently. Filtered per row rather than trusted.
+          if ( GMCP_Core::commerce_post_read_guard( $p ) !== true ) {
+            continue;
+          }
           $rows[] = [
             'ID' => $p->ID,
             'post_title' => $p->post_title,
@@ -3345,6 +3379,11 @@ class GMCP_Tools_Core {
         $p = get_post( intval( $a['ID'] ) );
         if ( !$p ) {
           $r = $this->error( $r, 'Post not found', -32602 );
+          break;
+        }
+        $one_read = GMCP_Core::commerce_post_read_guard( $p );
+        if ( $one_read !== true ) {
+          $r = $this->error( $r, $one_read, -32600 );
           break;
         }
         $out = [
@@ -3374,6 +3413,11 @@ class GMCP_Tools_Core {
 
         if ( !$p ) {
           $r = $this->error( $r, 'Post not found', -32602 );
+          break;
+        }
+        $snap_read = GMCP_Core::commerce_post_read_guard( $p );
+        if ( $snap_read !== true ) {
+          $r = $this->error( $r, $snap_read, -32600 );
           break;
         }
 
@@ -3415,10 +3459,10 @@ class GMCP_Tools_Core {
           $all_meta = get_post_meta( $post_id );
           foreach ( $all_meta as $key => $value ) {
             if ( is_array( $value ) && count( $value ) === 1 ) {
-              $snapshot['meta'][ $key ] = maybe_unserialize( $value[0] );
+              $snapshot['meta'][ $key ] = $this->readable_meta( (string) $key, maybe_unserialize( $value[0] ) );
             }
             else {
-              $snapshot['meta'][ $key ] = array_map( 'maybe_unserialize', $value );
+              $snapshot['meta'][ $key ] = $this->readable_meta( (string) $key, array_map( 'maybe_unserialize', (array) $value ) );
             }
           }
         }
@@ -4158,13 +4202,21 @@ class GMCP_Tools_Core {
           break;
         }
         $pid = intval( $a['ID'] );
+        $meta_read = GMCP_Core::commerce_post_read_guard( $pid );
+        if ( $meta_read !== true ) {
+          $r = $this->error( $r, $meta_read, -32600 );
+          break;
+        }
         // Compared against '' rather than tested for truthiness. The difference is "0",
         // which is falsy in PHP and which WordPress cannot address either: this way it
         // reaches meta_key_allowed() and is refused by name, instead of quietly turning
         // into "no key given" and answering a read of one key with every key.
         $get_key = (string) ( $a['key'] ?? '' );
         if ( $get_key === '' ) {
-          $out = get_post_meta( $pid );
+          $out = [];
+          foreach ( (array) get_post_meta( $pid ) as $meta_k => $meta_rows ) {
+            $out[ $meta_k ] = $this->readable_meta( (string) $meta_k, $meta_rows );
+          }
         }
         else {
           $get_why = $this->meta_key_allowed( $get_key );
@@ -4173,7 +4225,7 @@ class GMCP_Tools_Core {
             break;
           }
           // No wp_slash: get_metadata() does not unslash the key. @see meta_key_allowed().
-          $out = get_post_meta( $pid, $get_key, true );
+          $out = $this->readable_meta( $get_key, get_post_meta( $pid, $get_key, true ) );
         }
         $this->add_result_text( $r, wp_json_encode( $out, JSON_PRETTY_PRINT ) );
         break;
@@ -4437,21 +4489,32 @@ class GMCP_Tools_Core {
         break;
 
       case 'wp_read_post_meta_chunk':
-        // read level, and that is the whole reach it has. Post meta reads are ungated
-        // today: wp_get_post_meta is itself a read tool and returns any key on any post
-        // in full, with no option_guard() equivalent standing in front of it. Walking the
-        // same value in pieces therefore exposes nothing a read-only token could not
-        // already ask for in one call. If a guard is ever put on post meta reads it has
-        // to be put on both tools, or this one becomes the way around it.
+        // read level, and it asks exactly what wp_get_post_meta asks: the commerce read
+        // guard about the post, and the credential rule about the key. Post meta reads
+        // used to be ungated, and this comment said that if a guard were ever put on them
+        // it had to be put on both tools or this one would become the way around it. Both
+        // now ask the same two functions.
         $read_pid = intval( $a['ID'] ?? 0 );
         $read_key = (string) ( $a['key'] ?? '' );
         if ( !$read_pid || !get_post( $read_pid ) ) {
           $r = $this->error( $r, 'No post with ID ' . $read_pid . '.', -32602 );
           break;
         }
+        $chunk_read = GMCP_Core::commerce_post_read_guard( $read_pid );
+        if ( $chunk_read !== true ) {
+          $r = $this->error( $r, $chunk_read, -32600 );
+          break;
+        }
         $read_why = $this->meta_key_allowed( $read_key );
         if ( $read_why !== true ) {
           $r = $this->error( $r, $read_why, -32602 );
+          break;
+        }
+        // Refused rather than returned as the marker. This tool hands back bytes to be
+        // reassembled, and a caller stitching "[redacted]" into a value would have no way
+        // to tell it from the real thing.
+        if ( GMCP_Core::field_looks_secret( $read_key ) ) {
+          $r = $this->error( $r, 'The meta key "' . $read_key . '" looks like it holds a credential, so its value is not readable through the API. The same rule keeps such values out of the audit log and the change journal.', -32600 );
           break;
         }
 

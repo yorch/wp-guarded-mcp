@@ -579,6 +579,59 @@ class GMCP_Core {
   }
 
   /**
+  * The access level of the key making the current call: readonly, readwrite or admin.
+  *
+  * GMCP_Server publishes it through gmcp_caller_access_level for a named key. An OAuth
+  * grant, and anything outside a tool call (wp-cli, a cron job), reaches here with no
+  * filter attached and is answered "admin", which is what those callers are: OAuth
+  * already demands manage_options and applies no level filtering.
+  */
+  public static function caller_access_level(): string {
+    return (string) apply_filters( 'gmcp_caller_access_level', 'admin' );
+  }
+
+  /**
+  * Whether the current caller may READ a commerce post through a generic tool.
+  *
+  * The write guard above deliberately left reads alone, on the reasoning that reading an
+  * order is a legitimate admin operation. True, and the reasoning stopped one step short:
+  * the generic read tools are at the read level. wc_get_order and wc_list_orders are admin
+  * because an order is a customer's name, email address, phone number, postal address and
+  * IP address, and with HPOS off (or on with compatibility sync) every one of those is an
+  * ordinary meta row on a shop_order post. A readonly key asked wp_get_posts for
+  * post_type shop_order and then wp_get_post_meta for each id, and had the customer list
+  * the admin level exists to keep from it, by naming the same rows through another tool.
+  *
+  * So the policy belongs to the post type here too, and the read tools ask it: below
+  * admin, a commerce post is not returned, its meta is not returned, and a listing of
+  * them is refused. At admin it is answered exactly as before.
+  *
+  * @param int|string|WP_Post $post A post, its id, or a post type name.
+  * @return true|string True when the read is allowed, otherwise the refusal.
+  */
+  public static function commerce_post_read_guard( $post ) {
+    if ( self::caller_access_level() === 'admin' ) {
+      return true;
+    }
+    if ( $post instanceof WP_Post ) {
+      $type = $post->post_type;
+    }
+    elseif ( is_int( $post ) || ( is_string( $post ) && ctype_digit( $post ) ) ) {
+      $type = get_post_type( (int) $post );
+    }
+    else {
+      $type = $post;
+    }
+    if ( !self::is_commerce_post_type( $type ) ) {
+      return true;
+    }
+    return 'Reading a ' . strtolower( (string) $type ) . ' through the generic post tools needs an admin-level key. '
+      . 'Orders and subscriptions carry customers\' names, email addresses, phone numbers, postal addresses and IP addresses in their meta, '
+      . 'which is why the WooCommerce tools that read them on purpose (wc_get_order, wc_list_orders) are admin-level too. '
+      . 'This key is ' . self::caller_access_level() . '.';
+  }
+
+  /**
   * Whether a post is an Elementor library template something still renders, and the
   * sentence to refuse with.
   *

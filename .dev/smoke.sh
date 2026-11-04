@@ -593,6 +593,55 @@ check "and wp_undo_change will not put an order back with a plain post write" \
   "$(docker compose exec -T cli wp post get "$CG_DRAFT" --field=post_title 2>/dev/null | tr -d '\r\n')" "Commerce probe edited"
 docker compose exec -T cli wp eval "foreach ([$CG_SUB,$CG_DRAFT,$CG_ATT] as \$i) { wp_delete_post(\$i, true); } foreach (get_posts(['title'=>'Batch ok probe','post_status'=>'any','numberposts'=>-1,'fields'=>'ids']) as \$i) { wp_delete_post(\$i, true); } global \$wpdb; foreach (\$wpdb->get_col(\"SELECT ID FROM \$wpdb->posts WHERE post_title IN ('Minted sub','Batch order probe')\") as \$i) { wp_delete_post((int) \$i, true); }" >/dev/null 2>&1
 
+echo "-- an order is not readable below admin through the generic read tools --"
+# wc_get_order and wc_list_orders are admin because an order is a customer's name, email,
+# phone, address and IP. With HPOS off every one of those is a meta row on a shop_order
+# post, and wp_get_posts and wp_get_post_meta are read-level, so a readonly key had the
+# customer list by naming the same rows through another tool. Each absence check has a
+# control proving the same probe finds the value when it is there to find.
+CR=$(docker compose exec -T cli wp eval '
+  $o = wp_insert_post(["post_title"=>"Order probe","post_type"=>"shop_order","post_status"=>"wc-processing"]);
+  update_post_meta($o,"_billing_email","pii-probe@example.test");
+  wp_insert_comment(["comment_post_ID"=>$o,"comment_content"=>"NOTEPIIPROBE","comment_approved"=>1,"comment_type"=>"order_note"]);
+  $p = wp_insert_post(["post_title"=>"Secret meta probe","post_status"=>"draft"]);
+  update_post_meta($p,"api_key","SECRETMETAPROBE");
+  update_post_meta($p,"plain_probe","VISIBLEPROBE");
+  $k = GMCP_Tokens::create("smoke reader","readonly",0,[],get_users(["role"=>"administrator","number"=>1,"orderby"=>"ID","order"=>"ASC"])[0]->ID);
+  echo $o, " ", $p, " ", $k["secret"];' 2>/dev/null | tr -d '\r\n')
+read -r CR_ORDER CR_POST CR_KEY <<< "$CR"
+rcall() { # rcall <file> <tool> <arguments json>   as the readonly key
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $CR_KEY" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":420,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$3}}" -o "$OUT/$1"
+}
+call cr_ctl "{\"jsonrpc\":\"2.0\",\"id\":421,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_post_meta\",\"arguments\":{\"ID\":$CR_ORDER}}}"
+check "CONTROL: an admin key still reads the order's meta" "$(grep -c 'pii-probe@example.test' "$OUT/cr_ctl")" "1"
+rcall cr_list wp_get_posts '{"post_type":"shop_order","post_status":"any"}'
+check "a readonly key cannot list orders" "$(verdict cr_list)" "error"
+rcall cr_meta wp_get_post_meta "{\"ID\":$CR_ORDER}"
+rcall cr_chunk wp_read_post_meta_chunk "{\"ID\":$CR_ORDER,\"key\":\"_billing_email\"}"
+rcall cr_snap wp_get_post_snapshot "{\"ID\":$CR_ORDER}"
+rcall cr_one wp_get_post "{\"ID\":$CR_ORDER}"
+check "nor read an order's meta, whole, in chunks or in a snapshot" \
+  "$(cat "$OUT/cr_meta" "$OUT/cr_chunk" "$OUT/cr_snap" | grep -c 'pii-probe@example.test\|cGlpLXByb2Jl')" "0"
+check "and each of those is refused rather than answered empty" \
+  "$(for f in cr_meta cr_chunk cr_snap cr_one; do verdict $f; done | sort -u | tr -d '\n')" "error"
+rcall cr_notes wp_get_comments "{\"post_id\":$CR_ORDER,\"status\":\"all\"}"
+call cr_notes_ctl "{\"jsonrpc\":\"2.0\",\"id\":422,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_comments\",\"arguments\":{\"post_id\":$CR_ORDER,\"status\":\"all\"}}}"
+check "CONTROL: an admin key sees the order note" "$(grep -c NOTEPIIPROBE "$OUT/cr_notes_ctl")" "1"
+check "a readonly key does not" "$(grep -c NOTEPIIPROBE "$OUT/cr_notes")" "0"
+rcall cr_ok wp_get_post_meta "{\"ID\":$CR_POST}"
+check "CONTROL: a readonly key still reads an ordinary post's meta" "$(grep -c VISIBLEPROBE "$OUT/cr_ok")" "1"
+# The credential rule the option tools, the audit log and the journal already share,
+# asked of the META KEY on read.
+check "but a credential-shaped meta key comes back redacted" "$(grep -c SECRETMETAPROBE "$OUT/cr_ok")" "0"
+call cr_one_key "{\"jsonrpc\":\"2.0\",\"id\":423,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_post_meta\",\"arguments\":{\"ID\":$CR_POST,\"key\":\"api_key\"}}}"
+check "even to an admin key, asked for by name" \
+  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]))' cr_one_key)" "[redacted]"
+call cr_one_chunk "{\"jsonrpc\":\"2.0\",\"id\":424,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_read_post_meta_chunk\",\"arguments\":{\"ID\":$CR_POST,\"key\":\"api_key\"}}}"
+check "and the chunked reader refuses it rather than handing out its bytes" "$(verdict cr_one_chunk)" "error"
+docker compose exec -T cli wp eval "wp_delete_post($CR_ORDER,true); wp_delete_post($CR_POST,true); foreach (GMCP_Tokens::all() as \$k) { if ((\$k['label'] ?? '') === 'smoke reader') { GMCP_Tokens::revoke(\$k['id']); } }" >/dev/null 2>&1
+
 echo "-- the everyday meta tool keeps backslashes --"
 # update_post_meta() unslashes what it is given, so a value carrying backslashes arrives
 # stripped: a JSON payload stops parsing, a regex stops matching and a Windows path loses
