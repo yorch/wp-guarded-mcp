@@ -1872,6 +1872,15 @@ class GMCP_Tools_Admin {
         continue;
       }
 
+      // On multisite this row decides nothing: wp-login.php sends every registration to
+      // the network's wp-signup.php before it reads users_can_register, and wp-admin hides
+      // the checkbox on a network for that reason. Writing it would be reported as a
+      // change that changes nothing, which is the reply this tool exists not to give.
+      if ( $key === 'users_can_register' && is_multisite() ) {
+        $skipped[ $key ] = "On a multisite network, whether people may register is the network's setting (Network Admin, Settings, Allow new registrations), not this site's. Nothing was changed.";
+        continue;
+      }
+
       $clean = $this->coerce_setting( $allowed[ $key ], $value );
       if ( $clean instanceof WP_Error ) {
         $skipped[ $key ] = $clean->get_error_message();
