@@ -73,6 +73,12 @@ class GMCP_Core {
     // there is no write tool here and the option writer that could reach the log's own
     // settings refuses them (see option_write_policy()).
     'mcp_tools_wp_activity_log' => false,
+    // Redirection: redirects are an open-redirect and self-lockout primitive, so the writer
+    // keeps a target and source policy of its own (see GMCP_Tools_Redirection) and the group
+    // is off until someone switches it on.
+    'mcp_tools_redirection' => false,
+    // Polylang (free): read only. Languages and a post's translation group.
+    'mcp_tools_polylang' => false,
     'mcp_debug_mode' => false,
     // Keep a short history of tool calls, including refused ones, for the settings
     // screen. An agent otherwise operates with no visible record at all.
@@ -894,6 +900,17 @@ class GMCP_Core {
     // an operator needs when the log has stopped recording.
     if ( $this->get_option( 'mcp_tools_wp_activity_log' ) ) {
       new GMCP_Tools_Wsal();
+    }
+
+    // Redirection and Polylang. Constructed whenever the switch is on and not gated on the
+    // plugin having loaded, like the groups above: the per-call check in each handle_call()
+    // answers "this plugin is not loaded", which is a different statement from "there are
+    // none" and the one an operator needs.
+    if ( $this->get_option( 'mcp_tools_redirection' ) ) {
+      new GMCP_Tools_Redirection();
+    }
+    if ( $this->get_option( 'mcp_tools_polylang' ) ) {
+      new GMCP_Tools_Polylang();
     }
   }
 
