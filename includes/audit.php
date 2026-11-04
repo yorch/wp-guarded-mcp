@@ -30,10 +30,13 @@ if ( !defined( 'ABSPATH' ) ) {
 * does is make an edit visible: recomputing it finds the first row that no longer matches.
 * That is the difference between a history and an audit.
 *
-* PRUNING IS BOUNDED THREE WAYS. Age alone lets a runaway agent fill a disk in a day.
-* A row cap alone lets one enormous entry do it. A byte cap alone throws away last week
-* because of something that happened last year. So all three, and whichever is hit first
-* wins.
+* THE LOG IS BOUNDED THREE WAYS, AND ONLY ONE OF THEM DELETES. Age alone lets a runaway
+* agent fill a disk in a day, and a row cap or a byte cap that deleted the oldest rows
+* would let any key erase real history by flooding. So age is the only bound that removes
+* anything. The row and byte bounds stop the log recording instead, say so (an admin
+* notice, a Site Health test, the audit screen, the error log), and make the plugin refuse
+* every tool above read level until there is room again, because a write nobody can see
+* is worse than a write that did not happen. @see prune(), @see refuse_while_stopped().
 *
 * WHAT WAS CALLED IS NOT WHAT CHANGED. An entry saying wp_update_post ran on post 12 with
 * certain arguments does not say that the post went from private to publish, and that is
@@ -76,6 +79,14 @@ class GMCP_Audit {
   const MAX_ARGS = 64000;
 
   /**
+  * And for a refused call, which costs the caller nothing: a key limited to one harmless
+  * tool can send refused calls as fast as the endpoint answers, each one recorded. At the
+  * full cap a few hundred of them reached the byte bound; at this one the same flood has
+  * to be some thirty times larger, and the row still says what was asked for.
+  */
+  const MAX_REFUSED_ARGS = 2000;
+
+  /**
   * And on the recorded changes, which share the entry with them.
   *
   * Smaller than the argument cap on purpose. A summary is meant to be read, and forty
@@ -83,7 +94,10 @@ class GMCP_Audit {
   */
   const MAX_CHANGES = 16000;
 
-  /** Defaults, overridable from the settings screen. */
+  /**
+  * Defaults. The retention is a setting; the row and byte bounds are not, and can be
+  * changed through the gmcp_audit_max_rows and gmcp_audit_max_bytes filters. @see max_rows().
+  */
   const DEFAULT_DAYS = 90;
   const MAX_ROWS = 50000;
   const MAX_BYTES = 50000000;
@@ -103,6 +117,19 @@ class GMCP_Audit {
     }
     add_action( 'gmcp_tool_called', [ $this, 'record' ], 5 );
     add_action( self::CRON_HOOK, [ __CLASS__, 'prune' ] );
+
+    // Scheduling used to happen in the activation hook alone, which runs once: network
+    // activation scheduled the main site only, and every other site (whose table is built
+    // lazily, above) was never pruned. Checked on init, where the cron array is loaded, so
+    // a site that lost the event, or never had it, gets it back.
+    add_action( 'init', [ __CLASS__, 'schedule' ] );
+
+    // A log that has stopped recording has to say so, and has to stop the plugin doing
+    // things nobody will be able to see afterwards. @see refuse_while_stopped().
+    add_filter( 'gmcp_tools', [ __CLASS__, 'remember_levels' ], 9999 );
+    add_filter( 'gmcp_callback', [ __CLASS__, 'refuse_while_stopped' ], 1, 4 );
+    add_action( 'admin_notices', [ __CLASS__, 'admin_notice' ] );
+    add_filter( 'site_status_tests', [ __CLASS__, 'register_site_health' ] );
   }
 
   public static function table(): string {
@@ -246,7 +273,7 @@ class GMCP_Audit {
   const IDENTIFIER_ARGS = [ 'key', 'meta_key', 'option_key' ];
 
   /** Arguments as they will be stored: redacted, size-capped, and honest about both. */
-  private function storable_args( array $args ): string {
+  private function storable_args( array $args, bool $failed = false ): string {
     foreach ( self::NEVER_RECORD as $field ) {
       if ( array_key_exists( $field, $args ) ) {
         $args[ $field ] = '[redacted]';
@@ -281,12 +308,14 @@ class GMCP_Audit {
     if ( $json === false ) {
       return '{"__gmcp":"arguments could not be encoded"}';
     }
-    if ( strlen( $json ) > self::MAX_ARGS ) {
+    // A refused call is held to a much smaller cap. @see MAX_REFUSED_ARGS.
+    $cap = $failed ? self::MAX_REFUSED_ARGS : self::MAX_ARGS;
+    if ( strlen( $json ) > $cap ) {
       // Truncated rather than dropped, and the original size recorded, so a reader can
       // tell a large call from a missing one.
       return wp_json_encode( [
         '__gmcp_truncated' => strlen( $json ),
-        'preview' => mb_substr( $json, 0, 2000 ),
+        'preview' => mb_substr( $json, 0, $failed ? 1000 : 2000 ),
       ], JSON_UNESCAPED_SLASHES );
     }
     return $json;
@@ -300,7 +329,8 @@ class GMCP_Audit {
 
     // At a hard bound, refuse to write rather than write into a log that will have its
     // recent rows deleted to make room. The row this would have added is lost either way;
-    // what the refusal protects is the rows already there. @see prune().
+    // what the refusal protects is the rows already there. over_bound() also raises the
+    // alarm the first time it finds the log full. @see prune(), @see refuse_while_stopped().
     if ( self::over_bound() ) {
       return;
     }
@@ -325,27 +355,95 @@ class GMCP_Audit {
       'target' => $this->target( $args ),
       'outcome' => $failed ? 'refused' : 'ok',
       'ms' => (int) ( $call['duration_ms'] ?? 0 ),
-      'args' => $this->storable_args( $args ),
+      'args' => $this->storable_args( $args, $failed ),
       'changes' => class_exists( 'GMCP_Changes' )
         ? GMCP_Changes::summarise( GMCP_Changes::captured(), self::MAX_CHANGES )
         : null,
       'detail' => $this->detail( $call, $failed ),
     ];
+    self::write( $row );
+  }
 
-    // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant, not user input
-    $prev = (string) $wpdb->get_var( "SELECT hash FROM " . self::table() . " ORDER BY id DESC LIMIT 1" );
-    $row['prev_hash'] = $prev;
-    $row['hash'] = self::hash( $row, $prev );
+  /**
+  * Append one row to the chain.
+  *
+  * The read of the previous hash and the insert have to be one step. Parallel tool calls
+  * arrive as separate requests, and two that read the same predecessor before either has
+  * inserted write rows with the same prev_hash: the second row's link then fails to match
+  * what precedes it, verify() reports a missing row in a log nobody touched, and the fork
+  * is permanent because nothing short of clear() removes it. A named lock serialises them.
+  * Not SELECT ... FOR UPDATE: that is a no-op on MyISAM, and on InnoDB the gap locks two
+  * writers take on the last row are compatible, so both then wait on each other's insert
+  * and one is killed with a deadlock, losing its entry.
+  *
+  * The lock name carries the database and table name: the name space is server-wide, and
+  * a multisite network's blogs have no reason to queue behind one another. If the lock
+  * cannot be had in five seconds the row is written anyway, because an entry that might sit
+  * on a fork is a better outcome than an entry that does not exist; the timeout is logged.
+  * A server with no GET_LOCK (some SQLite drop-ins) answers null and is treated as having
+  * no lock to take, silently.
+  *
+  * @param array $row the columns, without prev_hash and hash.
+  */
+  private static function write( array $row ): void {
+    global $wpdb;
 
-    // Errors suppressed across the insert, and deliberately. wpdb prints a failed query
-    // straight to output when WP_DEBUG is on, and this runs inside the tool dispatcher's
-    // finally block, so the error text lands in front of the JSON-RPC body and the client
-    // gets a parse error instead of its result. A site with an out-of-date table would
-    // find every tool call broken rather than one audit entry missing. last_error is
-    // still set while suppressed, so nothing is lost but the printing.
+    // HyperDB and LudicrousDB may send the SELECT below to a lagging replica, which forks
+    // the chain with no concurrency at all. The lock, the read and the insert must all go
+    // to the primary.
+    if ( method_exists( $wpdb, 'send_reads_to_masters' ) ) {
+      $wpdb->send_reads_to_masters();
+    }
+
     $noisy = $wpdb->suppress_errors( true );
-    $written = $wpdb->insert( self::table(), $row );
+    $name = 'gmcp_audit_' . md5( DB_NAME . self::table() );
+    $got = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $name, 5 ) );
     $wpdb->suppress_errors( $noisy );
+    $locked = ( (string) $got === '1' );
+    if ( (string) $got === '0' ) {
+      error_log( '[Guarded MCP] audit chain lock not obtained within 5 seconds for ' . $row['tool']
+        . '; writing the entry unserialised, so the chain may fork here.' );
+    }
+
+    try {
+      // As the database will hold them. The hash is computed in PHP before the insert, and
+      // wpdb strips what the column's character set cannot represent (a four-byte
+      // character on a utf8mb3 table), so hashing the original would make the row fail its
+      // own check on the first full walk. Same call wpdb makes itself, run first.
+      if ( method_exists( $wpdb, 'strip_invalid_text_for_column' ) ) {
+        foreach ( [ 'actor_name', 'client', 'auth_method', 'tool', 'target', 'outcome', 'detail' ] as $column ) {
+          if ( isset( $row[ $column ] ) && is_string( $row[ $column ] ) ) {
+            $clean = $wpdb->strip_invalid_text_for_column( self::table(), $column, $row[ $column ] );
+            if ( is_string( $clean ) ) {
+              $row[ $column ] = $clean;
+            }
+          }
+        }
+      }
+
+      // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant, not user input
+      $prev = (string) $wpdb->get_var( "SELECT hash FROM " . self::table() . " ORDER BY id DESC LIMIT 1" );
+      $row['prev_hash'] = $prev;
+      $row['hash'] = self::hash( $row, $prev );
+
+      // Errors suppressed across the insert, and deliberately. wpdb prints a failed query
+      // straight to output when WP_DEBUG is on, and this runs inside the tool dispatcher's
+      // finally block, so the error text lands in front of the JSON-RPC body and the client
+      // gets a parse error instead of its result. A site with an out-of-date table would
+      // find every tool call broken rather than one audit entry missing. last_error is
+      // still set while suppressed, so nothing is lost but the printing.
+      $noisy = $wpdb->suppress_errors( true );
+      $written = $wpdb->insert( self::table(), $row );
+      $wpdb->suppress_errors( $noisy );
+    }
+    finally {
+      // Released explicitly. A persistent connection keeps its locks after the request.
+      if ( $locked ) {
+        $noisy = $wpdb->suppress_errors( true );
+        $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $name ) );
+        $wpdb->suppress_errors( $noisy );
+      }
+    }
 
     if ( $written === false ) {
       // A lost audit entry is the failure this table exists to prevent, and it is the
@@ -357,6 +455,33 @@ class GMCP_Audit {
       error_log( '[Guarded MCP] audit entry NOT recorded for ' . $row['tool'] . ': '
         . ( $wpdb->last_error ?: 'the database reported no error' ) );
     }
+  }
+
+  /**
+  * Record something the plugin itself did, outside any tool call.
+  *
+  * For actions taken from the settings screen that bear on the log, so that they leave a
+  * row in the chain they affect. Not reachable from a tool.
+  */
+  public static function note( string $tool, string $detail, string $target = '' ): void {
+    if ( self::over_bound() ) {
+      return;
+    }
+    $user = get_current_user_id();
+    self::write( [
+      'ts' => gmdate( 'Y-m-d H:i:s' ),
+      'actor' => $user,
+      'actor_name' => $user ? (string) ( get_userdata( $user )->user_login ?? '' ) : '',
+      'client' => 'settings screen',
+      'auth_method' => 'session',
+      'tool' => mb_substr( $tool, 0, 64 ),
+      'target' => mb_substr( $target, 0, 191 ),
+      'outcome' => 'ok',
+      'ms' => 0,
+      'args' => '{}',
+      'changes' => null,
+      'detail' => mb_substr( $detail, 0, 1000 ),
+    ] );
   }
 
   /**
@@ -663,6 +788,15 @@ class GMCP_Audit {
       return [ 'ok' => false, 'checked' => false, 'reason' => 'no such entry' ];
     }
     if ( (string) $row['hash'] === '' ) {
+      // Only the oldest rows can be unsigned. @see verify().
+      // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- table name is a plugin constant
+      $earlier = (int) $GLOBALS['wpdb']->get_var( $GLOBALS['wpdb']->prepare(
+        "SELECT COUNT(*) FROM " . self::table() . " WHERE id < %d AND hash <> ''", $id
+      ) );
+      if ( $earlier > 0 || (string) $row['prev_hash'] !== '' ) {
+        return [ 'ok' => false, 'checked' => true,
+          'reason' => 'this entry has no hash but follows entries that were signed, so its hash was removed' ];
+      }
       return [ 'ok' => true, 'checked' => false,
         'reason' => 'carried over from before the log was chained, so it was never signed' ];
     }
@@ -770,6 +904,7 @@ class GMCP_Audit {
     $prev = '';
     $checked = 0;
     $imported = 0;
+    $signed_seen = false;
     $after = $from > 0 ? $from - 1 : 0;
 
     while ( true ) {
@@ -786,10 +921,22 @@ class GMCP_Audit {
         // part of a chain and cannot retroactively join one. Counted and reported, not
         // treated as a break, or every upgraded site would be told on day one that its
         // audit log had been tampered with.
+        //
+        // But only as a prefix. Such rows exist because the import ran against an empty
+        // table, so they are the oldest rows there are, with no predecessor. An empty hash
+        // after a signed row is an edit: blanking the newest rows used to leave nothing
+        // after them to contradict it, and the walk reported the log intact. The id
+        // boundary is not the test, because it is recorded before the import runs and so
+        // sits below the imported rows on a fresh table.
         if ( (string) $row['hash'] === '' ) {
+          if ( $signed_seen || (string) $row['prev_hash'] !== '' ) {
+            return self::verdict( false, $checked, $imported, $total, $scope, (int) $row['id'],
+              'this row has no hash but follows rows that were signed, so its hash was removed' );
+          }
           $imported++;
           continue;
         }
+        $signed_seen = true;
         if ( $checked === 0 ) {
           $prev = (string) $row['prev_hash'];
         }
@@ -891,7 +1038,7 @@ class GMCP_Audit {
   }
 
   /**
-  * Apply the bounds, oldest first.
+  * Apply the bounds.
   *
   * AGE is the only bound that deletes rows, and it deletes exactly the rows the retention
   * setting says are past keeping. The row and byte bounds exist to stop the table growing
@@ -899,19 +1046,20 @@ class GMCP_Audit {
   *
   * They could, until this was fixed: both bounds called drop_oldest(), so exceeding either
   * deleted the oldest rows whatever their age. Any key can add rows — a refused call is
-  * recorded, and mcp_ping is reachable from a key scoped to it — and every recorded call
-  * keeps up to MAX_ARGS of arguments, so roughly eight hundred padded calls push the table
-  * over MAX_BYTES. The next cron run then deleted real history from the old end, and
+  * recorded, and mcp_ping is reachable from a key scoped to it — so a flood pushed the
+  * table over a bound and the next cron run deleted real history from the old end, while
   * verify() still reported the chain intact because a loss at the oldest end is invisible
   * to a walk that starts at the boundary. README says nothing exposed through MCP can prune
   * or clear the log; this is the path that made that untrue.
   *
   * So the row and byte bounds no longer delete anything. When one is reached the log stops
-  * recording and says so, through the stopped() state the settings screen and the read
-  * tools can report. That trades a bounded loss of detail at the NEW end for an unbounded
-  * loss of evidence at the old one, which is the right way round: the newest entries are
-  * the ones an operator is looking at, but the oldest retained entries are the ones the
-  * retention promise is about.
+  * recording, says so (stopped(), the admin notice, Site Health, the log screen, the error
+  * log), and the plugin refuses every tool above read level until there is room, so
+  * nothing happens that the log cannot show. That trades a bounded loss of detail at the
+  * NEW end for an unbounded loss of evidence at the old one, which is the right way round.
+  * Two things keep that trade cheap: a refused call is stored with at most
+  * MAX_REFUSED_ARGS of arguments, so a flood of them is expensive to mount, and the bounds
+  * are well past what a site records in its retention window.
   *
   * @return array{age:int,stopped:string} rows removed by age, and why recording stopped
   */
@@ -925,66 +1073,258 @@ class GMCP_Audit {
       $wpdb->prepare( "DELETE FROM {$table} WHERE ts < %s", $cutoff )
     );
 
-    // Still over a bound after the retention delete: the site is recording more than the
-    // bounds allow inside the retention window. Stop writing rather than delete recent
-    // rows, and leave a marker so an operator can see why their newer calls are missing.
-    if ( self::over_bound() ) {
-      $removed['stopped'] = self::over_bound_reason();
-      update_option( self::STOPPED_OPTION, [ 'at' => time(), 'why' => $removed['stopped'] ], false );
-      return $removed;
-    }
-
-    // Recording works again once the site is back under its bounds — the retention delete
-    // above, or an operator raising the limit. Clearing the marker here rather than on the
-    // next successful write keeps the reason attached to the condition that caused it.
-    if ( get_option( self::STOPPED_OPTION, null ) !== null ) {
-      delete_option( self::STOPPED_OPTION );
-    }
-
+    // Measured afresh, not from the cache, and the marker follows what is found: set when
+    // still over a bound after the retention delete, cleared once the site is back under
+    // them. Recording resumes by itself the moment the numbers allow it.
+    self::forget_usage();
+    $removed['stopped'] = self::over_bound_reason();
     return $removed;
   }
 
   /**
-  * Whether the log is at or past a hard bound, and which one.
-  *
-  * Counted rather than estimated: the bounds are enforced against these two numbers, and
-  * asking the database is the only way to know the answer the prune will act on.
+  * The row bound. Filterable, because it is not a setting: a site that genuinely records
+  * more than this inside its retention window can raise it, knowing the table grows with it.
   */
-  public static function over_bound(): bool {
-    return self::over_bound_reason() !== '';
+  public static function max_rows(): int {
+    return max( 1, (int) apply_filters( 'gmcp_audit_max_rows', self::MAX_ROWS ) );
   }
 
-  private static function over_bound_reason(): string {
-    if ( self::count() >= self::MAX_ROWS ) {
+  /** The byte bound. @see max_rows(). */
+  public static function max_bytes(): int {
+    return max( 1, (int) apply_filters( 'gmcp_audit_max_bytes', self::MAX_BYTES ) );
+  }
+
+  /** Where the last measurement of the table is kept, so a call does not scan it. */
+  const USAGE_TRANSIENT = 'gmcp_audit_usage';
+
+  /** @var array|null the measurement for this request. */
+  private static $usage = null;
+
+  /** Drop the remembered measurement, so the next question measures the table. */
+  public static function forget_usage(): void {
+    self::$usage = null;
+    delete_transient( self::USAGE_TRANSIENT );
+  }
+
+  /**
+  * How full the table is: rows and payload bytes.
+  *
+  * Asked before every tool call, and the byte figure is a SUM(LENGTH()) over longtext
+  * columns, which reads every row's off-page data: tens of megabytes near the bound, per
+  * call, reads included. So the answer is kept for a short while. Far from a bound it is
+  * kept for two minutes, since the table cannot move far in that time; within a tenth of
+  * one it is kept for five seconds, so the overshoot past a bound stays small. A measurement
+  * taken fresh is also where the stopped marker is brought into line with the numbers.
+  *
+  * @return array{rows:int,bytes:int}
+  */
+  private static function usage(): array {
+    if ( self::$usage !== null ) {
+      return self::$usage;
+    }
+    $cached = get_transient( self::USAGE_TRANSIENT );
+    if ( is_array( $cached ) && isset( $cached['rows'], $cached['bytes'] ) ) {
+      return self::$usage = [ 'rows' => (int) $cached['rows'], 'bytes' => (int) $cached['bytes'] ];
+    }
+    $usage = [ 'rows' => self::count(), 'bytes' => self::bytes() ];
+    $near = $usage['rows'] >= 0.9 * self::max_rows() || $usage['bytes'] >= 0.9 * self::max_bytes();
+    set_transient( self::USAGE_TRANSIENT, $usage, $near ? 5 : 2 * MINUTE_IN_SECONDS );
+    self::$usage = $usage;
+    self::sync_stopped( self::reason_for( $usage ) );
+    return $usage;
+  }
+
+  private static function reason_for( array $usage ): string {
+    if ( $usage['rows'] >= self::max_rows() ) {
       return 'rows';
     }
-    if ( self::bytes() >= self::MAX_BYTES ) {
+    if ( $usage['bytes'] >= self::max_bytes() ) {
       return 'bytes';
     }
     return '';
   }
 
   /**
+  * Bring the stopped marker in line with what was measured.
+  *
+  * The marker used to be set only by prune(), which runs daily or on a button, so a log
+  * could be dead for a day with nothing saying so. Set here the first time the log is
+  * found full, with one line in the error log, and cleared as soon as it is not.
+  */
+  private static function sync_stopped( string $reason ): void {
+    $state = get_option( self::STOPPED_OPTION, null );
+    $is_set = is_array( $state ) && !empty( $state['at'] );
+    if ( $reason === '' ) {
+      if ( $state !== null ) {
+        delete_option( self::STOPPED_OPTION );
+      }
+      return;
+    }
+    if ( !$is_set || ( $state['why'] ?? '' ) !== $reason ) {
+      update_option( self::STOPPED_OPTION, [ 'at' => $is_set ? (int) $state['at'] : time(), 'why' => $reason ], false );
+    }
+    if ( !$is_set ) {
+      error_log( '[Guarded MCP] the audit log is full (' . ( $reason === 'bytes' ? 'size' : 'entry-count' )
+        . ' limit) and has stopped recording. Tools above read level are refused until it has room. '
+        . 'Rows past the retention window are removed daily; the limits can be changed with the '
+        . 'gmcp_audit_max_rows and gmcp_audit_max_bytes filters.' );
+    }
+  }
+
+  /**
+  * Whether the log is at or past a hard bound, and which one.
+  *
+  * Counted rather than estimated, but not on every call. @see usage().
+  */
+  public static function over_bound(): bool {
+    return self::over_bound_reason() !== '';
+  }
+
+  private static function over_bound_reason(): string {
+    return self::reason_for( self::usage() );
+  }
+
+  /**
   * Why recording is currently stopped, or null.
   *
-  * Read by the settings screen and by any tool that reports on the log, so a missing recent
-  * entry can be told apart from one that never happened. Shaped as a small array rather
-  * than a bool because when it stopped and at which bound both matter to whoever has to
-  * decide whether to raise the limit or lower the retention.
+  * Read by the settings screen, the admin notice, Site Health and the tools that report on
+  * the log, so a missing recent entry can be told apart from one that never happened.
+  * Shaped as a small array rather than a bool because when it stopped and at which bound
+  * both matter to whoever has to decide whether to raise the limit or lower the retention.
   */
   public static function stopped(): ?array {
-    $state = get_option( self::STOPPED_OPTION, null );
-    if ( !is_array( $state ) || empty( $state['at'] ) ) {
+    // Asked of the numbers, which also brings the marker up to date when they are fresh.
+    // The marker alone can be stale (the retention delete may have made room since) or
+    // missing, and neither should change the answer.
+    if ( !self::over_bound() ) {
       return null;
     }
+    $state = get_option( self::STOPPED_OPTION, null );
+    $usage = self::usage();
     return [
-      'since' => gmdate( 'c', (int) $state['at'] ),
-      'bound' => (string) ( $state['why'] ?? '' ),
-      'rows' => self::count(),
-      'max_rows' => self::MAX_ROWS,
-      'bytes' => self::bytes(),
-      'max_bytes' => self::MAX_BYTES,
+      'since' => gmdate( 'c', is_array( $state ) && !empty( $state['at'] ) ? (int) $state['at'] : time() ),
+      'bound' => self::over_bound_reason(),
+      'rows' => $usage['rows'],
+      'max_rows' => self::max_rows(),
+      'bytes' => $usage['bytes'],
+      'max_bytes' => self::max_bytes(),
     ];
+  }
+
+  /**
+  * The access level of every tool offered on this request, learned from the registry.
+  *
+  * Collected at the end of the gmcp_tools filter, after every group has added its own, so
+  * the refusal below can tell a read from a write without reaching into the server's
+  * private tables. @see refuse_while_stopped().
+  *
+  * @var array<string,string>
+  */
+  private static $levels = [];
+
+  public static function remember_levels( $tools ) {
+    if ( is_array( $tools ) ) {
+      foreach ( $tools as $tool ) {
+        if ( is_array( $tool ) && isset( $tool['name'] ) ) {
+          self::$levels[ (string) $tool['name'] ] = (string) ( $tool['accessLevel'] ?? 'admin' );
+        }
+      }
+    }
+    return $tools;
+  }
+
+  /**
+  * While the log is full, refuse every tool that is not a read.
+  *
+  * Stopping the recording alone would let whoever filled the log act freely afterwards,
+  * with nothing written down: the cheapest way to switch an audit log off is to fill it.
+  * So the plugin fails closed. Reads still answer, which is how the operator finds out and
+  * how an agent can report the problem; everything that writes is refused, with the reason.
+  * A tool this request has no level for counts as not a read, except when the registry was
+  * never consulted at all (a resource read, which only ever borrows read tools).
+  *
+  * Hooked ahead of every tool group on gmcp_callback, so nothing else runs first. The
+  * refusal is itself a refused call, and is not recorded for the same reason.
+  */
+  public static function refuse_while_stopped( $result, $tool = '', $args = [], $id = 0 ) {
+    if ( $result !== null || !is_string( $tool ) || $tool === '' ) {
+      return $result;
+    }
+    $level = self::$levels[ $tool ] ?? ( self::$levels ? 'admin' : 'read' );
+    if ( $level === 'read' || !self::over_bound() ) {
+      return $result;
+    }
+    $why = self::over_bound_reason() === 'bytes' ? 'size' : 'entry-count';
+    return [
+      'jsonrpc' => '2.0',
+      'id' => $id,
+      'result' => [
+        'content' => [ [ 'type' => 'text', 'text' =>
+          "Refused: the audit log has reached its {$why} limit and has stopped recording, and this plugin does not "
+          . "allow changes it cannot record. Read-only tools still work. A site administrator can free room by "
+          . "waiting for entries to pass the retention window or lowering it, then using Prune now on the Audit "
+          . "log screen, or raise the limit with the gmcp_audit_max_rows / gmcp_audit_max_bytes filters." ] ],
+        'isError' => true,
+      ],
+    ];
+  }
+
+  /** The notice on every admin screen, for the people who can do something about it. */
+  public static function admin_notice(): void {
+    if ( !current_user_can( 'manage_options' ) ) {
+      return;
+    }
+    $state = self::stopped();
+    if ( !$state ) {
+      return;
+    }
+    printf(
+      '<div class="notice notice-error"><p><strong>%s</strong> %s <a href="%s">%s</a></p></div>',
+      esc_html__( 'Guarded MCP: the audit log is full and has stopped recording.', 'guarded-mcp' ),
+      esc_html__( 'Tools that change the site are refused until it has room. Reads still work.', 'guarded-mcp' ),
+      esc_url( GMCP_Settings::page_url( 'logs' ) ),
+      esc_html__( 'Open the audit log', 'guarded-mcp' )
+    );
+  }
+
+  /** @param array $tests */
+  public static function register_site_health( $tests ) {
+    $tests['direct']['gmcp_audit_log'] = [
+      'label' => __( 'MCP audit log', 'guarded-mcp' ),
+      'test' => [ __CLASS__, 'site_health_test' ],
+    ];
+    return $tests;
+  }
+
+  public static function site_health_test(): array {
+    $state = self::stopped();
+    $usage = self::usage();
+    $near = $usage['rows'] >= 0.9 * self::max_rows() || $usage['bytes'] >= 0.9 * self::max_bytes();
+    $result = [
+      'label' => __( 'The MCP audit log has room', 'guarded-mcp' ),
+      'status' => 'good',
+      'badge' => [ 'label' => __( 'MCP', 'guarded-mcp' ), 'color' => 'blue' ],
+      'description' => '<p>' . esc_html__( 'Entries are being recorded.', 'guarded-mcp' ) . '</p>',
+      'actions' => '',
+      'test' => 'gmcp_audit_log',
+    ];
+    if ( $state ) {
+      $result['label'] = __( 'The MCP audit log is full and has stopped recording', 'guarded-mcp' );
+      $result['status'] = 'critical';
+      $result['badge']['color'] = 'red';
+      $result['description'] = '<p>' . esc_html__( 'Tools that change the site are refused until the log has room, because the plugin does not allow changes it cannot record. Entries past the retention window are removed daily. The limits can be changed with the gmcp_audit_max_rows and gmcp_audit_max_bytes filters.', 'guarded-mcp' ) . '</p>';
+    }
+    elseif ( $near ) {
+      $result['label'] = __( 'The MCP audit log is nearly full', 'guarded-mcp' );
+      $result['status'] = 'recommended';
+      $result['badge']['color'] = 'orange';
+      $result['description'] = '<p>' . esc_html__( 'The log is within a tenth of its entry or size limit. When it is reached, recording stops and tools that change the site are refused.', 'guarded-mcp' ) . '</p>';
+    }
+    if ( $state || $near ) {
+      $result['actions'] = sprintf( '<p><a href="%s">%s</a></p>',
+        esc_url( GMCP_Settings::page_url( 'logs' ) ), esc_html__( 'Open the audit log', 'guarded-mcp' ) );
+    }
+    return $result;
   }
 
   public static function clear(): void {
@@ -997,6 +1337,10 @@ class GMCP_Audit {
     // them as tampered with. Nothing older survives a clear, so nothing needs the old
     // construction any more.
     update_option( self::BOUNDARY_OPTION, 0, false );
+    // Room again, so the remembered measurement and the stopped marker both describe a
+    // table that no longer exists.
+    self::forget_usage();
+    delete_option( self::STOPPED_OPTION );
     // The remembered full check describes rows that no longer exist. Kept, it would sit
     // under an empty log quoting a count from before the clear.
     delete_option( self::LAST_FULL_OPTION );

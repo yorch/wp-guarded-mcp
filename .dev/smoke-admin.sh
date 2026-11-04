@@ -1183,6 +1183,119 @@ check "deleting a row is detected too" \
 check "imported rows are reported, not called tampering" \
   "$(docker compose exec -T cli wp eval 'GMCP_Audit::clear();global $wpdb;$wpdb->insert($wpdb->prefix."gmcp_audit",["ts"=>gmdate("Y-m-d H:i:s"),"tool"=>"old","outcome"=>"ok","hash"=>"","prev_hash"=>""]);$v=GMCP_Audit::verify();echo $v["ok"]&&$v["imported"]===1?"handled":"WRONG";' 2>/dev/null | tr -d '\r\n')" "handled"
 
+# THE CHAIN UNDER CONCURRENCY. record() read the newest hash and then inserted, with
+# nothing between the two, so two calls landing together both chained to the same
+# predecessor. Parallel tool calls are ordinary client behaviour, and the fork it left was
+# permanent: verify() reported a missing row in a log nobody had touched, from then on.
+# Sixty calls, twenty at a time, are enough to fork it without the lock. The first check is
+# the control: an unrecorded call would shrink the chain and could hide a fork.
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+export TOK URL
+seq 1 60 | xargs -P 20 -I% sh -c 'curl -sS -o /dev/null -X POST "$URL" -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":%,\"method\":\"tools/call\",\"params\":{\"name\":\"mcp_ping\",\"arguments\":{}}}"'
+check "CONTROL: every one of sixty parallel calls was recorded" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"mcp_ping\"");' 2>/dev/null | tr -d '\r\n')" "60"
+check "the chain written by parallel calls verifies, end to end" \
+  "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify("all");echo $v["ok"]&&$v["complete"]&&$v["checked"]===60?"intact":"FORKED at ".var_export($v["broken_at"],true);' 2>/dev/null | tr -d '\r\n')" "intact"
+check "and no two rows share a predecessor" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(*) FROM (SELECT prev_hash FROM {$wpdb->prefix}gmcp_audit GROUP BY prev_hash HAVING COUNT(*) > 1) d");' 2>/dev/null | tr -d '\r\n')" "0"
+# The lock is released afterwards, or the next writer would wait five seconds for nothing.
+check "the chain lock is not left held" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$n="gmcp_audit_".md5(DB_NAME.GMCP_Audit::table());echo (int)$wpdb->get_var($wpdb->prepare("SELECT IS_FREE_LOCK(%s)",$n));' 2>/dev/null | tr -d '\r\n')" "1"
+
+# AN EMPTY HASH IS ACCEPTED ONLY BEFORE THE FIRST SIGNED ROW. Rows carried over from the
+# option-based version are the oldest rows there are; an unsigned row after a signed one is
+# an edit, and when it is the newest row nothing after it contradicts the blanking.
+check "CONTROL: unsigned rows ahead of the signed ones are still carried over, not broken" \
+  "$(docker compose exec -T cli wp eval 'GMCP_Audit::clear();global $wpdb;$t=GMCP_Audit::table();$wpdb->insert($t,["ts"=>gmdate("Y-m-d H:i:s"),"tool"=>"old","outcome"=>"ok","hash"=>"","prev_hash"=>""]);$a=new GMCP_Audit();foreach(["a","b","c"] as $n){$a->record(["tool"=>"t_".$n,"status"=>"success","args"=>[],"user_id"=>1]);}$v=GMCP_Audit::verify("all");echo $v["ok"]&&$v["imported"]===1&&$v["checked"]===3?"handled":"WRONG ".json_encode($v);' 2>/dev/null | tr -d '\r\n')" "handled"
+check "blanking the hash of the newest row is detected" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;$t=GMCP_Audit::table();$id=(int)$wpdb->get_var("SELECT MAX(id) FROM $t");$wpdb->query($wpdb->prepare("UPDATE $t SET hash=\"\", target=%s WHERE id=%d","edited",$id));$v=GMCP_Audit::verify("all");$r=GMCP_Audit::verify_row($id);echo !$v["ok"]&&$v["broken_at"]===$id&&!$r["ok"]?"detected":"MISSED ".json_encode($v);' 2>/dev/null | tr -d '\r\n')" "detected"
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+
+# THE PRUNE EVENT HEALS ITSELF. It was scheduled by the activation hook alone, which runs
+# once, so a site that lost the event (or a subsite of a network activation) was never
+# pruned. The first check is the control: unscheduling has to be observable, or "scheduled
+# again" below would pass on an event that was never gone.
+check "CONTROL: the event can be seen to be gone" \
+  "$(docker compose exec -T cli wp eval 'wp_clear_scheduled_hook("gmcp_audit_prune");echo wp_next_scheduled("gmcp_audit_prune") ? "present" : "absent";' 2>/dev/null | tr -d '\r\n')" "absent"
+check "and the next request puts it back" \
+  "$(docker compose exec -T cli wp eval 'echo wp_next_scheduled("gmcp_audit_prune") ? "scheduled" : "STILL GONE";' 2>/dev/null | tr -d '\r\n')" "scheduled"
+
+# A REFUSED CALL IS STORED SMALL. It costs the caller nothing, so a key limited to one
+# harmless tool could fill the byte bound with refused calls carrying 60 KB each. The
+# control is an accepted call with the same padding, which keeps the full cap: it proves
+# the length probe can see a large row.
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+PAD=$(python3 -c "print('p'*20000)")
+call au_big_refused "{\"jsonrpc\":\"2.0\",\"id\":230,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_theme\",\"arguments\":{\"stylesheet\":\"twentytwentyfive\",\"pad\":\"$PAD\"}}}"
+call au_big_ok "{\"jsonrpc\":\"2.0\",\"id\":231,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_post\",\"arguments\":{\"post_title\":\"Padded audit probe\",\"post_status\":\"draft\",\"post_content\":\"$PAD\"}}}"
+check "CONTROL: an accepted call keeps its large arguments" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT LENGTH(args) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_create_post\" ORDER BY id DESC LIMIT 1") > 15000 ? "large" : "SMALL";' 2>/dev/null | tr -d '\r\n')" "large"
+check "CONTROL: the refused call was recorded as refused" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (string)$wpdb->get_var("SELECT outcome FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_delete_theme\" ORDER BY id DESC LIMIT 1");' 2>/dev/null | tr -d '\r\n')" "refused"
+check "a refused call's stored arguments are capped near 2 KB" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT LENGTH(args) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_delete_theme\" ORDER BY id DESC LIMIT 1") <= 2300 ? "capped" : "UNCAPPED";' 2>/dev/null | tr -d '\r\n')" "capped"
+check "and the cap says how large the call really was" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo strpos((string)$wpdb->get_var("SELECT args FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_delete_theme\" ORDER BY id DESC LIMIT 1"),"__gmcp_truncated")!==false?"marked":"UNMARKED";' 2>/dev/null | tr -d '\r\n')" "marked"
+docker compose exec -T cli wp post list --post_type=post --post_status=draft --name='' --format=ids --s='Padded audit probe' 2>/dev/null | xargs -r docker compose exec -T cli wp post delete --force >/dev/null 2>&1
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+
+# A FULL LOG SAYS SO, AND THE PLUGIN STOPS DOING THINGS IT CANNOT RECORD. The bounds are
+# constants, so the test lowers the row bound through the filter, from a must-use plugin
+# that reads an option and is removed again below. The log stopped silently before: the
+# marker was set only by the daily prune, so for a day nothing said that every call since
+# had gone unrecorded, and a hostile caller who filled it could act freely afterwards.
+MU=/var/www/html/wp-content/mu-plugins/gmcp-test-audit-limit.php
+docker compose exec -T cli sh -c "mkdir -p /var/www/html/wp-content/mu-plugins && echo '<?php add_filter( \"gmcp_audit_max_rows\", function ( \$n ) { \$v = get_option( \"gmcp_test_max_rows\" ); return \$v ? (int) \$v : \$n; } );' > $MU" >/dev/null 2>&1
+fill_audit() { # fill_audit <limit> <rows>: a log holding <rows> rows under a bound of <limit>
+  docker compose exec -T cli wp eval 'update_option("gmcp_test_max_rows",'"$1"'); GMCP_Audit::clear(); $a=new GMCP_Audit();
+    for($i=0;$i<'"$2"';$i++){ GMCP_Audit::note("fixture","row ".$i); }
+    GMCP_Audit::forget_usage(); echo GMCP_Audit::count();' 2>/dev/null | tr -d '\r\n'; }
+check "CONTROL: the filter lowers the bound and the fixture fills it" "$(fill_audit 3 3)" "3"
+check "CONTROL: the log is over its bound" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::over_bound() ? "over" : "under";' 2>/dev/null | tr -d '\r\n')" "over"
+call full_write '{"jsonrpc":"2.0","id":232,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Written into a full log","post_status":"draft"}}}'
+check "a full log refuses a tool that writes" "$(verdict full_write)" "error"
+check "and says why" \
+  "$(py 'import json,sys;d=json.load(sys.stdin);print("audit log" in d["result"]["content"][0]["text"])' full_write)" "True"
+check "and the post was not created" \
+  "$(docker compose exec -T cli wp post list --post_type=post --post_status=any --s='Written into a full log' --format=count 2>/dev/null | tr -d '\r\n')" "0"
+call full_read '{"jsonrpc":"2.0","id":233,"method":"tools/call","params":{"name":"wp_get_posts","arguments":{"limit":1}}}'
+check "CONTROL: a read still answers" "$(verdict full_read)" "ok"
+call full_ping '{"jsonrpc":"2.0","id":234,"method":"tools/call","params":{"name":"mcp_ping","arguments":{}}}'
+check "CONTROL: and so does the connectivity check" "$(verdict full_ping)" "ok"
+check "nothing was recorded for them while it was full" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::count();' 2>/dev/null | tr -d '\r\n')" "3"
+check "the stopped marker is set from the recorder, not only from a prune" \
+  "$(docker compose exec -T cli wp eval 'echo is_array(get_option(GMCP_Audit::STOPPED_OPTION,null)) ? "set" : "NOT SET";' 2>/dev/null | tr -d '\r\n')" "set"
+check "an administrator is shown a notice" \
+  "$(docker compose exec -T cli wp eval 'wp_set_current_user(1);ob_start();GMCP_Audit::admin_notice();echo strpos(ob_get_clean(),"stopped recording")!==false?"shown":"SILENT";' 2>/dev/null | tr -d '\r\n')" "shown"
+check "Site Health reports it as critical" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::site_health_test()["status"];' 2>/dev/null | tr -d '\r\n')" "critical"
+check "and the Audit Log screen says it is full" \
+  "$(docker compose exec -T cli wp eval 'wp_set_current_user(1);$r=new ReflectionMethod("GMCP_Settings","render_entry_list");$r->setAccessible(true);$s=(new ReflectionClass("GMCP_Settings"))->newInstanceWithoutConstructor();ob_start();$r->invoke($s);echo strpos(ob_get_clean(),"has stopped recording")!==false?"said":"SILENT";' 2>/dev/null | tr -d '\r\n')" "said"
+# The other direction: room again, and everything returns to normal with no manual step.
+check "CONTROL: raising the bound makes room" \
+  "$(docker compose exec -T cli wp eval 'update_option("gmcp_test_max_rows",100);GMCP_Audit::forget_usage();echo GMCP_Audit::over_bound() ? "over" : "under";' 2>/dev/null | tr -d '\r\n')" "under"
+call room_write '{"jsonrpc":"2.0","id":235,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Written once there was room","post_status":"draft"}}}'
+check "a write goes through again" "$(verdict room_write)" "ok"
+check "and is recorded" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(*) FROM ".GMCP_Audit::table()." WHERE tool=\"wp_create_post\"");' 2>/dev/null | tr -d '\r\n')" "1"
+check "and the stopped marker is cleared" \
+  "$(docker compose exec -T cli wp eval 'GMCP_Audit::forget_usage();GMCP_Audit::over_bound();echo get_option(GMCP_Audit::STOPPED_OPTION,null)===null ? "cleared" : "STILL SET";' 2>/dev/null | tr -d '\r\n')" "cleared"
+check "and Site Health is good again" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::site_health_test()["status"];' 2>/dev/null | tr -d '\r\n')" "good"
+docker compose exec -T cli sh -c "rm -f $MU" >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_test_max_rows >/dev/null 2>&1
+docker compose exec -T cli wp post list --post_type=post --post_status=any --s='Written once there was room' --format=ids 2>/dev/null | xargs -r docker compose exec -T cli wp post delete --force >/dev/null 2>&1
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+check "CONTROL: the test limit is gone again" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_Audit::max_rows();' 2>/dev/null | tr -d '\r\n')" "50000"
+
+# Clearing the log leaves a first row that says it happened.
+check "a cleared log starts with a row recording the clear" \
+  "$(docker compose exec -T cli wp eval 'GMCP_Audit::clear();GMCP_Audit::note("gmcp_audit_cleared","cleared in a test");$v=GMCP_Audit::verify("all");echo GMCP_Audit::count()===1&&$v["ok"]&&$v["checked"]===1?"tombstone":"WRONG";' 2>/dev/null | tr -d '\r\n')" "tombstone"
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+
 # A KEY LIMITED TO NAMES THAT SANITISE TO NOTHING WAS UNRESTRICTED. The key store drops
 # empty names, and an empty list means every tool the access level allows. Driven through
 # the same method the form posts to, with the keys counted before and after.
