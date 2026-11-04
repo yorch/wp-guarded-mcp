@@ -434,21 +434,51 @@ names, `error_log()` for the connector's own diagnostics).
 
 ### Releasing
 
-1. Set the new version in **three** places: `Version:` and the `GMCP_VERSION` define in
-   `guarded-mcp.php`, and `Stable tag:` in `readme.txt`. `.dev/check-release.sh version`
-   fails if they disagree, and CI runs it on every push and pull request.
-2. Merge to `main`. The release workflow refuses a tag whose commit is not reachable from it.
-3. Tag the merged commit and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+Versions come from commit messages. Write every commit, and every squash-merged PR title, as a
+[Conventional Commit](https://www.conventionalcommits.org/); the `PR title` check enforces it
+on pull requests.
 
-The tag runs the release workflow, which checks the versions against the tag, builds the zip
-with `.dev/build.sh`, checks its contents, and publishes it as a GitHub Release with checksums
-and a provenance attestation. Nothing is sent to wordpress.org. The install links in this
-README resolve only once the first release exists.
+| Commit | Effect on the next release |
+|---|---|
+| `fix: ...` | patch (1.0.0 to 1.0.1) |
+| `feat: ...` | minor (1.0.0 to 1.1.0) |
+| `feat!: ...`, or a `BREAKING CHANGE:` footer | major (1.0.0 to 2.0.0) |
+| `docs:`, `ci:`, `chore:`, `refactor:`, `test:`, `build:`, `style:` | none by themselves |
+| a `Release-As: 1.4.0` footer | forces that version |
 
-The workflow runs in the `release` environment. Add required reviewers to that environment
-and restrict who may create `v*` tags (Settings, Environments and Rules): a tag's workflow
-file comes from the tagged commit, so the on-main check alone does not stop someone with
-write access.
+The release workflow keeps one open pull request, "chore(main): release X.Y.Z", that bumps
+`Version:` and the `GMCP_VERSION` define in `guarded-mcp.php` and `Stable tag:` in `readme.txt`,
+and adds the entries to `CHANGELOG.md`. It collects changes until you merge it. **Merging that
+pull request is the release**: the workflow then tags `vX.Y.Z`, creates the GitHub Release with
+the changelog section as its notes, and a second job builds the zip with `.dev/build.sh`, checks
+its contents, attests it and attaches the zips and checksums. Nothing is sent to wordpress.org.
+Pushing a tag by hand releases nothing.
+
+Things that are easy to get wrong:
+
+- **The version lives in three places and release-please edits them by marker.** The
+  `Release-Please:` lines in the plugin header and in the `readme.txt` header, and the
+  `x-release-please-version` comment on the `GMCP_VERSION` line, are what it finds. Leave them
+  in place. They are written as `Key: value` lines on purpose: wordpress.org's readme parser
+  ends the header at the first non-blank line that has no colon, and a bare marker there would
+  silently drop the headers after it. `.dev/check-release.sh version` fails if the three
+  disagree, and the release job runs it against the tag before attaching anything.
+- **The release PR gets no checks unless you add a token.** Pull requests created with the
+  default `GITHUB_TOKEN` do not start other workflows, so `Package` and `Plugin Check` do not
+  run on it. Add a repository secret `RELEASE_PLEASE_TOKEN` (a fine-grained token or GitHub App
+  token with contents, pull requests and issues write) and they do. The release works without it.
+- **The first release is whatever the first release PR says.** `bootstrap-sha` in
+  `release-please-config.json` starts the history at the commit that was `main` when this was
+  added, so only later `feat`/`fix` commits count, and nothing is proposed until one lands. To
+  release the current state as is, merge a commit with a `Release-As: 1.0.0` footer. The install
+  links in this README resolve only once a release exists.
+- **Who may merge the release PR is the control.** The tag and release are created after the
+  merge, so the `release` environment can only gate the file upload, not the release. Require a
+  review on `main` and keep merge rights narrow. Restricting who can create `v*` tags no longer
+  protects anything, because no workflow reads them.
+- **If the upload job fails, the tag and release already exist.** Fix the cause and use "Re-run
+  failed jobs" on that run; do not create a second release. A tag that disagrees with the files
+  means the markers broke, and is a manual repair.
 
 ## Licence
 
