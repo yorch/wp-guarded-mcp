@@ -3,22 +3,34 @@ name: Release
 # Commit-driven releases. release-please reads the Conventional Commit messages that have
 # landed on main since the last release and keeps one open "release PR" that bumps the
 # version (guarded-mcp.php, readme.txt) and writes CHANGELOG.md. Merging that PR is the
-# release: release-please then creates the tag and the GitHub Release, and the second job
-# below builds the zip, checks it, attests it and attaches it.
+# release: release-please creates the tag and a DRAFT GitHub Release (config: draft and
+# force-tag-creation), and the second job below builds the zip, checks it, attests it,
+# attaches it and only then publishes the draft. A release is therefore never public, and
+# never "Latest", without its files.
 #
-# Pushing a tag by hand does not release anything any more.
+# Pushing a tag by hand does not release anything, but see "Tag and commit agree" below: a
+# tag pushed ahead of the release PR is something this workflow has to defend against.
 #
 # TOKEN. Pull requests, tags and releases created with the default GITHUB_TOKEN do not start
-# other workflows. So the build is a job in this workflow rather than a tag-triggered one,
-# and nothing here depends on that. What does depend on it is the release PR itself: with
-# the default token, package.yml and plugin-check.yml do not run on it. To get those checks
-# on the release PR, add a repository secret RELEASE_PLEASE_TOKEN (a fine-grained token or a
-# GitHub App token with contents, pull-requests and issues write). Without it the workflow
-# still works and falls back to GITHUB_TOKEN.
+# other workflows, so the build is a job here, not a tag-triggered one. The release PR itself
+# gets no package.yml / plugin-check.yml run with the default token; add a repository secret
+# RELEASE_PLEASE_TOKEN (fine-grained or GitHub App token with contents, pull-requests and
+# issues write) to get them. The default token also needs Settings, Actions, General,
+# "Allow GitHub Actions to create and approve pull requests" switched on, or release-please
+# cannot open the PR at all.
+#
+# RECOVERY. If the draft exists but the files never got attached (release-please failed after
+# creating it, or the publish job needs a re-run on a cause outside the repo), run this workflow
+# by hand from main with the tag as input. It refuses anything that is not still a draft.
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag of an existing DRAFT release to build and attach files to (recovery only)'
+        required: true
 
 # Nothing is granted by default; each job asks for what it needs.
 permissions: {}
@@ -30,6 +42,7 @@ concurrency:
 
 jobs:
   release-please:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write        # tag and release
@@ -38,6 +51,7 @@ jobs:
     outputs:
       release_created: ${{ steps.rp.outputs.release_created }}
       tag_name: ${{ steps.rp.outputs.tag_name }}
+      sha: ${{ steps.rp.outputs.sha }}
     steps:
       # Pinned to a commit SHA (resolved with git ls-remote; v5.0.0, whose only breaking
       # change is the node24 runtime). Bump deliberately: this action writes tags and
@@ -51,38 +65,71 @@ jobs:
 
   publish:
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.release-please.outputs.release_created == 'true') }}
     runs-on: ubuntu-latest
-    # Names a deployment environment so required reviewers can be put in front of the
-    # upload (Settings, Environments). By this point the tag and the release exist, so it
-    # gates the files, not the release. The control over what gets released is who may
-    # merge the release PR into main.
+    # Names a deployment environment so required reviewers can be put in front of the upload
+    # (Settings, Environments). The tag and the draft exist by then, so it gates the files and
+    # the publishing, not the release PR. The control over what gets released is who may merge
+    # into main.
     environment: release
     permissions:
-      contents: write      # attach the files to the release
+      contents: write      # attach the files, publish the draft
       id-token: write      # sign the attestation
       attestations: write  # store the attestation
-    env:
-      TAG: ${{ needs.release-please.outputs.tag_name }}
     steps:
+      - name: Resolve the release
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RP_TAG: ${{ needs.release-please.outputs.tag_name }}
+          RP_SHA: ${{ needs.release-please.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            [ "$GITHUB_REF" = refs/heads/main ] || { echo "run recovery from main, not $GITHUB_REF" >&2; exit 1; }
+            TAG=$INPUT_TAG
+            SHA=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json targetCommitish -q .targetCommitish)
+          else
+            TAG=$RP_TAG
+            SHA=$RP_SHA
+          fi
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "not a release tag: '$TAG'" >&2; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "release target is not a commit SHA: '$SHA'" >&2; exit 1; }
+          # Only ever touch a draft: a published release's files are never replaced from here.
+          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)
+          [ "$draft" = true ] || { echo "release $TAG is not a draft; refusing to change a published release" >&2; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
       # Same pinning as above; bump deliberately.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
-          # All branches, so origin/main exists for the check below.
+          ref: ${{ steps.rel.outputs.sha }}
+          # All branches and tags, so origin/main and the tag exist for the check below.
           fetch-depth: 0
           # Nothing after this step needs git credentials; do not leave the token in .git/config.
           persist-credentials: false
 
-      - name: Tagged commit is on main
+      # release-please creates the release by tag name, and GitHub does not move a tag that
+      # already exists, so anyone who pushed vX.Y.Z before the release PR was merged decides
+      # which commit the release points at. Build only the commit release-please released,
+      # only if the tag really points at it, and only if it is on main.
+      - name: Tag and commit agree, and are on main
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+          SHA: ${{ steps.rel.outputs.sha }}
         run: |
-          # If origin/main is missing, merge-base fails and this refuses, which is the safe direction.
-          if ! git merge-base --is-ancestor "$(git rev-parse HEAD)" origin/main; then
-            echo "Tag $TAG is not reachable from origin/main; refusing to attach files." >&2
-            exit 1
-          fi
+          [ "$(git rev-parse HEAD)" = "$SHA" ] || { echo "checked-out commit is not $SHA" >&2; exit 1; }
+          TAGSHA=$(git rev-parse "refs/tags/$TAG^{commit}") || { echo "tag $TAG does not exist" >&2; exit 1; }
+          [ "$TAGSHA" = "$SHA" ] || { echo "tag $TAG points at $TAGSHA, not at the released commit $SHA; refusing" >&2; exit 1; }
+          # If origin/main is missing, merge-base fails and this refuses, the safe direction.
+          git merge-base --is-ancestor "$SHA" origin/main || { echo "$SHA is not reachable from origin/main; refusing" >&2; exit 1; }
 
       - name: Version strings agree with the tag
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
         run: .dev/check-release.sh version "$TAG"
 
       - name: Build
@@ -108,13 +155,14 @@ jobs:
             tmp/guarded-mcp-*.zip
             tmp/guarded-mcp.zip
 
-      # The release already exists (release-please made it, with the changelog as its
-      # notes), so this only adds files. No --clobber: if a file is already there, stop
-      # and look rather than overwrite something users may have downloaded.
-      - name: Attach the files to the release
+      # The release is still a draft, so nobody has downloaded anything: replacing files on a
+      # re-run is safe here, and it is what lets a half-finished upload be repaired.
+      - name: Attach the files, then publish the draft
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rel.outputs.tag }}
         run: |
-          gh release upload "$TAG" \
+          gh release upload "$TAG" --clobber \
             tmp/guarded-mcp-*.zip tmp/guarded-mcp-*.zip.sha256 \
             tmp/guarded-mcp.zip tmp/guarded-mcp.zip.sha256
+          gh release edit "$TAG" --draft=false

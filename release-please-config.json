@@ -11,5 +11,8 @@
         "readme.txt"
       ]
     }
-  }
+  },
+  "draft": true,
+  "force-tag-creation": true,
+  "prerelease": true
 }
