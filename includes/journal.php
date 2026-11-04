@@ -849,7 +849,7 @@ class GMCP_Journal {
         // The one row the addition created, and only if it is still that row: same post,
         // same key. Its siblings were there before and stay.
         $row = get_metadata_by_mid( 'post', (int) $entry['mid'] );
-        if ( $row && (int) $row->post_id === $meta_post && (string) $row->meta_key === $meta_key ) {
+        if ( $row && (int) $row->post_id === $meta_post && self::same_meta_key( (string) $row->meta_key, $meta_key ) ) {
           if ( !delete_metadata_by_mid( 'post', (int) $entry['mid'] ) ) {
             return [ 'ok' => false, 'message' => 'Removing the added custom field "' . $meta_key . '" row from post ' . $meta_post . ' failed. Nothing was marked as reverted.' ];
           }
@@ -871,7 +871,7 @@ class GMCP_Journal {
           $restored_rows = 0;
           foreach ( $meta_value[ self::META_ROWS ] as $mid => $old ) {
             $row = get_metadata_by_mid( 'post', (int) $mid );
-            if ( $row && (int) $row->post_id === $meta_post && (string) $row->meta_key === $meta_key ) {
+            if ( $row && (int) $row->post_id === $meta_post && self::same_meta_key( (string) $row->meta_key, $meta_key ) ) {
               if ( maybe_serialize( $row->meta_value ) !== maybe_serialize( $old ) ) {
                 update_metadata_by_mid( 'post', (int) $mid, $old );
               }
@@ -986,6 +986,17 @@ class GMCP_Journal {
     }
 
     return [ 'ok' => true, 'message' => $done ];
+  }
+
+  /**
+  * Whether a row's key is the key an entry recorded, as the database compares them.
+  *
+  * The rows were found through wp_postmeta's collation, case-insensitive on a stock
+  * install, so a row filed as "Existing_Key" was one of the rows a write of "existing_key"
+  * touched. Comparing exactly here would add a duplicate instead of restoring it by id.
+  */
+  private static function same_meta_key( string $stored, string $recorded ): bool {
+    return $stored === $recorded || strtolower( $stored ) === strtolower( $recorded );
   }
 
   /** Wraps the rows a multi-row meta snapshot holds, so a revert can tell them from a value. */
