@@ -1502,6 +1502,30 @@ call bk_start '{"jsonrpc":"2.0","id":231,"method":"tools/call","params":{"name":
 check "starting succeeds" "$(verdict bk_start)" "ok"
 check "and says plainly that it is not finished" "$(refusal bk_start | grep -c 'not finished yet')" "1"
 check "and never claims a backup was taken" "$(refusal bk_start | grep -ci 'backup complete\|backup taken\|backed up successfully')" "0"
+# The job runs in its own request now, queued on WP-Cron, rather than inside this one: a
+# medium site used to hold the call for the whole first resumption, and a proxy timeout
+# answered 504 while the backup carried on. Measured as "the job is visible as in flight
+# once the reply is back", which inline running could never show: by then it had finished.
+call bk_status2 '{"jsonrpc":"2.0","id":233,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
+BK_RUNNING=$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(d['running'])" bk_status2)
+call bk_again '{"jsonrpc":"2.0","id":235,"method":"tools/call","params":{"name":"wp_start_backup","arguments":{}}}'
+check "the job reads as in flight after the reply" "$BK_RUNNING" "True"
+# boot_backup() returns false on a held lock and do_action() threw that away, so a second
+# start read as a start. Refused here, before anything is queued.
+check "a second start while one is in flight is refused" "$(verdict bk_again)" "error"
+check "and the refusal says why" "$(refusal bk_again | grep -c 'already has a backup in progress')" "1"
+# The job id is the secret half of every archive filename, which is why the listing
+# withholds it. The start reply must not hand it over either.
+check "the reply carries no job id" "$(refusal bk_start | grep -cE '[0-9a-f]{12}')" "0"
+# Let it finish, so the sections below begin with nothing in flight: Backuply's section
+# deactivates UpdraftPlus, and doing that mid-job leaves resumptions nothing will run.
+for _ in $(seq 1 60); do
+  [ "$(docker compose exec -T cli wp eval 'foreach ( (array) _get_cron_array() as $e ) { foreach ( [ "updraft_backup_resume", "updraft_backupnow_backup_all" ] as $h ) { if ( !empty( $e[ $h ] ) ) { echo 1; return; } } } echo 0;' 2>/dev/null | tr -d '\r\n')" = "0" ] && break
+  sleep 5
+done
+call bk_status3 '{"jsonrpc":"2.0","id":236,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
+check "CONTROL: and reads as finished once UpdraftPlus is done" \
+  "$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(d['running'])" bk_status3)" "False"
 
 # The two-step confirmation reports the situation rather than gating on it.
 call bk_confirm '{"jsonrpc":"2.0","id":232,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"akismet/akismet.php"}}}'

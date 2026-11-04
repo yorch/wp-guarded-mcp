@@ -124,21 +124,18 @@ class GMCP_Backup {
             ];
           }
 
-          // nocloud 0 means "also send it to whatever remote storage the site configured".
-          // Leaving that to the site's own settings is the right default: a backup that
-          // only exists on the same disk as the site is not much of a backup.
-          do_action( $action, [ 'nocloud' => 0 ] );
-          return [ 'ok' => true, 'handle' => (string) get_site_option( 'updraft_last_backup_job_nonce', '' ) ];
+          return self::updraft_start( $action );
         },
         'state' => function () {
           $history = UpdraftPlus_Backup_History::get_history();
           $times = array_map( 'intval', array_keys( (array) $history ) );
           $last = $times ? max( $times ) : null;
 
-          $running = false;
-          if ( class_exists( 'UpdraftPlus_Options' ) ) {
-            $running = (bool) UpdraftPlus_Options::get_updraft_option( 'updraft_activejobs', [] );
-          }
+          // Read from the cron schedule, which is where UpdraftPlus's own Backup Now
+          // screen finds its active jobs. This used to read an updraft_activejobs option
+          // that UpdraftPlus never writes (the name is only an element id in its admin
+          // template), so a running backup always read as not running.
+          $running = self::updraft_running();
 
           $report = get_option( 'updraft_last_backup' );
           $errors = is_array( $report ) && !empty( $report['errors'] ) ? count( (array) $report['errors'] ) : 0;
@@ -521,6 +518,127 @@ class GMCP_Backup {
     return $slug !== '' ? $slug : 'an unnamed backup adapter';
   }
 
+  /** The three actions UpdraftPlus starts a backup on, one per scope. */
+  private const UPDRAFT_START_ACTIONS = [ 'updraft_backupnow_backup_all', 'updraft_backupnow_backup_database', 'updraft_backupnow_backup' ];
+
+  /**
+  * Queue an UpdraftPlus backup on WP-Cron, in a request that is not this one.
+  *
+  * Firing the action here used to run the backup inside the MCP request. The action
+  * reaches UpdraftPlus::boot_backup(), which calls backup_resume() inline; UpdraftPlus's
+  * own Backup Now closes the browser connection first and then does that, but a REST
+  * reply cannot be sent early, so a medium site held the call for as long as its first
+  * resumption took and a proxy with a 60 to 100 second timeout answered 504 while the
+  * backup carried on. boot_backup()'s false on a held lock or a hosting limit was also
+  * discarded by do_action(), so a refusal read as a start.
+  *
+  * A single cron event on the same action is the same entry point UpdraftPlus's
+  * scheduler uses: wp-cron.php calls the action with these options, and backup_all() and
+  * its siblings boot exactly as Backup Now would. The job id is chosen here, in the shape
+  * backup_time_nonce() makes, and passed as use_nonce, which boot_backup() honours, so
+  * this request can watch for the job's own log file appearing. It is never put in the
+  * reply: that id is the secret part of every archive filename, and the listing withholds
+  * it for that reason.
+  *
+  * @return array{ok:bool,message?:string,note?:string}
+  */
+  private static function updraft_start( string $action ): array {
+    if ( self::updraft_running() ) {
+      return [
+        'ok' => false,
+        'message' => 'UpdraftPlus already has a backup in progress or queued. Its own lock would refuse a second one, so nothing was started. Call wp_backup_status until it reports nothing running.',
+      ];
+    }
+
+    $nonce = substr( md5( time() . wp_rand() ), 20 );
+    // nocloud 0 means "also send it to whatever remote storage the site configured".
+    // Leaving that to the site's own settings is the right default: a backup that only
+    // exists on the same disk as the site is not much of a backup.
+    $options = [ 'nocloud' => 0, 'use_nonce' => $nonce ];
+    $queued = wp_schedule_single_event( time(), $action, [ $options ] );
+    if ( $queued === false || is_wp_error( $queued ) ) {
+      return [
+        'ok' => false,
+        'message' => 'UpdraftPlus is ready, but WordPress would not queue the event that starts the backup, so nothing was started. Something is filtering the cron schedule.',
+      ];
+    }
+
+    // Kick the runner rather than waiting for the next visitor. A non-blocking loopback,
+    // sent even under DISABLE_WP_CRON because the switch that skips cron sits in the
+    // request handler rather than in wp-cron.php itself.
+    spawn_cron();
+
+    // A few seconds to see whether UpdraftPlus picked it up, read off the log file it opens
+    // when the job boots. A file rather than the cron option, because a persistent object
+    // cache can keep serving this request the schedule as it was.
+    $log = self::updraft_log_path( $nonce );
+    $started = false;
+    for ( $i = 0; $i < 6 && $log !== null; $i++ ) {
+      clearstatcache( true, $log );
+      if ( file_exists( $log ) ) {
+        $started = true;
+        break;
+      }
+      sleep( 1 );
+    }
+
+    if ( $started ) {
+      return [ 'ok' => true, 'note' => 'UpdraftPlus has picked the job up and is running it in its own request.' ];
+    }
+    if ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) {
+      $note = 'It is queued but had not started a few seconds later. This site sets DISABLE_WP_CRON, so it starts when the server\'s own cron next calls wp-cron.php; if nothing does, it will not start at all.';
+    }
+    elseif ( defined( 'ALTERNATE_WP_CRON' ) && ALTERNATE_WP_CRON ) {
+      $note = 'It is queued but had not started a few seconds later. This site uses ALTERNATE_WP_CRON, which runs queued events on the next ordinary page view.';
+    }
+    else {
+      $note = 'It is queued but had not started a few seconds later, so WP-Cron will start it on the next page load; a host that blocks the site calling itself delays it until then.';
+    }
+    return [ 'ok' => true, 'note' => $note ];
+  }
+
+  /**
+  * Whether an UpdraftPlus backup is running or waiting to.
+  *
+  * Two signals, both from the cron schedule. A job in progress keeps its next resumption
+  * scheduled as updraft_backup_resume with the job id in its arguments, which is how
+  * UpdraftPlus's own screen lists active jobs, and a job this adapter queued sits on one
+  * of the three start actions until wp-cron.php takes it.
+  */
+  private static function updraft_running(): bool {
+    $cron = function_exists( '_get_cron_array' ) ? _get_cron_array() : [];
+    foreach ( (array) $cron as $events ) {
+      if ( !is_array( $events ) ) {
+        continue;
+      }
+      if ( !empty( $events['updraft_backup_resume'] ) ) {
+        return true;
+      }
+      foreach ( self::UPDRAFT_START_ACTIONS as $hook ) {
+        if ( !empty( $events[ $hook ] ) ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** Where UpdraftPlus writes the log for a job, or null when that cannot be worked out. */
+  private static function updraft_log_path( string $nonce ): ?string {
+    global $updraftplus;
+    if ( !is_object( $updraftplus ) ) {
+      return null;
+    }
+    if ( method_exists( $updraftplus, 'get_logfile_name' ) ) {
+      return (string) $updraftplus->get_logfile_name( $nonce );
+    }
+    if ( !method_exists( $updraftplus, 'backups_dir_location' ) ) {
+      return null;
+    }
+    $dir = (string) $updraftplus->backups_dir_location();
+    return $dir !== '' ? trailingslashit( $dir ) . 'log.' . $nonce . '.txt' : null;
+  }
+
   /**
   * The components an UpdraftPlus backup can hold, asked of UpdraftPlus rather than listed
   * here.
@@ -718,6 +836,10 @@ class GMCP_Backup {
     // on disk" is the assumption this sentence exists to head off.
     if ( $scope !== 'database' ) {
       $message .= ' The file half covers whatever this site already has its backup plugin configured to include, so anything excluded there is excluded here too.';
+    }
+    $note = trim( (string) ( $result['note'] ?? '' ) );
+    if ( $note !== '' ) {
+      $message .= ' ' . $note;
     }
     $message .= ' Call wp_backup_status to see when one completes.';
 
