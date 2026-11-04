@@ -65,6 +65,17 @@ for the first caller that passes a secret.
 **There is no restore tool, at any access level.** Backups can be started and read. That is
 deliberate and not an omission to be helpfully filled in.
 
+**No tool reads, lists, answers or edits the approval queue, at any access level.** The
+approval queue (`GMCP_Approvals`) holds a call until a person signed in to wp-admin answers
+it, and its whole value is that the agent cannot answer for itself. `decide()` is the only
+place a request leaves pending, and it demands a logged-in cookie that belongs to the
+current user, because a bearer key and an OAuth grant both set the current user to an
+administrator with no cookie. A tool that listed pending requests would hand a
+prompt-injected agent the ids and arguments to reason about; a tool that approved would
+delete the feature. `smoke-admin.sh` asserts no such tool exists at any level. Which tools
+are held is derived from their registration (`GMCP_Approvals::classify()`), never from a
+list of names, and an unclassifiable tool is held.
+
 **There is no kit import, and no tool that takes an archive.** `elementor_set_active_kit`
 switches between kits the site already has, which is reversible because the previous one is
 still there. Importing one rewrites the whole design system from an archive built elsewhere,

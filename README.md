@@ -234,7 +234,7 @@ option guards live on the option, why backups never return filenames, and the re
 
 ## The settings screen
 
-At **MCP Server** in the admin menu, in five pages. It is top level rather than buried
+At **MCP Server** in the admin menu, in six pages. It is top level rather than buried
 under Settings, because it is the first thing anyone needs after activating, and there
 is a Settings link on the plugin's row too.
 
@@ -270,6 +270,46 @@ key's secret appears once, on creation, and is not recoverable afterwards.
 
 Which groups of tools an agent is offered, and nothing else. A group that is off is not
 merely hidden: its tools are refused if asked for by name.
+
+### Approvals
+
+Off by default. When switched on, a tool call that would delete something, or change the
+site, does not run: it is stored as a pending request, the agent is told it is waiting
+for human approval (a normal reply, not an error) and is given a request id. A signed-in
+administrator sees the request here, with its tool, the key that asked and its redacted
+arguments, and answers it with **Approve** or **Decline**. After an approval the agent
+repeats the identical call and it runs once.
+
+- **Ask before** is `never`, `deletes`, or `deletes and site changes`. It applies to every
+  key and every connected app, so a key made later is covered too. Which tools count is
+  worked out from each tool's own access level and annotations rather than from a list of
+  names: deletions, anything the plugin cannot classify (held in both modes, so an
+  unrecognised tool fails closed), and, in the wider mode, every other `admin`-level write
+  (plugins, themes, users, options, settings, menus, and the writes of the optional
+  groups). Content edits at the `read` and `write` level never wait.
+- A pending request lapses after an hour. An approval lasts 15 minutes and works once, for
+  that key, that tool and exactly those arguments (a hash of the canonical JSON, keyed so
+  a stored row cannot be used to guess a password offline). A different argument, key or
+  tool is a different request. An identical call after the approval was used is refused
+  and asks again.
+- It is out of band because there is nothing to hand the agent: no approval token exists.
+  A request only leaves "pending" through the wp-admin screen, which requires a logged-in
+  session cookie that belongs to the current user, `manage_options`, a nonce bound to that
+  request and verdict, and a request that is not a tool call or a REST call. No tool reads,
+  lists, approves, declines or edits the queue, at any access level.
+- The two-step confirmation still applies inside an approved call, and one approval covers
+  both legs: a call that only issued a confirmation token has not spent it.
+- Arguments are redacted by the same test the audit log uses before they are stored or
+  shown, so a credential is approved unseen (the hash covers the real value). Requests,
+  approvals, declines, lapses, uses and refused replays are written to the audit log.
+  There are no bulk actions and nothing to delete: a request leaves the list by being
+  answered or by lapsing.
+
+What it does not do: it does not make a gated tool safe, only attended. It does not gate
+read-level or write-level tools, `wp_undo_change` (a write-level tool that replays earlier
+values), or the one-time upload endpoint behind `wp_upload_request`. A preview waits like
+the call it previews. A tool at the `admin` level with no destructive verb, annotation or
+read verb in its name is a site change, not a deletion, so it waits only in the wider mode.
 
 ### Logging
 
@@ -369,6 +409,7 @@ Other hooks:
 - Only administrators can authorize an OAuth client, checked both at authorize time and again on every request.
 - Keys are stored as a SHA-256 hash and shown once, so the database holds nothing that can be replayed. A key also records the administrator who created it and acts as that account, which is what lets the log name a person; it stops working the moment that account stops holding `manage_options`, so revoking somebody's access revokes their agent with it.
 - No row belonging to this plugin, and no option whose name looks like a credential, can be read or written through the option tools. The change journal additionally inspects the value it is about to record, so a `secret_key` or `pass` field inside a settings array is blanked before the rest of that array is kept, and an undo leaves the live value in place rather than writing the placeholder over it. Strings that parse as JSON or as a serialized array are unpacked and judged too, and blanked whole when they hold one. The check reads field names, not content, so it will not catch a secret held as a bare string under an innocuous option name.
+- Optional human approval holds deletes, and optionally site changes, until an administrator signed in to wp-admin approves that exact call. There is no approval token for an agent to learn or mint, and no tool that reads or answers the queue. See Approvals above.
 - Tools do not execute arbitrary PHP or SQL. Every tool is a fixed WordPress operation with a schema.
 - An open stream holds one PHP worker for up to 180 seconds. Size your pool accordingly if several agents connect at once.
 - **The token-in-URL endpoint is gone, and so is the shared bearer token.** If you were connecting over either, connect with a named key in the `Authorization` header instead. An existing shared token is carried over into a key on upgrade, so it keeps working through the header without you doing anything; it is no longer readable back from the screen or the database. If your host strips the header, the fix is the header: re-saving your permalink structure regenerates the `.htaccess` rule that forwards it, and the connection check on the settings screen tells you whether it worked.

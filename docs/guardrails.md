@@ -910,6 +910,64 @@ made here and the previous one is still there to switch back to. A site that
 genuinely wants an import has the Elementor screen for it, where a person sees
 what is about to happen.
 
+## Human approval
+
+The two-step confirmation on irreversible tools is minted by the server and handed to
+whoever called, so an agent that was talked into a deletion by a comment it read makes
+the second call itself. It raises the bar from one call to two. The approval queue is the
+other kind of gate, and it exists because of that gap: the person, not the agent, supplies
+the second half.
+
+- **Where it sits.** In `execute_tool()`, after the key, level and required-argument
+  checks and before dispatch. That function is the only place a `tools/call` reaches a
+  tool: `handle_direct_jsonrpc()` is its one caller, and the resource layer only borrows
+  read-level tools directly. A gate in a tool class would be one gate per class, which is
+  how the option policy once protected one writer and not the others. A call refused
+  earlier never becomes a request, and a held call has done nothing.
+- **Nothing to steal.** No approval token exists. The agent is told a request id, which is
+  a reference and grants nothing. The retry is matched on what it is (key, tool, keyed
+  hash of canonical arguments) against a row that only `GMCP_Approvals::decide()` can move
+  to approved, and `decide()` refuses unless the request is a wp-admin page load with a
+  logged-in cookie belonging to the current user (a bearer key or OAuth grant sets the
+  current user without a cookie), `manage_options`, a nonce bound to the request and the
+  verdict, and no tool call or REST request in flight. There is no tool that reads,
+  lists, approves, declines or edits the queue, and the setting and the table are not
+  reachable through the option tools (`gmcp_` rows are refused by name; the queue is not an
+  option at all).
+- **What it binds.** Key, tool and arguments. The arguments are canonical JSON with object
+  keys sorted, hashed with HMAC under the site's auth salt: arguments can hold a password,
+  and a plain digest stored beside the row would let a database read confirm a guess. The
+  one exception is `confirm`, dropped from the hash only when the tool declares it as its
+  two-step token, so the retry that carries the token is the same call finishing and one
+  approval covers both legs. `finish()` gives an approval back when the call only issued a
+  token, with its original deadline, and never after a leg that ran.
+- **Single use and lapse.** A pending request lapses after an hour, an approval after 15
+  minutes. The claim is one `UPDATE ... WHERE status = 'approved' AND approved_until >= now`,
+  so two retries racing each other cannot both run. A declined call is refused for 15
+  minutes so an agent does not refill the queue with the same question. A queue is capped
+  per credential and overall; hitting the cap is a refusal, not a pass.
+- **What counts.** Derived from each tool's own registration, not from a list of names.
+  `unknown` (no definition, or no recognised level) and `destructive` (a destructive hint
+  or verb, which outranks the level) are held in both modes. In the wider mode so is
+  `site`: any other admin-level write. `read` and `write` levels never wait. That relies on
+  the README's definition of the `write` level as having no destructive tools, which
+  `smoke-admin.sh` checks against the registered tools. Honest limits: a destructive admin
+  tool with no hint and a verb outside the list is a site change, so it waits only in the
+  wider mode; `wp_undo_change` (write level) replays earlier values and is not gated; the
+  `wp_upload_request` endpoint is not a tool call; a preview waits like the call it
+  previews, because the setting cannot tell the two apart.
+- **What a person sees.** The tool, the key, and the arguments as the audit log would
+  record them. A credential-shaped value is hidden, so it is approved unseen and covered
+  by the hash. Long arguments are shortened on screen only.
+- **A held call is not a success.** The reply is a normal result, not `isError`, so a
+  client does not send the agent looking for a workaround; the audit log records the call
+  as refused, because nothing ran. Requests, approvals, declines, lapses, uses and refused
+  replays are rows in the same hash chain (`approval:requested`, `approval:approved`, ...).
+  If the audit log is switched off they are not written, and the queue says so.
+- **No bulk and no delete.** Same reasoning as the audit log: an approval is a decision
+  about one call, and a button that answers fifty is pressed without reading. Settled rows
+  are pruned daily after 30 days; the audit log keeps the history.
+
 ## Prompts and resources
 
 The server offers six ready-made upkeep jobs through MCP prompts, and publishes
