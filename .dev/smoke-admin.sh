@@ -786,6 +786,35 @@ check "reverting restores the post status" \
   "$(docker compose exec -T cli wp post get "$J_POST" --field=post_status 2>/dev/null | tr -d '\r\n')" "publish"
 docker compose exec -T cli wp post delete "$J_POST" --force >/dev/null 2>&1
 
+# The restored fields are raw WP_Post values, and wp_insert_post() unslashes what it is
+# given, so every backslash came back stripped: Gutenberg stores "<b>" in an attribute as
+# <b>, which returned as u003cbu003e, and the reply said "Restored". Seeded with
+# wp_slash, the way the plugin's own writers store content, and compared byte for byte.
+J_BS=$(docker compose exec -T cli wp eval '
+  $c = "<!-- wp:paragraph {\"x\":\"" . chr(92) . "u003cb" . chr(92) . "u003e\"} --><p>C:" . chr(92) . "Users</p><!-- /wp:paragraph -->";
+  echo wp_insert_post(wp_slash(["post_title"=>"Undo slash probe","post_content"=>$c,"post_status"=>"draft"]));' 2>/dev/null | tr -d '\r\n')
+J_BS_MD5=$(docker compose exec -T cli wp eval "echo md5(get_post_field('post_content',$J_BS,'raw'));" 2>/dev/null | tr -d '\r\n')
+check "CONTROL: the seed kept its backslashes" \
+  "$(docker compose exec -T cli wp eval "echo substr_count(get_post_field('post_content',$J_BS,'raw'), chr(92));" 2>/dev/null | tr -d '\r\n')" "3"
+call j_bs_edit "{\"jsonrpc\":\"2.0\",\"id\":110,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$J_BS,\"post_content\":\"<p>replaced</p>\"}}}"
+call j_bs_list '{"jsonrpc":"2.0","id":111,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":1}}}'
+J_BS_ID=$(py "import json,sys;d=json.load(sys.stdin);print(json.loads(d['result']['content'][0]['text'])[0]['id'])" j_bs_list)
+# A restore WordPress refuses must not be stamped as done. A must-use plugin makes the next
+# post write fail on request, which is the only way to make wp_update_post() say no.
+docker compose exec -T cli bash -c 'mkdir -p /var/www/html/wp-content/mu-plugins && printf "%s\n" "<?php" "if ( get_option( \"smoke_fail_post_write\" ) ) { add_filter( \"wp_insert_post_empty_content\", \"__return_true\" ); }" > /var/www/html/wp-content/mu-plugins/smoke-fail-post-write.php' >/dev/null 2>&1
+docker compose exec -T cli wp option update smoke_fail_post_write 1 >/dev/null 2>&1
+call j_bs_fail "{\"jsonrpc\":\"2.0\",\"id\":112,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$J_BS_ID\"}}}"
+docker compose exec -T cli wp option delete smoke_fail_post_write >/dev/null 2>&1
+check "a restore WordPress refused is reported as failed" "$(verdict j_bs_fail)" "error"
+call j_bs_list2 '{"jsonrpc":"2.0","id":113,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":5}}}'
+check "and is still on the list as reversible, to be tried again" \
+  "$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next((r['reversible'] for r in rows if r['id']=='$J_BS_ID'),'MISSING'))" j_bs_list2)" "True"
+call j_bs_undo "{\"jsonrpc\":\"2.0\",\"id\":114,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$J_BS_ID\"}}}"
+check "undo puts post content back byte for byte, backslashes included" \
+  "$(docker compose exec -T cli wp eval "echo md5(get_post_field('post_content',$J_BS,'raw'));" 2>/dev/null | tr -d '\r\n')" "$J_BS_MD5"
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/smoke-fail-post-write.php >/dev/null 2>&1
+docker compose exec -T cli wp post delete "$J_BS" --force >/dev/null 2>&1
+
 # Only the agent's writes. A person saving a settings page is not the agent's to undo,
 # and listing it would make the history untrustworthy at exactly the wrong moment.
 docker compose exec -T cli wp option update blogname "Edited by a person" >/dev/null 2>&1
