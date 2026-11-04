@@ -1051,6 +1051,70 @@ class GMCP_Core {
     return $out;
   }
 
+  /** Top-level arguments that name a thing rather than authenticate to it. @see redact_call_args() */
+  const IDENTIFIER_ARGS = [ 'key', 'meta_key', 'option_key' ];
+
+  /** Top-level arguments never written anywhere, whatever their shape. */
+  const NEVER_RECORD_ARGS = [ 'user_pass', 'password', 'pass' ];
+
+  /**
+  * A tool call's arguments as any log may keep them: the one answer for every channel.
+  *
+  * redact() alone is wrong for a call's arguments in two directions, and the debug
+  * error_log used it alone. It blanks the top-level "key", which for wp_update_option and
+  * the meta tools is the NAME of the row, so a log line lost which option changed; and it
+  * judges only field names, so "value" was printed whatever it held, and
+  * wp_update_option {key: "myplugin_pwd", value: "hunter2"} logged the password. It also
+  * does not open strings, so a meta object sent as a JSON string went out whole.
+  *
+  * This does what the audit log's own wrapper did, in core so that the audit table and the
+  * debug log cannot drift apart: never-record fields blanked, identifier fields kept, a
+  * value blanked when the name it is stored under looks secret, and any string leaf that
+  * holds_credential() flags (a JSON or serialized blob with a secret-named field inside)
+  * blanked whole.
+  */
+  public static function redact_call_args( array $args ): array {
+    foreach ( self::NEVER_RECORD_ARGS as $field ) {
+      if ( array_key_exists( $field, $args ) ) {
+        $args[ $field ] = self::REDACTION_MARKER;
+      }
+    }
+    $redacted = self::redact( $args );
+    if ( !is_array( $redacted ) ) {
+      return [];
+    }
+    foreach ( self::IDENTIFIER_ARGS as $field ) {
+      if ( isset( $args[ $field ] ) && is_scalar( $args[ $field ] ) ) {
+        $redacted[ $field ] = $args[ $field ];
+        if ( self::field_looks_secret( (string) $args[ $field ] ) ) {
+          foreach ( [ 'value', 'meta_value', 'option_value', 'data' ] as $companion ) {
+            if ( array_key_exists( $companion, $redacted ) ) {
+              $redacted[ $companion ] = self::REDACTION_MARKER;
+            }
+          }
+        }
+      }
+    }
+    return self::blank_credential_strings( $redacted );
+  }
+
+  /** Every string leaf holds_credential() flags, replaced by the marker. */
+  private static function blank_credential_strings( $value, int $depth = 0 ) {
+    if ( $depth > 8 ) {
+      return $value;
+    }
+    if ( is_string( $value ) ) {
+      return self::holds_credential( $value ) ? self::REDACTION_MARKER : $value;
+    }
+    if ( !is_array( $value ) ) {
+      return $value;
+    }
+    foreach ( $value as $k => $inner ) {
+      $value[ $k ] = self::blank_credential_strings( $inner, $depth + 1 );
+    }
+    return $value;
+  }
+
   /**
   * Throw away anything cached against the old build, once, on the first request after the
   * plugin's version changes.

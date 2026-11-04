@@ -976,6 +976,18 @@ check "and that secret is not in the journal either" \
   "$(docker compose exec -T cli wp eval 'echo strpos(maybe_serialize(get_option("gmcp_journal",[])),"sk_live_OBJECT")===false?0:1;' 2>/dev/null | tr -d '\r\n')" "0"
 docker compose exec -T cli wp option delete acme_object_settings >/dev/null 2>&1
 
+echo "-- a tool call's arguments, as any log may keep them --"
+# The debug error_log redacted arguments with redact() alone, which blanks the top-level
+# "key" (the option's NAME) and prints "value" whatever it holds, and does not open a JSON
+# string. GMCP_Core::redact_call_args() is the one answer for every channel that writes a
+# call down. Each case greps for the planted secret, with the identifier as its control.
+ARGS_OUT=$(docker compose exec -T cli wp eval '
+  echo wp_json_encode( GMCP_Core::redact_call_args( [ "key" => "myplugin_pwd", "value" => "ARGSECRET1" ] ) ), "|",
+    wp_json_encode( GMCP_Core::redact_call_args( [ "ID" => 5, "meta" => "{\"_stripe_secret_key\":\"ARGSECRET2\"}" ] ) );' 2>/dev/null | tr -d '\r\n')
+check "a value stored under a secret-looking name is not kept" "$(echo "$ARGS_OUT" | grep -c 'ARGSECRET1')" "0"
+check "CONTROL: and the name it was stored under is" "$(echo "$ARGS_OUT" | grep -c 'myplugin_pwd')" "1"
+check "a secret inside a JSON-string argument is not kept" "$(echo "$ARGS_OUT" | grep -c 'ARGSECRET2')" "0"
+
 echo "-- redaction reaches every shape the detector reaches --"
 # The blanking has to be at least as thorough as holds_credential(), or it is a hole
 # rather than a guard. That function unpacks JSON and serialized strings before judging
