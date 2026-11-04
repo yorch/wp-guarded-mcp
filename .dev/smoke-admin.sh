@@ -366,6 +366,34 @@ echo "-- install source restriction --"
 call url_inst '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"url":"https://example.invalid/x.zip"}}}'
 check "arbitrary ZIP URL refused" "$(verdict url_inst)" "error"
 
+echo "-- a host whose content directory is not directly writable --"
+# The upgrader decides "direct or ask for FTP credentials" about WP_CONTENT_DIR: run()
+# calls fs_connect( [ WP_CONTENT_DIR, $destination ] ) and the first entry is the one
+# probed. The guard used to probe the plugins root instead, so on a host where wp-content
+# belongs to the deploy user and only the plugins directory is PHP's, it passed and the
+# call failed deep in the upgrader with a credentials sentence the agent cannot act on.
+# Simulated with core's own filesystem_method filter, scoped to the content directory.
+docker compose exec -T cli sh -c 'cat > /var/www/html/wp-content/mu-plugins/gmcp-smoke-fs.php' <<'PHP'
+<?php
+add_filter( 'filesystem_method', function ( $m, $args, $context ) {
+  return untrailingslashit( (string) $context ) === untrailingslashit( WP_CONTENT_DIR ) ? 'ftpext' : $m;
+}, 10, 3 );
+PHP
+# WP-CLI pins the method to direct with its own filter at priority 99, so the CLI has to
+# take that off to see what a web request sees. Without that, both controls read "direct"
+# whatever the simulation does.
+fs_method() { docker compose exec -T cli wp eval 'remove_all_filters( "filesystem_method", 99 ); require_once ABSPATH . "wp-admin/includes/file.php"; echo get_filesystem_method( [], '"$1"' );' 2>/dev/null | tr -d '\r\n'; }
+# CONTROLS: the simulation is in place, and it is the layout the old probe missed.
+check "CONTROL: the plugins directory still reads as direct" "$(fs_method WP_PLUGIN_DIR)" "direct"
+check "CONTROL: the content directory reads as ftpext" "$(fs_method WP_CONTENT_DIR)" "ftpext"
+call fs_inst '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"classic-editor"}}}'
+FS_INSTALLED=$(docker compose exec -T cli wp plugin list --format=csv 2>/dev/null | grep -c '^classic-editor,')
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-fs.php >/dev/null 2>&1
+check "an install on that host is refused" "$(verdict fs_inst)" "error"
+check "by the guard, with the sentence that names the method" "$(refusal fs_inst | grep -c "filesystem method is 'ftpext'")" "1"
+check "and nothing was installed" "$FS_INSTALLED" "0"
+check "CONTROL: the simulation is gone again" "$(fs_method WP_CONTENT_DIR)" "direct"
+
 echo "-- two-step confirmation (needs the network: installs from wordpress.org) --"
 call inst '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"classic-editor","activate":true}}}'
 check "install from wordpress.org" \

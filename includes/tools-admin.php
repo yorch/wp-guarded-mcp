@@ -53,18 +53,74 @@ class GMCP_Tools_Admin {
     if ( !function_exists( 'get_filesystem_method' ) ) {
       require_once ABSPATH . 'wp-admin/includes/file.php';
     }
-    // The directory matters. Called with no arguments this probes WP_CONTENT_DIR, but
-    // WP_Upgrader::fs_connect() probes the plugins or themes root, and the "direct"
-    // decision is made by comparing the owner of a probe file in THAT directory. On a
-    // hardened layout where wp-content belongs to the deploy user and only
-    // wp-content/plugins is writable by PHP, the two disagree and this guard refuses
-    // every install on a site where wp-admin's own installer works fine.
-    $directory = $context === 'theme' ? get_theme_root() : WP_PLUGIN_DIR;
-    $method = get_filesystem_method( [], $directory );
-    if ( $method !== 'direct' ) {
-      return "This site's filesystem method is '{$method}', which needs FTP or SSH credentials that cannot be collected over an API call. Installing, updating and deleting must be done another way on this host.";
+    // Probe what the upgrader probes, both of it. WP_Upgrader::run() connects with
+    // fs_connect( [ WP_CONTENT_DIR, $destination ] ), and fs_connect() hands
+    // $directories[0], the content directory, to request_filesystem_credentials(), which
+    // is where the "direct" decision is made by comparing the owner of a probe file.
+    // delete_plugins() and delete_theme() ask about the content directory as well. So the
+    // content directory is the one that decides; the plugins or themes root is checked too
+    // because the files land there and a host can own the two differently. A guard that
+    // probed only the destination passed on a layout where wp-content belongs to the
+    // deploy user, and the call then failed deep inside the upgrader with a sentence about
+    // credentials instead of this one. wp-admin's own installer fails on that host too.
+    $directories = [ WP_CONTENT_DIR, $context === 'theme' ? get_theme_root() : WP_PLUGIN_DIR ];
+    foreach ( $directories as $directory ) {
+      $method = get_filesystem_method( [], $directory );
+      if ( $method === 'direct' ) {
+        continue;
+      }
+      // A non-direct method is workable when wp-config.php already carries the
+      // credentials, because then core never needs to ask: request_filesystem_credentials()
+      // fills host, user and password (or the SSH key pair) from these constants and the
+      // form is never built. Without them the upgrader would need a person to type into
+      // an HTML form, and there is no form here.
+      if ( $this->fs_credentials_configured( (string) $method ) ) {
+        continue;
+      }
+      return "This site's filesystem method is '{$method}', which needs FTP or SSH credentials, and they cannot be collected over an API call. Installing, updating and deleting have to be done from wp-admin on this host, or the site owner can define FTP_HOST, FTP_USER and FTP_PASS (or FTP_PUBKEY and FTP_PRIKEY for SSH) in wp-config.php. Nothing was changed.";
     }
     return true;
+  }
+
+  /**
+  * Whether wp-config.php already supplies what a non-direct filesystem method needs.
+  *
+  * Mirrors the constants request_filesystem_credentials() reads. Deliberately answers
+  * only yes or no: the values themselves never leave this function, so nothing about
+  * them can reach a reply, the audit log or the journal.
+  */
+  private function fs_credentials_configured( string $method ): bool {
+    if ( !in_array( $method, [ 'ftpext', 'ftpsockets', 'ssh2' ], true ) ) {
+      return false;
+    }
+    if ( !defined( 'FTP_HOST' ) || !defined( 'FTP_USER' ) ) {
+      return false;
+    }
+    if ( defined( 'FTP_PASS' ) ) {
+      return true;
+    }
+    return $method === 'ssh2' && defined( 'FTP_PUBKEY' ) && defined( 'FTP_PRIKEY' );
+  }
+
+  /**
+  * Run an upgrader or deleter call with any output it prints thrown away.
+  *
+  * WP_Ajax_Upgrader_Skin already buffers the credentials form, and delete_plugins()
+  * buffers its own. This is the backstop for whatever does not: a third-party filter on
+  * an upgrader hook that echoes, or a future core change. A stray byte ahead of the JSON
+  * makes the whole reply unparseable, and a credentials form in particular is not
+  * something to hand to a client even by accident.
+  *
+  * @return mixed Whatever the callback returned.
+  */
+  private function quietly( callable $callback ) {
+    ob_start();
+    try {
+      return $callback();
+    }
+    finally {
+      ob_end_clean();
+    }
   }
 
   /**
@@ -83,9 +139,13 @@ class GMCP_Tools_Admin {
   /**
   * The plugin file of this plugin, e.g. "guarded-mcp/guarded-mcp.php".
   *
-  * Deactivating or deleting ourselves would tear down the endpoint handling the very
-  * call that asked for it: the agent gets a dropped connection rather than a result,
-  * and then has no way back in to undo it. Refuse instead.
+  * Deactivating, deleting or updating ourselves would tear down or swap out the endpoint
+  * handling the very call that asked for it: the agent gets a dropped connection rather
+  * than a result, and then has no way back in to undo it. Refuse instead.
+  *
+  * Derived from the folder the plugin actually sits in, through plugin_basename(), and
+  * compared against keys of get_plugins(), which carry the same folder name. So it holds
+  * under a renamed folder as well as under the canonical one.
   */
   private function self_plugin_file(): string {
     return plugin_basename( GMCP_ENTRY );
@@ -948,7 +1008,7 @@ class GMCP_Tools_Admin {
 
     $skin = $this->skin();
     $upgrader = new Plugin_Upgrader( $skin );
-    $result = $upgrader->install( $package );
+    $result = $this->quietly( function () use ( $upgrader, $package ) { return $upgrader->install( $package ); } );
 
     if ( $result !== true ) {
       return $this->error( $r, 'Install failed: ' . $this->upgrader_error( $result, $skin, 'the package could not be installed.' ) );
@@ -1052,7 +1112,7 @@ class GMCP_Tools_Admin {
       return $this->error( $r, $ok );
     }
 
-    $result = delete_plugins( [ $plugin ] );
+    $result = $this->quietly( function () use ( $plugin ) { return delete_plugins( [ $plugin ] ); } );
     if ( is_wp_error( $result ) ) {
       return $this->error( $r, 'Delete failed: ' . $result->get_error_message() );
     }
@@ -1264,7 +1324,7 @@ class GMCP_Tools_Admin {
     $this->load_upgrader();
     $skin = $this->skin();
     $upgrader = new Theme_Upgrader( $skin );
-    $result = $upgrader->install( $package );
+    $result = $this->quietly( function () use ( $upgrader, $package ) { return $upgrader->install( $package ); } );
 
     if ( $result !== true ) {
       return $this->error( $r, 'Install failed: ' . $this->upgrader_error( $result, $skin, 'the package could not be installed.' ) );
@@ -1376,7 +1436,7 @@ class GMCP_Tools_Admin {
       return $this->error( $r, $ok );
     }
 
-    $result = delete_theme( $stylesheet );
+    $result = $this->quietly( function () use ( $stylesheet ) { return delete_theme( $stylesheet ); } );
     if ( is_wp_error( $result ) ) {
       return $this->error( $r, 'Delete failed: ' . $result->get_error_message() );
     }
@@ -1414,7 +1474,7 @@ class GMCP_Tools_Admin {
 
     $skin = $this->skin();
     $upgrader = new Theme_Upgrader( $skin );
-    $result = $upgrader->upgrade( $stylesheet );
+    $result = $this->quietly( function () use ( $upgrader, $stylesheet ) { return $upgrader->upgrade( $stylesheet ); } );
 
     if ( $result !== true ) {
       return $this->error( $r, 'Update failed: ' . $this->upgrader_error( $result, $skin, 'the update could not be applied.' ) );
