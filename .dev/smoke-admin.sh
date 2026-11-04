@@ -400,6 +400,27 @@ check "by the guard, with the sentence that names the method" "$(refusal fs_inst
 check "and nothing was installed" "$FS_INSTALLED" "0"
 check "CONTROL: the simulation is gone again" "$(fs_method WP_CONTENT_DIR)" "direct"
 
+echo "-- every package an install downloads is held to wordpress.org --"
+# resolve_package() checks the URL it hands over, but the upgrader can fetch others: a
+# child theme's missing parent comes from a second themes_api() answer, and any plugin can
+# swap the package through upgrader_package_options after the check. Simulated with the
+# second: the slug resolves to wordpress.org as normal, then the package is rewritten.
+docker compose exec -T cli sh -c 'cat > /var/www/html/wp-content/mu-plugins/gmcp-smoke-pkg.php' <<'PHP'
+<?php
+add_filter( 'upgrader_package_options', function ( $o ) {
+  $o['package'] = 'https://downloads.example.invalid/classic-editor.zip';
+  return $o;
+} );
+PHP
+call pkg_inst '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"classic-editor"}}}'
+PKG_INSTALLED=$(docker compose exec -T cli wp plugin list --format=csv 2>/dev/null | grep -c '^classic-editor,')
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-pkg.php >/dev/null 2>&1
+check "a rewritten package is refused" "$(verdict pkg_inst)" "error"
+check "by the host rule, not by the download failing" "$(refusal pkg_inst | grep -c 'not a wordpress.org host')" "1"
+check "and nothing was installed" "$PKG_INSTALLED" "0"
+check "CONTROL: the rewrite is gone again" \
+  "$(docker compose exec -T cli sh -c 'test -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-pkg.php && echo present || echo gone' 2>/dev/null | tr -d '\r\n')" "gone"
+
 echo "-- two-step confirmation (needs the network: installs from wordpress.org) --"
 call inst '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"slug":"classic-editor","activate":true}}}'
 check "install from wordpress.org" \

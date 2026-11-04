@@ -409,13 +409,59 @@ class GMCP_Tools_Admin {
     // earlier could redirect the next install to a package of its choosing. Check the
     // host of the answer, not just the provenance of the question.
     $host = strtolower( (string) wp_parse_url( $link, PHP_URL_HOST ) );
-    if ( $host !== 'wordpress.org' && substr( $host, -14 ) !== '.wordpress.org' ) {
+    if ( !self::is_dot_org_host( $host ) ) {
       return new WP_Error(
         'gmcp_not_dot_org',
         "The download for \"{$slug}\" resolved to \"{$host}\", which is not a wordpress.org host. Something on this site is rewriting the repository response, so the package was not installed."
       );
     }
     return $link;
+  }
+
+  private static function is_dot_org_host( string $host ): bool {
+    return $host === 'wordpress.org' || substr( $host, -14 ) === '.wordpress.org';
+  }
+
+  /**
+  * Run an install with every package the upgrader downloads held to resolve_package()'s rule.
+  *
+  * resolve_package() checks the one URL it hands over, and the upgrader can download
+  * others. Theme_Upgrader::install() hooks check_parent_theme_filter, which asks
+  * themes_api() again for a child theme's missing parent and installs whatever
+  * download_link comes back, unchecked; and upgrader_package_options lets any plugin
+  * swap the package after the check. Holding the rule at upgrader_pre_download, the
+  * last step before bytes are fetched, covers every one of those for the duration of
+  * this call and nothing outside it.
+  *
+  * Installs only. An update installs whatever the site's update data names, and for a
+  * premium plugin that is legitimately its vendor's server; the update tools say so
+  * rather than claiming wordpress.org.
+  *
+  * @return mixed Whatever the callback returned.
+  */
+  private function with_download_guard( string $type, callable $callback ) {
+    $guard = function ( $reply, $package ) use ( $type ) {
+      if ( is_wp_error( $reply ) ) {
+        return $reply;
+      }
+      $package = (string) $package;
+      $host = strtolower( (string) wp_parse_url( $package, PHP_URL_HOST ) );
+      if ( self::is_dot_org_host( $host ) || apply_filters( 'gmcp_allow_remote_install', false, $package, $type ) ) {
+        return $reply;
+      }
+      return new WP_Error(
+        'gmcp_not_dot_org',
+        'The upgrader was about to download a package from "' . ( $host !== '' ? $host : $package ) . '", which is not a wordpress.org host. Something on this site changed the download after it was checked (a parent theme lookup, or a filter on the package), so nothing was installed.'
+      );
+    };
+    // Early, so a refusal is in place before any other filter fetches the package itself.
+    add_filter( 'upgrader_pre_download', $guard, -1000, 2 );
+    try {
+      return $callback();
+    }
+    finally {
+      remove_filter( 'upgrader_pre_download', $guard, -1000 );
+    }
   }
 
   /**
@@ -517,7 +563,7 @@ class GMCP_Tools_Admin {
       ],
       'wp_install_theme' => [
         'name' => 'wp_install_theme',
-        'description' => 'Install a theme from the wordpress.org repository by slug, optionally activating it. Installing from an arbitrary URL is disabled unless the site opts in.',
+        'description' => 'Install a theme from the wordpress.org repository by slug, optionally activating it. A child theme\'s missing parent is installed too, from wordpress.org only. Installing from an arbitrary URL is disabled unless the site opts in.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1081,7 +1127,9 @@ class GMCP_Tools_Admin {
 
     $skin = $this->skin();
     $upgrader = new Plugin_Upgrader( $skin );
-    $result = $this->quietly( function () use ( $upgrader, $package ) { return $upgrader->install( $package ); } );
+    $result = $this->with_download_guard( 'plugin', function () use ( $upgrader, $package ) {
+      return $this->quietly( function () use ( $upgrader, $package ) { return $upgrader->install( $package ); } );
+    } );
 
     if ( $result !== true ) {
       return $this->error( $r, 'Install failed: ' . $this->upgrader_error( $result, $skin, 'the package could not be installed.' ) );
@@ -1557,7 +1605,9 @@ class GMCP_Tools_Admin {
     $this->load_upgrader();
     $skin = $this->skin();
     $upgrader = new Theme_Upgrader( $skin );
-    $result = $this->quietly( function () use ( $upgrader, $package ) { return $upgrader->install( $package ); } );
+    $result = $this->with_download_guard( 'theme', function () use ( $upgrader, $package ) {
+      return $this->quietly( function () use ( $upgrader, $package ) { return $upgrader->install( $package ); } );
+    } );
 
     if ( $result !== true ) {
       return $this->error( $r, 'Install failed: ' . $this->upgrader_error( $result, $skin, 'the package could not be installed.' ) );
