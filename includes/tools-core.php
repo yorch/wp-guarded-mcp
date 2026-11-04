@@ -64,6 +64,43 @@ class GMCP_Tools_Core {
   }
 
   /**
+  * An argument filtered through kses, with nothing unslashed.
+  *
+  * clean_html() unslashes first, which is right for nothing that reaches this class:
+  * arguments arrive from json_decode() of the request body, never from $_POST, so no
+  * slashes were added on the way in and the unslash removes real ones. Every WordPress
+  * writer then unslashes again, so a comment reading "C:\Users\x" was stored as
+  * "C:Usersx" and reported as created. Callers using this slash the array they hand to
+  * the writer, the way the post writers already do.
+  */
+  private function kses_arg( string $v ): string {
+    return wp_kses_post( $v );
+  }
+
+  /**
+  * tax_input as wp_update_post() expects it: taxonomy => term ids, or names for a flat
+  * taxonomy, or a comma-separated string. sanitize_text_field() blanked the array whole.
+  */
+  private function clean_tax_input( $v ): array {
+    $out = [];
+    foreach ( (array) $v as $tax => $terms ) {
+      $tax = sanitize_key( (string) $tax );
+      if ( $tax === '' ) {
+        continue;
+      }
+      if ( is_array( $terms ) ) {
+        $out[ $tax ] = array_values( array_map( function ( $t ) {
+          return is_int( $t ) || ( is_string( $t ) && ctype_digit( $t ) ) ? (int) $t : sanitize_text_field( (string) ( is_scalar( $t ) ? $t : '' ) );
+        }, $terms ) );
+      }
+      elseif ( is_scalar( $terms ) ) {
+        $out[ $tax ] = sanitize_text_field( (string) $terms );
+      }
+    }
+    return $out;
+  }
+
+  /**
   * Whether this site has opted into storing raw HTML in post content.
   *
   * Off by default. A site that genuinely needs an iframe, inline SVG, a <style> block
@@ -516,28 +553,22 @@ class GMCP_Tools_Core {
   }
 
   /**
-  * Options that may not be deleted, each with what actually breaks if it goes.
+  * A meta value as a read tool may hand it out.
   *
-  * These are separate from option_guard(), which is about secrecy. These are rows
-  * WordPress either cannot run without or cannot rebuild, so losing one is not a
-  * recoverable mistake. The value is the sentence the refusal says, so the reason and
-  * the rule cannot drift apart.
+  * Post meta reads had no credential rule at all: wp_get_post_meta returned an api_key or
+  * a stripe secret stored on a post in full, at the read level, while the option tools
+  * refuse the same shape of row at every level and the audit log and journal blank it.
+  * The answer is the one those subsystems already share, GMCP_Core::field_looks_secret(),
+  * asked of the meta KEY, so the four cannot disagree about what counts.
   *
-  * rewrite_rules is deliberately NOT here. It is a derived cache, WordPress regenerates
-  * it on the next permalink flush, and deleting it is a normal repair for broken
-  * permalinks rather than damage.
+  * Judged by the key and not by walking the value. A value is what a caller reads in order
+  * to write it back, and a design blob with one blanked leaf inside it, written back, would
+  * replace a live credential with the marker. A whole value withheld cannot be mistaken
+  * for the real one.
   */
-  private const OPTIONS_NEVER_DELETED = [
-    'siteurl' => 'WordPress builds every URL from it, so with the row gone the site cannot resolve its own address; wp-admin and this endpoint included, which means there is no way back in through the API that deleted it.',
-    'home' => 'Same as siteurl: the front page and every link on it become unreachable, and so does the route this request arrived on.',
-    'template' => 'It names the active theme. With no theme WordPress has nothing to render the front end with.',
-    'stylesheet' => 'It names the active child or parent theme. Removing it leaves WordPress looking for a theme directory that is not identified anywhere.',
-    'active_plugins' => 'Every plugin deactivates at once, this one among them, so the API that deleted the row is no longer running to restore it.',
-    'db_version' => 'It records which schema the database is on. Missing, WordPress runs its upgrade routine against a schema it can no longer place.',
-    'initial_db_version' => 'It records the schema the site was installed at, which upgrade routines read to decide what to skip.',
-    'cron' => 'The entire schedule is this one row. Deleting it silently drops every scheduled event on the site: publishing, backups, renewals, WooCommerce actions. Nothing errors; things just stop happening.',
-    'admin_email' => 'It is where recovery mail, password resets and fatal-error notices go. Without it nobody is told when the site is in trouble.',
-  ];
+  private function readable_meta( string $key, $value ) {
+    return GMCP_Core::field_looks_secret( $key ) ? GMCP_Core::REDACTION_MARKER : $value;
+  }
 
   /**
   * A meta value as it should be STORED, from a value that arrived as a tool argument.
@@ -559,15 +590,20 @@ class GMCP_Tools_Core {
   * is worse than a refusal, because nothing downstream has any reason to look again.
   */
   private function prepare_meta_value( $value ) {
+    // Deep by way of map_deep(), so a nested array is slashed at every leaf, and a
+    // non-string leaf is returned untouched rather than cast.
+    return wp_slash( $this->decode_meta_value( $value ) );
+  }
+
+  /** The decoding half of prepare_meta_value(), for a writer that slashes on its own. */
+  private function decode_meta_value( $value ) {
     if ( is_string( $value ) && isset( $value[0] ) && ( $value[0] === '[' || $value[0] === '{' ) ) {
       $decoded = json_decode( $value, true );
       if ( json_last_error() === JSON_ERROR_NONE && is_array( $decoded ) ) {
-        $value = $decoded;
+        return $decoded;
       }
     }
-    // Deep by way of map_deep(), so a nested array is slashed at every leaf, and a
-    // non-string leaf is returned untouched rather than cast.
-    return wp_slash( $value );
+    return $value;
   }
 
   private function bust_post_cache( int $post_id, array $context = [] ): void {
@@ -1017,6 +1053,12 @@ class GMCP_Tools_Core {
   * @return int|WP_Error The new post ID.
   */
   private function create_one_post( array $a, string $tool ) {
+    // Asked here, in the one implementation both create tools share, so neither can mint
+    // an order or a subscription by naming its type. @see GMCP_Core::commerce_post_guard().
+    $commerce = GMCP_Core::commerce_post_guard( 0, 'Creating', sanitize_key( $a['post_type'] ?? 'post' ) );
+    if ( $commerce !== true ) {
+      return new WP_Error( 'gmcp_commerce_post', $commerce );
+    }
     $ins = [
       'post_title' => sanitize_text_field( $a['post_title'] ),
       'post_status' => sanitize_key( $a['post_status'] ?? 'draft' ),
@@ -1026,7 +1068,7 @@ class GMCP_Tools_Core {
       $ins['post_content'] = $this->prepare_new_content( $a['post_content'] );
     }
     if ( $a['post_excerpt'] ?? '' ) {
-      $ins['post_excerpt'] = $this->clean_html( $a['post_excerpt'] );
+      $ins['post_excerpt'] = $this->kses_arg( (string) $a['post_excerpt'] );
     }
     if ( $a['post_name'] ?? '' ) {
       $ins['post_name'] = sanitize_title( $a['post_name'] );
@@ -1038,20 +1080,20 @@ class GMCP_Tools_Core {
       $meta_input = json_decode( $meta_input, true ) ?? [];
     }
     if ( !empty( $meta_input ) && is_array( $meta_input ) ) {
-      $ins['meta_input'] = $meta_input;
+      // JSON for an array is decoded here as every other meta writer decodes it, so the
+      // same payload is not an array through wp_update_post_meta and a string through this
+      // tool. Not slashed here: wp_slash( $ins ) below does that once for the whole row.
+      $ins['meta_input'] = array_map( [ $this, 'decode_meta_value' ], $meta_input );
     }
 
+    // meta_input rides inside $ins, so wp_slash() below slashes its values once and
+    // wp_insert_post() hands them to update_post_meta(), which unslashes once: the round
+    // trip is exact. (A fallback loop used to follow for "meta_input that wp_insert_post did
+    // not write", a condition that could never be true, and it sanitize_key()'d the keys,
+    // contradicting the rule that meta keys are stored as given.)
     $new = wp_insert_post( wp_slash( $ins ), true );
     if ( is_wp_error( $new ) ) {
       return $new;
-    }
-    if ( empty( $ins['meta_input'] ) && !empty( $meta_input ) && is_array( $meta_input ) ) {
-      foreach ( $meta_input as $k => $v ) {
-        // Pass the value as-is: update_post_meta() serializes arrays itself.
-        // maybe_serialize() here double-serialized nested arrays, so they read
-        // back as a string and consumers (e.g. Noptin) rejected them as legacy.
-        update_post_meta( $new, sanitize_key( $k ), $v );
-      }
     }
     $this->bust_post_cache( (int) $new, [ 'tool' => $tool ] );
     return (int) $new;
@@ -1143,7 +1185,7 @@ class GMCP_Tools_Core {
       ],
       'wp_create_user' => [
         'name' => 'wp_create_user',
-        'description' => 'Create a user. Requires user_login and user_email. Optional: user_pass (random if omitted), display_name, role.',
+        'description' => 'Create a user. Requires user_login and user_email. Optional: user_pass (random if omitted), display_name, role. A role that can manage the site (administrator, or any role holding manage_options, promote_users, edit_users, plugin or theme capabilities) takes two calls: the first returns a confirmation token and creates nothing.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1152,6 +1194,7 @@ class GMCP_Tools_Core {
             'user_pass' => [ 'type' => 'string' ],
             'display_name' => [ 'type' => 'string' ],
             'role' => [ 'type' => 'string' ],
+            'confirm' => [ 'type' => 'string', 'description' => 'Confirmation token, needed only for a privileged role. Call without it first; the response supplies the token.' ],
           ],
           'required' => [ 'user_login', 'user_email' ],
         ],
@@ -1159,11 +1202,12 @@ class GMCP_Tools_Core {
       ],
       'wp_update_user' => [
         'name' => 'wp_update_user',
-        'description' => 'Update a user – pass ID plus a “fields” object (user_email, display_name, user_pass, role).',
+        'description' => 'Update a user – pass ID plus a “fields” object (user_email, display_name, user_pass, role). Granting a privileged role, or changing anything but display fields (names, nickname, description, website) on an account that can manage the site, takes two calls: the first returns a confirmation token and changes nothing.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
             'ID' => [ 'type' => 'integer' ],
+            'confirm' => [ 'type' => 'string', 'description' => 'Confirmation token, needed only for a privileged change. Call without it first; the response supplies the token.' ],
             'fields' => [
               'type' => 'object',
               'properties' => [
@@ -1807,14 +1851,15 @@ class GMCP_Tools_Core {
       ],
       'wp_get_terms' => [
         'name' => 'wp_get_terms',
-        'description' => 'List terms of a taxonomy.',
+        'description' => 'List terms of a taxonomy, 100 at a time by default (limit up to 500, offset to page).',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
             'taxonomy' => [ 'type' => 'string' ],
             'search' => [ 'type' => 'string' ],
             'parent' => [ 'type' => 'integer' ],
-            'limit' => [ 'type' => 'integer' ],
+            'limit' => [ 'type' => 'integer', 'description' => 'At most this many terms (default 100, maximum 500).' ],
+            'offset' => [ 'type' => 'integer', 'description' => 'Skip this many terms, for paging past the limit.' ],
           ],
           'required' => [ 'taxonomy' ],
         ],
@@ -1882,14 +1927,14 @@ class GMCP_Tools_Core {
       ],
       'wp_add_post_terms' => [
         'name' => 'wp_add_post_terms',
-        'description' => 'Attach or replace terms for a post. Set "append=true" to ADD terms to existing ones, or "append=false" (default) to REPLACE all terms. Use for categories, tags, or WooCommerce attributes (pa_color, pa_size, etc.).',
+        'description' => 'Attach or replace terms for a post. By default (append true) the terms are ADDED to the ones the post already has; pass "append": false to REPLACE them all. Terms are term ids; for a hierarchical taxonomy such as category, a name is looked up and refused if it does not exist, and for a flat one such as post_tag a new name creates the tag. The reply lists the term ids the post holds afterwards. Use for categories, tags, or WooCommerce attributes (pa_color, pa_size, etc.).',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
             'ID' => [ 'type' => 'integer' ],
             'taxonomy' => [ 'type' => 'string' ],
-            'terms' => [ 'type' => 'array', 'items' => [ 'type' => 'integer' ] ],
-            'append' => [ 'type' => 'boolean' ],
+            'terms' => [ 'type' => 'array', 'items' => [ 'type' => [ 'integer', 'string' ] ] ],
+            'append' => [ 'type' => 'boolean', 'description' => 'true (default) adds to the existing terms; false replaces them.' ],
           ],
           'required' => [ 'ID', 'terms' ],
         ],
@@ -2216,6 +2261,22 @@ class GMCP_Tools_Core {
   * in a place nobody looked, or matches nothing at all and reports success either way.
   * This shows every match in context with the text that would take its place.
   */
+  /**
+  * What wp_alter_post stores for a field, from the text a replacement produced.
+  *
+  * The same answers wp_update_post gives for the same fields: store_html() for the body and
+  * the excerpt, sanitize_text_field() for the title. wp_alter_post wrote its result raw, and
+  * the request runs as an administrator holding unfiltered_html, so core's own kses was off
+  * as well: a write-level key replacing "</p>" with "</p><script>...</script>" stored a
+  * script that ran for every visitor, which is the exact hole store_html() was written to
+  * close, reopened one tool along. The whole result is sanitised rather than the
+  * replacement text alone, because a regex back-reference or two innocent-looking calls can
+  * assemble a tag out of pieces that are each harmless on their own.
+  */
+  private function alter_sanitize( string $field, string $value ): string {
+    return $field === 'post_title' ? sanitize_text_field( $value ) : $this->store_html( $value );
+  }
+
   private function preview_alter_post( array $a, array $r ): array {
     $post = get_post( (int) ( $a['ID'] ?? 0 ) );
     if ( !$post ) {
@@ -2303,6 +2364,13 @@ class GMCP_Tools_Core {
     if ( $count > count( $matches ) ) {
       $lines[] = '';
       $lines[] = '(' . ( $count - count( $matches ) ) . ' further match(es) not shown.)';
+    }
+    // The real call sanitises what it stores, so a preview that stopped at "becomes" would
+    // show a result the write then does not keep.
+    $whole = $pattern !== null ? @preg_replace( $pattern, $replace, $subject ) : str_replace( $search, $replace, $subject );
+    if ( is_string( $whole ) && $this->alter_sanitize( $field, $whole ) !== $whole ) {
+      $lines[] = '';
+      $lines[] = 'Saving this sanitises the result the way wp_update_post does, and that changes it: markup not allowed in ' . $field . ' (a script, an event handler, an unknown tag) is removed, so the stored field will not read exactly as shown above.';
     }
     return $this->preview_text( $r, implode( "\n", $lines ) );
   }
@@ -2486,6 +2554,16 @@ class GMCP_Tools_Core {
     // cannot fall through into the real handler by way of a missed early return in one
     // of forty case blocks.
     if ( !empty( $a['preview'] ) && isset( self::PREVIEWABLE[ $tool ] ) ) {
+      // A preview of a write the real call would refuse is answered with the refusal. The
+      // preview of an update prints the fields it would change, which for an order is the
+      // customer's note and address, so previewing must not become the way round either
+      // the write guard or the read guard.
+      if ( in_array( $tool, [ 'wp_update_post', 'wp_alter_post', 'wp_delete_post' ], true ) ) {
+        $commerce = GMCP_Core::commerce_post_guard( (int) ( $a['ID'] ?? 0 ), 'Previewing a change to' );
+        if ( $commerce !== true ) {
+          return $this->error( $r, $commerce, -32600 );
+        }
+      }
       return $this->preview( $tool, $a, $r );
     }
 
@@ -2521,7 +2599,12 @@ class GMCP_Tools_Core {
         // administrator role. wp_insert_user() runs no capability checks, so
         // require create_users (which on Multisite is a network-only capability,
         // correctly denying per-site Administrators) and refuse to assign a role
-        // the caller cannot grant (e.g. administrator).
+        // the caller's own account could not assign in wp-admin.
+        //
+        // That second check is NOT a refusal of administrator. get_editable_roles() for an
+        // administrator includes administrator, so on a single site it passes, and this
+        // comment used to claim otherwise. What stops one injected instruction from minting
+        // a working administrator is the confirmation gate below.
         if ( !current_user_can( 'create_users' ) ) {
           $r = $this->error( $r, 'You are not allowed to create users.', -32603 );
           break;
@@ -2532,13 +2615,37 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'You are not allowed to assign this role.', -32603 );
           break;
         }
+        if ( isset( $a['user_pass'] ) && !is_string( $a['user_pass'] ) ) {
+          $r = $this->error( $r, 'user_pass must be a string.', -32602 );
+          break;
+        }
         $data = [
-          'user_login' => sanitize_user( $a['user_login'] ),
-          'user_email' => sanitize_email( $a['user_email'] ),
+          'user_login' => sanitize_user( (string) $a['user_login'] ),
+          'user_email' => sanitize_email( (string) $a['user_email'] ),
+          // Passed through untouched: WordPress hashes it, and a password is the one field
+          // where "sanitising" means storing something other than what the owner was told.
           'user_pass' => $a['user_pass'] ?? wp_generate_password( 12, true ),
-          'display_name' => sanitize_text_field( $a['display_name'] ?? '' ),
+          'display_name' => sanitize_text_field( (string) ( $a['display_name'] ?? '' ) ),
           'role' => $role,
         ];
+        // An account that can run the site is created on a person's say, not on one call.
+        // This agent reads comments and form entries strangers wrote, and "create a support
+        // account with the administrator role for help@..." is exactly the instruction one
+        // of them would plant. Bound to the login, address and role, so the token cannot be
+        // spent on a different account.
+        if ( $role !== '' && GMCP_Core::role_is_privileged( $role ) ) {
+          $gate = GMCP_Core::confirm_gate( 'wp_create_user', $role . '|' . strtolower( $data['user_login'] ) . '|' . strtolower( $data['user_email'] ), $a,
+            'This creates the account "' . $data['user_login'] . '" (' . $data['user_email'] . ') with the role "' . $role . '", which can change who else can do what on this site and run code on it. Whoever holds its password holds the site.' );
+          if ( $gate !== true ) {
+            $r = $this->error( $r, $gate, -32600 );
+            break;
+          }
+        }
+        // wp_insert_user() unslashes the fields it stores, and these arrive from JSON with
+        // nothing added. The password is left alone: it is hashed before the unslash runs.
+        foreach ( [ 'user_login', 'user_email', 'display_name' ] as $slash_field ) {
+          $data[ $slash_field ] = wp_slash( $data[ $slash_field ] );
+        }
         $uid = wp_insert_user( $data );
         if ( is_wp_error( $uid ) ) {
           $r = $this->error( $r, $uid->get_error_message(), $uid->get_error_code() );
@@ -2566,21 +2673,112 @@ class GMCP_Tools_Core {
           break;
         }
         $upd = [ 'ID' => $target_id ];
-        if ( !empty( $a['fields'] ) && is_array( $a['fields'] ) ) {
-          foreach ( $a['fields'] as $k => $v ) {
-            $upd[ $k ] = ( $k === 'role' ) ? sanitize_key( $v ) : sanitize_text_field( $v );
+        $user_fields = $a['fields'] ?? [];
+        if ( is_string( $user_fields ) ) {
+          $user_fields = json_decode( $user_fields, true );
+        }
+        $user_field_error = null;
+        if ( !empty( $user_fields ) && is_array( $user_fields ) ) {
+          foreach ( $user_fields as $k => $v ) {
+            $k = (string) $k;
+            if ( $k === 'ID' ) {
+              continue; // The id is the top-level one, forced below.
+            }
+            // Scalars only. An array reached wp_insert_user() as meta_input, which writes any
+            // user meta it names, wp_capabilities included, past every role check here.
+            if ( !is_scalar( $v ) ) {
+              $user_field_error = 'fields.' . $k . ' must be a string or a number.';
+              break;
+            }
+            switch ( $k ) {
+              case 'user_pass':
+                // Never sanitize_text_field(). It strips anything tag-shaped, every %xx octet,
+                // tabs and newlines and runs of spaces, so "Tr0ub%41dor<x>  9" was stored as
+                // "Tr0ubdor 9" and the reply said the password had been set. WordPress hashes
+                // what it is given; the only thing to check is that there is something to hash.
+                if ( !is_string( $v ) || $v === '' ) {
+                  $user_field_error = 'fields.user_pass must be a non-empty string.';
+                  break 2;
+                }
+                $upd[ $k ] = $v;
+                break;
+              case 'user_email':
+                $upd[ $k ] = sanitize_email( (string) $v );
+                break;
+              case 'user_url':
+                $upd[ $k ] = esc_url_raw( (string) $v );
+                break;
+              case 'role':
+                $upd[ $k ] = sanitize_key( (string) $v );
+                break;
+              default:
+                $upd[ $k ] = sanitize_text_field( (string) $v );
+            }
           }
+        }
+        if ( $user_field_error !== null ) {
+          $r = $this->error( $r, $user_field_error . ' Nothing was changed.', -32602 );
+          break;
         }
         // A role change is a promotion/demotion. Require promote_user on the
         // target and refuse any role the caller cannot themselves assign, so a
         // lower admin cannot grant a role above their own reach.
-        if ( isset( $upd['role'] ) && $upd['role'] !== '' ) {
+        //
+        // A role that is present and empty is a role change too, and the most drastic one:
+        // wp_update_user() hands it to set_role(''), which removes every role the account
+        // has. It used to skip this check and go through, so one call could leave the key's
+        // own owner, or the site's only administrator, with no role at all.
+        if ( array_key_exists( 'role', $upd ) ) {
+          if ( $upd['role'] === '' ) {
+            $r = $this->error( $r, 'fields.role must name a role. An empty role removes every role the account holds, which this tool does not do. Nothing was changed.', -32602 );
+            break;
+          }
           require_once ABSPATH . 'wp-admin/includes/user.php'; // get_editable_roles()
           if ( !current_user_can( 'promote_user', $target_id ) || !array_key_exists( $upd['role'], get_editable_roles() ) ) {
             $r = $this->error( $r, 'You are not allowed to assign this role.', -32603 );
             break;
           }
         }
+
+        // Making an account privileged, or changing how anyone signs in to one that already
+        // is, takes a person's say. On a single site an administrator passes edit_user for
+        // every account, so without this one call could reset another administrator's
+        // password and address, or promote a stranger, on an instruction smuggled into a
+        // comment. Display fields are the exception, because they change nothing about who
+        // can sign in or what they can do. Anything else, including a field this list does
+        // not know, takes the gate: a list of what is safe fails closed, a list of what is
+        // dangerous does not.
+        $display_only = [ 'display_name', 'first_name', 'last_name', 'nickname', 'description', 'user_url', 'user_nicename' ];
+        $grants = isset( $upd['role'] ) && GMCP_Core::role_is_privileged( $upd['role'] );
+        $touches = array_diff( array_keys( $upd ), array_merge( [ 'ID' ], $display_only ) );
+        if ( $grants || ( $touches && GMCP_Core::user_is_privileged( $target_id ) ) ) {
+          $who = get_userdata( $target_id );
+          $gate = GMCP_Core::confirm_gate( 'wp_update_user', $target_id . '|' . hash( 'sha256', serialize( $upd ) ), $a,
+            'This changes ' . implode( ', ', $touches ) . ' on account #' . $target_id . ( $who ? ' "' . $who->user_login . '"' : '' )
+              . ( $grants ? ', giving it the role "' . $upd['role'] . '", which can change who else can do what on this site and run code on it.' : ', an account that can already run this site. Whoever controls how it signs in controls the site.' ) );
+          if ( $gate !== true ) {
+            $r = $this->error( $r, $gate, -32600 );
+            break;
+          }
+        }
+
+        // wp_insert_user() unslashes what it stores and these arrive from JSON with nothing
+        // added, so a backslash in a name was lost. The password is hashed before that
+        // unslash runs, so slashing it would change the password itself.
+        foreach ( $upd as $slash_k => $slash_v ) {
+          if ( $slash_k !== 'ID' && $slash_k !== 'user_pass' && is_string( $slash_v ) ) {
+            $upd[ $slash_k ] = wp_slash( $slash_v );
+          }
+        }
+        // Forced back last, immediately before the write. Every check above was made about
+        // $target_id, and `fields` is an open object: a caller could put an "ID" in it and
+        // the merge copied it over the authorised one, so edit_user and promote_user were
+        // asked about the caller's own account and wp_update_user() then wrote whichever
+        // account the nested ID named. On multisite that reopened exactly the Network Owner
+        // takeover the edit_user check above was added to close. Re-asserting the id here
+        // rather than skipping the key during the merge is deliberate: anything added to
+        // $upd later is covered too, without having to remember this.
+        $upd['ID'] = $target_id;
         $u = wp_update_user( $upd );
         if ( is_wp_error( $u ) ) {
           $r = $this->error( $r, $u->get_error_message(), $u->get_error_code() );
@@ -2623,6 +2821,11 @@ class GMCP_Tools_Core {
         }
         $list = [];
         foreach ( get_comments( $args ) as $c ) {
+          // Order notes are comments on the order post, and they quote the order: status
+          // changes, refunds, the customer's own note. Same rule as reading the order.
+          if ( (int) $c->comment_post_ID > 0 && GMCP_Core::commerce_post_read_guard( (int) $c->comment_post_ID ) !== true ) {
+            continue;
+          }
           $list[] = [
             'comment_ID' => $c->comment_ID,
             'comment_post_ID' => $c->comment_post_ID,
@@ -2643,13 +2846,14 @@ class GMCP_Tools_Core {
         }
         $ins = [
           'comment_post_ID' => intval( $a['post_id'] ),
-          'comment_content' => $this->clean_html( $a['comment_content'] ),
-          'comment_author' => sanitize_text_field( $a['comment_author'] ?? '' ),
-          'comment_author_email' => sanitize_email( $a['comment_author_email'] ?? '' ),
-          'comment_author_url' => esc_url_raw( $a['comment_author_url'] ?? '' ),
+          'comment_content' => $this->kses_arg( (string) $a['comment_content'] ),
+          'comment_author' => sanitize_text_field( (string) ( $a['comment_author'] ?? '' ) ),
+          'comment_author_email' => sanitize_email( (string) ( $a['comment_author_email'] ?? '' ) ),
+          'comment_author_url' => esc_url_raw( (string) ( $a['comment_author_url'] ?? '' ) ),
           'comment_approved' => $a['comment_approved'] ?? 1,
         ];
-        $cid = wp_insert_comment( $ins );
+        // Slashed because wp_insert_comment() unslashes. @see kses_arg().
+        $cid = wp_insert_comment( wp_slash( $ins ) );
         if ( is_wp_error( $cid ) ) {
           /** @var WP_Error $cid */
           $r = $this->error( $r, $cid->get_error_message(), $cid->get_error_code() );
@@ -2667,15 +2871,32 @@ class GMCP_Tools_Core {
         $c = [ 'comment_ID' => intval( $a['comment_ID'] ) ];
         if ( !empty( $a['fields'] ) && is_array( $a['fields'] ) ) {
           foreach ( $a['fields'] as $k => $v ) {
-            $c[ $k ] = ( $k === 'comment_content' ) ? $this->clean_html( $v ) : sanitize_text_field( $v );
+            if ( !is_scalar( $v ) ) {
+              continue;
+            }
+            $c[ $k ] = ( $k === 'comment_content' ) ? $this->kses_arg( (string) $v ) : sanitize_text_field( (string) $v );
           }
         }
-        $cid = wp_update_comment( $c, true );
+        // The id the caller named at the top level, forced back after the merge for the
+        // same reason wp_update_post and wp_update_user do it: `fields` is open, and a
+        // nested comment_ID would otherwise decide which comment is written.
+        $comment_id = intval( $a['comment_ID'] );
+        $c['comment_ID'] = $comment_id;
+        // Slashed because wp_update_comment() unslashes. @see kses_arg().
+        $cid = wp_update_comment( wp_slash( $c ), true );
         if ( is_wp_error( $cid ) ) {
           $r = $this->error( $r, $cid->get_error_message(), $cid->get_error_code() );
         }
+        elseif ( $cid === false ) {
+          $r = $this->error( $r, 'Comment #' . $comment_id . ' could not be updated.', -32603 );
+        }
         else {
-          $this->add_result_text( $r, 'Comment #' . $cid . ' updated' );
+          // wp_update_comment() returns the number of rows changed, 1 or 0, never the id.
+          // Printing it read "Comment #1 updated" for every comment, and "#0" for a no-op,
+          // which hid that nothing had changed.
+          $this->add_result_text( $r, $cid
+            ? 'Comment #' . $comment_id . ' updated'
+            : 'Comment #' . $comment_id . ' unchanged: it already held those values.' );
         }
         break;
 
@@ -2783,7 +3004,10 @@ class GMCP_Tools_Core {
         // refusal wp_update_settings makes was reachable here by naming the same row.
         $policy = GMCP_Core::option_write_policy( $key, $value );
         if ( $policy !== true ) {
-          $r['error'] = [ 'code' => -32600, 'message' => $policy ];
+          // An isError result like every other refusal here, not a JSON-RPC error. A client
+          // discards a protocol error whole, so the most important refusal this tool makes was
+          // the one most likely never to reach the model. @see error().
+          $r = $this->error( $r, $policy, -32600 );
           break;
         }
         // update_option() returns false both when the write fails AND when the value
@@ -2821,27 +3045,15 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $permitted, -32600 );
           break;
         }
-        // Anything the shared write policy will not let you change, this will not let you
-        // remove. Deleting a row is the harsher edit of the two, so a key too dangerous to
-        // set cannot be safe to drop, and composing the two lists here means a key added to
-        // the shared one is covered the day it is added rather than the day someone
-        // notices. The entries this file names itself win, because they answer the question
-        // that was actually asked: "set new_admin_email instead" is the right answer to a
-        // write and not to a deletion.
-        $undeletable = self::OPTIONS_NEVER_DELETED;
-        foreach ( GMCP_Core::unwritable_options() as $name => $why ) {
-          if ( !isset( $undeletable[ $name ] ) ) {
-            $undeletable[ $name ] = $why;
-          }
-        }
-        if ( isset( $undeletable[ strtolower( $key ) ] ) ) {
-          $r = $this->error(
-            $r,
-            'The option "' . $key . '" cannot be deleted through this API: '
-              . $undeletable[ strtolower( $key ) ]
-              . ' Change it with wp_update_option if you need a different value.',
-            -32600
-          );
+        // Asked of the one deletion policy, which the journal's undo of a created option asks
+        // too. This used to compose its own answer from unwritable_options() and a list kept
+        // in this file, and claimed that made it cover everything the write policy refuses.
+        // It did not: the rules inside option_write_policy() were never consulted, so the
+        // wsal_ rows that policy protects and the site's role definitions could each be
+        // deleted in one call. @see GMCP_Core::option_delete_policy().
+        $deletable = GMCP_Core::option_delete_policy( $key );
+        if ( $deletable !== true ) {
+          $r = $this->error( $r, $deletable, -32600 );
           break;
         }
         // "Absent" and "stored as false" are different states and get_option() returns
@@ -2933,9 +3145,15 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $permitted, -32600 );
           break;
         }
-        $policy = GMCP_Core::option_write_policy( $row, $value );
+        // Asked about the row as it will be written, the whole merged array, because that
+        // is what update_option() receives. Passing the one mod's value was harmless only
+        // while no rule judged this row by its value.
+        $merged_mods = get_theme_mods();
+        $merged_mods = is_array( $merged_mods ) ? $merged_mods : [];
+        $merged_mods[ $key ] = $value;
+        $policy = GMCP_Core::option_write_policy( $row, $merged_mods );
         if ( $policy !== true ) {
-          $r['error'] = [ 'code' => -32600, 'message' => $policy ];
+          $r = $this->error( $r, $policy, -32600 );
           break;
         }
         set_theme_mod( $key, $value );
@@ -3215,7 +3433,18 @@ class GMCP_Tools_Core {
         if ( $d ) {
           $args['date_query'] = [ $d ];
         }
-        $total = count( get_posts( $args ) );
+        // Counted, never listed. get_posts() defaults to five results, so this answered "5"
+        // on a site with twelve thousand attachments; asking for every id instead would load
+        // all of them to print one number. Without a date filter WordPress keeps the count.
+        if ( !$d ) {
+          $by_type = (array) wp_count_attachments();
+          unset( $by_type['trash'] );
+          $total = (int) array_sum( array_map( 'intval', $by_type ) );
+        }
+        else {
+          $count_q = new WP_Query( $args + [ 'posts_per_page' => 1, 'no_found_rows' => false ] );
+          $total = (int) $count_q->found_posts;
+        }
         $this->add_result_text( $r, (string) $total );
         break;
 
@@ -3254,6 +3483,11 @@ class GMCP_Tools_Core {
 
         /* ===== Posts: list ===== */
       case 'wp_get_posts':
+        $list_read = GMCP_Core::commerce_post_read_guard( sanitize_key( $a['post_type'] ?? 'post' ) );
+        if ( $list_read !== true ) {
+          $r = $this->error( $r, $list_read, -32600 );
+          break;
+        }
         $q = [
           'post_type' => sanitize_key( $a['post_type'] ?? 'post' ),
           'post_status' => sanitize_key( $a['post_status'] ?? 'publish' ),
@@ -3287,6 +3521,12 @@ class GMCP_Tools_Core {
         }
         $rows = [];
         foreach ( get_posts( $q ) as $p ) {
+          // "any" can still reach a commerce row: WordPress expands it to the registered
+          // types not excluded from search, which says nothing about a type registered by a
+          // plugin that sets it differently. Filtered per row rather than trusted.
+          if ( GMCP_Core::commerce_post_read_guard( $p ) !== true ) {
+            continue;
+          }
           $rows[] = [
             'ID' => $p->ID,
             'post_title' => $p->post_title,
@@ -3307,6 +3547,11 @@ class GMCP_Tools_Core {
         $p = get_post( intval( $a['ID'] ) );
         if ( !$p ) {
           $r = $this->error( $r, 'Post not found', -32602 );
+          break;
+        }
+        $one_read = GMCP_Core::commerce_post_read_guard( $p );
+        if ( $one_read !== true ) {
+          $r = $this->error( $r, $one_read, -32600 );
           break;
         }
         $out = [
@@ -3336,6 +3581,11 @@ class GMCP_Tools_Core {
 
         if ( !$p ) {
           $r = $this->error( $r, 'Post not found', -32602 );
+          break;
+        }
+        $snap_read = GMCP_Core::commerce_post_read_guard( $p );
+        if ( $snap_read !== true ) {
+          $r = $this->error( $r, $snap_read, -32600 );
           break;
         }
 
@@ -3377,10 +3627,10 @@ class GMCP_Tools_Core {
           $all_meta = get_post_meta( $post_id );
           foreach ( $all_meta as $key => $value ) {
             if ( is_array( $value ) && count( $value ) === 1 ) {
-              $snapshot['meta'][ $key ] = maybe_unserialize( $value[0] );
+              $snapshot['meta'][ $key ] = $this->readable_meta( (string) $key, maybe_unserialize( $value[0] ) );
             }
             else {
-              $snapshot['meta'][ $key ] = array_map( 'maybe_unserialize', $value );
+              $snapshot['meta'][ $key ] = $this->readable_meta( (string) $key, array_map( 'maybe_unserialize', (array) $value ) );
             }
           }
         }
@@ -3495,6 +3745,13 @@ class GMCP_Tools_Core {
           }
           if ( empty( $item['post_title'] ) ) {
             $unfit[] = 'item ' . $i . ' has no post_title';
+          }
+          // The same question create_one_post() asks, asked before anything is written so a
+          // refused item cannot leave the ones before it behind. It is a refusal the single
+          // create also makes, so this is not a guard the batch has and the single lacks.
+          $item_commerce = GMCP_Core::commerce_post_guard( 0, 'Creating', sanitize_key( (string) ( $item['post_type'] ?? 'post' ) ) );
+          if ( $item_commerce !== true ) {
+            $unfit[] = 'item ' . $i . ': ' . $item_commerce;
           }
         }
         if ( $unfit ) {
@@ -3651,6 +3908,11 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'Post ' . $wb_id . ' not found.', -32602 );
           break;
         }
+        $commerce = GMCP_Core::commerce_post_guard( $wb_id, 'Writing blocks to' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
         // Some MCP clients send arrays as JSON strings.
         $wb_blocks = $a['blocks'] ?? null;
         if ( is_string( $wb_blocks ) ) {
@@ -3748,6 +4010,11 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'Post ' . $bp_id . ' not found.', -32602 );
           break;
         }
+        $commerce = GMCP_Core::commerce_post_guard( $bp_id, 'Inserting a pattern into' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
         $bp_mode = in_array( $a['mode'] ?? 'append', [ 'replace', 'append', 'prepend' ], true ) ? ( $a['mode'] ?? 'append' ) : 'append';
         if ( $bp_mode === 'replace' ) {
           $bp_new = $bp_markup;
@@ -3810,11 +4077,52 @@ class GMCP_Tools_Core {
           }
         }
 
+        // The guard at the top judged the type the post HAS. A write that sets post_type
+        // decides the type it will have, and turning an ordinary draft into a subscription
+        // is the same harm reached from the other side.
+        if ( array_key_exists( 'post_type', $fields ) ) {
+          $retype = GMCP_Core::commerce_post_guard( $post_id, 'Updating', is_scalar( $fields['post_type'] ) ? (string) $fields['post_type'] : '' );
+          if ( $retype !== true ) {
+            $r = $this->error( $r, $retype, -32600 );
+            break;
+          }
+        }
+
         // Track what we're trying to update for verification
         $content_to_verify = null;
         if ( !empty( $fields ) && is_array( $fields ) ) {
+          $field_error = null;
           foreach ( $fields as $k => $v ) {
-            $c[ $k ] = in_array( $k, [ 'post_content', 'post_excerpt' ], true ) ? $this->store_html( $v ) : sanitize_text_field( $v );
+            if ( $k === 'post_category' ) {
+              // An array, per the schema. sanitize_text_field() turned it into "", and
+              // wp_update_post() keeps the existing categories for anything that is not a
+              // non-empty array, so the call reported success and changed nothing.
+              $c[ $k ] = array_values( array_filter( array_map( 'intval', (array) $v ) ) );
+              continue;
+            }
+            if ( $k === 'tax_input' ) {
+              $c[ $k ] = $this->clean_tax_input( $v );
+              continue;
+            }
+            if ( in_array( $k, [ 'post_content', 'post_excerpt' ], true ) ) {
+              if ( !is_scalar( $v ) ) {
+                $field_error = 'fields.' . $k . ' must be a string.';
+                break;
+              }
+              $c[ $k ] = $this->store_html( (string) $v );
+              continue;
+            }
+            if ( !is_scalar( $v ) && $v !== null ) {
+              // Blanked to "" before, which wrote an empty title or slug while reporting
+              // success. Said instead, before anything is written.
+              $field_error = 'fields.' . $k . ' must be a string or a number.';
+              break;
+            }
+            $c[ $k ] = sanitize_text_field( (string) $v );
+          }
+          if ( $field_error !== null ) {
+            $r = $this->error( $r, $field_error . ' Nothing was written.', -32602 );
+            break;
           }
           if ( isset( $c['post_content'] ) ) {
             $content_to_verify = $c['post_content'];
@@ -3921,6 +4229,12 @@ class GMCP_Tools_Core {
 
         // Update post fields if any
         if ( $has_fields ) {
+          // The authorised id, forced back immediately before the write. `fields` is an
+          // open object and the merge above copies every key in it, "ID" included, so a
+          // nested ID replaced the one commerce_post_guard() and template_reference_guard()
+          // had just been asked about: the guards judged one post and this wrote another,
+          // and the meta below followed $u to the same place.
+          $c['ID'] = $post_id;
           $u = wp_update_post( wp_slash( $c ), true );
           if ( is_wp_error( $u ) ) {
             $r = $this->error( $r, $u->get_error_message(), $u->get_error_code() );
@@ -3932,10 +4246,12 @@ class GMCP_Tools_Core {
         $meta_notes = [];
         if ( $has_meta ) {
           foreach ( $meta_input as $k => $v ) {
-            // Pass the value as-is: update_post_meta() serializes arrays itself.
-            // maybe_serialize() here double-serialized nested arrays.
-            // wp_slash on the key alone, because update_metadata() unslashes it.
-            update_post_meta( $u, wp_slash( (string) $k ), $v );
+            // Through prepare_meta_value(), the answer the other meta writers already share:
+            // JSON for an array is decoded, and the value is slashed because
+            // update_metadata() unslashes it. Only the key used to be slashed, so every
+            // backslash in a value was lost and a JSON design came back unparseable under a
+            // success reply. Never maybe_serialize(): update_post_meta() serializes arrays.
+            update_post_meta( $u, wp_slash( (string) $k ), $this->prepare_meta_value( $v ) );
             $meta_elsewhere = $this->meta_key_stored_as( (int) $u, (string) $k );
             if ( $meta_elsewhere !== '' ) {
               $meta_notes[ (string) $k ] = 'went into the row already spelled "' . $meta_elsewhere
@@ -4035,6 +4351,11 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'Post not found', -32602 );
           break;
         }
+        $commerce = GMCP_Core::commerce_post_guard( $post_id, 'Altering' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
 
         $content = $post->$field;
         $count = 0;
@@ -4061,6 +4382,10 @@ class GMCP_Tools_Core {
           break;
         }
 
+        // Sanitised the way wp_update_post sanitises the same field. @see alter_sanitize().
+        $raw_result = $new_content;
+        $new_content = $this->alter_sanitize( $field, $new_content );
+
         // wp_update_post() runs wp_unslash() internally, which would strip the
         // backslash from Unicode escapes like \u003c in block JSON (Rank Math
         // FAQ, etc.) and silently corrupt the post. Pre-slash to compensate.
@@ -4071,7 +4396,8 @@ class GMCP_Tools_Core {
         }
 
         $this->bust_post_cache( $post_id, [ 'tool' => 'wp_alter_post' ] );
-        $this->add_result_text( $r, $count . ' replacement' . ( $count === 1 ? '' : 's' ) . ' applied to ' . $field . ' of post #' . $post_id );
+        $this->add_result_text( $r, $count . ' replacement' . ( $count === 1 ? '' : 's' ) . ' applied to ' . $field . ' of post #' . $post_id
+          . ( $new_content !== $raw_result ? '. The result was sanitised before it was stored, as wp_update_post would: markup not allowed in ' . $field . ' was removed, so read the field back rather than assuming it holds the replacement exactly.' : '' ) );
         break;
 
         /* ===== Post-meta ===== */
@@ -4081,13 +4407,21 @@ class GMCP_Tools_Core {
           break;
         }
         $pid = intval( $a['ID'] );
+        $meta_read = GMCP_Core::commerce_post_read_guard( $pid );
+        if ( $meta_read !== true ) {
+          $r = $this->error( $r, $meta_read, -32600 );
+          break;
+        }
         // Compared against '' rather than tested for truthiness. The difference is "0",
         // which is falsy in PHP and which WordPress cannot address either: this way it
         // reaches meta_key_allowed() and is refused by name, instead of quietly turning
         // into "no key given" and answering a read of one key with every key.
         $get_key = (string) ( $a['key'] ?? '' );
         if ( $get_key === '' ) {
-          $out = get_post_meta( $pid );
+          $out = [];
+          foreach ( (array) get_post_meta( $pid ) as $meta_k => $meta_rows ) {
+            $out[ $meta_k ] = $this->readable_meta( (string) $meta_k, $meta_rows );
+          }
         }
         else {
           $get_why = $this->meta_key_allowed( $get_key );
@@ -4096,7 +4430,7 @@ class GMCP_Tools_Core {
             break;
           }
           // No wp_slash: get_metadata() does not unslash the key. @see meta_key_allowed().
-          $out = get_post_meta( $pid, $get_key, true );
+          $out = $this->readable_meta( $get_key, get_post_meta( $pid, $get_key, true ) );
         }
         $this->add_result_text( $r, wp_json_encode( $out, JSON_PRETTY_PRINT ) );
         break;
@@ -4215,6 +4549,14 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'No target post with ID ' . $to_id . '.', -32602 );
           break;
         }
+        // The target is the post that is written. Copying a crafted _billing_period from an
+        // ordinary draft onto a subscription is a meta write on the subscription, however
+        // innocent the source.
+        $commerce = GMCP_Core::commerce_post_guard( $to_id, 'Copying meta to' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
         // Some MCP clients send arrays as JSON strings.
         $copy_keys = $a['keys'] ?? [];
         if ( is_string( $copy_keys ) ) {
@@ -4257,6 +4599,13 @@ class GMCP_Tools_Core {
         }
         if ( !$chunk_pid || !get_post( $chunk_pid ) ) {
           $r = $this->error( $r, 'No post with ID ' . $chunk_pid . '.', -32602 );
+          break;
+        }
+        // On every chunk, not only the final one, so nothing is staged for a target the
+        // write would be refused on, and a post retyped between chunks is still caught.
+        $commerce = GMCP_Core::commerce_post_guard( $chunk_pid, 'Setting meta on' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
           break;
         }
         $chunk_why = $this->meta_key_allowed( $chunk_key );
@@ -4345,21 +4694,32 @@ class GMCP_Tools_Core {
         break;
 
       case 'wp_read_post_meta_chunk':
-        // read level, and that is the whole reach it has. Post meta reads are ungated
-        // today: wp_get_post_meta is itself a read tool and returns any key on any post
-        // in full, with no option_guard() equivalent standing in front of it. Walking the
-        // same value in pieces therefore exposes nothing a read-only token could not
-        // already ask for in one call. If a guard is ever put on post meta reads it has
-        // to be put on both tools, or this one becomes the way around it.
+        // read level, and it asks exactly what wp_get_post_meta asks: the commerce read
+        // guard about the post, and the credential rule about the key. Post meta reads
+        // used to be ungated, and this comment said that if a guard were ever put on them
+        // it had to be put on both tools or this one would become the way around it. Both
+        // now ask the same two functions.
         $read_pid = intval( $a['ID'] ?? 0 );
         $read_key = (string) ( $a['key'] ?? '' );
         if ( !$read_pid || !get_post( $read_pid ) ) {
           $r = $this->error( $r, 'No post with ID ' . $read_pid . '.', -32602 );
           break;
         }
+        $chunk_read = GMCP_Core::commerce_post_read_guard( $read_pid );
+        if ( $chunk_read !== true ) {
+          $r = $this->error( $r, $chunk_read, -32600 );
+          break;
+        }
         $read_why = $this->meta_key_allowed( $read_key );
         if ( $read_why !== true ) {
           $r = $this->error( $r, $read_why, -32602 );
+          break;
+        }
+        // Refused rather than returned as the marker. This tool hands back bytes to be
+        // reassembled, and a caller stitching "[redacted]" into a value would have no way
+        // to tell it from the real thing.
+        if ( GMCP_Core::field_looks_secret( $read_key ) ) {
+          $r = $this->error( $r, 'The meta key "' . $read_key . '" looks like it holds a credential, so its value is not readable through the API. The same rule keeps such values out of the audit log and the change journal.', -32600 );
           break;
         }
 
@@ -4483,6 +4843,11 @@ class GMCP_Tools_Core {
           break;
         }
         $post_id = intval( $a['post_id'] );
+        $commerce = GMCP_Core::commerce_post_guard( $post_id, 'Setting the featured image of' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
         $media_id = isset( $a['media_id'] ) ? intval( $a['media_id'] ) : 0;
         if ( $media_id ) {
           $done = set_post_thumbnail( $post_id, $media_id );
@@ -4514,14 +4879,26 @@ class GMCP_Tools_Core {
         $args = [
           'taxonomy' => $tax,
           'hide_empty' => false,
-          'number' => intval( $a['limit'] ?? 0 ),
-          'search' => $a['search'] ?? '',
+          // Bounded like every other list tool. 0 meant "all", and on a site with a hundred
+          // thousand tags one read loaded every term object into memory.
+          'number' => max( 1, min( 500, intval( $a['limit'] ?? 100 ) ) ),
+          'search' => (string) ( $a['search'] ?? '' ),
         ];
+        if ( isset( $a['offset'] ) ) {
+          $args['offset'] = max( 0, intval( $a['offset'] ) );
+        }
         if ( isset( $a['parent'] ) ) {
           $args['parent'] = intval( $a['parent'] );
         }
+        $terms_found = get_terms( $args );
+        // An unknown taxonomy is a WP_Error, and walking it as a list printed rows of nulls
+        // instead of saying what was wrong.
+        if ( is_wp_error( $terms_found ) ) {
+          $r = $this->error( $r, $terms_found->get_error_message(), $terms_found->get_error_code() );
+          break;
+        }
         $out = [];
-        foreach ( get_terms( $args ) as $t ) {
+        foreach ( (array) $terms_found as $t ) {
           $out[] = [ 'term_id' => $t->term_id, 'name' => $t->name, 'slug' => $t->slug, 'count' => $t->count ];
         }
         $this->add_result_text( $r, wp_json_encode( $out, JSON_PRETTY_PRINT ) );
@@ -4596,8 +4973,13 @@ class GMCP_Tools_Core {
           break;
         }
         $tax = sanitize_key( $a['taxonomy'] ?? 'category' );
+        $post_terms = wp_get_post_terms( intval( $a['ID'] ), $tax, [ 'fields' => 'all' ] );
+        if ( is_wp_error( $post_terms ) ) {
+          $r = $this->error( $r, $post_terms->get_error_message(), $post_terms->get_error_code() );
+          break;
+        }
         $out = [];
-        foreach ( wp_get_post_terms( intval( $a['ID'] ), $tax, [ 'fields' => 'all' ] ) as $t ) {
+        foreach ( (array) $post_terms as $t ) {
           $out[] = [ 'term_id' => $t->term_id, 'name' => $t->name ];
         }
         $this->add_result_text( $r, wp_json_encode( $out, JSON_PRETTY_PRINT ) );
@@ -4613,14 +4995,56 @@ class GMCP_Tools_Core {
         if ( is_string( $terms ) ) {
           $terms = json_decode( $terms, true ) ?? [];
         }
+        $commerce = GMCP_Core::commerce_post_guard( intval( $a['ID'] ), 'Setting terms on' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
         $tax = sanitize_key( $a['taxonomy'] ?? 'category' );
+        if ( !taxonomy_exists( $tax ) ) {
+          $r = $this->error( $r, 'There is no taxonomy "' . $tax . '" on this site. wp_get_taxonomies lists them.', -32602 );
+          break;
+        }
+        // Append by default, which is what the code always did; the description used to say
+        // the default replaced, so a caller relying on it ended up with old and new terms.
         $append = !isset( $a['append'] ) || $a['append'];
+        $terms = is_array( $terms ) ? array_values( $terms ) : [ $terms ];
+        // wp_set_post_terms() intval()s every term of a hierarchical taxonomy, so a category
+        // NAME became 0, was dropped, and the reply said "Terms set". Names are looked up
+        // here instead, and one that does not exist is refused rather than silently lost.
+        if ( is_taxonomy_hierarchical( $tax ) ) {
+          $resolved = [];
+          $unknown = [];
+          foreach ( $terms as $term ) {
+            if ( is_int( $term ) || ( is_string( $term ) && ctype_digit( $term ) ) ) {
+              $resolved[] = (int) $term;
+              continue;
+            }
+            $hit = is_scalar( $term ) ? term_exists( (string) $term, $tax ) : null;
+            if ( $hit ) {
+              $resolved[] = (int) ( is_array( $hit ) ? $hit['term_id'] : $hit );
+            }
+            else {
+              $unknown[] = is_scalar( $term ) ? (string) $term : gettype( $term );
+            }
+          }
+          if ( $unknown ) {
+            $r = $this->error( $r, 'No ' . $tax . ' term named ' . implode( ', ', array_map( function ( $n ) { return '"' . $n . '"'; }, $unknown ) ) . '. Create it with wp_create_term or pass term ids. Nothing was changed.', -32602 );
+            break;
+          }
+          $terms = $resolved;
+        }
         $set = wp_set_post_terms( intval( $a['ID'] ), $terms, $tax, $append );
         if ( is_wp_error( $set ) ) {
           $r = $this->error( $r, $set->get_error_message(), $set->get_error_code() );
         }
+        elseif ( $set === false ) {
+          $r = $this->error( $r, 'Post #' . intval( $a['ID'] ) . ' does not exist, so no terms were set.', -32602 );
+        }
         else {
-          $this->add_result_text( $r, 'Terms set for post #' . $a['ID'] );
+          $now = wp_get_object_terms( intval( $a['ID'] ), $tax, [ 'fields' => 'ids' ] );
+          $this->add_result_text( $r, 'Terms ' . ( $append ? 'added to' : 'replaced on' ) . ' post #' . intval( $a['ID'] )
+            . '. It now holds ' . $tax . ' term ids: ' . ( is_array( $now ) && $now ? implode( ', ', $now ) : 'none' ) . '.' );
         }
         break;
 
@@ -4755,15 +5179,23 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
+        // Attachments only, in the handler. The tool's name says media and its fields are an
+        // attachment's, but it wrote title, caption and description onto whatever post the
+        // id named, at write level, past the commerce guard: an order's post_excerpt is the
+        // customer's note.
+        if ( get_post_type( intval( $a['ID'] ) ) !== 'attachment' ) {
+          $r = $this->error( $r, 'No attachment with ID ' . intval( $a['ID'] ) . '. This tool edits media only; use wp_update_post for other posts.', -32602 );
+          break;
+        }
         $upd = [ 'ID' => intval( $a['ID'] ) ];
         if ( $a['title'] ?? '' ) {
           $upd['post_title'] = sanitize_text_field( $a['title'] );
         }
         if ( $a['caption'] ?? '' ) {
-          $upd['post_excerpt'] = $this->clean_html( $a['caption'] );
+          $upd['post_excerpt'] = $this->kses_arg( (string) $a['caption'] );
         }
         if ( $a['description'] ?? '' ) {
-          $upd['post_content'] = $this->clean_html( $a['description'] );
+          $upd['post_content'] = $this->kses_arg( (string) $a['description'] );
         }
         $u = wp_update_post( wp_slash( $upd ), true );
         if ( is_wp_error( $u ) ) {
@@ -4784,6 +5216,15 @@ class GMCP_Tools_Core {
           break;
         }
         $media_id = intval( $a['ID'] );
+        // The same refusal the preview gives, made by the real call. Only the preview used to
+        // check the type, so a caller that previewed was told "No attachment" and the real
+        // call then permanently deleted the post anyway, a subscription or an Elementor
+        // template still rendered by live pages among them, past both the commerce guard and
+        // the template guard that wp_delete_post asks.
+        if ( get_post_type( $media_id ) !== 'attachment' ) {
+          $r = $this->error( $r, 'No attachment with ID ' . $media_id . '. This tool deletes media only; use wp_delete_post for other posts.', -32602 );
+          break;
+        }
         $d = wp_delete_post( $media_id, !empty( $a['force'] ) );
         if ( $d ) {
           // An attachment has no trash, so this is always the permanent branch. Asked

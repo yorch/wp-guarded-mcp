@@ -157,6 +157,78 @@ check "control: the reply says something about restoring at all" \
   "$(py 'import json,sys;print("restore" in json.load(sys.stdin)["result"]["content"][0]["text"])' d_notrash)" "True"
 docker compose exec -T cli wp config delete EMPTY_TRASH_DAYS >/dev/null 2>&1
 
+echo "-- a nested id cannot choose which record is written --"
+# Every guard in these handlers is asked about the top-level ID, and `fields` is an open
+# object that was merged over the write array key by key, "ID" included. So the guards
+# judged one record and WordPress wrote another. Each check reads the DECOY and the TARGET
+# back from the database; the reply named the target and said nothing was wrong.
+RT_A=$(docker compose exec -T cli wp post create --post_title='retarget decoy' --post_status=draft --porcelain 2>/dev/null | tr -d '\r\n')
+RT_B=$(docker compose exec -T cli wp post create --post_title='retarget victim' --post_status=draft --porcelain 2>/dev/null | tr -d '\r\n')
+call rt_post "{\"jsonrpc\":\"2.0\",\"id\":65,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$RT_A,\"fields\":{\"ID\":$RT_B,\"post_title\":\"retargeted\"}}}}"
+check "wp_update_post: fields.ID does not move the write to another post" \
+  "$(docker compose exec -T cli wp post get "$RT_B" --field=post_title 2>/dev/null | tr -d '\r\n')" "retarget victim"
+check "control: the post the call named is the one written" \
+  "$(docker compose exec -T cli wp post get "$RT_A" --field=post_title 2>/dev/null | tr -d '\r\n')" "retargeted"
+RT_U=$(docker compose exec -T cli wp eval 'echo wp_insert_user(["user_login"=>"rt_decoy","user_pass"=>wp_generate_password(),"display_name"=>"Decoy"]);' 2>/dev/null | tr -d '\r\n')
+RT_V=$(docker compose exec -T cli wp eval 'echo wp_insert_user(["user_login"=>"rt_victim","user_pass"=>wp_generate_password(),"display_name"=>"Victim"]);' 2>/dev/null | tr -d '\r\n')
+call rt_user "{\"jsonrpc\":\"2.0\",\"id\":66,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_user\",\"arguments\":{\"ID\":$RT_U,\"fields\":{\"ID\":$RT_V,\"display_name\":\"Retargeted\"}}}}"
+check "wp_update_user: fields.ID does not move the write to another account" \
+  "$(docker compose exec -T cli wp user get "$RT_V" --field=display_name 2>/dev/null | tr -d '\r\n')" "Victim"
+check "control: the account the call named is the one written" \
+  "$(docker compose exec -T cli wp user get "$RT_U" --field=display_name 2>/dev/null | tr -d '\r\n')" "Retargeted"
+RT_C1=$(docker compose exec -T cli wp comment create --comment_post_ID="$RT_A" --comment_content='decoy comment' --porcelain 2>/dev/null | tr -d '\r\n')
+RT_C2=$(docker compose exec -T cli wp comment create --comment_post_ID="$RT_A" --comment_content='victim comment' --porcelain 2>/dev/null | tr -d '\r\n')
+call rt_comment "{\"jsonrpc\":\"2.0\",\"id\":67,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_comment\",\"arguments\":{\"comment_ID\":$RT_C1,\"fields\":{\"comment_ID\":$RT_C2,\"comment_content\":\"retargeted\"}}}}"
+check "wp_update_comment: fields.comment_ID does not move the write" \
+  "$(docker compose exec -T cli wp comment get "$RT_C2" --field=comment_content 2>/dev/null | tr -d '\r\n')" "victim comment"
+# wp_update_comment() returns 1 or 0, not an id, and the reply printed that number.
+check "and the reply names the comment written, not a row count" \
+  "$(py 'import sys,json;print(json.load(sys.stdin)["result"]["content"][0]["text"])' rt_comment)" "Comment #$RT_C1 updated"
+docker compose exec -T cli wp post delete "$RT_A" "$RT_B" --force >/dev/null 2>&1
+docker compose exec -T cli wp user delete "$RT_U" "$RT_V" --yes >/dev/null 2>&1
+
+echo "-- an account that can run the site takes two calls --"
+# One injected instruction could mint a working administrator or reset another one's
+# password: get_editable_roles() includes administrator for an administrator, which the code
+# comment claimed it did not, and edit_user passes for every account on a single site.
+ucall() { call "$1" "{\"jsonrpc\":\"2.0\",\"id\":450,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$3}}"; }
+docker compose exec -T cli wp user delete gate_admin --yes >/dev/null 2>&1
+ucall ua_create wp_create_user '{"user_login":"gate_admin","user_email":"gate_admin@example.test","role":"administrator"}'
+check "creating an administrator in one call creates nothing" \
+  "$(docker compose exec -T cli wp eval 'echo username_exists("gate_admin") ? "created" : "absent";' 2>/dev/null | tr -d '\r\n')" "absent"
+UA_TOKEN=$(py 'import json,sys,re;m=re.search(r"confirm set to \"([0-9a-f]+)\"",json.load(sys.stdin)["result"]["content"][0]["text"]);print(m.group(1) if m else "")' ua_create)
+ucall ua_create2 wp_create_user "{\"user_login\":\"gate_admin\",\"user_email\":\"gate_admin@example.test\",\"role\":\"administrator\",\"confirm\":\"$UA_TOKEN\"}"
+check "CONTROL: the second call with the token creates it" \
+  "$(docker compose exec -T cli wp eval 'echo username_exists("gate_admin") ? "created" : "absent";' 2>/dev/null | tr -d '\r\n')" "created"
+UA_ID=$(docker compose exec -T cli wp eval 'echo username_exists("gate_admin");' 2>/dev/null | tr -d '\r\n')
+UA_HASH=$(docker compose exec -T cli wp eval "echo get_userdata($UA_ID)->user_pass;" 2>/dev/null | tr -d '\r\n')
+ucall ua_pass wp_update_user "{\"ID\":$UA_ID,\"fields\":{\"user_pass\":\"taken-over\",\"user_email\":\"attacker@example.test\"}}"
+check "resetting an administrator's password and address in one call changes nothing" \
+  "$(docker compose exec -T cli wp eval "\$u=get_userdata($UA_ID); echo \$u->user_pass === '$UA_HASH' && \$u->user_email === 'gate_admin@example.test' ? 'unchanged' : 'changed';" 2>/dev/null | tr -d '\r\n')" "unchanged"
+ucall ua_name wp_update_user "{\"ID\":$UA_ID,\"fields\":{\"display_name\":\"Gate Admin\"}}"
+check "CONTROL: a display field on the same account needs no token" \
+  "$(docker compose exec -T cli wp user get "$UA_ID" --field=display_name 2>/dev/null | tr -d '\r\n')" "Gate Admin"
+docker compose exec -T cli wp user delete gate_admin --yes >/dev/null 2>&1
+# A password is hashed, never "sanitised": sanitize_text_field stored "Tr0ubdor 9" for
+# "Tr0ub%41dor<x>  9 " and the reply said the password had been set.
+UP=$(docker compose exec -T cli wp eval 'echo wp_insert_user(["user_login"=>"gate_sub","user_pass"=>wp_generate_password(),"role"=>"subscriber"]);' 2>/dev/null | tr -d '\r\n')
+python3 - "$OUT" "$UP" <<'PYPW'
+import json, sys
+out, uid = sys.argv[1], int(sys.argv[2])
+open(out + '/up.json', 'w').write(json.dumps({"jsonrpc": "2.0", "id": 451, "method": "tools/call", "params": {"name": "wp_update_user",
+  "arguments": {"ID": uid, "fields": {"user_pass": "Tr0ub%41dor<x>  9 \\z", "display_name": "C:\\Users\\x"}}}}))
+PYPW
+curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' -d @"$OUT/up.json" -o "$OUT/up"
+check "the password stored is the password sent" \
+  "$(docker compose exec -T cli wp eval "echo wp_check_password('Tr0ub%41dor<x>  9 ' . chr(92) . 'z', get_userdata($UP)->user_pass, $UP) ? 'exact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "exact"
+check "and a backslash in a name survives" \
+  "$(docker compose exec -T cli wp eval "echo get_userdata($UP)->display_name === 'C:' . chr(92) . 'Users' . chr(92) . 'x' ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
+ucall up_role wp_update_user "{\"ID\":$UP,\"fields\":{\"role\":\"\"}}"
+check "an empty role does not strip every role from the account" \
+  "$(docker compose exec -T cli wp user get "$UP" --field=roles 2>/dev/null | tr -d '\r\n')" "subscriber"
+docker compose exec -T cli wp user delete "$UP" --yes >/dev/null 2>&1
+
 echo "-- preview: say what would happen, change nothing --"
 # A preview that quietly performs the write is worse than no preview, so every check
 # here asserts the stored state afterwards rather than trusting the wording.
@@ -486,6 +558,222 @@ call ch_b "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{
 # reusing an id would interleave their bytes into one value and neither would know.
 check "a session started on one target is refused on another" "$(verdict ch_b)" "error"
 
+echo "-- the commerce guard reaches every generic post and meta writer --"
+# An order and a subscription are wp_posts rows when HPOS is off, and their status, billing
+# period and next payment date live in that row and its meta. commerce_post_guard() was
+# asked by five writers while four others wrote the same rows unasked, and it judged only
+# the type a post HAD, so creating one or retyping a draft into one sailed through. Seeded
+# as bare rows: the guard reads get_post_type() and nothing else, so WooCommerce need not
+# be active for the harm or for the refusal.
+#
+# Every check reads the row back. Read, call, read back, and the fixture is deleted at the
+# end whatever happened, so a missing guard leaves nothing for the next block to trip on.
+CG=$(docker compose exec -T cli wp eval '
+  $sub = wp_insert_post(["post_title"=>"Commerce probe sub","post_type"=>"shop_subscription","post_status"=>"wc-active","post_content"=>"SUBBODY"]);
+  update_post_meta($sub,"_billing_period","month");
+  $draft = wp_insert_post(["post_title"=>"Commerce probe draft","post_status"=>"draft"]);
+  update_post_meta($draft,"_billing_period","day");
+  $att = wp_insert_attachment(["post_title"=>"Commerce probe media","post_mime_type"=>"image/png","post_status"=>"inherit"], false, 0);
+  update_post_meta($att,"_wp_attached_file","commerce-probe.png");
+  echo $sub, " ", $draft, " ", $att;' 2>/dev/null | tr -d '\r\n')
+read -r CG_SUB CG_DRAFT CG_ATT <<< "$CG"
+cg() { # cg <file> <id> <tool> <arguments json>
+  call "$1" "{\"jsonrpc\":\"2.0\",\"id\":$2,\"method\":\"tools/call\",\"params\":{\"name\":\"$3\",\"arguments\":$4}}"
+}
+cg_meta() { docker compose exec -T cli wp eval "echo get_post_meta($CG_SUB,'_billing_period',true);" 2>/dev/null | tr -d '\r\n'; }
+# Control first: the guard recognises the seeded row. Without this every refusal below
+# could be the row failing to exist rather than the guard working.
+cg cg_ctl 400 wp_update_post_meta "{\"ID\":$CG_SUB,\"key\":\"_billing_period\",\"value\":\"year\"}"
+check "CONTROL: the long-standing guard refuses the seeded subscription" "$(verdict cg_ctl)" "error"
+cg cg_copy 401 wp_copy_post_meta "{\"from_id\":$CG_DRAFT,\"to_id\":$CG_SUB,\"keys\":[\"_billing_period\"],\"overwrite\":true}"
+check "wp_copy_post_meta cannot copy meta onto a subscription" "$(cg_meta)" "month"
+cg cg_chunk 402 wp_write_post_meta_chunk "{\"session\":\"cgprobe\",\"ID\":$CG_SUB,\"key\":\"_billing_period\",\"data\":\"year\",\"final\":true}"
+check "wp_write_post_meta_chunk cannot write one" "$(cg_meta)" "month"
+cg cg_alter 403 wp_alter_post "{\"ID\":$CG_SUB,\"field\":\"post_content\",\"search\":\"SUBBODY\",\"replace\":\"ALTERED\"}"
+cg cg_blocks 404 wp_write_blocks "{\"ID\":$CG_SUB,\"blocks\":[{\"type\":\"paragraph\",\"text\":\"BLOCKS\"}]}"
+check "wp_alter_post and wp_write_blocks cannot rewrite its body" \
+  "$(docker compose exec -T cli wp post get "$CG_SUB" --field=post_content 2>/dev/null | tr -d '\r\n')" "SUBBODY"
+cg cg_thumb 405 wp_set_featured_image "{\"post_id\":$CG_SUB,\"media_id\":$CG_ATT}"
+cg cg_terms 406 wp_add_post_terms "{\"ID\":$CG_SUB,\"terms\":[1],\"taxonomy\":\"category\"}"
+check "nor can the featured-image writer" \
+  "$(docker compose exec -T cli wp eval "echo metadata_exists('post',$CG_SUB,'_thumbnail_id')?'set':'untouched';" 2>/dev/null | tr -d '\r\n')" "untouched"
+check "nor the term writer" \
+  "$(docker compose exec -T cli wp eval "echo wp_get_object_terms($CG_SUB,'category',['fields'=>'ids'])?'set':'untouched';" 2>/dev/null | tr -d '\r\n')" "untouched"
+# The featured-image refusal above is only worth something if the same call can set one:
+# set_post_thumbnail() quietly declines an attachment it cannot render.
+cg cg_thumb_ok 416 wp_set_featured_image "{\"post_id\":$CG_DRAFT,\"media_id\":$CG_ATT}"
+check "CONTROL: the same attachment can be set on an ordinary post" \
+  "$(docker compose exec -T cli wp eval "echo (int) get_post_thumbnail_id($CG_DRAFT) === $CG_ATT ? 'set' : 'not set';" 2>/dev/null | tr -d '\r\n')" "set"
+cg cg_prev 407 wp_update_post "{\"ID\":$CG_SUB,\"preview\":true,\"post_title\":\"x\"}"
+check "a preview of the refused write is refused too" "$(verdict cg_prev)" "error"
+# The type a write LEAVES, not only the type it found.
+cg cg_retype 408 wp_update_post "{\"ID\":$CG_DRAFT,\"fields\":{\"post_type\":\"shop_subscription\"}}"
+cg cg_retype2 409 wp_update_post "{\"ID\":$CG_DRAFT,\"post_type\":\"Shop_Order\"}"
+check "wp_update_post cannot retype a draft into a subscription or an order" \
+  "$(docker compose exec -T cli wp post get "$CG_DRAFT" --field=post_type 2>/dev/null | tr -d '\r\n')" "post"
+CG_SUBS_BEFORE=$(docker compose exec -T cli wp eval 'global $wpdb; echo (int) $wpdb->get_var("SELECT COUNT(*) FROM $wpdb->posts WHERE post_type IN (\"shop_subscription\",\"shop_order\")");' 2>/dev/null | tr -d '\r\n')
+cg cg_create 410 wp_create_post "{\"post_title\":\"Minted sub\",\"post_type\":\"shop_subscription\",\"post_status\":\"wc-active\",\"meta_input\":{\"_customer_user\":1}}"
+cg cg_batch 411 wp_create_posts "{\"items\":[{\"post_title\":\"Batch ok probe\"},{\"post_title\":\"Batch order probe\",\"post_type\":\"shop_order\"}]}"
+check "wp_create_post and wp_create_posts cannot mint one" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb; echo (int) $wpdb->get_var("SELECT COUNT(*) FROM $wpdb->posts WHERE post_type IN (\"shop_subscription\",\"shop_order\")");' 2>/dev/null | tr -d '\r\n')" "$CG_SUBS_BEFORE"
+check "and the batch refused before writing its ordinary item either" \
+  "$(docker compose exec -T cli wp eval 'echo count(get_posts(["title"=>"Batch ok probe","post_status"=>"any","numberposts"=>-1,"fields"=>"ids"]));' 2>/dev/null | tr -d '\r\n')" "0"
+# Control: the same tools still write an ordinary post, so the refusals above are about
+# the type and not a broken tool.
+cg cg_ok 412 wp_copy_post_meta "{\"from_id\":$CG_SUB,\"to_id\":$CG_DRAFT,\"keys\":[\"_billing_period\"],\"overwrite\":true}"
+check "CONTROL: copying FROM a subscription onto an ordinary post still works" \
+  "$(docker compose exec -T cli wp eval "echo get_post_meta($CG_DRAFT,'_billing_period',true);" 2>/dev/null | tr -d '\r\n')" "month"
+# Undo is a generic writer too. Journal an ordinary edit, retype the post underneath it the
+# way an order saved by WooCommerce is a post, and ask for the undo.
+cg cg_j1 413 wp_update_post "{\"ID\":$CG_DRAFT,\"post_title\":\"Commerce probe edited\"}"
+call cg_jl '{"jsonrpc":"2.0","id":414,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":10}}}'
+CG_JID=$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(next((r['id'] for r in rows if 'Commerce probe edited' in r['what'] or 'Commerce probe draft' in r['what']),''))" cg_jl)
+check "CONTROL: the ordinary edit was journalled" "$([ -n "$CG_JID" ] && echo yes || echo no)" "yes"
+docker compose exec -T cli wp eval "set_post_type($CG_DRAFT,'shop_order');" >/dev/null 2>&1
+call cg_undo "{\"jsonrpc\":\"2.0\",\"id\":415,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$CG_JID\"}}}"
+check "and wp_undo_change will not put an order back with a plain post write" \
+  "$(docker compose exec -T cli wp post get "$CG_DRAFT" --field=post_title 2>/dev/null | tr -d '\r\n')" "Commerce probe edited"
+docker compose exec -T cli wp eval "foreach ([$CG_SUB,$CG_DRAFT,$CG_ATT] as \$i) { wp_delete_post(\$i, true); } foreach (get_posts(['title'=>'Batch ok probe','post_status'=>'any','numberposts'=>-1,'fields'=>'ids']) as \$i) { wp_delete_post(\$i, true); } global \$wpdb; foreach (\$wpdb->get_col(\"SELECT ID FROM \$wpdb->posts WHERE post_title IN ('Minted sub','Batch order probe')\") as \$i) { wp_delete_post((int) \$i, true); }" >/dev/null 2>&1
+
+echo "-- an order is not readable below admin through the generic read tools --"
+# wc_get_order and wc_list_orders are admin because an order is a customer's name, email,
+# phone, address and IP. With HPOS off every one of those is a meta row on a shop_order
+# post, and wp_get_posts and wp_get_post_meta are read-level, so a readonly key had the
+# customer list by naming the same rows through another tool. Each absence check has a
+# control proving the same probe finds the value when it is there to find.
+CR=$(docker compose exec -T cli wp eval '
+  $o = wp_insert_post(["post_title"=>"Order probe","post_type"=>"shop_order","post_status"=>"wc-processing"]);
+  update_post_meta($o,"_billing_email","pii-probe@example.test");
+  wp_insert_comment(["comment_post_ID"=>$o,"comment_content"=>"NOTEPIIPROBE","comment_approved"=>1,"comment_type"=>"order_note"]);
+  $p = wp_insert_post(["post_title"=>"Secret meta probe","post_status"=>"draft"]);
+  update_post_meta($p,"api_key","SECRETMETAPROBE");
+  update_post_meta($p,"plain_probe","VISIBLEPROBE");
+  $k = GMCP_Tokens::create("smoke reader","readonly",0,[],get_users(["role"=>"administrator","number"=>1,"orderby"=>"ID","order"=>"ASC"])[0]->ID);
+  echo $o, " ", $p, " ", $k["secret"];' 2>/dev/null | tr -d '\r\n')
+read -r CR_ORDER CR_POST CR_KEY <<< "$CR"
+rcall() { # rcall <file> <tool> <arguments json>   as the readonly key
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $CR_KEY" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":420,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$3}}" -o "$OUT/$1"
+}
+call cr_ctl "{\"jsonrpc\":\"2.0\",\"id\":421,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_post_meta\",\"arguments\":{\"ID\":$CR_ORDER}}}"
+check "CONTROL: an admin key still reads the order's meta" "$(grep -c 'pii-probe@example.test' "$OUT/cr_ctl")" "1"
+rcall cr_list wp_get_posts '{"post_type":"shop_order","post_status":"any"}'
+check "a readonly key cannot list orders" "$(verdict cr_list)" "error"
+rcall cr_meta wp_get_post_meta "{\"ID\":$CR_ORDER}"
+rcall cr_chunk wp_read_post_meta_chunk "{\"ID\":$CR_ORDER,\"key\":\"_billing_email\"}"
+rcall cr_snap wp_get_post_snapshot "{\"ID\":$CR_ORDER}"
+rcall cr_one wp_get_post "{\"ID\":$CR_ORDER}"
+check "nor read an order's meta, whole, in chunks or in a snapshot" \
+  "$(cat "$OUT/cr_meta" "$OUT/cr_chunk" "$OUT/cr_snap" | grep -c 'pii-probe@example.test\|cGlpLXByb2Jl')" "0"
+check "and each of those is refused rather than answered empty" \
+  "$(for f in cr_meta cr_chunk cr_snap cr_one; do verdict $f; done | sort -u | tr -d '\n')" "error"
+rcall cr_notes wp_get_comments "{\"post_id\":$CR_ORDER,\"status\":\"all\"}"
+call cr_notes_ctl "{\"jsonrpc\":\"2.0\",\"id\":422,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_comments\",\"arguments\":{\"post_id\":$CR_ORDER,\"status\":\"all\"}}}"
+check "CONTROL: an admin key sees the order note" "$(grep -c NOTEPIIPROBE "$OUT/cr_notes_ctl")" "1"
+check "a readonly key does not" "$(grep -c NOTEPIIPROBE "$OUT/cr_notes")" "0"
+rcall cr_ok wp_get_post_meta "{\"ID\":$CR_POST}"
+check "CONTROL: a readonly key still reads an ordinary post's meta" "$(grep -c VISIBLEPROBE "$OUT/cr_ok")" "1"
+# The credential rule the option tools, the audit log and the journal already share,
+# asked of the META KEY on read.
+check "but a credential-shaped meta key comes back redacted" "$(grep -c SECRETMETAPROBE "$OUT/cr_ok")" "0"
+call cr_one_key "{\"jsonrpc\":\"2.0\",\"id\":423,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_post_meta\",\"arguments\":{\"ID\":$CR_POST,\"key\":\"api_key\"}}}"
+check "even to an admin key, asked for by name" \
+  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]))' cr_one_key)" "[redacted]"
+call cr_one_chunk "{\"jsonrpc\":\"2.0\",\"id\":424,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_read_post_meta_chunk\",\"arguments\":{\"ID\":$CR_POST,\"key\":\"api_key\"}}}"
+check "and the chunked reader refuses it rather than handing out its bytes" "$(verdict cr_one_chunk)" "error"
+docker compose exec -T cli wp eval "wp_delete_post($CR_ORDER,true); wp_delete_post($CR_POST,true); foreach (GMCP_Tokens::all() as \$k) { if ((\$k['label'] ?? '') === 'smoke reader') { GMCP_Tokens::revoke(\$k['id']); } }" >/dev/null 2>&1
+
+echo "-- the media tools touch media only --"
+# Only the preview of wp_delete_media checked the type. The real call deleted whatever the
+# id named, permanently, past the commerce and template guards wp_delete_post asks, and
+# wp_update_media rewrote any post's title, excerpt and body at write level.
+MO=$(docker compose exec -T cli wp eval '
+  $s = wp_insert_post(["post_title"=>"Media probe sub","post_type"=>"shop_subscription","post_status"=>"wc-active"]);
+  $p = wp_insert_post(["post_title"=>"Media probe page","post_type"=>"page","post_status"=>"publish"]);
+  $m = wp_insert_attachment(["post_title"=>"Media probe file","post_mime_type"=>"image/png","post_status"=>"inherit"], false, 0);
+  echo $s, " ", $p, " ", $m;' 2>/dev/null | tr -d '\r\n')
+read -r MO_SUB MO_PAGE MO_ATT <<< "$MO"
+call mo_del "{\"jsonrpc\":\"2.0\",\"id\":430,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_media\",\"arguments\":{\"ID\":$MO_SUB,\"force\":true}}}"
+call mo_del2 "{\"jsonrpc\":\"2.0\",\"id\":431,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_media\",\"arguments\":{\"ID\":$MO_PAGE,\"force\":true}}}"
+check "wp_delete_media does not delete a subscription or a page" \
+  "$(docker compose exec -T cli wp eval "echo (get_post($MO_SUB)?'s':'-') . (get_post($MO_PAGE)?'p':'-');" 2>/dev/null | tr -d '\r\n')" "sp"
+call mo_upd "{\"jsonrpc\":\"2.0\",\"id\":432,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_media\",\"arguments\":{\"ID\":$MO_PAGE,\"title\":\"Media tool wrote this\"}}}"
+check "wp_update_media does not rewrite a page" \
+  "$(docker compose exec -T cli wp post get "$MO_PAGE" --field=post_title 2>/dev/null | tr -d '\r\n')" "Media probe page"
+call mo_upd_ok "{\"jsonrpc\":\"2.0\",\"id\":433,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_media\",\"arguments\":{\"ID\":$MO_ATT,\"title\":\"Media probe renamed\"}}}"
+check "CONTROL: it still renames an attachment" \
+  "$(docker compose exec -T cli wp post get "$MO_ATT" --field=post_title 2>/dev/null | tr -d '\r\n')" "Media probe renamed"
+call mo_del_ok "{\"jsonrpc\":\"2.0\",\"id\":434,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_media\",\"arguments\":{\"ID\":$MO_ATT}}}"
+check "CONTROL: and still deletes one" \
+  "$(docker compose exec -T cli wp eval "echo get_post($MO_ATT)?'present':'gone';" 2>/dev/null | tr -d '\r\n')" "gone"
+docker compose exec -T cli wp eval "wp_delete_post($MO_SUB,true); wp_delete_post($MO_PAGE,true);" >/dev/null 2>&1
+
+echo "-- search and replace is sanitised like any other content write --"
+# wp_alter_post wrote its result raw while wp_update_post ran the same field through
+# store_html(). The request runs as an administrator, so core's kses was off too, and a
+# write-level key stored a script that ran for every visitor. Asserted on the stored row.
+AL=$(docker compose exec -T cli wp post create --post_title='Alter probe' --post_content='<p>alter-legit</p>' --post_status=draft --porcelain 2>/dev/null | tr -d '\r\n')
+al() { call "$1" "{\"jsonrpc\":\"2.0\",\"id\":440,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":$2}}"; }
+al al_prev "{\"ID\":$AL,\"field\":\"post_content\",\"search\":\"</p>\",\"replace\":\"</p><script>alert(1)</script>\",\"preview\":true}"
+check "the preview says the stored result will be sanitised" \
+  "$(py 'import json,sys;print("sanitises the result" in json.load(sys.stdin)["result"]["content"][0]["text"])' al_prev)" "True"
+al al_xss "{\"ID\":$AL,\"field\":\"post_content\",\"search\":\"</p>\",\"replace\":\"</p><script>alert(1)</script>\"}"
+check "a script spliced in by search and replace is not stored" \
+  "$(docker compose exec -T cli wp post get "$AL" --field=post_content 2>/dev/null | grep -c '<script')" "0"
+al al_title "{\"ID\":$AL,\"field\":\"post_title\",\"search\":\"Alter probe\",\"replace\":\"<img src=x onerror=alert(1)>Alter title\"}"
+check "nor is markup spliced into a title" \
+  "$(docker compose exec -T cli wp post get "$AL" --field=post_title 2>/dev/null | tr -d '\r\n')" "Alter title"
+al al_ok "{\"ID\":$AL,\"field\":\"post_content\",\"search\":\"alter-legit\",\"replace\":\"alter-changed\"}"
+check "CONTROL: an ordinary replacement still lands" \
+  "$(docker compose exec -T cli wp post get "$AL" --field=post_content 2>/dev/null | grep -c 'alter-changed')" "1"
+docker compose exec -T cli wp post delete "$AL" --force >/dev/null 2>&1
+
+echo "-- writes that reported success while storing something else --"
+# Each of these replied normally and stored less than it was given. Asserted on the row.
+MS_ID=$(docker compose exec -T cli wp post create --post_title='Misc probe' --post_status=draft --porcelain 2>/dev/null | tr -d '\r\n')
+python3 - "$OUT" "$MS_ID" <<'PYMS'
+import json, sys
+out, pid = sys.argv[1], int(sys.argv[2])
+def req(name, i, args):
+    open('%s/%s.json' % (out, name), 'w').write(json.dumps({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": name.split('-')[0], "arguments": args}}))
+req('wp_update_post-mi', 460, {"ID": pid, "meta_input": {"mi_probe": "a\\b \"q\""}})
+req('wp_create_comment-c', 461, {"post_id": pid, "comment_content": "C:\\Users\\x"})
+req('wp_create_post-ex', 462, {"post_title": "Excerpt slash probe", "post_excerpt": "C:\\Temp", "meta_input": {"mj_probe": "{\"a\":\"x\\\\y\"}"}})
+PYMS
+for f in wp_update_post-mi wp_create_comment-c wp_create_post-ex; do
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d @"$OUT/$f.json" -o "$OUT/$f"
+done
+check "meta_input keeps the backslashes in a value" \
+  "$(docker compose exec -T cli wp eval "echo get_post_meta($MS_ID,'mi_probe',true) === 'a' . chr(92) . 'b \"q\"' ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
+check "a comment keeps its backslashes" \
+  "$(docker compose exec -T cli wp eval "\$c=get_comments(['post_id'=>$MS_ID,'number'=>1]); echo \$c && \$c[0]->comment_content === 'C:' . chr(92) . 'Users' . chr(92) . 'x' ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
+# One answer for every meta writer: JSON for an array is stored as the array, not as a
+# string through one tool and an array through the next.
+check "wp_create_post meta_input stores JSON as the array it describes, backslash intact" \
+  "$(docker compose exec -T cli wp eval "\$p=get_posts(['title'=>'Excerpt slash probe','post_status'=>'any','numberposts'=>1]); \$v=\$p?get_post_meta(\$p[0]->ID,'mj_probe',true):null; echo is_array(\$v) && \$v['a'] === 'x' . chr(92) . 'y' ? 'array' : gettype(\$v);" 2>/dev/null | tr -d '\r\n')" "array"
+check "and so does an excerpt" \
+  "$(docker compose exec -T cli wp eval "\$p=get_posts(['title'=>'Excerpt slash probe','post_status'=>'any','numberposts'=>1]); echo \$p && \$p[0]->post_excerpt === 'C:' . chr(92) . 'Temp' ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
+MS_CAT=$(docker compose exec -T cli wp term create category 'Misc probe cat' --porcelain 2>/dev/null | tr -d '\r\n')
+call ms_cat "{\"jsonrpc\":\"2.0\",\"id\":463,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$MS_ID,\"fields\":{\"post_category\":[$MS_CAT]}}}}"
+check "post_category is applied, not blanked into a no-op" \
+  "$(docker compose exec -T cli wp eval "echo in_array($MS_CAT, wp_get_post_categories($MS_ID)) ? 'set' : 'unchanged';" 2>/dev/null | tr -d '\r\n')" "set"
+call ms_tname "{\"jsonrpc\":\"2.0\",\"id\":464,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_post_terms\",\"arguments\":{\"ID\":$MS_ID,\"taxonomy\":\"category\",\"terms\":[\"No such category probe\"]}}}"
+check "a category name that does not exist is refused, not silently dropped" "$(verdict ms_tname)" "error"
+call ms_tname2 "{\"jsonrpc\":\"2.0\",\"id\":465,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_post_terms\",\"arguments\":{\"ID\":$MS_ID,\"taxonomy\":\"category\",\"terms\":[\"Uncategorized\"]}}}"
+check "CONTROL: one that does exist is looked up and added" \
+  "$(docker compose exec -T cli wp eval "echo in_array(1, wp_get_post_categories($MS_ID)) && in_array($MS_CAT, wp_get_post_categories($MS_ID)) ? 'both' : 'missing';" 2>/dev/null | tr -d '\r\n')" "both"
+# get_posts() defaults to five, so the count never passed five.
+MS_ATT=$(docker compose exec -T cli wp eval 'for ($i=0;$i<7;$i++) { wp_insert_attachment(["post_title"=>"count probe $i","post_mime_type"=>"image/png","post_status"=>"inherit"], false, 0); } echo count(get_posts(["post_type"=>"attachment","post_status"=>"inherit","numberposts"=>-1,"fields"=>"ids"]));' 2>/dev/null | tr -d '\r\n')
+call ms_count '{"jsonrpc":"2.0","id":466,"method":"tools/call","params":{"name":"wp_count_media","arguments":{}}}'
+call ms_count2 '{"jsonrpc":"2.0","id":467,"method":"tools/call","params":{"name":"wp_count_media","arguments":{"after":"2000-01-01"}}}'
+check "wp_count_media counts past five" "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["content"][0]["text"])' ms_count)" "$MS_ATT"
+check "and with a date filter too" "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["content"][0]["text"])' ms_count2)" "$MS_ATT"
+call ms_terms '{"jsonrpc":"2.0","id":468,"method":"tools/call","params":{"name":"wp_get_terms","arguments":{"taxonomy":"no_such_taxonomy"}}}'
+check "wp_get_terms says an unknown taxonomy is unknown instead of listing nulls" "$(verdict ms_terms)" "error"
+docker compose exec -T cli wp eval "foreach (get_posts(['post_type'=>'attachment','post_status'=>'any','numberposts'=>-1,'s'=>'count probe','fields'=>'ids']) as \$i) { wp_delete_post(\$i,true); } foreach (get_posts(['title'=>'Excerpt slash probe','post_status'=>'any','numberposts'=>-1,'fields'=>'ids']) as \$i) { wp_delete_post(\$i,true); } wp_delete_post($MS_ID,true); wp_delete_term($MS_CAT,'category');" >/dev/null 2>&1
+
 echo "-- the everyday meta tool keeps backslashes --"
 # update_post_meta() unslashes what it is given, so a value carrying backslashes arrives
 # stripped: a JSON payload stops parsing, a regex stops matching and a Windows path loses
@@ -751,6 +1039,20 @@ docker compose exec -T cli wp eval "
 call tr_wdel "{\"jsonrpc\":\"2.0\",\"id\":132,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$TR_WTPL}}}"
 check "a widget embed with no shortcode is caught too" \
   "$(py "import json,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print('rendering nothing' in t and 'Embedding page' in t)" tr_wdel)" "True"
+
+# The route with no page at all. An Elementor Pro header or footer renders by its display
+# conditions, so neither search finds a reference and the site's header was deletable.
+# Seeded in both of Pro's stores, one template each, since a guard reading only one would
+# pass this block half the time. Pro is not needed for the conditions to be live data.
+TR_COND=$(docker compose exec -T cli wp eval '$t=wp_insert_post(["post_title"=>"Site header","post_type"=>"elementor_library","post_status"=>"publish"]); update_post_meta($t,"_elementor_conditions",["include/general"]); echo $t;' 2>/dev/null | tr -d '\r\n')
+TR_COND2=$(docker compose exec -T cli wp eval '$t=wp_insert_post(["post_title"=>"Site footer","post_type"=>"elementor_library","post_status"=>"publish"]); $c=get_option("elementor_pro_theme_builder_conditions",[]); $c=is_array($c)?$c:[]; $c["footer"][$t]=["include/general"]; update_option("elementor_pro_theme_builder_conditions",$c); echo $t;' 2>/dev/null | tr -d '\r\n')
+call tr_cdel "{\"jsonrpc\":\"2.0\",\"id\":136,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$TR_COND,\"force\":true}}}"
+call tr_cdel2 "{\"jsonrpc\":\"2.0\",\"id\":137,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$TR_COND2,\"force\":true}}}"
+check "a template shown by display conditions is not deletable, from either store" \
+  "$(docker compose exec -T cli wp eval "echo (get_post($TR_COND)?'h':'-') . (get_post($TR_COND2)?'f':'-');" 2>/dev/null | tr -d '\r\n')" "hf"
+check "and the refusal says why" \
+  "$(py "import json,sys;print('display conditions' in json.load(sys.stdin)['result']['content'][0]['text'])" tr_cdel)" "True"
+docker compose exec -T cli wp eval "wp_delete_post($TR_COND,true); wp_delete_post($TR_COND2,true); \$c=get_option('elementor_pro_theme_builder_conditions',[]); if (is_array(\$c) && isset(\$c['footer'])) { unset(\$c['footer'][$TR_COND2]); if (!\$c['footer']) unset(\$c['footer']); } if (\$c) update_option('elementor_pro_theme_builder_conditions',\$c); else delete_option('elementor_pro_theme_builder_conditions');" >/dev/null 2>&1
 
 # The guard must not be blanket, or it becomes something to route around rather than read.
 TR_FREE=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Unreferenced template","post_type"=>"elementor_library","post_status"=>"publish"]);' 2>/dev/null | tr -d '\r\n')

@@ -312,6 +312,12 @@ class GMCP_Journal {
     if ( $post_id <= 0 || $meta_key === '' ) {
       return;
     }
+    // An entry this journal will never undo is not worth a place on a forty-entry list:
+    // a shop tool saving one order writes a dozen meta rows, and journalling them would push
+    // the agent's real, reversible changes off the end. The audit log still records them.
+    if ( !GMCP_Changes::undoable_post( $post_id ) ) {
+      return;
+    }
 
     $verb = [ 'created' => 'added', 'updated' => 'changed', 'deleted' => 'removed' ][ $op ] ?? null;
     if ( $verb === null ) {
@@ -329,6 +335,22 @@ class GMCP_Journal {
       'tool' => (string) ( $change['tool'] ?? '' ),
       'call' => (string) ( $change['call'] ?? '' ),
     ];
+
+    // The row an addition created, so undo can remove that row and not every row of the
+    // key. A key holding several rows is ordinary: _wp_old_slug gains one per rename.
+    if ( $op === 'created' && !empty( $change['mid'] ) ) {
+      $entry['mid'] = (int) $change['mid'];
+    }
+
+    // What is kept for a deletion, and for an update of a key holding more than one row, is
+    // every row it touched, by meta id. A single value restored with update_post_meta()
+    // overwrote every sibling with it, and never re-added a row that was deleted while
+    // others of the key remained. A single-row update keeps the single value, as before.
+    $rows = isset( $change['rows'] ) && is_array( $change['rows'] ) ? $change['rows'] : null;
+    if ( $rows !== null && ( $op === 'deleted' || count( $rows ) > 1 ) ) {
+      $change['previous'] = [ self::META_ROWS => $rows ];
+      $entry['rows'] = count( $rows );
+    }
 
     // A key whose NAME looks like a credential, or a value that holds one, is recorded as
     // changed and its previous value is not kept. Same functions as the option side, so the
@@ -402,6 +424,11 @@ class GMCP_Journal {
   */
   private function observe_post( array $change ): void {
     if ( ( $change['op'] ?? '' ) !== 'updated' ) {
+      return;
+    }
+    // Same reason as observe_meta(): an order or a subscription is never put back from
+    // here, so recording one would only evict entries that can be.
+    if ( !GMCP_Changes::undoable_post( (int) ( $change['id'] ?? 0 ) ) ) {
       return;
     }
     $changed = array_keys( (array) ( $change['fields'] ?? [] ) );
@@ -582,7 +609,7 @@ class GMCP_Journal {
         return 'The post no longer exists.';
       }
       if ( !GMCP_Changes::undoable_post( (int) $entry['ID'] ) ) {
-        return 'It belongs to a ' . self::post_type_label( (int) $entry['ID'] ) . ', whose writes this journal does not record or revert. Putting a subscription back with a plain post write leaves the site and the payment gateway disagreeing.';
+        return self::commerce_refusal( (int) $entry['ID'] );
       }
       if ( !empty( $entry['redacted'] ) ) {
         return 'The previous value looked like it held a credential, so it was never stored.';
@@ -604,7 +631,7 @@ class GMCP_Journal {
         return 'The post no longer exists.';
       }
       if ( !GMCP_Changes::undoable_post( (int) $entry['ID'] ) ) {
-        return 'It belongs to a ' . self::post_type_label( (int) $entry['ID'] ) . ', whose writes this journal does not record or revert. Putting a subscription back with a plain post write leaves the site and the payment gateway disagreeing.';
+        return self::commerce_refusal( (int) $entry['ID'] );
       }
       foreach ( (array) ( $entry['previous'] ?? [] ) as $value ) {
         if ( !self::too_large( $value ) ) {
@@ -614,6 +641,19 @@ class GMCP_Journal {
       return 'Every previous value was too large to keep.';
     }
     return 'Unknown change type.';
+  }
+
+  /**
+  * Why an order or a subscription is not put back, in one sentence both entry kinds share.
+  *
+  * The same rule GMCP_Core::commerce_post_guard() applies to the generic writers, because
+  * an undo is one of them: it puts a status or a meta row back with a plain post write,
+  * which skips every transition, stock and payment hook the shop runs.
+  */
+  private static function commerce_refusal( int $post_id ): string {
+    return 'It belongs to a ' . self::post_type_label( $post_id ) . ', which the generic post tools do not write and this journal does not revert. '
+      . 'Putting an order or a subscription back with a plain post write skips every status transition, stock and payment hook the shop runs, so the site and the payment gateway would disagree. '
+      . 'Use the WooCommerce tools to change it.';
   }
 
   /** The post type of an entry's target, for naming it in a refusal. */
@@ -766,109 +806,208 @@ class GMCP_Journal {
       }
 
       // A revert writes options and posts like anything else, and recording it would
-      // put the change back on the list as though the agent had made it.
+      // put the change back on the list as though the agent had made it. Resumed in a
+      // finally, because the option branch returns from inside the paused region and a
+      // return there used to leave recording off for the rest of the call.
       $was = GMCP_Changes::pause();
-
-      $done = '';
-      if ( $entry['kind'] === 'meta' ) {
-        $meta_post = (int) $entry['ID'];
-        $meta_key = (string) $entry['key'];
-        if ( !empty( $entry['absent'] ) ) {
-          // It was not there before, so putting it back means removing it. Every row for
-          // the key goes, which is what "absent" described.
-          delete_post_meta( $meta_post, $meta_key );
-          $done = 'Custom field "' . $meta_key . '" removed from post ' . $meta_post . ', which is what it was before.';
-        }
-        else {
-          // wp_slash for the reason prepare_meta_value() gives: update_post_meta()
-          // unslashes what it is handed, so restoring a JSON or regex value without this
-          // puts back a corrupted copy of what was recorded correctly.
-          $meta_value = self::snapshot_for( (string) $entry['id'] );
-          update_post_meta( $meta_post, $meta_key, wp_slash( $meta_value ) );
-          $done = 'Custom field "' . $meta_key . '" on post ' . $meta_post . ' restored to its previous value.';
-        }
-        clean_post_cache( $meta_post );
+      try {
+        $outcome = self::apply( $entry );
       }
-      elseif ( $entry['kind'] === 'option' ) {
-        // An undo is still a write, and the same policy applies to it. Being able to
-        // call wp_update_option is not the same as being allowed to make this write:
-        // a site whose default_role was already an editing role would otherwise have
-        // that value restorable by reverting the change that closed it, which is the
-        // refusal arriving one call late.
-        //
-        // Removing an option writes no value, so only the outright refusals can apply
-        // to it. Running the value checks over a deletion would refuse it for failing
-        // to be a valid value, which is true and beside the point.
-        $absent = !empty( $entry['absent'] );
-
-        // What will actually be written, worked out before the policy is asked about it.
-        // A partly redacted snapshot is not the value that goes to disk: the blanked
-        // leaves take whatever the option holds now, because writing the marker over a
-        // live credential would destroy the thing the blanking protected. Asking the
-        // policy about the snapshot instead would be asking about a value that is never
-        // written.
-        $kept = 0;
-        $restore = $entry['previous'] ?? null;
-        if ( !$absent && !empty( $entry['partly_redacted'] ) ) {
-          $restore = self::refill( $restore, get_option( (string) $entry['key'] ), $kept );
-        }
-
-        $refusals = GMCP_Core::unwritable_options();
-        $policy = $absent
-          ? ( $refusals[ strtolower( (string) $entry['key'] ) ] ?? true )
-          : GMCP_Core::option_write_policy( (string) $entry['key'], $restore );
-        if ( $policy !== true ) {
-          return [ 'ok' => false, 'message' => 'That change cannot be reverted. ' . $policy ];
-        }
-        if ( $absent ) {
-          delete_option( $entry['key'] );
-          $done = "Option \"{$entry['key']}\" removed, which is what it was before.";
-        }
-        else {
-          update_option( $entry['key'], $restore );
-          $done = "Option \"{$entry['key']}\" restored to its previous value.";
-          if ( $kept > 0 ) {
-            $done .= ' ' . $kept . ' field' . ( $kept === 1 ? '' : 's' )
-              . ' looked like a credential and was never recorded, so '
-              . ( $kept === 1 ? 'it was' : 'they were' ) . ' left exactly as found rather than overwritten.';
-          }
-        }
-      }
-      else {
-        $post_id = (int) $entry['ID'];
-        $restored = [];
-        $fields = [ 'ID' => $post_id ];
-        foreach ( (array) ( $entry['fields'] ?? [] ) as $field ) {
-          if ( !array_key_exists( $field, (array) $entry['previous'] ) ) {
-            continue;
-          }
-          $value = $entry['previous'][ $field ];
-          if ( self::too_large( $value ) ) {
-            continue;
-          }
-          $fields[ $field ] = $value;
-          $restored[] = str_replace( 'post_', '', $field );
-        }
-        if ( count( $fields ) > 1 ) {
-          wp_update_post( $fields );
-        }
-        $done = $restored
-          ? 'Restored the ' . implode( ', ', array_unique( $restored ) ) . ' of post ' . $post_id . '.'
-          : 'Nothing was left to restore on post ' . $post_id . '.';
+      finally {
+        GMCP_Changes::resume( $was );
       }
 
-      GMCP_Changes::resume( $was );
+      // Marked only when the write happened. It used to be stamped unconditionally, so a
+      // restore WordPress refused read as done, was hidden from revert_call(), and could
+      // not be tried again.
+      if ( empty( $outcome['ok'] ) ) {
+        return $outcome;
+      }
 
       // Marked rather than removed, so the history still shows that it happened and
       // that it was put back. A revert cannot be double-applied.
       $log[ $index ]['undone'] = time();
       update_option( self::OPTION, $log, false );
 
-      return [ 'ok' => true, 'message' => $done ];
+      return $outcome;
     }
 
     return [ 'ok' => false, 'message' => "No recorded change with id \"{$id}\". Call wp_list_changes to see what is on record." ];
   }
+
+  /**
+  * Make one entry's write, backwards. Called with recording paused.
+  *
+  * @return array{ok:bool,message:string}
+  */
+  private static function apply( array $entry ): array {
+    $done = '';
+    if ( $entry['kind'] === 'meta' ) {
+      $meta_post = (int) $entry['ID'];
+      $meta_key = (string) $entry['key'];
+      if ( !empty( $entry['absent'] ) && !empty( $entry['mid'] ) ) {
+        // The one row the addition created, and only if it is still that row: same post,
+        // same key. Its siblings were there before and stay.
+        $row = get_metadata_by_mid( 'post', (int) $entry['mid'] );
+        if ( $row && (int) $row->post_id === $meta_post && self::same_meta_key( (string) $row->meta_key, $meta_key ) ) {
+          if ( !delete_metadata_by_mid( 'post', (int) $entry['mid'] ) ) {
+            return [ 'ok' => false, 'message' => 'Removing the added custom field "' . $meta_key . '" row from post ' . $meta_post . ' failed. Nothing was marked as reverted.' ];
+          }
+        }
+        $done = 'The custom field "' . $meta_key . '" row this change added to post ' . $meta_post . ' was removed; any other rows of that key were left alone.';
+      }
+      elseif ( !empty( $entry['absent'] ) ) {
+        // An entry recorded before additions carried their row id. It was not there before,
+        // so putting it back means removing it: every row for the key goes.
+        delete_post_meta( $meta_post, wp_slash( $meta_key ) );
+        $done = 'Custom field "' . $meta_key . '" removed from post ' . $meta_post . ', which is what it was before.';
+      }
+      else {
+        $meta_value = self::snapshot_for( (string) $entry['id'] );
+        if ( is_array( $meta_value ) && array_key_exists( self::META_ROWS, $meta_value ) && is_array( $meta_value[ self::META_ROWS ] ) ) {
+          // Row by row. A row that is still there gets its old value back by id, which
+          // leaves its siblings alone; a row that is gone, because this change deleted it,
+          // is added back. update_metadata_by_mid() does not unslash, add_post_meta() does.
+          $restored_rows = 0;
+          foreach ( $meta_value[ self::META_ROWS ] as $mid => $old ) {
+            $row = get_metadata_by_mid( 'post', (int) $mid );
+            if ( $row && (int) $row->post_id === $meta_post && self::same_meta_key( (string) $row->meta_key, $meta_key ) ) {
+              if ( maybe_serialize( $row->meta_value ) !== maybe_serialize( $old ) ) {
+                update_metadata_by_mid( 'post', (int) $mid, $old );
+              }
+            }
+            else {
+              add_post_meta( $meta_post, wp_slash( $meta_key ), wp_slash( $old ) );
+            }
+            $restored_rows++;
+          }
+          $done = 'Custom field "' . $meta_key . '" on post ' . $meta_post . ': ' . $restored_rows . ' row' . ( $restored_rows === 1 ? '' : 's' ) . ' put back as they were.';
+        }
+        else {
+          // wp_slash for the reason prepare_meta_value() gives: update_post_meta()
+          // unslashes what it is handed, so restoring a JSON or regex value without this
+          // puts back a corrupted copy of what was recorded correctly.
+          update_post_meta( $meta_post, wp_slash( $meta_key ), wp_slash( $meta_value ) );
+          $done = 'Custom field "' . $meta_key . '" on post ' . $meta_post . ' restored to its previous value.';
+        }
+      }
+      clean_post_cache( $meta_post );
+    }
+    elseif ( $entry['kind'] === 'option' ) {
+      // An undo is still a write, and the same policy applies to it. Being able to
+      // call wp_update_option is not the same as being allowed to make this write:
+      // a site whose default_role was already an editing role would otherwise have
+      // that value restorable by reverting the change that closed it, which is the
+      // refusal arriving one call late.
+      //
+      // Removing an option writes no value, so only the outright refusals can apply
+      // to it. Running the value checks over a deletion would refuse it for failing
+      // to be a valid value, which is true and beside the point.
+      $absent = !empty( $entry['absent'] );
+
+      // What will actually be written, worked out before the policy is asked about it.
+      // A partly redacted snapshot is not the value that goes to disk: the blanked
+      // leaves take whatever the option holds now, because writing the marker over a
+      // live credential would destroy the thing the blanking protected. Asking the
+      // policy about the snapshot instead would be asking about a value that is never
+      // written.
+      $kept = 0;
+      $restore = $entry['previous'] ?? null;
+      if ( !$absent && !empty( $entry['partly_redacted'] ) ) {
+        $restore = self::refill( $restore, get_option( (string) $entry['key'] ), $kept );
+      }
+
+      // Undoing a creation deletes the row, so it asks the deletion policy, the same one
+      // wp_delete_option asks. Composing the answer here from unwritable_options() alone
+      // missed every rule that lives inside the write policy, an audit log's rows and the
+      // role definitions among them.
+      $policy = $absent
+        ? GMCP_Core::option_delete_policy( (string) $entry['key'] )
+        : GMCP_Core::option_write_policy( (string) $entry['key'], $restore );
+      if ( $policy !== true ) {
+        return [ 'ok' => false, 'message' => 'That change cannot be reverted. ' . $policy ];
+      }
+      if ( $absent ) {
+        // false from delete_option() means either it failed or there was nothing to delete,
+        // and only the first is a failure.
+        if ( !delete_option( $entry['key'] ) && get_option( $entry['key'], self::ABSENT ) !== self::ABSENT ) {
+          return [ 'ok' => false, 'message' => "Removing option \"{$entry['key']}\" failed. Nothing was marked as reverted, so it can be tried again." ];
+        }
+        $done = "Option \"{$entry['key']}\" removed, which is what it was before.";
+      }
+      else {
+        // Likewise: false from update_option() also means "already held that value".
+        if ( !update_option( $entry['key'], $restore ) && maybe_serialize( get_option( $entry['key'] ) ) !== maybe_serialize( $restore ) ) {
+          return [ 'ok' => false, 'message' => "Restoring option \"{$entry['key']}\" failed. Nothing was marked as reverted, so it can be tried again." ];
+        }
+        $done = "Option \"{$entry['key']}\" restored to its previous value.";
+        if ( $kept > 0 ) {
+          $done .= ' ' . $kept . ' field' . ( $kept === 1 ? '' : 's' )
+            . ' looked like a credential and was never recorded, so '
+            . ( $kept === 1 ? 'it was' : 'they were' ) . ' left exactly as found rather than overwritten.';
+        }
+      }
+    }
+    else {
+      $post_id = (int) $entry['ID'];
+      $restored = [];
+      $fields = [ 'ID' => $post_id ];
+      foreach ( (array) ( $entry['fields'] ?? [] ) as $field ) {
+        if ( !array_key_exists( $field, (array) $entry['previous'] ) ) {
+          continue;
+        }
+        $value = $entry['previous'][ $field ];
+        if ( self::too_large( $value ) ) {
+          continue;
+        }
+        $fields[ $field ] = $value;
+        $restored[] = str_replace( 'post_', '', $field );
+      }
+      if ( count( $fields ) > 1 ) {
+        // Slashed, because wp_insert_post() unslashes what it is given and these are the
+        // raw values off the WP_Post, exactly as stored. Unslashed, every backslash in the
+        // restored fields was removed: a block attribute Gutenberg stores as \u003cb\u003e
+        // came back as u003cbu003e and failed validation, a Windows path lost its
+        // separators, and the reply said the post had been restored. The meta branch and the
+        // menu tool already knew this.
+        $result = wp_update_post( wp_slash( $fields ), true );
+        if ( is_wp_error( $result ) || !$result ) {
+          return [
+            'ok' => false,
+            'message' => 'Restoring post ' . $post_id . ' failed'
+              . ( is_wp_error( $result ) ? ': ' . $result->get_error_message() : '.' )
+              . ' Nothing was marked as reverted, so it can be tried again.',
+          ];
+        }
+      }
+      $done = $restored
+        ? 'Restored the ' . implode( ', ', array_unique( $restored ) ) . ' of post ' . $post_id . '.'
+        : 'Nothing was left to restore on post ' . $post_id . '.';
+    }
+
+    return [ 'ok' => true, 'message' => $done ];
+  }
+
+  /**
+  * Whether a row's key is the key an entry recorded, as the database compares them.
+  *
+  * The rows were found through wp_postmeta's collation, case-insensitive on a stock
+  * install, so a row filed as "Existing_Key" was one of the rows a write of "existing_key"
+  * touched. Comparing exactly here would add a duplicate instead of restoring it by id.
+  */
+  private static function same_meta_key( string $stored, string $recorded ): bool {
+    return $stored === $recorded || strtolower( $stored ) === strtolower( $recorded );
+  }
+
+  /** Wraps the rows a multi-row meta snapshot holds, so a revert can tell them from a value. */
+  //
+  // Deliberately not prefixed gmcp_: field_looks_secret() honours option_guard(), which
+  // refuses that prefix, so a wrapper named after this plugin read as a credential and every
+  // multi-row snapshot was discarded as one.
+  const META_ROWS = '__meta_rows_by_id';
+
+  /** A default no stored option can hold, so "absent" and "stored as false" stay distinct. */
+  const ABSENT = '__gmcp_option_absent__';
 
   public static function clear(): void {
     delete_option( self::OPTION );
