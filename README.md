@@ -216,9 +216,15 @@ the plugin's version changes.
 describes what would happen and changes nothing: `wp_delete_post`, `wp_update_post`,
 `wp_alter_post`, `wp_delete_term`, `wp_delete_media` and `wp_delete_comment`.
 
-**Undo.** `wp_list_changes` and `wp_undo_change` put back a setting or post an agent
-*modified*. Only writes made during a tool call are recorded, never a person's own edits.
-Creations and deletions are not covered; post meta is.
+**Undo.** `wp_list_changes` and `wp_undo_change` put back something an agent *modified*:
+a setting, a post, a custom field, a term's name, slug, description or parent (which
+includes renaming a menu), which terms a post carries, and an individual theme setting
+(a menu-location assignment is one). A menu item's edit is covered because a menu item is a
+post and some custom fields. Only writes made during a tool call are recorded, never a
+person's own edits. **Creations, deletions and users are not covered**, and adding or
+deleting a menu item is a creation or a deletion. An undo is itself recorded, so
+reverting the undo puts the edit back; that second step is refused if the thing has
+changed since, so it cannot overwrite newer work with an older copy.
 
 **Backups.** `wp_backup_status` reports what is known, `wp_list_backups` says which backups
 exist, and `wp_start_backup` asks the site's backup plugin to start one. Listings never
