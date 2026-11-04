@@ -50,6 +50,17 @@ shape_problems() {
 # Prints the entries of a verbose `unzip -Z` listing that are symlinks (mode starts with l).
 symlink_hits() { grep -E '^l[rwxsStT-]{9}[[:space:]]' || true; }
 
+# True when a line matching $2 in file $1 lies between a start-version marker and an end
+# marker that actually closes the block. An unclosed block would run to the end of the file,
+# and the updater would rewrite the first version-looking string on every line after it.
+markers_around() {
+  awk -v re="$2" '
+    /x-release-please-start-version/ { s=1; next }
+    s && $0 ~ re                      { f=1 }
+    /x-release-please-end/            { if (s && f) e=1; s=0 }
+    END { exit !(f && e) }' "$1"
+}
+
 cmd_version() {
   local tag="${1:-}" main stable const headers
   # WordPress reads the header with a case-insensitive regex over the first 8 KB that also
@@ -73,6 +84,13 @@ cmd_version() {
     # Defined in some form this script cannot parse. Say so rather than skip silently.
     die "GMCP_VERSION appears in $SLUG.php but its value could not be parsed"
   fi
+  # release-please finds the version by marker. If a refactor drops one, the versions still
+  # agree today and the next release PR bumps only some of them, which nothing catches until
+  # after the tag exists. So the markers are part of the check, here, on every PR.
+  markers_around "$SLUG.php" '^Version:' || die "$SLUG.php: the Version: line is not between the x-release-please-start-version and x-release-please-end marker lines"
+  markers_around readme.txt '^Stable tag:' || die "readme.txt: the Stable tag: line is not between the x-release-please-start-version and x-release-please-end marker lines"
+  grep -qE "define\([[:space:]]*'GMCP_VERSION'.*x-release-please-version" "$SLUG.php" \
+    || die "$SLUG.php: the GMCP_VERSION line lost its x-release-please-version marker"
   if [ -n "$tag" ]; then
     tag=${tag#v}
     [ "$tag" = "$main" ] || die "tag is $tag but the plugin version is $main"
