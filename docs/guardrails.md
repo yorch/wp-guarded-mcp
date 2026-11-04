@@ -653,6 +653,60 @@ subscription is built without a payment gateway, and a manual subscription repor
 gateway feature as supported. So the gateway-dependent branches are unreachable here, and
 the suite says so rather than implying coverage it does not have.
 
+## Redirection and Polylang
+
+**A redirect is two primitives in one row.** Pointed at a foreign host it is an open
+redirect: the site's own reputation, and its own URLs in a phishing mail, in front of
+someone else's page. Pointed from `/wp-login.php` or `/wp-admin/` it takes the operator's way
+back in. The agent that would write one also reads comments and post bodies written by
+strangers, so the policy is in the tool and is not a setting. A target must be a path on this
+site or a URL on its own host; another host is accepted only over `https`, by exact name, if
+the `gmcp_redirect_allowed_hosts` filter lists it (empty by default; entries that are not a
+bare host name are dropped, so a filter returning `*` matches nothing). Refused outright:
+`//host` and `/\host` (browsers read both as another site), tabs and newlines (browsers strip
+them from inside a URL), userinfo before the host, and a non-ASCII host. In a
+regular-expression redirect a `$1` that starts the target is the classic open redirect (the
+request `//evil.com` is copied in), so a capture is accepted only after a fixed first path
+segment.
+
+**Sources.** A literal path, compared after percent-decoding to a fixed point, lower-casing,
+and rejecting `.`, `..` and empty segments; the site's subdirectory and a leading `index.php`
+are peeled off before the protected list is applied, and the protected paths are taken from
+WordPress (`wp_login_url()`, `admin_url()`, `rest_url()`, this plugin's endpoint) rather than
+hard-coded, so a moved login page is covered. A `rest_route` query is refused on any path.
+Regular-expression sources are off by default because a pattern cannot be proven not to cover
+the login page; when a site allows them, the pattern is tested against the protected paths
+and refused if it matches one. That test is best effort and is the reason the default is off.
+
+**The policy belongs to the redirect, not to the call.** It is evaluated on the stored row
+after every write, and a row that fails is switched off, because Redirection sanitises what it
+is given and the request was only ever a claim. Enabling an existing redirect evaluates it
+too: a redirect written in the Redirection screen to a foreign host stays off through this
+tool. Disabling asks nothing. Only the plain URL match and redirect action are managed,
+because match types that depend on the visitor (agent, referrer, cookie, IP, login status)
+are how a redirect is shown to a crawler and hidden from the owner, and an update that
+rebuilt one would drop its conditions without saying.
+
+**No delete.** Disabling is the reversible removal and loses nothing. A deletion also loses
+the hit count and cannot be undone, and no task needs it. Adding one later means giving it
+the two-step every other irreversible tool here takes.
+
+**Not covered:** the change journal (the rows are in Redirection's own tables), a duplicate
+source (Redirection decides what a second redirect on the same path means), and a redirect
+whose Redirection group or module is disabled, which stays inert regardless of its own state.
+
+**Polylang is read only, and `log_state`-style honesty is the point.** Three answers look
+the same as an empty list and are different facts: Polylang loaded with no languages
+(`not_configured`), a post with no language or of a post type Polylang does not manage, and a
+post with a language and no siblings (`no_translations`). Linking posts or setting a language
+is not offered: it changes which page a visitor is shown and which URL is the original, and
+nothing here could undo it. The translation group can name drafts and private posts, so that
+tool is `write`, and it returns IDs, languages, statuses and post types but no titles.
+
+**WPML is deferred.** Its translation groups live in its own table behind filters rather than
+functions, its "not configured" state has several shapes, and it could not be installed to
+measure. A reader written from memory is how a confident "no translations" is produced.
+
 ## Theme mods
 
 Theme mods are the customizer's storage, and four generic tools cover them:

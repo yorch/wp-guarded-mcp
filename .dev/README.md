@@ -80,6 +80,12 @@ docker compose exec -T cli wp plugin activate elementor-pro
 
 docker compose exec -T cli wp plugin activate woocommerce-subscriptions
 ./smoke-woo-subscriptions.sh  # the Subscriptions tools; needs WooCommerce Subscriptions
+
+docker compose exec -T cli wp plugin install redirection --activate   # a fresh slug, not this repository's directory
+./smoke-redirection.sh  # the Redirection tools; needs Redirection
+
+docker compose exec -T cli wp plugin install polylang --activate
+./smoke-polylang.sh  # the Polylang tools (read only); needs Polylang
 ```
 
 `smoke-admin.sh` also expects a theme named `futuretheme` that declares a PHP version this

@@ -335,6 +335,8 @@ class GMCP_Settings {
       'mcp_tools_gravityforms' => 'bool',
       'mcp_tools_learndash' => 'bool',
       'mcp_tools_wp_activity_log' => 'bool',
+      'mcp_tools_redirection' => 'bool',
+      'mcp_tools_polylang' => 'bool',
       'mcp_debug_mode' => 'bool',
       'mcp_activity_log' => 'bool',
       'mcp_audit_days' => 'days',
@@ -1224,6 +1226,11 @@ class GMCP_Settings {
     // WP Activity Log: the version constant plus the class and method the message renderer
     // calls, which is the same per-call signal the group itself uses.
     $wsal = defined( 'WSAL_VERSION' ) && class_exists( '\WSAL\Controllers\Alert' ) && method_exists( '\WSAL\Controllers\Alert', 'get_original_alert_message' );
+    // Redirection: the version constant plus the class and the three methods its tools call,
+    // the same signal the group's own per-call check uses.
+    $redirection = defined( 'REDIRECTION_VERSION' ) && class_exists( 'Red_Item' ) && method_exists( 'Red_Item', 'get_by_id' ) && method_exists( 'Red_Item', 'create' ) && method_exists( 'Red_Item', 'get_filtered' );
+    // Polylang (free or Pro): its version constant plus the functions the tools call.
+    $polylang = defined( 'POLYLANG_VERSION' ) && function_exists( 'pll_languages_list' ) && function_exists( 'pll_get_post_translations' );
     // Subscriptions has no version constant in 7.7.0, so presence is the classes plus a
     // function a tool here calls. WC_Subscription alone is not enough: a gateway bundling
     // the subscriptions core library provides it without WooCommerce Subscriptions.
@@ -1265,6 +1272,12 @@ class GMCP_Settings {
     }
     if ( $wsal ) {
       $keys[] = 'mcp_tools_wp_activity_log';
+    }
+    if ( $redirection ) {
+      $keys[] = 'mcp_tools_redirection';
+    }
+    if ( $polylang ) {
+      $keys[] = 'mcp_tools_polylang';
     }
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'Which groups of tools an agent is offered. A group that is off is not merely hidden: its tools are refused if asked for by name.', 'guarded-mcp' ); ?></p>
@@ -1349,6 +1362,18 @@ class GMCP_Settings {
                   <?php esc_html_e( 'WP Activity Log (read the site\'s security log: event counts, and the events themselves at admin level)', 'guarded-mcp' ); ?>
                 </label>
               <?php endif; ?>
+              <?php if ( $redirection ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_redirection" value="1" <?php checked( !empty( $options['mcp_tools_redirection'] ) ); ?>>
+                  <?php esc_html_e( 'Redirection (list, create, edit and switch redirects on or off, with a target and source policy)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
+              <?php if ( $polylang ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_polylang" value="1" <?php checked( !empty( $options['mcp_tools_polylang'] ) ); ?>>
+                  <?php esc_html_e( 'Polylang (read the configured languages and a post\'s translation group; read only)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
               <label>
                 <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>
                 <?php esc_html_e( 'Generate create, read, update and delete tools for posts, pages and media from the REST API', 'guarded-mcp' ); ?>
@@ -1380,6 +1405,16 @@ class GMCP_Settings {
             <?php if ( $kirki ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The Kirki tools resolve a field\'s storage model from its registration and write through the right path, so a value written through them lands where Kirki reads it. Writing through the generic option tools instead is a silent success: the value lands in a row nothing reads, and the front end keeps rendering the old one.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $redirection ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'A redirect sends every visitor of one URL somewhere else, so a redirect to a site you do not control is an open redirect, and one on the login page locks you out. The Redirection tools therefore accept a target only on this site\'s own host (other https hosts only if listed through the gmcp_redirect_allowed_hosts filter), refuse regular-expression sources unless gmcp_redirect_allow_regex allows them, refuse sources on wp-login, wp-admin, the REST API and this plugin\'s endpoint, and re-check a redirect before switching it on. There is no delete tool; switching a redirect off is the way to remove one.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $polylang ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The Polylang tools only read. They say which languages are configured and which posts Polylang links as translations of one another, and they tell "Polylang has no languages" apart from "this post has no translations". There is no tool that links posts or assigns a language.', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
             <?php if ( $yoast ) : ?>
