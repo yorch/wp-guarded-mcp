@@ -43,10 +43,11 @@ class GMCP_Tokens {
   * @return array{id:string,secret:string}
   */
   /**
-  * @param int $owner The administrator this key acts as. Defaults to whoever is creating it.
+  * @param int  $owner       The administrator this key acts as. Defaults to whoever is creating it.
+  * @param bool $drafts_only The key may create and edit drafts but nothing that is live. @see GMCP_Core::drafts_only_guard()
   */
   public static function create( string $label, string $level, int $expires_days, array $tools,
-    int $owner = 0 ): array {
+    int $owner = 0, bool $drafts_only = false ): array {
     $rows = self::all();
     $owner = $owner > 0 ? $owner : get_current_user_id();
 
@@ -60,7 +61,10 @@ class GMCP_Tokens {
       'id' => $id,
       'label' => mb_substr( sanitize_text_field( $label ), 0, 60 ) ?: 'Unnamed key',
       'hash' => hash( 'sha256', $token ),
-      'level' => in_array( $level, self::LEVELS, true ) ? $level : 'readonly',
+      'level' => self::capped_level( in_array( $level, self::LEVELS, true ) ? $level : 'readonly', $drafts_only ),
+      // Absent on every key made before this existed, which reads as false: those keys
+      // keep working exactly as they did.
+      'drafts_only' => $drafts_only,
       'tools' => array_values( array_filter( array_map( 'sanitize_key', $tools ) ) ),
       // The account this key acts as, recorded once at creation.
       //
@@ -76,6 +80,28 @@ class GMCP_Tokens {
     update_option( self::OPTION, $rows, false );
 
     return [ 'id' => $id, 'secret' => $token ];
+  }
+
+  /**
+  * The most a drafts-only key may be. Writing drafts is a write-level job, and the tools
+  * above it (options, plugins, menus, the page builders) reach code that writes the posts
+  * table directly, which no hook can see. So the restriction is only as strong as this cap,
+  * and it is applied twice: when the key is made, and again whenever one is presented, so a
+  * row written by hand or by an older version cannot hold both flags at their strongest.
+  */
+  public static function capped_level( string $level, bool $drafts_only ): string {
+    return $drafts_only && $level === 'admin' ? 'readwrite' : $level;
+  }
+
+  /** The level a presented key actually gets: its stored level, capped if it is drafts-only. */
+  public static function effective_level( array $row ): string {
+    // Not normalised: a level this class does not know gives no access at all, as before.
+    $level = (string) ( $row['level'] ?? '' );
+    return self::capped_level( $level, self::is_drafts_only( $row ) );
+  }
+
+  public static function is_drafts_only( array $row ): bool {
+    return !empty( $row['drafts_only'] );
   }
 
   public static function revoke( string $id ): bool {

@@ -1017,6 +1017,12 @@ class GMCP_Tools_Core {
   * @return int|WP_Error The new post ID.
   */
   private function create_one_post( array $a, string $tool ) {
+    // Before anything is built or written. The net under wp_insert_post would catch it too,
+    // but this says why in a sentence instead of as an exception from inside WordPress.
+    $drafts = GMCP_Core::drafts_only_status_guard( (string) ( $a['post_status'] ?? 'draft' ), 'Creating a post' );
+    if ( $drafts !== true ) {
+      return new WP_Error( 'gmcp_drafts_only', $drafts );
+    }
     $ins = [
       'post_title' => sanitize_text_field( $a['post_title'] ),
       'post_status' => sanitize_key( $a['post_status'] ?? 'draft' ),
@@ -3497,6 +3503,17 @@ class GMCP_Tools_Core {
             $unfit[] = 'item ' . $i . ' has no post_title';
           }
         }
+        // A drafts-only key is refused the whole batch if any item would go live, and
+        // before anything is written: a refusal at item twelve would leave eleven posts behind.
+        foreach ( $items as $i => $item ) {
+          if ( is_array( $item ) ) {
+            $drafts = GMCP_Core::drafts_only_status_guard( (string) ( $item['post_status'] ?? 'draft' ), 'Creating item ' . $i );
+            if ( $drafts !== true ) {
+              $r = $this->error( $r, 'Nothing was created. ' . $drafts, -32600 );
+              break 2;
+            }
+          }
+        }
         if ( $unfit ) {
           $r = $this->error( $r, 'Nothing was created. ' . count( $unfit ) . ' of ' . count( $items )
             . ' items would have failed, and they were found before anything was written: '
@@ -3578,6 +3595,13 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $commerce, -32600 );
           break;
         }
+        // The source is only read, so a live page may be copied by a drafts-only key; what
+        // matters is the status the copy would be given.
+        $drafts = GMCP_Core::drafts_only_status_guard( (string) ( $a['post_status'] ?? 'draft' ), 'Duplicating post #' . $src->ID );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
+          break;
+        }
         $dup = [
           'post_title' => ( $a['post_title'] ?? '' ) !== '' ? sanitize_text_field( $a['post_title'] ) : $src->post_title,
           // A copy is a draft unless the caller says otherwise, and the source's own
@@ -3649,6 +3673,11 @@ class GMCP_Tools_Core {
         $wb_post = get_post( $wb_id );
         if ( !$wb_post ) {
           $r = $this->error( $r, 'Post ' . $wb_id . ' not found.', -32602 );
+          break;
+        }
+        $drafts = GMCP_Core::drafts_only_guard( $wb_id, 'Writing blocks to' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
           break;
         }
         // Some MCP clients send arrays as JSON strings.
@@ -3748,6 +3777,11 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'Post ' . $bp_id . ' not found.', -32602 );
           break;
         }
+        $drafts = GMCP_Core::drafts_only_guard( $bp_id, 'Inserting a pattern into' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
+          break;
+        }
         $bp_mode = in_array( $a['mode'] ?? 'append', [ 'replace', 'append', 'prepend' ], true ) ? ( $a['mode'] ?? 'append' ) : 'append';
         if ( $bp_mode === 'replace' ) {
           $bp_new = $bp_markup;
@@ -3774,7 +3808,7 @@ class GMCP_Tools_Core {
           break;
         }
         $post_id = intval( $a['ID'] );
-        $commerce = GMCP_Core::commerce_post_guard( $post_id, 'Updating' );
+        $commerce = GMCP_Core::post_write_guard( $post_id, 'Updating' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
           break;
@@ -3831,6 +3865,15 @@ class GMCP_Tools_Core {
         }
 
         // Handle JSON strings for meta_input
+        // The status this call would leave the post in is only known now that fields and
+        // schedule_for are both folded into $c, and it is asked before anything is written:
+        // the trash and restore steps below write before wp_update_post does.
+        $drafts = GMCP_Core::drafts_only_guard( $post_id, 'Updating', (string) ( $c['post_status'] ?? '' ) );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
+          break;
+        }
+
         $meta_raw = $a['meta_input'] ?? null;
         $meta_input = $meta_raw;
         if ( is_string( $meta_input ) ) {
@@ -3980,7 +4023,7 @@ class GMCP_Tools_Core {
           break;
         }
         $delete_id = intval( $a['ID'] );
-        $commerce = GMCP_Core::commerce_post_guard( $delete_id, 'Deleting' );
+        $commerce = GMCP_Core::post_write_guard( $delete_id, 'Deleting' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
           break;
@@ -4033,6 +4076,11 @@ class GMCP_Tools_Core {
         $post = get_post( $post_id );
         if ( !$post ) {
           $r = $this->error( $r, 'Post not found', -32602 );
+          break;
+        }
+        $drafts = GMCP_Core::drafts_only_guard( $post_id, 'Altering' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
           break;
         }
 
@@ -4107,7 +4155,7 @@ class GMCP_Tools_Core {
           break;
         }
         $pid = intval( $a['ID'] );
-        $commerce = GMCP_Core::commerce_post_guard( $pid, 'Setting meta on' );
+        $commerce = GMCP_Core::post_write_guard( $pid, 'Setting meta on' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
           break;
@@ -4181,7 +4229,7 @@ class GMCP_Tools_Core {
           break;
         }
         $pid = intval( $a['ID'] );
-        $commerce = GMCP_Core::commerce_post_guard( $pid, 'Deleting meta from' );
+        $commerce = GMCP_Core::post_write_guard( $pid, 'Deleting meta from' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
           break;
@@ -4213,6 +4261,12 @@ class GMCP_Tools_Core {
         }
         if ( !$to_id || !get_post( $to_id ) ) {
           $r = $this->error( $r, 'No target post with ID ' . $to_id . '.', -32602 );
+          break;
+        }
+        // The target is the write; the source is only read.
+        $drafts = GMCP_Core::drafts_only_guard( $to_id, 'Copying meta onto' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
           break;
         }
         // Some MCP clients send arrays as JSON strings.
@@ -4257,6 +4311,13 @@ class GMCP_Tools_Core {
         }
         if ( !$chunk_pid || !get_post( $chunk_pid ) ) {
           $r = $this->error( $r, 'No post with ID ' . $chunk_pid . '.', -32602 );
+          break;
+        }
+        // Asked on every chunk, not only the last: a refusal after the whole value has been
+        // staged is a refusal the caller learns about too late to have saved the bytes.
+        $drafts = GMCP_Core::drafts_only_guard( $chunk_pid, 'Writing meta on' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
           break;
         }
         $chunk_why = $this->meta_key_allowed( $chunk_key );
@@ -4483,6 +4544,11 @@ class GMCP_Tools_Core {
           break;
         }
         $post_id = intval( $a['post_id'] );
+        $drafts = GMCP_Core::drafts_only_guard( $post_id, 'Setting the featured image of' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
+          break;
+        }
         $media_id = isset( $a['media_id'] ) ? intval( $a['media_id'] ) : 0;
         if ( $media_id ) {
           $done = set_post_thumbnail( $post_id, $media_id );
@@ -4612,6 +4678,11 @@ class GMCP_Tools_Core {
         // Handle JSON strings (some MCP clients send arrays as JSON strings)
         if ( is_string( $terms ) ) {
           $terms = json_decode( $terms, true ) ?? [];
+        }
+        $drafts = GMCP_Core::drafts_only_guard( intval( $a['ID'] ), 'Setting the terms of' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
+          break;
         }
         $tax = sanitize_key( $a['taxonomy'] ?? 'category' );
         $append = !isset( $a['append'] ) || $a['append'];
@@ -4755,6 +4826,11 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'ID required', -32602 );
           break;
         }
+        $drafts = GMCP_Core::drafts_only_guard( intval( $a['ID'] ), 'Updating' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
+          break;
+        }
         $upd = [ 'ID' => intval( $a['ID'] ) ];
         if ( $a['title'] ?? '' ) {
           $upd['post_title'] = sanitize_text_field( $a['title'] );
@@ -4784,6 +4860,11 @@ class GMCP_Tools_Core {
           break;
         }
         $media_id = intval( $a['ID'] );
+        $drafts = GMCP_Core::drafts_only_guard( $media_id, 'Deleting', '', true );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
+          break;
+        }
         $d = wp_delete_post( $media_id, !empty( $a['force'] ) );
         if ( $d ) {
           // An attachment has no trash, so this is always the permanent branch. Asked

@@ -436,6 +436,11 @@ class GMCP_Tools_Woo {
     if ( empty( $a['name'] ) ) {
       return $this->error( $r, 'name is required.' );
     }
+    // A product is a post. A drafts-only key may not create one that is for sale.
+    $drafts = GMCP_Core::drafts_only_status_guard( ( $a['status'] ?? '' ) === 'publish' ? 'publish' : 'draft', 'Creating a product' );
+    if ( $drafts !== true ) {
+      return $this->error( $r, $drafts, -32600 );
+    }
     $product = new WC_Product_Simple();
     $product->set_name( sanitize_text_field( $a['name'] ) );
     // Draft unless asked otherwise. A product created live with no price and no image
@@ -501,6 +506,10 @@ class GMCP_Tools_Woo {
     if ( !$product ) {
       return $this->error( $r, 'No product with id ' . (int) ( $a['id'] ?? 0 ) . '.' );
     }
+    $drafts = GMCP_Core::drafts_only_guard( $product->get_id(), 'Updating', (string) ( $a['status'] ?? '' ) );
+    if ( $drafts !== true ) {
+      return $this->error( $r, $drafts, -32600 );
+    }
 
     $fields = [ 'name', 'regular_price', 'sale_price', 'sku', 'status', 'description', 'short_description' ];
     $changes = [];
@@ -556,6 +565,10 @@ class GMCP_Tools_Woo {
     $product = wc_get_product( (int) ( $a['id'] ?? 0 ) );
     if ( !$product ) {
       return $this->error( $r, 'No product with id ' . (int) ( $a['id'] ?? 0 ) . '.' );
+    }
+    $drafts = GMCP_Core::drafts_only_guard( $product->get_id(), 'Changing the stock of' );
+    if ( $drafts !== true ) {
+      return $this->error( $r, $drafts, -32600 );
     }
     if ( !isset( $a['quantity'] ) && !isset( $a['delta'] ) ) {
       return $this->error( $r, 'Pass quantity for an absolute figure, or delta to add or subtract.' );

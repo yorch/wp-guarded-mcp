@@ -468,7 +468,10 @@ class GMCP_Settings {
       $tools = array_filter( array_map( 'trim', preg_split( '/[\s,]+/', $raw ) ) );
     }
 
-    $key = GMCP_Tokens::create( $label, $level, $days, $tools );
+    // A checkbox, so unchecked is simply absent. Drafts-only caps the level at read and
+    // write; the notice says so when that changed what was asked for.
+    $drafts_only = !empty( $_POST['key_drafts_only'] );
+    $key = GMCP_Tokens::create( $label, $level, $days, $tools, 0, $drafts_only );
     // Named for the person who minted it, so it is not a fixed target that anything else
     // can go and read. Belt to the option guard's braces: without a persistent object
     // cache a transient is an ordinary wp_options row, so for its sixty seconds the
@@ -476,6 +479,9 @@ class GMCP_Settings {
     // keys exists to avoid.
     set_transient( self::new_key_transient(), $key['secret'], MINUTE_IN_SECONDS );
     $this->notice = __( 'Key created. Copy it now: it is stored hashed and cannot be shown again.', 'guarded-mcp' );
+    if ( $drafts_only && $level === 'admin' ) {
+      $this->notice .= ' ' . __( 'A drafts-only key cannot have full administration, so it was created with read and write access.', 'guarded-mcp' );
+    }
   }
 
   /**
@@ -1025,7 +1031,12 @@ class GMCP_Settings {
         <?php foreach ( $keys as $key ) : $expired = GMCP_Tokens::is_expired( $key ); ?>
           <tr<?php echo $expired ? ' class="gmcp-expired"' : ''; ?>>
             <td><strong><?php echo esc_html( $key['label'] ); ?></strong></td>
-            <td><?php echo esc_html( $key['level'] ); ?></td>
+            <td>
+              <?php echo esc_html( GMCP_Tokens::effective_level( $key ) ); ?>
+              <?php if ( GMCP_Tokens::is_drafts_only( $key ) ) : ?>
+                <br><strong><?php esc_html_e( 'drafts only', 'guarded-mcp' ); ?></strong>
+              <?php endif; ?>
+            </td>
             <td>
               <?php if ( empty( $key['tools'] ) ) : ?>
                 <span class="gmcp-muted"><?php esc_html_e( 'everything its access level allows', 'guarded-mcp' ); ?></span>
@@ -1082,6 +1093,18 @@ class GMCP_Settings {
           </td>
         </tr>
         <tr>
+          <th scope="row"><?php esc_html_e( 'Drafts only', 'guarded-mcp' ); ?></th>
+          <td>
+            <label for="key_drafts_only">
+              <input type="checkbox" id="key_drafts_only" name="key_drafts_only" value="1">
+              <?php esc_html_e( 'Never publish, schedule or change anything that is live', 'guarded-mcp' ); ?>
+            </label>
+            <p class="description">
+              <?php esc_html_e( 'The key can create and edit drafts and pending posts, and upload media for them. It is refused any write that would publish, schedule or make a post private, and any edit, deletion or unpublishing of a post that is already live, whichever tool is used. Comments, orders, terms and users are not posts and are not covered by this setting. Because full administration reaches tools this cannot police, a drafts-only key is held to read and write.', 'guarded-mcp' ); ?>
+            </p>
+          </td>
+        </tr>
+        <tr>
           <th scope="row"><label for="key_expires"><?php esc_html_e( 'Expires after', 'guarded-mcp' ); ?></label></th>
           <td>
             <select id="key_expires" name="key_expires">
@@ -1128,6 +1151,7 @@ class GMCP_Settings {
         <tr>
           <th scope="col"><?php esc_html_e( 'App', 'guarded-mcp' ); ?></th>
           <th scope="col"><?php esc_html_e( 'Account', 'guarded-mcp' ); ?></th>
+          <th scope="col"><?php esc_html_e( 'Access', 'guarded-mcp' ); ?></th>
           <th scope="col"><?php esc_html_e( 'Connected', 'guarded-mcp' ); ?></th>
           <th scope="col"><?php esc_html_e( 'Last used', 'guarded-mcp' ); ?></th>
           <th scope="col"><span class="screen-reader-text"><?php esc_html_e( 'Actions', 'guarded-mcp' ); ?></span></th>
@@ -1138,6 +1162,7 @@ class GMCP_Settings {
           <tr>
             <td><?php echo esc_html( $app['client_name'] ); ?></td>
             <td><?php echo esc_html( $app['user_display'] . ' (' . $app['user_login'] . ')' ); ?></td>
+            <td><?php echo esc_html( ( $app['access'] ?? 'full' ) === 'readonly' ? __( 'Read-only', 'guarded-mcp' ) : __( 'Full', 'guarded-mcp' ) ); ?></td>
             <td><?php echo esc_html( $this->format_date( $app['created'] ) ); ?></td>
             <td><?php echo esc_html( $app['last_used'] ? $this->format_date( $app['last_used'] ) : __( 'Never', 'guarded-mcp' ) ); ?></td>
             <td>

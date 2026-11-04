@@ -33,6 +33,14 @@ ordering storage off, and their billing period, next payment date and status liv
 same rows. One write tool enforcing it and the next not is the same defect as the settings
 tool that once enforced an option policy no other writer did.
 
+**A drafts-only key is held by the post, not by the tool.** `GMCP_Core::drafts_only_guard()`
+(through `post_write_guard()` for the generic writers) is asked by every tool that writes a
+post, its meta, its terms or its thumbnail, and `restrict_caller_to_drafts()` installs hooks
+under WordPress that ask it again for writers that do not. A new tool that writes a post asks
+the guard; the net is the backstop, not the plan. Attachments are filtered through
+`wp_insert_attachment_data`, not `wp_insert_post_data`, and the net needs both. The flag caps the
+key at `readwrite`; that cap is part of the guard.
+
 **Never run `wp plugin install --force`, `wp plugin update` or `wp plugin delete` against
 the `.dev` stack.** Its plugin directory is a bind mount of this repository, and WordPress
 deletes the old directory before unpacking the new one. The delete goes through the mount

@@ -43,7 +43,7 @@ Then open **MCP Server** in the admin menu.
 
 The settings screen shows the endpoint URL. There are two ways in.
 
-**OAuth**, for clients that support it (Claude Desktop, the Claude web connector). Paste the endpoint URL into the client. It discovers the authorization server, sends you to a WordPress login, and shows a consent screen. Nothing to configure, and no shared secret. Only administrators can approve a connection, and the resulting token keeps working only while that account is still an administrator.
+**OAuth**, for clients that support it (Claude Desktop, the Claude web connector). Paste the endpoint URL into the client. It discovers the authorization server, sends you to a WordPress login, and shows a consent screen. Nothing to configure, and no shared secret. The consent screen asks whether the app gets **Full access** or **Read-only**; Full is preselected, as it always was. Only administrators can approve a connection, and the resulting token keeps working only while that account is still an administrator.
 
 **A named key**, for clients that cannot do OAuth, such as a CLI agent. Create one on the Access page and give it to the client. A key is shown once and stored only as a hash, so keep it wherever the client keeps its configuration:
 
@@ -63,7 +63,7 @@ If your host strips the `Authorization` header before PHP sees it, the plugin al
 
 ## Access levels
 
-An access level belongs to a named key. OAuth callers always act as the administrator who approved the connection, at full access.
+An access level belongs to a named key, or to an OAuth grant. A key carries the level it was created with. An OAuth grant is **full** or **read-only**, as chosen on the consent screen, and acts as the administrator who approved it. A read-only grant is held to the `readonly` row below: only read-level tools are listed, and a write or admin tool named anyway is refused. The choice is stored with the grant and copied by every refresh, so nothing the client sends can raise it; a grant made before the choice existed stays full. To change one, revoke it under Connected apps and approve again.
 
 | Level | Content only | + administration | + WooCommerce | What it can do |
 |---|---|---|---|---|
@@ -83,6 +83,12 @@ and an optional list of the only tools it may call, so a key handed to a deploy 
 can be limited to reading posts and nothing else. Keys are stored hashed and shown once.
 There is no shared token; an existing one is carried over into a key on upgrade so
 nothing stops working.
+
+### Drafts-only keys
+
+A key can also be **drafts only**. It may create and edit drafts and pending posts, and upload media for them, and it is refused every write that would publish, schedule or make a post private, and every edit, trash, deletion or unpublishing of a post that is already live (publish, future or private, or any status a plugin registers as public). That covers post fields, custom fields, categories and tags, the featured image, block content, and revert through the change journal, whichever tool is asked, including the generated REST tools. Copying a live page into a draft is allowed, because the live page is only read.
+
+The flag caps the key at read and write: a drafts-only key cannot have full administration, because those tools reach code that writes posts in ways this cannot see. It protects posts and the things stored as posts (pages, products, menu items, media on a live page). It does not cover comments, orders, taxonomy terms themselves, users or options, so pair it with a tool list when the key should do less than that. A refused call is recorded in the audit log like any other refusal. Keys made before this existed carry no flag and behave as they always did.
 
 ## Tools
 
@@ -260,9 +266,9 @@ common and is not a fault.
 ### Access
 
 Who may connect, and how far each of them reaches: named keys, then the OAuth apps that
-have connected.
+have connected. **Connected apps** shows whether each grant is full or read-only.
 
-**Keys** lists the named keys. Each row shows the label, its access level, the tools it is
+**Keys** lists the named keys. Each row shows the label, its access level (and "drafts only" where set), the tools it is
 limited to, when it expires and when it was last used, with a control to revoke it. A new
 key's secret appears once, on creation, and is not recoverable afterwards.
 
@@ -366,7 +372,8 @@ Other hooks:
 
 ## Security notes
 
-- Only administrators can authorize an OAuth client, checked both at authorize time and again on every request.
+- Only administrators can authorize an OAuth client, checked both at authorize time and again on every request. A grant approved as read-only stays read-only through every refresh.
+- A drafts-only key cannot put anything in front of the public or change what is already there, through any tool, because the refusal sits under the post writes rather than in each tool. It does not cover writers that bypass WordPress and update the posts table directly, which is why the key is held below full administration. Orders, comments, users and options are outside it.
 - Keys are stored as a SHA-256 hash and shown once, so the database holds nothing that can be replayed. A key also records the administrator who created it and acts as that account, which is what lets the log name a person; it stops working the moment that account stops holding `manage_options`, so revoking somebody's access revokes their agent with it.
 - No row belonging to this plugin, and no option whose name looks like a credential, can be read or written through the option tools. The change journal additionally inspects the value it is about to record, so a `secret_key` or `pass` field inside a settings array is blanked before the rest of that array is kept, and an undo leaves the live value in place rather than writing the placeholder over it. Strings that parse as JSON or as a serialized array are unpacked and judged too, and blanked whole when they hold one. The check reads field names, not content, so it will not catch a secret held as a bare string under an innocuous option name.
 - Tools do not execute arbitrary PHP or SQL. Every tool is a fixed WordPress operation with a schema.
