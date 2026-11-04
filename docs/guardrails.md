@@ -892,6 +892,62 @@ database dump is sent is not a decision to hand to something that reads
 instructions out of a comment queue. The reply says the scope was asked for
 rather than confirming what ran, because neither adapter reports back.
 
+## Drafts-only keys, and OAuth that can only read
+
+A named key can be marked drafts only. The point is a credential for an agent that
+writes copy: it may fill the drafts folder, and it must not be the thing that puts a
+sentence in front of the public, because the agent reads comments and pages that
+strangers wrote.
+
+**The policy belongs to the post, not to the tool.** Every tool that writes a post, its
+meta, its terms or its featured image asks `GMCP_Core::drafts_only_guard()` (the
+generic ones through `post_write_guard()`, which asks the commerce policy first), for
+the same reason `commerce_post_guard()` exists: one tool enforcing it and the next
+not is the defect the settings tool once had with options. Live means publish, future
+or private now, or a status that would make it so; plugin-registered public and
+private statuses count, and the comparison ignores case and trailing spaces, because
+the posts table does and a stricter PHP check would call "Publish " a draft that every
+query finds. Unpublishing a live post is refused as well as publishing: taking a page
+down is a change to what the public sees. An attachment takes its parent's visibility,
+so media on a live page is protected and media on a draft, or on nothing, can be made
+and edited. Deleting unattached media is refused, because it can be a live page's
+featured image.
+
+**A net sits under the tools.** The tool-level checks give a clear sentence and stop
+before anything is half written, but a list of tools is not a proof that none was
+missed. When a request is authenticated by a drafts-only key, `restrict_caller_to_drafts()`
+hooks WordPress itself: the final row about to be stored (posts and attachments, which
+have separate filters; the attachment one was found missing by a test, not by reading),
+post meta added, changed or deleted including by meta id, trash, restore, permanent
+deletion, and term relationships. Each throws before anything is written, so Elementor,
+Yoast, ACF, WooCommerce, the generated REST tools, menu items and the journal's undo
+are held without knowing about it. It throws rather than short-circuiting with false
+because a pre-filter that returns false makes the caller believe it wrote.
+
+**What it does not do.** A plugin that updates the posts table with SQL, or calls
+`wp_publish_post()` (which does), is not seen by any hook, and none of this plugin's
+tools does either for content. That is why a drafts-only key is capped at read and
+write: the groups that reach third-party code (options, menus, the page builders, SEO
+and form plugins) are admin-level and are not offered to it. The
+cap is applied when the key is made and again whenever the key is presented. Comments,
+orders, taxonomy terms, users and options are not posts and are not covered. Pair the
+flag with a tool list when the key should do less than that.
+
+A refusal is an ordinary tool failure, so the audit log records it as a refusal under
+the key's label. Keys made before the flag exist have no `drafts_only` field, which
+reads as false.
+
+**OAuth is no longer always full.** The consent screen offers Full access or Read-only,
+with Full preselected because a changed default is a decision and not a side effect. The
+level is stored in the grant's scope as a `mcp:readonly` marker. That reuses a column
+that already travels with the grant, is copied by every refresh, and needs no schema
+change; a grant made before has no marker and stays full. The level comes only from the
+person's choice, never from the scope string the client asked for, and an unrecognised
+value on the form fails narrow. The server used to exempt OAuth callers from the level
+filter by their authentication method; that exemption is gone, so a read-only grant
+is listed only read tools and is refused a write tool named anyway, in the same places a
+read-only key is. The "still an administrator" check on every request is unchanged.
+
 ## No restore, no kit import
 
 There is no restore tool at any access level. Restoring discards everything

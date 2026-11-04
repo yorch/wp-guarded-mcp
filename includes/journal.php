@@ -581,6 +581,27 @@ class GMCP_Journal {
     return $out;
   }
 
+  /**
+  * Whether a drafts-only caller may put this entry back, as the refusal or true.
+  *
+  * Shared by the listing and the revert so the two cannot disagree, which is how the
+  * gates loop and the revert once came to answer differently.
+  *
+  * @return true|string
+  */
+  private static function drafts_only_refusal( array $entry ) {
+    if ( !GMCP_Core::caller_drafts_only() || ( $entry['kind'] ?? '' ) === 'option' ) {
+      return true;
+    }
+    if ( ( $entry['kind'] ?? '' ) === 'meta' ) {
+      return GMCP_Core::drafts_only_guard( (int) $entry['ID'], 'Reverting meta on' );
+    }
+    $previous = (array) ( $entry['previous'] ?? [] );
+    $status = array_key_exists( 'post_status', $previous ) && in_array( 'post_status', (array) ( $entry['fields'] ?? [] ), true )
+      ? (string) $previous['post_status'] : '';
+    return GMCP_Core::drafts_only_guard( (int) $entry['ID'], 'Reverting', $status );
+  }
+
   /** @return true|string True if it can be put back, otherwise why not. */
   private static function reversible( array $entry ) {
     if ( !empty( $entry['undone'] ) ) {
@@ -590,6 +611,10 @@ class GMCP_Journal {
       if ( !apply_filters( 'gmcp_can_call_tool', false, $tool ) ) {
         return "It needs {$tool}, which this connection cannot call.";
       }
+    }
+    $drafts = self::drafts_only_refusal( $entry );
+    if ( $drafts !== true ) {
+      return $drafts;
     }
     if ( ( $entry['kind'] ?? '' ) === 'option' ) {
       if ( !empty( $entry['redacted'] ) ) {
@@ -803,6 +828,14 @@ class GMCP_Journal {
             'message' => "Reverting this is the same write in reverse, and it needs {$tool}, which this connection cannot call.",
           ];
         }
+      }
+
+      // A revert is a post write like any other, so a drafts-only key is asked the same
+      // question here, before anything is paused or touched. Restoring a field on a page
+      // that has since gone live is editing that page, and "undo" is not a different verb.
+      $drafts = self::drafts_only_refusal( $entry );
+      if ( $drafts !== true ) {
+        return [ 'ok' => false, 'message' => 'That change cannot be reverted. ' . $drafts ];
       }
 
       // A revert writes options and posts like anything else, and recording it would

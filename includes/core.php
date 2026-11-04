@@ -828,6 +828,293 @@ class GMCP_Core {
       . 'This key is ' . self::caller_access_level() . '.';
   }
 
+  #region Drafts-only keys
+
+  /**
+  * Set once per request, by the server, when the credential presented is a drafts-only key.
+  * Nothing sets it back: a request has one caller.
+  */
+  private static $drafts_only = false;
+  private static $drafts_net_installed = false;
+
+  /** Whether the credential behind this request may only touch content that is not live. */
+  public static function caller_drafts_only(): bool {
+    return self::$drafts_only;
+  }
+
+  /**
+  * The statuses at which a post is in front of the public, or scheduled to be.
+  *
+  * publish, future and private are the three the brief names, and any status a plugin has
+  * registered as public or private joins them, so a custom "published" state is not a way
+  * round. inherit is deliberately not here: an attachment or a revision takes its parent's
+  * visibility, which status_is_live() resolves.
+  *
+  * @return string[]
+  */
+  public static function live_statuses(): array {
+    $statuses = [ 'publish', 'future', 'private' ];
+    if ( function_exists( 'get_post_stati' ) ) {
+      $statuses = array_merge(
+        $statuses,
+        array_values( get_post_stati( [ 'public' => true ] ) ),
+        array_values( get_post_stati( [ 'private' => true ] ) )
+      );
+    }
+    $statuses = (array) apply_filters( 'gmcp_live_post_statuses', $statuses );
+    return array_values( array_diff( array_unique( array_map( [ __CLASS__, 'normalise_status' ], $statuses ) ), [ 'inherit' ] ) );
+  }
+
+  /**
+  * Whether a status, for a post with this parent, is one the public can reach.
+  *
+  * An attachment is "inherit", and an attachment on a live page is part of that page. One
+  * attached to a draft, or to nothing, is not live content: uploading media while drafting
+  * is the ordinary use of a drafts-only key, and refusing it would make the key useless.
+  * The walk up the parents is bounded so a loop cannot hang the request.
+  */
+  public static function status_is_live( string $status, int $parent = 0, int $depth = 0 ): bool {
+    $status = self::normalise_status( $status );
+    if ( $status === 'inherit' ) {
+      if ( $parent <= 0 || $depth >= 5 ) {
+        return false;
+      }
+      $up = get_post( $parent );
+      return $up ? self::status_is_live( (string) $up->post_status, (int) $up->post_parent, $depth + 1 ) : false;
+    }
+    return in_array( $status, self::live_statuses(), true );
+  }
+
+  /**
+  * Lower case, no surrounding whitespace. The posts table compares with a case- and
+  * padding-insensitive collation on a stock install, so a post stored with the status
+  * "Publish" or "publish " is found by every query that asks for "publish", and a
+  * comparison here that was stricter than the database would call it a draft.
+  */
+  private static function normalise_status( $status ): string {
+    return strtolower( trim( (string) $status ) );
+  }
+
+  /** @param int|WP_Post $post */
+  public static function post_is_live( $post ): bool {
+    $post = get_post( $post );
+    return $post ? self::status_is_live( (string) $post->post_status, (int) $post->post_parent ) : false;
+  }
+
+  private static function drafts_only_explanation(): string {
+    return 'This key is drafts-only: it can create and edit drafts and pending posts, but it cannot publish, schedule, '
+      . 'make private, edit, delete or unpublish anything that is live. '
+      . 'Ask an administrator to make the change, or use a key that is not drafts-only.';
+  }
+
+  /**
+  * Whether a drafts-only caller may write to this existing post, and the sentence to refuse
+  * with when it may not.
+  *
+  * A policy about the OBJECT, like commerce_post_guard(): every tool that writes a post or
+  * its meta, terms or thumbnail asks this one question, and a net of WordPress hooks
+  * (below) asks it again underneath for writers that do not, so a tool added later, or a
+  * third-party plugin's, cannot be the one that was missed. The tools ask first so the
+  * refusal is a clear sentence and nothing is half written; the net is the backstop.
+  *
+  * Live means the post is publish, future or private now, OR the write would make it so.
+  * Unpublishing is refused as well as publishing: taking a page down is a change to the
+  * site the public sees.
+  *
+  * @param string $new_status The status the write would leave the post in, or '' if it
+  *                           does not change it.
+  * @param bool   $removing   Deleting rather than editing. Media is judged harder, because an
+  *                           unattached attachment can be the featured image of a live post.
+  * @return true|string True when the write is allowed, otherwise the refusal.
+  */
+  public static function drafts_only_guard( int $post_id, string $verb = 'Changing', string $new_status = '', bool $removing = false ) {
+    if ( !self::$drafts_only || $post_id <= 0 ) {
+      return true;
+    }
+    $post = get_post( $post_id );
+    if ( !$post ) {
+      return true;
+    }
+    $new_status = sanitize_key( $new_status );
+    if ( self::post_is_live( $post ) ) {
+      return $verb . ' post #' . $post_id . ' is refused: it is live (status "' . $post->post_status . '"). ' . self::drafts_only_explanation();
+    }
+    if ( $new_status !== '' && self::status_is_live( $new_status, (int) $post->post_parent ) ) {
+      return $verb . ' post #' . $post_id . ' with status "' . $new_status . '" is refused: that would put it in front of the public. ' . self::drafts_only_explanation();
+    }
+    if ( $removing && $post->post_type === 'attachment' && ( (int) $post->post_parent <= 0 ) ) {
+      return $verb . ' media #' . $post_id . ' is refused: it is not attached to a draft, so a live page may be using it. ' . self::drafts_only_explanation();
+    }
+    return true;
+  }
+
+  /**
+  * The same question for content that does not exist yet: may this key create something
+  * with this status?
+  *
+  * @return true|string
+  */
+  public static function drafts_only_status_guard( string $status, string $verb = 'Creating content' ) {
+    if ( !self::$drafts_only ) {
+      return true;
+    }
+    $status = sanitize_key( $status );
+    if ( $status !== '' && self::status_is_live( $status ) ) {
+      return $verb . ' with status "' . $status . '" is refused: that would put it in front of the public. ' . self::drafts_only_explanation();
+    }
+    return true;
+  }
+
+  /**
+  * The one question for the generic post and meta writes: the commerce policy first, then
+  * the drafts-only one. Both are policies about the post, so both are asked here rather
+  * than in whichever tool happens to be writing.
+  *
+  * @return true|string
+  */
+  public static function post_write_guard( int $post_id, string $verb = 'Changing', string $new_status = '' ) {
+    $commerce = self::commerce_post_guard( $post_id, $verb );
+    if ( $commerce !== true ) {
+      return $commerce;
+    }
+    return self::drafts_only_guard( $post_id, $verb, $new_status );
+  }
+
+  /**
+  * Turn the restriction on for this request, and install the net underneath the tools.
+  *
+  * The tool-level guards above give a clear refusal. This is what makes "no writer is
+  * missed" true rather than hoped: every route to a post row that goes through WordPress,
+  * which is every tool in this plugin and every plugin a tool calls into (Elementor, Yoast,
+  * ACF, WooCommerce, the generated REST tools, menu items, the change journal's undo),
+  * passes through one of these hooks, and each throws before anything is written.
+  *
+  * It throws rather than returning false. A pre-filter that short-circuits with false
+  * makes update_post_meta() report failure quietly and the caller carry on as though it had
+  * worked, which is a tool answering success over a write that did not happen. An
+  * exception reaches execute_tool(), which turns it into an isError reply the audit log
+  * records as a refusal.
+  *
+  * What it cannot see: a plugin writing the posts table with $wpdb directly. None of this
+  * plugin's tools does that for content, and a drafts-only key is held to the write level,
+  * which excludes the tool groups (Elementor, Yoast, ACF, menus, options) that reach such code.
+  */
+  public static function restrict_caller_to_drafts(): void {
+    self::$drafts_only = true;
+    if ( self::$drafts_net_installed ) {
+      return;
+    }
+    self::$drafts_net_installed = true;
+
+    // The status the row is about to be stored with, after every other plugin has had its
+    // say, which is why this runs last. Covers wp_insert_post and wp_update_post, and so
+    // everything built on them.
+    add_filter( 'wp_insert_post_data', [ __CLASS__, 'net_insert' ], PHP_INT_MAX, 4 );
+    // Attachments are filtered through their own hook instead of that one, so media
+    // uploads, edits and re-parenting would otherwise walk straight past the net.
+    add_filter( 'wp_insert_attachment_data', [ __CLASS__, 'net_insert' ], PHP_INT_MAX, 4 );
+
+    // Meta, added, changed or removed, through every route including by meta id.
+    foreach ( [ 'add', 'update', 'delete' ] as $op ) {
+      add_filter( $op . '_post_metadata', [ __CLASS__, 'net_meta' ], PHP_INT_MIN, 3 );
+    }
+    add_filter( 'update_post_metadata_by_mid', [ __CLASS__, 'net_meta_by_mid' ], PHP_INT_MIN, 2 );
+    add_filter( 'delete_post_metadata_by_mid', [ __CLASS__, 'net_meta_by_mid' ], PHP_INT_MIN, 2 );
+
+    // Trash, restore and permanent deletion. These fire before anything is touched.
+    foreach ( [ 'pre_delete_post', 'pre_delete_attachment', 'pre_trash_post', 'pre_untrash_post' ] as $hook ) {
+      add_filter( $hook, [ __CLASS__, 'net_remove' ], PHP_INT_MIN, 2 );
+    }
+    // Restoring from the trash goes back to the status the post held before, which on
+    // WordPress older than 5.6 was publish. A restore is always a draft for this caller.
+    add_filter( 'wp_untrash_post_status', function ( $status ) {
+      return self::status_is_live( (string) $status ) ? 'draft' : $status;
+    }, PHP_INT_MAX );
+
+    // Category, tag and any other taxonomy assignment, fired before the row is written.
+    add_action( 'add_term_relationship', [ __CLASS__, 'net_terms' ], PHP_INT_MIN, 3 );
+    add_action( 'delete_term_relationships', [ __CLASS__, 'net_terms' ], PHP_INT_MIN, 3 );
+  }
+
+  private static function net_refuse( string $message ): void {
+    throw new GMCP_Drafts_Only_Refusal( $message );
+  }
+
+  public static function net_insert( $data, $postarr = [], $unsanitized = [], $update = false ) {
+    if ( !self::$drafts_only || !is_array( $data ) ) {
+      return $data;
+    }
+    $id = (int) ( $postarr['ID'] ?? 0 );
+    if ( $update && $id > 0 ) {
+      $why = self::drafts_only_guard( $id, 'Updating', (string) ( $data['post_status'] ?? '' ) );
+      if ( $why !== true ) {
+        self::net_refuse( $why );
+      }
+      return $data;
+    }
+    $why = self::drafts_only_status_guard( (string) ( $data['post_status'] ?? '' ), 'Creating a post' );
+    if ( $why === true && self::status_is_live( (string) ( $data['post_status'] ?? '' ), (int) ( $data['post_parent'] ?? 0 ) ) ) {
+      // inherit under a live parent: new media or a revision attached to a live page.
+      $why = 'Creating a post attached to a live post is refused. ' . self::drafts_only_explanation();
+    }
+    if ( $why !== true ) {
+      self::net_refuse( $why );
+    }
+    return $data;
+  }
+
+  public static function net_meta( $check, $object_id = 0, $meta_key = '' ) {
+    if ( self::$drafts_only ) {
+      $why = self::drafts_only_guard( (int) $object_id, 'Writing meta on' );
+      if ( $why !== true ) {
+        self::net_refuse( $why );
+      }
+    }
+    return $check;
+  }
+
+  public static function net_meta_by_mid( $check, $meta_id = 0 ) {
+    if ( self::$drafts_only ) {
+      $row = function_exists( 'get_metadata_by_mid' ) ? get_metadata_by_mid( 'post', (int) $meta_id ) : null;
+      if ( $row && !empty( $row->post_id ) ) {
+        $why = self::drafts_only_guard( (int) $row->post_id, 'Writing meta on' );
+        if ( $why !== true ) {
+          self::net_refuse( $why );
+        }
+      }
+    }
+    return $check;
+  }
+
+  public static function net_remove( $check, $post = null ) {
+    if ( self::$drafts_only && $post instanceof WP_Post ) {
+      $why = self::drafts_only_guard( (int) $post->ID, 'Removing', '', true );
+      if ( $why !== true ) {
+        self::net_refuse( $why );
+      }
+    }
+    return $check;
+  }
+
+  public static function net_terms( $object_id = 0, $unused = null, $taxonomy = '' ) {
+    if ( !self::$drafts_only ) {
+      return;
+    }
+    // The action also fires for objects that are not posts, and a user or a link can share
+    // a post's numeric id. Only a taxonomy that belongs to the post's own type is a post write.
+    $post = get_post( (int) $object_id );
+    $tax = $post ? get_taxonomy( (string) $taxonomy ) : null;
+    if ( !$post || !$tax || !in_array( $post->post_type, (array) $tax->object_type, true ) ) {
+      return;
+    }
+    $why = self::drafts_only_guard( (int) $post->ID, 'Changing the terms of' );
+    if ( $why !== true ) {
+      self::net_refuse( $why );
+    }
+  }
+
+  #endregion
+
   /**
   * Whether a post is an Elementor library template something still renders, and the
   * sentence to refuse with.
@@ -1453,4 +1740,13 @@ class GMCP_Core {
   }
 
   #endregion
+}
+
+/**
+* Thrown by the drafts-only net under the tools, before anything is written.
+*
+* Its own class so a caller that must tell a policy refusal from a bug can, and so the
+* journal's undo can answer with the sentence instead of a stack of "failed".
+*/
+class GMCP_Drafts_Only_Refusal extends RuntimeException {
 }

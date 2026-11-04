@@ -337,6 +337,15 @@ class GMCP_Server {
           $this->auth_method = 'oauth';
           $this->auth_client_id = $token_data['client_id'] ?? null;
           $this->auth_client_name = $token_data['client_name'] ?? null;
+          // The level the person chose on the consent screen travels in the grant, and a
+          // refresh copies it from the grant, so nothing the client sends can raise it.
+          // A grant from before the choice existed carries no marker and stays full.
+          if ( GMCP_OAuth::scope_is_readonly( (string) ( $token_data['scope'] ?? '' ) ) ) {
+            $this->mcp_role = 'readonly';
+            add_filter( 'gmcp_caller_access_level', function () {
+              return $this->mcp_role;
+            } );
+          }
           return true;
         }
       }
@@ -359,7 +368,13 @@ class GMCP_Server {
           // token had no identity to carry over. The screen asks you to replace it.
           wp_set_current_user( $admin->ID, $admin->user_login );
         }
-        $this->mcp_role = $key['level'];
+        // The stored level, capped when the key is drafts-only (see GMCP_Tokens::capped_level()).
+        $this->mcp_role = GMCP_Tokens::effective_level( $key );
+        if ( GMCP_Tokens::is_drafts_only( $key ) ) {
+          // Before any tool can run. Installs the net under every post write this request
+          // can make, not only the ones this plugin's own tools ask about.
+          GMCP_Core::restrict_caller_to_drafts();
+        }
         $this->token_tools = $key['tools'] ? $key['tools'] : null;
         $this->token_id = $key['id'];
         $this->auth_method = 'bearer';
@@ -1074,22 +1089,21 @@ class GMCP_Server {
 
   #region Access Control
   /**
-  * Whether the Access Level setting narrows this request.
+  * Whether a level below full administration narrows this request.
   *
-  * It governs the shared bearer token, which is what its description has always
-  * said: one secret handed to a script, so the owner decides how far it reaches.
-  * An OAuth connection is the opposite case. It belongs to one person who signed
-  * in as themselves, and the authorize step already refuses anyone without
-  * manage_options, so narrowing them again by a global role meant an
-  * administrator on Claude Desktop silently lost every admin-level tool, with no
-  * reason given and no setting on screen to explain it (the selector only appears
-  * when a bearer token is configured).
+  * A named key carries its level, and an OAuth grant carries the one the person chose on
+  * the consent screen. Both set mcp_role during authentication; the default is admin, so a
+  * caller who chose nothing is not narrowed. An OAuth connection used to be exempt by its
+  * auth method, which was right while OAuth could only mean "a person signed in as
+  * themselves, with everything": it is not right once the person can say read-only, and an
+  * exemption that survived would have listed and run every tool for a grant that promised
+  * not to.
   *
   * Both the listing and the execution gate call this. They used to decide it
   * separately, which is how they drifted apart in the first place.
   */
   private function role_filter_applies(): bool {
-    return $this->auth_method !== 'oauth' && $this->mcp_role !== 'admin';
+    return $this->mcp_role !== 'admin';
   }
 
   /**
@@ -1203,16 +1217,8 @@ class GMCP_Server {
       }
     }
 
-    // Filter tools by access level based on the MCP role.
-    //
-    // This applies to the shared bearer token only, which is what the setting has
-    // always described: one secret handed to a script, so the site owner decides
-    // how far it reaches. An OAuth connection is the opposite case. It belongs to
-    // one person, they signed in as themselves, and authorize_token() already
-    // refuses anyone without manage_options, so filtering them again by a global
-    // role meant an administrator on Claude Desktop silently lost every
-    // admin-level tool with no visible reason and no setting on screen to explain
-    // it (the selector only appears when a bearer token is configured).
+    // Filter tools by the caller's level: a key's, or the one granted on the OAuth consent
+    // screen. Hiding is not the boundary, execute_tool() checks again.
     if ( $this->role_filter_applies() ) {
       $filtered_tools = array_filter( $filtered_tools, function ( $tool ) {
         $level = $tool['accessLevel'] ?? 'admin';
