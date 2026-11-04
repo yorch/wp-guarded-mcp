@@ -56,7 +56,7 @@ fi
 # accompanies README.md. phpcs.xml.dist is a local development tool config; wordpress.org
 # Plugin Check rejects it as an "application file."
 # CHANGELOG.md is release-please's, and the two release-please files configure that tool;
-# the plugin's own changelog for users is in readme.txt.
+# readme.txt carries the changelog users see, and release-please does not update it.
 ( cd "$STAGE/$SLUG" && rm -rf .dev .wordpress-org .github .gitignore README.md AGENTS.md CLAUDE.md docs phpcs.xml.dist CHANGELOG.md release-please-config.json .release-please-manifest.json )
 # languages/.gitkeep is a git placeholder to keep the empty directory; the directory
 # itself ships so WordPress.org's translation system can populate it.

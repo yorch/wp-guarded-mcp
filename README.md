@@ -434,51 +434,78 @@ names, `error_log()` for the connector's own diagnostics).
 
 ### Releasing
 
-Versions come from commit messages. Write every commit, and every squash-merged PR title, as a
-[Conventional Commit](https://www.conventionalcommits.org/); the `PR title` check enforces it
-on pull requests.
+Versions come from commit messages. Write commits, and squash-merged PR titles, as
+[Conventional Commits](https://www.conventionalcommits.org/).
 
 | Commit | Effect on the next release |
 |---|---|
-| `fix: ...` | patch (1.0.0 to 1.0.1) |
-| `feat: ...` | minor (1.0.0 to 1.1.0) |
-| `feat!: ...`, or a `BREAKING CHANGE:` footer | major (1.0.0 to 2.0.0) |
+| `fix:`, `perf:`, `revert:` | patch (1.0.0 to 1.0.1) |
+| `feat:` | minor (1.0.0 to 1.1.0) |
+| `feat!:`, or a `BREAKING CHANGE:` footer | major (1.0.0 to 2.0.0) |
 | `docs:`, `ci:`, `chore:`, `refactor:`, `test:`, `build:`, `style:` | none by themselves |
-| a `Release-As: 1.4.0` footer | forces that version |
+| a `Release-As: 1.4.0` footer | forces that version, even on a `chore:` |
 
-The release workflow keeps one open pull request, "chore(main): release X.Y.Z", that bumps
-`Version:` and the `GMCP_VERSION` define in `guarded-mcp.php` and `Stable tag:` in `readme.txt`,
-and adds the entries to `CHANGELOG.md`. It collects changes until you merge it. **Merging that
-pull request is the release**: the workflow then tags `vX.Y.Z`, creates the GitHub Release with
-the changelog section as its notes, and a second job builds the zip with `.dev/build.sh`, checks
-its contents, attests it and attaches the zips and checksums. Nothing is sent to wordpress.org.
-Pushing a tag by hand releases nothing.
+**What release-please reads.** This repository squash-merges with the PR description as the
+commit body, so it reads the PR title *and* the description. A `BREAKING CHANGE:` or
+`Release-As:` footer only counts if it is in the description (one in a branch commit is
+discarded), and a line shaped like a commit message in the description can be read as a
+separate change. The `PR title` check validates the title and warns about those footers. It
+is advisory: it blocks a merge only if the ruleset lists it as a required status check, and a
+direct push to `main` skips it.
 
-Things that are easy to get wrong:
+**How a release happens.**
+
+1. A workflow keeps one open pull request, "chore(main): release X.Y.Z", that bumps `Version:`
+   and the `GMCP_VERSION` define in `guarded-mcp.php` and `Stable tag:` in `readme.txt`, and adds
+   the entries to `CHANGELOG.md`. It collects changes until you merge it.
+2. **Merging that pull request starts the release.** The workflow tags `vX.Y.Z` and creates the
+   GitHub Release as a **draft**.
+3. A second job checks that the tag points at the commit that was released and that the commit
+   is on `main`, runs `check-release.sh version` against the tag, builds the zip with
+   `.dev/build.sh`, checks its contents, attests it, attaches the zips and checksums, and only
+   then publishes the draft. A release is never public, and never "Latest", without its files.
+
+Nothing is sent to wordpress.org. The install links in this README resolve only once a release
+exists.
+
+**Things that are easy to get wrong.**
 
 - **The version lives in three places and release-please edits them by marker.** The
-  `Release-Please:` lines in the plugin header and in the `readme.txt` header, and the
-  `x-release-please-version` comment on the `GMCP_VERSION` line, are what it finds. Leave them
-  in place. They are written as `Key: value` lines on purpose: wordpress.org's readme parser
-  ends the header at the first non-blank line that has no colon, and a bare marker there would
-  silently drop the headers after it. `.dev/check-release.sh version` fails if the three
-  disagree, and the release job runs it against the tag before attaching anything.
-- **The release PR gets no checks unless you add a token.** Pull requests created with the
-  default `GITHUB_TOKEN` do not start other workflows, so `Package` and `Plugin Check` do not
-  run on it. Add a repository secret `RELEASE_PLEASE_TOKEN` (a fine-grained token or GitHub App
-  token with contents, pull requests and issues write) and they do. The release works without it.
-- **The first release is whatever the first release PR says.** `bootstrap-sha` in
-  `release-please-config.json` starts the history at the commit that was `main` when this was
-  added, so only later `feat`/`fix` commits count, and nothing is proposed until one lands. To
-  release the current state as is, merge a commit with a `Release-As: 1.0.0` footer. The install
-  links in this README resolve only once a release exists.
-- **Who may merge the release PR is the control.** The tag and release are created after the
-  merge, so the `release` environment can only gate the file upload, not the release. Require a
-  review on `main` and keep merge rights narrow. Restricting who can create `v*` tags no longer
-  protects anything, because no workflow reads them.
-- **If the upload job fails, the tag and release already exist.** Fix the cause and use "Re-run
-  failed jobs" on that run; do not create a second release. A tag that disagrees with the files
-  means the markers broke, and is a manual repair.
+  `Release-Please:` lines in the plugin header and the `readme.txt` header, and the
+  `x-release-please-version` comment on the `GMCP_VERSION` line, are what it finds. They are
+  written as `Key: value` lines on purpose: wordpress.org's readme parser ends the header at the
+  first non-blank line with no colon, and a bare marker there would silently drop the headers
+  after it. `.dev/check-release.sh version` fails if a marker is missing or unclosed, or if the
+  three versions disagree, and CI runs it on every push and pull request.
+- **Switch on "Allow GitHub Actions to create and approve pull requests"** (Settings, Actions,
+  General), or add a `RELEASE_PLEASE_TOKEN` secret. Without one of them release-please cannot
+  open the release PR. The secret (a fine-grained token or GitHub App token with contents, pull
+  requests and issues write) also makes `Package` and `Plugin Check` run on the release PR:
+  pull requests created with the default token do not start other workflows.
+- **`readme.txt`'s Changelog and Upgrade Notice are not updated by release-please.** It
+  writes `CHANGELOG.md` and the GitHub Release notes. A release whose `readme.txt` still ends at
+  the previous version's entry ships with a stale changelog, so edit it on the release PR's branch.
+- **The first release depends on `bootstrap-sha`** in `release-please-config.json`. It starts the
+  history at the commit that was `main` when this was added, so only later `feat`/`fix`/`perf`
+  commits count and nothing is proposed until one lands. To release the current state as is, merge
+  a PR whose description ends with a `Release-As: 1.0.0` footer.
+- **Pushing a tag by hand releases nothing, but a tag pushed early is not harmless.** release-please
+  creates the release by tag name, and GitHub does not move a tag that already exists, so someone
+  who pushes `vX.Y.Z` before the release PR is merged decides which commit that tag, and the
+  draft, point at. The publish job builds only the commit release-please released, and refuses if
+  the tag points anywhere else or the commit is not on `main`. That refusal is the defence; a tag
+  ruleset (Settings, Rules) restricting who can create `v*` tags makes it unnecessary to rely on.
+- **The control is who can push or merge to `main`.** Merging the release PR, or pushing a commit
+  that does what one would, is what releases. Check that the ruleset requires a pull request and
+  the `Package` and `PR title` checks, and keep merge rights narrow. The `release` environment can
+  put required reviewers in front of the upload and the publishing, but not the release PR.
+- **If the publish job fails, the draft and its tag already exist and nothing is public.** For a
+  cause outside the repository (an approval, a network error), use "Re-run failed jobs"; a
+  half-finished upload is replaced, because a draft has no downloads to protect. If the draft
+  exists but the job never ran (release-please failed after creating it), run the `Release`
+  workflow by hand from `main` with the tag as input; it refuses anything that is not a draft. If
+  the commit itself cannot be built, abandon that version: delete the draft and its tag, merge the
+  fix, and the next release PR ships it as the next version.
 
 ## Licence
 

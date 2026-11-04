@@ -219,8 +219,8 @@ written, and the build fails if any of the four files derived from AI Engine has
 its upstream notice, because that per-file attribution is what GPLv2 section 2(a)
 requires.
 
-CI runs this same script: the release workflow's upload job after release-please creates a
-release, and on every PR and push to main to upload the zip as a workflow artifact. The
+CI runs this same script: the release workflow's publish job, once release-please has created a
+draft release, and on every PR and push to main to upload the zip as a workflow artifact. The
 unversioned `guarded-mcp.zip`, the checksums and the attestation are added by that workflow,
 not by `build.sh`. `build.sh` also strips `CHANGELOG.md` and the two release-please files; the
 zip allowlist in `check-release.sh` would reject them otherwise.
