@@ -2240,6 +2240,22 @@ class GMCP_Tools_Core {
   * in a place nobody looked, or matches nothing at all and reports success either way.
   * This shows every match in context with the text that would take its place.
   */
+  /**
+  * What wp_alter_post stores for a field, from the text a replacement produced.
+  *
+  * The same answers wp_update_post gives for the same fields: store_html() for the body and
+  * the excerpt, sanitize_text_field() for the title. wp_alter_post wrote its result raw, and
+  * the request runs as an administrator holding unfiltered_html, so core's own kses was off
+  * as well: a write-level key replacing "</p>" with "</p><script>...</script>" stored a
+  * script that ran for every visitor, which is the exact hole store_html() was written to
+  * close, reopened one tool along. The whole result is sanitised rather than the
+  * replacement text alone, because a regex back-reference or two innocent-looking calls can
+  * assemble a tag out of pieces that are each harmless on their own.
+  */
+  private function alter_sanitize( string $field, string $value ): string {
+    return $field === 'post_title' ? sanitize_text_field( $value ) : $this->store_html( $value );
+  }
+
   private function preview_alter_post( array $a, array $r ): array {
     $post = get_post( (int) ( $a['ID'] ?? 0 ) );
     if ( !$post ) {
@@ -2327,6 +2343,13 @@ class GMCP_Tools_Core {
     if ( $count > count( $matches ) ) {
       $lines[] = '';
       $lines[] = '(' . ( $count - count( $matches ) ) . ' further match(es) not shown.)';
+    }
+    // The real call sanitises what it stores, so a preview that stopped at "becomes" would
+    // show a result the write then does not keep.
+    $whole = $pattern !== null ? @preg_replace( $pattern, $replace, $subject ) : str_replace( $search, $replace, $subject );
+    if ( is_string( $whole ) && $this->alter_sanitize( $field, $whole ) !== $whole ) {
+      $lines[] = '';
+      $lines[] = 'Saving this sanitises the result the way wp_update_post does, and that changes it: markup not allowed in ' . $field . ' (a script, an event handler, an unknown tag) is removed, so the stored field will not read exactly as shown above.';
     }
     return $this->preview_text( $r, implode( "\n", $lines ) );
   }
@@ -4182,6 +4205,10 @@ class GMCP_Tools_Core {
           break;
         }
 
+        // Sanitised the way wp_update_post sanitises the same field. @see alter_sanitize().
+        $raw_result = $new_content;
+        $new_content = $this->alter_sanitize( $field, $new_content );
+
         // wp_update_post() runs wp_unslash() internally, which would strip the
         // backslash from Unicode escapes like \u003c in block JSON (Rank Math
         // FAQ, etc.) and silently corrupt the post. Pre-slash to compensate.
@@ -4192,7 +4219,8 @@ class GMCP_Tools_Core {
         }
 
         $this->bust_post_cache( $post_id, [ 'tool' => 'wp_alter_post' ] );
-        $this->add_result_text( $r, $count . ' replacement' . ( $count === 1 ? '' : 's' ) . ' applied to ' . $field . ' of post #' . $post_id );
+        $this->add_result_text( $r, $count . ' replacement' . ( $count === 1 ? '' : 's' ) . ' applied to ' . $field . ' of post #' . $post_id
+          . ( $new_content !== $raw_result ? '. The result was sanitised before it was stored, as wp_update_post would: markup not allowed in ' . $field . ' was removed, so read the field back rather than assuming it holds the replacement exactly.' : '' ) );
         break;
 
         /* ===== Post-meta ===== */

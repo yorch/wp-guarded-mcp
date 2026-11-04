@@ -667,6 +667,26 @@ check "CONTROL: and still deletes one" \
   "$(docker compose exec -T cli wp eval "echo get_post($MO_ATT)?'present':'gone';" 2>/dev/null | tr -d '\r\n')" "gone"
 docker compose exec -T cli wp eval "wp_delete_post($MO_SUB,true); wp_delete_post($MO_PAGE,true);" >/dev/null 2>&1
 
+echo "-- search and replace is sanitised like any other content write --"
+# wp_alter_post wrote its result raw while wp_update_post ran the same field through
+# store_html(). The request runs as an administrator, so core's kses was off too, and a
+# write-level key stored a script that ran for every visitor. Asserted on the stored row.
+AL=$(docker compose exec -T cli wp post create --post_title='Alter probe' --post_content='<p>alter-legit</p>' --post_status=draft --porcelain 2>/dev/null | tr -d '\r\n')
+al() { call "$1" "{\"jsonrpc\":\"2.0\",\"id\":440,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_alter_post\",\"arguments\":$2}}"; }
+al al_prev "{\"ID\":$AL,\"field\":\"post_content\",\"search\":\"</p>\",\"replace\":\"</p><script>alert(1)</script>\",\"preview\":true}"
+check "the preview says the stored result will be sanitised" \
+  "$(py 'import json,sys;print("sanitises the result" in json.load(sys.stdin)["result"]["content"][0]["text"])' al_prev)" "True"
+al al_xss "{\"ID\":$AL,\"field\":\"post_content\",\"search\":\"</p>\",\"replace\":\"</p><script>alert(1)</script>\"}"
+check "a script spliced in by search and replace is not stored" \
+  "$(docker compose exec -T cli wp post get "$AL" --field=post_content 2>/dev/null | grep -c '<script')" "0"
+al al_title "{\"ID\":$AL,\"field\":\"post_title\",\"search\":\"Alter probe\",\"replace\":\"<img src=x onerror=alert(1)>Alter title\"}"
+check "nor is markup spliced into a title" \
+  "$(docker compose exec -T cli wp post get "$AL" --field=post_title 2>/dev/null | tr -d '\r\n')" "Alter title"
+al al_ok "{\"ID\":$AL,\"field\":\"post_content\",\"search\":\"alter-legit\",\"replace\":\"alter-changed\"}"
+check "CONTROL: an ordinary replacement still lands" \
+  "$(docker compose exec -T cli wp post get "$AL" --field=post_content 2>/dev/null | grep -c 'alter-changed')" "1"
+docker compose exec -T cli wp post delete "$AL" --force >/dev/null 2>&1
+
 echo "-- the everyday meta tool keeps backslashes --"
 # update_post_meta() unslashes what it is given, so a value carrying backslashes arrives
 # stripped: a JSON payload stops parsing, a regex stops matching and a Windows path loses
