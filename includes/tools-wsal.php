@@ -148,16 +148,31 @@ class GMCP_Tools_Wsal {
   * Explicit ids rather than a range or a prefix, because alert numbering in this plugin is
   * historical and grouped by subsystem rather than contiguous. The families are the four
   * questions worth asking about a site's security in one call.
+  *
+  * Built from the alert catalogue shipped in WP Activity Log 5.6.8 (defaults.php: the
+  * title, object and event type of each id), not from memory. The first version of this
+  * table filed logins under passwords (1000 is "User logged in"), account creation under
+  * passwords (4001), and left out the role change itself (4002), so the briefing
+  * undercounted role escalations under "roles". Every id appears in exactly one family. An
+  * id a given version of the plugin does not define simply never matches.
   */
   const FAMILIES = [
-    // Logins and logouts, including the failed attempts that matter.
-    'logins'   => [ 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010 ],
-    // Password changes, on a user and on the site.
-    'passwords' => [ 1000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009 ],
-    // Role and capability changes, including user creation and deletion.
-    'roles'    => [ 4000, 4001, 4010, 4011, 4012, 4013, 4014, 4015, 4016, 4017 ],
-    // Plugin and theme installs, updates, activations and deletions.
-    'plugins'  => [ 5000, 5001, 5002, 5003, 5004, 5005, 5006, 5007, 5010, 5011, 5012, 5013, 5014, 5015, 5016, 5017, 5018, 5022, 5023, 5024, 5050, 5051, 5052, 5053, 5054, 5055 ],
+    // Sessions: 1000 logged in, 1001 logged out, 1002 failed login (existing user), 1003 failed
+    // login (unknown user), 1004 login blocked, 1005 login with existing sessions, 1006 other
+    // sessions logged out, 1007 session destroyed, 1008 switched user, 1009 idle session ended.
+    'logins'   => [ 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009 ],
+    // Credentials: 1010 password reset requested, 4003 own password changed, 4004 another
+    // user's password changed, 4029 admin sent a reset request, 4025-4028 application
+    // passwords created and revoked.
+    'passwords' => [ 1010, 4003, 4004, 4029, 4025, 4026, 4027, 4028 ],
+    // Who exists and what they may do: 4002 role changed, 4000 and 4001 user created, 4007
+    // user deleted, 4008 and 4009 Super Admin granted and revoked, 4010 and 4011 user added to
+    // and removed from a site, 4012 network user created.
+    'roles'    => [ 4002, 4000, 4001, 4007, 4008, 4009, 4010, 4011, 4012 ],
+    // Code on the site: 5000 plugin installed, 5001 activated, 5002 deactivated, 5003
+    // uninstalled, 5004 upgraded, 5030 install failed; 5005 theme installed, 5006 activated,
+    // 5007 uninstalled, 5008 and 5009 activated and deactivated on the network, 5031 updated.
+    'plugins'  => [ 5000, 5001, 5002, 5003, 5004, 5030, 5005, 5006, 5007, 5008, 5009, 5031 ],
   ];
 
   /**
@@ -179,10 +194,15 @@ class GMCP_Tools_Wsal {
   * a new piece of metadata that a future version stores cannot arrive in a reply because
   * nobody remembered to exclude it. The scalar names are safe by being about the site
   * (a post, a role, a plugin), not about a person.
+  *
+  * OldValue and NewValue are deliberately absent. wsal_get_event withholds them (they are
+  * not in RETURNED_META), and a message built from the same row that printed them would
+  * make the withholding decorative. The stock templates that use them describe counters,
+  * not secrets, but a custom alert is free to put anything there.
   */
   const FILLABLE = [
     'PostTitle', 'PostType', 'PostStatus', 'PostID', 'OldTitle', 'NewTitle',
-    'OldStatus', 'NewStatus', 'OldRole', 'NewRole', 'OldValue', 'NewValue',
+    'OldStatus', 'NewStatus', 'OldRole', 'NewRole',
     'CustomFieldName', 'MetaKey', 'WidgetName', 'MenuName', 'WidgetType',
     'PluginName', 'ThemeName', 'File', 'FileName', 'EventType', 'Object',
     'ColorScheme', 'OptionName',
@@ -281,10 +301,25 @@ class GMCP_Tools_Wsal {
   * a group that assumed otherwise would report a version that is no longer running.
   */
   private function loaded(): bool {
-    return defined( 'WSAL_VERSION' )
+    return defined( 'WSAL_VERSION' );
+  }
+
+  /**
+  * Whether this WP Activity Log can supply alert message templates.
+  *
+  * Separate from loaded() because counting and listing need only the two tables, which 4.x
+  * has as well, while the template API (\WSAL\Controllers\Alert) arrived in 5.x. A site
+  * still on 4.x has a populated log; refusing to read it because a class it never had is
+  * missing would report "no activity log" for one that exists.
+  */
+  private function templates_available(): bool {
+    return $this->loaded()
       && class_exists( '\WSAL\Controllers\Alert' )
       && method_exists( '\WSAL\Controllers\Alert', 'get_original_alert_message' );
   }
+
+  /** The occurrence columns the readers select. A schema without them is reported, not guessed at. */
+  const REQUIRED_COLUMNS = [ 'id', 'site_id', 'alert_id', 'created_on', 'severity', 'object', 'event_type', 'post_id', 'post_type', 'user_id', 'username', 'user_roles' ];
 
   private function tools(): array {
     return [
@@ -532,7 +567,7 @@ class GMCP_Tools_Wsal {
 
   /** One event and its metadata. */
   private function get_event( array $args, array $r ): array {
-    $state = $this->log_state();
+    $state = $this->log_state( false );
     if ( true !== $state['readable'] ) {
       return $this->json( $r, [ 'log_state' => $state, 'event' => null, 'note' => 'There is no readable local activity log, so no event is reported.' ] );
     }
@@ -577,7 +612,7 @@ class GMCP_Tools_Wsal {
   * The four ways a zero can be wrong are separated here, so no tool has to guess. readable
   * is true only when the plugin is loaded, both tables are present and storage is local.
   */
-  private function log_state(): array {
+  private function log_state( bool $with_totals = true ): array {
     $state = [
       'plugin_loaded'   => $this->loaded(),
       'storage'         => 'local',
@@ -642,6 +677,29 @@ class GMCP_Tools_Wsal {
     }
 
     $state['readable'] = true;
+    $state['message_templates'] = $this->templates_available();
+    if ( !$state['message_templates'] ) {
+      $state['templates_note'] = 'This WP Activity Log version has no message-template API, so events are listed without a message.';
+    }
+
+    // Columns the readers select. Older schemas (4.x before the occurrence row carried
+    // severity, object and event type) lack some; naming them is better than a SQL error.
+    $columns = $this->rows( 'SHOW COLUMNS FROM ' . $this->table( self::T_OCCURRENCES ), [] );
+    if ( is_array( $columns ) ) {
+      $have = array_map( 'strval', array_column( $columns, 'Field' ) );
+      $lacking = array_values( array_diff( self::REQUIRED_COLUMNS, $have ) );
+      if ( $lacking ) {
+        $state['readable'] = false;
+        $state['note'] = 'The activity log table exists but its columns differ from the schema this plugin reads (missing: ' . implode( ', ', $lacking ) . '). That is what an older WP Activity Log looks like. No counts are reported, because a count from a table read the wrong way is not a count. Update WP Activity Log, or read the log on its own screen.';
+        return $state;
+      }
+    }
+
+    // wsal_get_event asks for one row by id and has no use for a whole-table aggregate, which
+    // scans every row of a log that is often millions long.
+    if ( !$with_totals ) {
+      return $state;
+    }
 
     $sql = 'SELECT COUNT(*) AS n, MIN(created_on) AS oldest, MAX(created_on) AS newest'
       . ' FROM ' . $this->table( self::T_OCCURRENCES ) . ' WHERE site_id = %d';
@@ -710,7 +768,13 @@ class GMCP_Tools_Wsal {
       // unset option and not the same as an empty one.
       return null === $value ? $default : $value;
     }
-    return get_option( 'wsal_' . $name, $default );
+    // Before the settings helper existed the options were written with a dash (wsal-pruning-
+    // date) as well as, on some versions, an underscore. Either one set means it is set.
+    $value = get_option( 'wsal_' . $name, null );
+    if ( null === $value ) {
+      $value = get_option( 'wsal-' . $name, null );
+    }
+    return null === $value ? $default : $value;
   }
 
   /** A table name for this site's log. */
@@ -719,7 +783,12 @@ class GMCP_Tools_Wsal {
     // base_prefix, not prefix: this plugin keeps one network-wide table pair, so on
     // multisite prefix would name a table that does not exist. Not verified on a multisite
     // install — this stack is single-site, where the two are the same string.
-    return $wpdb->base_prefix . $suffix;
+    $base = $wpdb->base_prefix . $suffix;
+    if ( $wpdb->prefix !== $wpdb->base_prefix && !$this->table_exists( $base ) && $this->table_exists( $wpdb->prefix . $suffix ) ) {
+      // An older WP Activity Log on a subsite keeps its tables under the site prefix.
+      return $wpdb->prefix . $suffix;
+    }
+    return $base;
   }
 
   private function site_id(): int {
@@ -763,9 +832,9 @@ class GMCP_Tools_Wsal {
   * Whether the caller of this request holds an admin-level credential.
   *
   * The level is published by the server when it authenticates a key. Defaulting to admin
-  * when it is absent is deliberate: a caller this cannot identify is treated as the more
-  * privileged one for the purpose of what is withheld, so a missing filter withholds more
-  * rather than less.
+  * when it is absent is the permissive direction, not the careful one: a caller this cannot
+  * identify is shown exact timestamps. That is safe only because these tools are reachable
+  * solely through the server, which sets the level whenever it authenticates a key.
   */
   private function caller_is_admin(): bool {
     return 'admin' === (string) apply_filters( 'gmcp_caller_access_level', 'admin' );
@@ -842,7 +911,7 @@ class GMCP_Tools_Wsal {
   */
   private function alert_templates( array $alert_ids ): array {
     $out = [];
-    if ( !$this->loaded() ) {
+    if ( !$this->templates_available() ) {
       return $out;
     }
     foreach ( array_unique( array_map( 'intval', $alert_ids ) ) as $alert_id ) {
@@ -917,11 +986,20 @@ class GMCP_Tools_Wsal {
       }
       $value = $meta[ $name ] ?? null;
       if ( !is_scalar( $value ) ) {
-        // Covers a serialised object and an absent name in one branch: neither is a value
-        // this tool prints, and the placeholder stays visible.
         return $m[0];
       }
-      return (string) $value;
+      $value = (string) $value;
+      // A serialised object arrives from the database as a STRING, so is_scalar() above does
+      // not exclude it; printing it would be the raw a:..{...} text. The same test
+      // wsal_get_event applies.
+      if ( $this->looks_serialised( $value ) ) {
+        return $m[0];
+      }
+      // A name-holding field the site calls secret: the rule safe_metadata() applies.
+      if ( in_array( $name, [ 'MetaKey', 'CustomFieldName', 'OptionName' ], true ) && GMCP_Core::field_looks_secret( $value ) ) {
+        return $m[0];
+      }
+      return $value;
     }, $template );
 
     return trim( wp_strip_all_tags( (string) $out ) );
@@ -999,7 +1077,10 @@ class GMCP_Tools_Wsal {
     }
 
     $template = $templates[ $alert_id ] ?? '';
-    if ( $suppressed ) {
+    if ( !$this->templates_available() && !$suppressed ) {
+      $event['message'] = null;
+      $event['message_note'] = 'This version of WP Activity Log (' . ( defined( 'WSAL_VERSION' ) ? WSAL_VERSION : 'unknown' ) . ') does not expose the alert message templates this tool fills, so there is no message. The event itself is above.';
+    } elseif ( $suppressed ) {
       $event['message'] = null;
       $event['message_withheld'] = 'The message for this alert type is not returned, because it is built from the username someone typed at the login form and that field regularly contains a mistyped password. The event itself, its time and its actor are above.';
     } elseif ( $template === '' ) {
@@ -1023,8 +1104,8 @@ class GMCP_Tools_Wsal {
   * The allowlisted metadata for a set of occurrences, in one query.
   *
   * Separate from safe_metadata() because the two answer different questions: this one
-  * supplies values to fill a message template, and it reads only the names on the allowlist.
-  * safe_metadata() returns a filtered name/value map for one event and works by exclusion.
+  * supplies values to fill a message template, and it reads only the names on FILLABLE.
+  * safe_metadata() returns a name/value map for one event, filtered to RETURNED_META.
   */
   private function fillable_metadata( array $occurrence_ids ): array {
     global $wpdb;
@@ -1058,16 +1139,11 @@ class GMCP_Tools_Wsal {
   *
   * Deny by default, which is the opposite of how this started. The names returned are ones
   * that describe the site; every other name on the row is withheld, and the names of the
-  * withheld keys are reported so an absence is visible rather than silent.
-  *
-  * A value is additionally dropped when the name holding it — `MetaKey`, `custom_field_name`,
-  * `OptionName` — itself looks credential-shaped, because that is a field the site chose to
-  * call secret and the sibling check the earlier version used looked in the wrong place: it
-  * asked whether a sibling's NAME looked secret, while the signal is in the VALUE of the
-  * name-holding key.
+  * withheld keys are reported so an absence is visible rather than silent. The name-holding
+  * keys (MetaKey, custom_field_name, OptionName) and the values beside them are not in the
+  * allowlist at all, so a field the site calls secret cannot be reached through a sibling.
   */
   private function safe_metadata( int $occurrence_id, array $row ): array {
-    global $wpdb;
     $sql = 'SELECT name, value FROM ' . $this->table( self::T_METADATA ) . ' WHERE occurrence_id = %d';
     $rows = $this->rows( $sql, [ $occurrence_id ] );
     if ( is_string( $rows ) ) {
@@ -1077,16 +1153,6 @@ class GMCP_Tools_Wsal {
     }
     if ( !$rows ) {
       return [ (object) [], [ 'metadata_note' => 'This event has no metadata rows.' ] ];
-    }
-
-    // Does any name on the row hold the name of a field the site called secret?
-    $secret_field = false;
-    foreach ( $rows as $meta ) {
-      if ( in_array( (string) $meta['name'], [ 'MetaKey', 'custom_field_name', 'OptionName', 'CustomFieldName' ], true )
-        && GMCP_Core::field_looks_secret( (string) $meta['value'] ) ) {
-        $secret_field = true;
-        break;
-      }
     }
 
     $out = [];
@@ -1101,12 +1167,6 @@ class GMCP_Tools_Wsal {
         }
         continue;
       }
-      if ( $secret_field && in_array( $name, [ 'OldValue', 'NewValue' ], true ) ) {
-        $withheld[] = $name;
-        $marked = true;
-        continue;
-      }
-
       $value = (string) $meta['value'];
       if ( $this->looks_serialised( $value ) ) {
         // A serialised value is never printed. Casting one still exposes every property it
