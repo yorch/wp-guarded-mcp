@@ -64,6 +64,43 @@ class GMCP_Tools_Core {
   }
 
   /**
+  * An argument filtered through kses, with nothing unslashed.
+  *
+  * clean_html() unslashes first, which is right for nothing that reaches this class:
+  * arguments arrive from json_decode() of the request body, never from $_POST, so no
+  * slashes were added on the way in and the unslash removes real ones. Every WordPress
+  * writer then unslashes again, so a comment reading "C:\Users\x" was stored as
+  * "C:Usersx" and reported as created. Callers using this slash the array they hand to
+  * the writer, the way the post writers already do.
+  */
+  private function kses_arg( string $v ): string {
+    return wp_kses_post( $v );
+  }
+
+  /**
+  * tax_input as wp_update_post() expects it: taxonomy => term ids, or names for a flat
+  * taxonomy, or a comma-separated string. sanitize_text_field() blanked the array whole.
+  */
+  private function clean_tax_input( $v ): array {
+    $out = [];
+    foreach ( (array) $v as $tax => $terms ) {
+      $tax = sanitize_key( (string) $tax );
+      if ( $tax === '' ) {
+        continue;
+      }
+      if ( is_array( $terms ) ) {
+        $out[ $tax ] = array_values( array_map( function ( $t ) {
+          return is_int( $t ) || ( is_string( $t ) && ctype_digit( $t ) ) ? (int) $t : sanitize_text_field( (string) ( is_scalar( $t ) ? $t : '' ) );
+        }, $terms ) );
+      }
+      elseif ( is_scalar( $terms ) ) {
+        $out[ $tax ] = sanitize_text_field( (string) $terms );
+      }
+    }
+    return $out;
+  }
+
+  /**
   * Whether this site has opted into storing raw HTML in post content.
   *
   * Off by default. A site that genuinely needs an iframe, inline SVG, a <style> block
@@ -1026,7 +1063,7 @@ class GMCP_Tools_Core {
       $ins['post_content'] = $this->prepare_new_content( $a['post_content'] );
     }
     if ( $a['post_excerpt'] ?? '' ) {
-      $ins['post_excerpt'] = $this->clean_html( $a['post_excerpt'] );
+      $ins['post_excerpt'] = $this->kses_arg( (string) $a['post_excerpt'] );
     }
     if ( $a['post_name'] ?? '' ) {
       $ins['post_name'] = sanitize_title( $a['post_name'] );
@@ -1041,17 +1078,14 @@ class GMCP_Tools_Core {
       $ins['meta_input'] = $meta_input;
     }
 
+    // meta_input rides inside $ins, so wp_slash() below slashes its values once and
+    // wp_insert_post() hands them to update_post_meta(), which unslashes once: the round
+    // trip is exact. (A fallback loop used to follow for "meta_input that wp_insert_post did
+    // not write", a condition that could never be true, and it sanitize_key()'d the keys,
+    // contradicting the rule that meta keys are stored as given.)
     $new = wp_insert_post( wp_slash( $ins ), true );
     if ( is_wp_error( $new ) ) {
       return $new;
-    }
-    if ( empty( $ins['meta_input'] ) && !empty( $meta_input ) && is_array( $meta_input ) ) {
-      foreach ( $meta_input as $k => $v ) {
-        // Pass the value as-is: update_post_meta() serializes arrays itself.
-        // maybe_serialize() here double-serialized nested arrays, so they read
-        // back as a string and consumers (e.g. Noptin) rejected them as legacy.
-        update_post_meta( $new, sanitize_key( $k ), $v );
-      }
     }
     $this->bust_post_cache( (int) $new, [ 'tool' => $tool ] );
     return (int) $new;
@@ -1809,14 +1843,15 @@ class GMCP_Tools_Core {
       ],
       'wp_get_terms' => [
         'name' => 'wp_get_terms',
-        'description' => 'List terms of a taxonomy.',
+        'description' => 'List terms of a taxonomy, 100 at a time by default (limit up to 500, offset to page).',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
             'taxonomy' => [ 'type' => 'string' ],
             'search' => [ 'type' => 'string' ],
             'parent' => [ 'type' => 'integer' ],
-            'limit' => [ 'type' => 'integer' ],
+            'limit' => [ 'type' => 'integer', 'description' => 'At most this many terms (default 100, maximum 500).' ],
+            'offset' => [ 'type' => 'integer', 'description' => 'Skip this many terms, for paging past the limit.' ],
           ],
           'required' => [ 'taxonomy' ],
         ],
@@ -1884,14 +1919,14 @@ class GMCP_Tools_Core {
       ],
       'wp_add_post_terms' => [
         'name' => 'wp_add_post_terms',
-        'description' => 'Attach or replace terms for a post. Set "append=true" to ADD terms to existing ones, or "append=false" (default) to REPLACE all terms. Use for categories, tags, or WooCommerce attributes (pa_color, pa_size, etc.).',
+        'description' => 'Attach or replace terms for a post. By default (append true) the terms are ADDED to the ones the post already has; pass "append": false to REPLACE them all. Terms are term ids; for a hierarchical taxonomy such as category, a name is looked up and refused if it does not exist, and for a flat one such as post_tag a new name creates the tag. The reply lists the term ids the post holds afterwards. Use for categories, tags, or WooCommerce attributes (pa_color, pa_size, etc.).',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
             'ID' => [ 'type' => 'integer' ],
             'taxonomy' => [ 'type' => 'string' ],
-            'terms' => [ 'type' => 'array', 'items' => [ 'type' => 'integer' ] ],
-            'append' => [ 'type' => 'boolean' ],
+            'terms' => [ 'type' => 'array', 'items' => [ 'type' => [ 'integer', 'string' ] ] ],
+            'append' => [ 'type' => 'boolean', 'description' => 'true (default) adds to the existing terms; false replaces them.' ],
           ],
           'required' => [ 'ID', 'terms' ],
         ],
@@ -2803,13 +2838,14 @@ class GMCP_Tools_Core {
         }
         $ins = [
           'comment_post_ID' => intval( $a['post_id'] ),
-          'comment_content' => $this->clean_html( $a['comment_content'] ),
-          'comment_author' => sanitize_text_field( $a['comment_author'] ?? '' ),
-          'comment_author_email' => sanitize_email( $a['comment_author_email'] ?? '' ),
-          'comment_author_url' => esc_url_raw( $a['comment_author_url'] ?? '' ),
+          'comment_content' => $this->kses_arg( (string) $a['comment_content'] ),
+          'comment_author' => sanitize_text_field( (string) ( $a['comment_author'] ?? '' ) ),
+          'comment_author_email' => sanitize_email( (string) ( $a['comment_author_email'] ?? '' ) ),
+          'comment_author_url' => esc_url_raw( (string) ( $a['comment_author_url'] ?? '' ) ),
           'comment_approved' => $a['comment_approved'] ?? 1,
         ];
-        $cid = wp_insert_comment( $ins );
+        // Slashed because wp_insert_comment() unslashes. @see kses_arg().
+        $cid = wp_insert_comment( wp_slash( $ins ) );
         if ( is_wp_error( $cid ) ) {
           /** @var WP_Error $cid */
           $r = $this->error( $r, $cid->get_error_message(), $cid->get_error_code() );
@@ -2827,7 +2863,10 @@ class GMCP_Tools_Core {
         $c = [ 'comment_ID' => intval( $a['comment_ID'] ) ];
         if ( !empty( $a['fields'] ) && is_array( $a['fields'] ) ) {
           foreach ( $a['fields'] as $k => $v ) {
-            $c[ $k ] = ( $k === 'comment_content' ) ? $this->clean_html( $v ) : sanitize_text_field( $v );
+            if ( !is_scalar( $v ) ) {
+              continue;
+            }
+            $c[ $k ] = ( $k === 'comment_content' ) ? $this->kses_arg( (string) $v ) : sanitize_text_field( (string) $v );
           }
         }
         // The id the caller named at the top level, forced back after the merge for the
@@ -2835,7 +2874,8 @@ class GMCP_Tools_Core {
         // nested comment_ID would otherwise decide which comment is written.
         $comment_id = intval( $a['comment_ID'] );
         $c['comment_ID'] = $comment_id;
-        $cid = wp_update_comment( $c, true );
+        // Slashed because wp_update_comment() unslashes. @see kses_arg().
+        $cid = wp_update_comment( wp_slash( $c ), true );
         if ( is_wp_error( $cid ) ) {
           $r = $this->error( $r, $cid->get_error_message(), $cid->get_error_code() );
         }
@@ -3385,7 +3425,18 @@ class GMCP_Tools_Core {
         if ( $d ) {
           $args['date_query'] = [ $d ];
         }
-        $total = count( get_posts( $args ) );
+        // Counted, never listed. get_posts() defaults to five results, so this answered "5"
+        // on a site with twelve thousand attachments; asking for every id instead would load
+        // all of them to print one number. Without a date filter WordPress keeps the count.
+        if ( !$d ) {
+          $by_type = (array) wp_count_attachments();
+          unset( $by_type['trash'] );
+          $total = (int) array_sum( array_map( 'intval', $by_type ) );
+        }
+        else {
+          $count_q = new WP_Query( $args + [ 'posts_per_page' => 1, 'no_found_rows' => false ] );
+          $total = (int) $count_q->found_posts;
+        }
         $this->add_result_text( $r, (string) $total );
         break;
 
@@ -4032,8 +4083,38 @@ class GMCP_Tools_Core {
         // Track what we're trying to update for verification
         $content_to_verify = null;
         if ( !empty( $fields ) && is_array( $fields ) ) {
+          $field_error = null;
           foreach ( $fields as $k => $v ) {
-            $c[ $k ] = in_array( $k, [ 'post_content', 'post_excerpt' ], true ) ? $this->store_html( $v ) : sanitize_text_field( $v );
+            if ( $k === 'post_category' ) {
+              // An array, per the schema. sanitize_text_field() turned it into "", and
+              // wp_update_post() keeps the existing categories for anything that is not a
+              // non-empty array, so the call reported success and changed nothing.
+              $c[ $k ] = array_values( array_filter( array_map( 'intval', (array) $v ) ) );
+              continue;
+            }
+            if ( $k === 'tax_input' ) {
+              $c[ $k ] = $this->clean_tax_input( $v );
+              continue;
+            }
+            if ( in_array( $k, [ 'post_content', 'post_excerpt' ], true ) ) {
+              if ( !is_scalar( $v ) ) {
+                $field_error = 'fields.' . $k . ' must be a string.';
+                break;
+              }
+              $c[ $k ] = $this->store_html( (string) $v );
+              continue;
+            }
+            if ( !is_scalar( $v ) && $v !== null ) {
+              // Blanked to "" before, which wrote an empty title or slug while reporting
+              // success. Said instead, before anything is written.
+              $field_error = 'fields.' . $k . ' must be a string or a number.';
+              break;
+            }
+            $c[ $k ] = sanitize_text_field( (string) $v );
+          }
+          if ( $field_error !== null ) {
+            $r = $this->error( $r, $field_error . ' Nothing was written.', -32602 );
+            break;
           }
           if ( isset( $c['post_content'] ) ) {
             $content_to_verify = $c['post_content'];
@@ -4157,10 +4238,12 @@ class GMCP_Tools_Core {
         $meta_notes = [];
         if ( $has_meta ) {
           foreach ( $meta_input as $k => $v ) {
-            // Pass the value as-is: update_post_meta() serializes arrays itself.
-            // maybe_serialize() here double-serialized nested arrays.
-            // wp_slash on the key alone, because update_metadata() unslashes it.
-            update_post_meta( $u, wp_slash( (string) $k ), $v );
+            // Through prepare_meta_value(), the answer the other meta writers already share:
+            // JSON for an array is decoded, and the value is slashed because
+            // update_metadata() unslashes it. Only the key used to be slashed, so every
+            // backslash in a value was lost and a JSON design came back unparseable under a
+            // success reply. Never maybe_serialize(): update_post_meta() serializes arrays.
+            update_post_meta( $u, wp_slash( (string) $k ), $this->prepare_meta_value( $v ) );
             $meta_elsewhere = $this->meta_key_stored_as( (int) $u, (string) $k );
             if ( $meta_elsewhere !== '' ) {
               $meta_notes[ (string) $k ] = 'went into the row already spelled "' . $meta_elsewhere
@@ -4788,14 +4871,26 @@ class GMCP_Tools_Core {
         $args = [
           'taxonomy' => $tax,
           'hide_empty' => false,
-          'number' => intval( $a['limit'] ?? 0 ),
-          'search' => $a['search'] ?? '',
+          // Bounded like every other list tool. 0 meant "all", and on a site with a hundred
+          // thousand tags one read loaded every term object into memory.
+          'number' => max( 1, min( 500, intval( $a['limit'] ?? 100 ) ) ),
+          'search' => (string) ( $a['search'] ?? '' ),
         ];
+        if ( isset( $a['offset'] ) ) {
+          $args['offset'] = max( 0, intval( $a['offset'] ) );
+        }
         if ( isset( $a['parent'] ) ) {
           $args['parent'] = intval( $a['parent'] );
         }
+        $terms_found = get_terms( $args );
+        // An unknown taxonomy is a WP_Error, and walking it as a list printed rows of nulls
+        // instead of saying what was wrong.
+        if ( is_wp_error( $terms_found ) ) {
+          $r = $this->error( $r, $terms_found->get_error_message(), $terms_found->get_error_code() );
+          break;
+        }
         $out = [];
-        foreach ( get_terms( $args ) as $t ) {
+        foreach ( (array) $terms_found as $t ) {
           $out[] = [ 'term_id' => $t->term_id, 'name' => $t->name, 'slug' => $t->slug, 'count' => $t->count ];
         }
         $this->add_result_text( $r, wp_json_encode( $out, JSON_PRETTY_PRINT ) );
@@ -4870,8 +4965,13 @@ class GMCP_Tools_Core {
           break;
         }
         $tax = sanitize_key( $a['taxonomy'] ?? 'category' );
+        $post_terms = wp_get_post_terms( intval( $a['ID'] ), $tax, [ 'fields' => 'all' ] );
+        if ( is_wp_error( $post_terms ) ) {
+          $r = $this->error( $r, $post_terms->get_error_message(), $post_terms->get_error_code() );
+          break;
+        }
         $out = [];
-        foreach ( wp_get_post_terms( intval( $a['ID'] ), $tax, [ 'fields' => 'all' ] ) as $t ) {
+        foreach ( (array) $post_terms as $t ) {
           $out[] = [ 'term_id' => $t->term_id, 'name' => $t->name ];
         }
         $this->add_result_text( $r, wp_json_encode( $out, JSON_PRETTY_PRINT ) );
@@ -4893,13 +4993,50 @@ class GMCP_Tools_Core {
           break;
         }
         $tax = sanitize_key( $a['taxonomy'] ?? 'category' );
+        if ( !taxonomy_exists( $tax ) ) {
+          $r = $this->error( $r, 'There is no taxonomy "' . $tax . '" on this site. wp_get_taxonomies lists them.', -32602 );
+          break;
+        }
+        // Append by default, which is what the code always did; the description used to say
+        // the default replaced, so a caller relying on it ended up with old and new terms.
         $append = !isset( $a['append'] ) || $a['append'];
+        $terms = is_array( $terms ) ? array_values( $terms ) : [ $terms ];
+        // wp_set_post_terms() intval()s every term of a hierarchical taxonomy, so a category
+        // NAME became 0, was dropped, and the reply said "Terms set". Names are looked up
+        // here instead, and one that does not exist is refused rather than silently lost.
+        if ( is_taxonomy_hierarchical( $tax ) ) {
+          $resolved = [];
+          $unknown = [];
+          foreach ( $terms as $term ) {
+            if ( is_int( $term ) || ( is_string( $term ) && ctype_digit( $term ) ) ) {
+              $resolved[] = (int) $term;
+              continue;
+            }
+            $hit = is_scalar( $term ) ? term_exists( (string) $term, $tax ) : null;
+            if ( $hit ) {
+              $resolved[] = (int) ( is_array( $hit ) ? $hit['term_id'] : $hit );
+            }
+            else {
+              $unknown[] = is_scalar( $term ) ? (string) $term : gettype( $term );
+            }
+          }
+          if ( $unknown ) {
+            $r = $this->error( $r, 'No ' . $tax . ' term named ' . implode( ', ', array_map( function ( $n ) { return '"' . $n . '"'; }, $unknown ) ) . '. Create it with wp_create_term or pass term ids. Nothing was changed.', -32602 );
+            break;
+          }
+          $terms = $resolved;
+        }
         $set = wp_set_post_terms( intval( $a['ID'] ), $terms, $tax, $append );
         if ( is_wp_error( $set ) ) {
           $r = $this->error( $r, $set->get_error_message(), $set->get_error_code() );
         }
+        elseif ( $set === false ) {
+          $r = $this->error( $r, 'Post #' . intval( $a['ID'] ) . ' does not exist, so no terms were set.', -32602 );
+        }
         else {
-          $this->add_result_text( $r, 'Terms set for post #' . $a['ID'] );
+          $now = wp_get_object_terms( intval( $a['ID'] ), $tax, [ 'fields' => 'ids' ] );
+          $this->add_result_text( $r, 'Terms ' . ( $append ? 'added to' : 'replaced on' ) . ' post #' . intval( $a['ID'] )
+            . '. It now holds ' . $tax . ' term ids: ' . ( is_array( $now ) && $now ? implode( ', ', $now ) : 'none' ) . '.' );
         }
         break;
 
@@ -5047,10 +5184,10 @@ class GMCP_Tools_Core {
           $upd['post_title'] = sanitize_text_field( $a['title'] );
         }
         if ( $a['caption'] ?? '' ) {
-          $upd['post_excerpt'] = $this->clean_html( $a['caption'] );
+          $upd['post_excerpt'] = $this->kses_arg( (string) $a['caption'] );
         }
         if ( $a['description'] ?? '' ) {
-          $upd['post_content'] = $this->clean_html( $a['description'] );
+          $upd['post_content'] = $this->kses_arg( (string) $a['description'] );
         }
         $u = wp_update_post( wp_slash( $upd ), true );
         if ( is_wp_error( $u ) ) {
