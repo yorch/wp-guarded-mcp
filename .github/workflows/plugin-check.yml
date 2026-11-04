@@ -92,7 +92,7 @@ jobs:
               # publication.
               wp-mem plugin check guarded-mcp \
                 --exclude-directories=.dev,.github,tmp \
-                --exclude-files=.gitignore,AGENTS.md,CLAUDE.md,README.md \
+                --exclude-files=.gitignore,AGENTS.md,CLAUDE.md,README.md,CHANGELOG.md,release-please-config.json,.release-please-manifest.json \
                 --ignore-codes=hidden_files,github_directory \
                 --format=table \
                 --allow-root
