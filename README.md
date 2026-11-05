@@ -351,7 +351,12 @@ count is zero and the honest answer is "nothing has looked yet", so the scan blo
 firewall's `learning-mode` is reported with what it means, because "enabled" and "blocking"
 are different claims. `wf_lockouts` lists only the block types that name one address — a
 country or pattern block stores an all-zero IP, which renders as `::` — and the counts in
-`wf_status` break down by type so those are not lost. There is **no write tool, and there will
+`wf_status` break down by type so those are not lost. A login lockout's recorded reason ends
+in what the visitor typed at the login form (`... was: 'username'`, and the same for the
+password-reset form and for an invalid username), which regularly is a mistyped password or an
+email address, so that text is replaced with `[withheld: typed text]` and the fixed wording
+around it is kept. Only those three templates of Wordfence's are recognised; a reason of any
+other shape is returned as stored. There is **no write tool, and there will
 not be one**: dismissing an issue, whitelisting an address, changing a firewall mode or
 starting a scan are each a way to make the watcher quieter, and an agent that can quiet it and
 then read it back can confirm its own silence. No configuration value that is a credential or

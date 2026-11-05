@@ -234,6 +234,37 @@ check "the lockout is reported active" "$(jget wf_lockouts lockouts.0.active)" "
 check "the reason is returned" "$(has wf_lockouts "probe lockout")" "yes"
 check "parameters are named as withheld" "$(jget wf_lockouts withheld.0)" "parameters"
 
+# The reason column of a login lockout holds what a visitor TYPED at the login form. Wordfence's
+# own templates (waf/wfWAFBlockConstants.php) end "... was: '<username>'", "... entered before
+# getting locked out was: '<username or email>'" and "Used an invalid username '<username>' to
+# try to sign in", and that field regularly holds a mistyped password or an email address. The
+# WP Activity Log group withholds the same text for the same reason, and a reply is copied into
+# this plugin's own audit log, so a value returned here cannot be taken back. The fixtures use
+# the real templates, through Wordfence's own writer, with an apostrophe in one of them because
+# Wordfence's own pattern for reading the field back stops at the first one.
+TYPED_A="typedpw-$MARK-a"
+TYPED_B="typed-$MARK-b@example.test"
+TYPED_C="typedinv-$MARK-c'tail"
+wpc eval 'wfBlock::createLockout("Exceeded the maximum number of login failures which is: 20. The last username they tried to sign in with was: \x27'"$TYPED_A"'\x27","203.0.113.78",3600);' >/dev/null 2>&1
+wpc eval 'wfBlock::createLockout("Exceeded the maximum number of tries to recover their password which is set at: 5. The last username or email they entered before getting locked out was: \x27'"$TYPED_B"'\x27","203.0.113.79",3600);' >/dev/null 2>&1
+wpc eval 'wfBlock::createLockout("Used an invalid username \x27'"$TYPED_C"'\x27 to try to sign in","203.0.113.80",3600);' >/dev/null 2>&1
+check "CONTROL: the typed username is stored in the reason" "$(dbhas "SELECT reason FROM wp_wfblocks7" "$TYPED_A")" "yes"
+check "CONTROL: the typed email is stored in the reason" "$(dbhas "SELECT reason FROM wp_wfblocks7" "$TYPED_B")" "yes"
+check "CONTROL: the typed invalid username is stored in the reason" "$(dbhas "SELECT reason FROM wp_wfblocks7" "typedinv-$MARK-c")" "yes"
+call wf_lockouts_t '{"jsonrpc":"2.0","id":53,"method":"tools/call","params":{"name":"wf_lockouts","arguments":{"limit":100}}}'
+check "CONTROL: the three rows are listed" "$(has wf_lockouts_t "203.0.113.78")$(has wf_lockouts_t "203.0.113.79")$(has wf_lockouts_t "203.0.113.80")" "yesyesyes"
+check "CONTROL: the fixed wording of each reason is returned" \
+  "$(has wf_lockouts_t "Exceeded the maximum number of login failures")$(has wf_lockouts_t "Exceeded the maximum number of tries to recover")$(has wf_lockouts_t "Used an invalid username")" "yesyesyes"
+check "the username typed at the login form is not returned" "$(has wf_lockouts_t "typedpw-$MARK")" "no"
+check "the email typed into the password-reset form is not returned" "$(has wf_lockouts_t "typed-$MARK-b")" "no"
+check "an invalid username is not returned, nor what follows an apostrophe in it" "$(has wf_lockouts_t "typedinv-$MARK")$(has wf_lockouts_t "c'tail")" "nono"
+check "and the reply says where the typed text was withheld" "$(has wf_lockouts_t "[withheld: typed text]")" "yes"
+for typed in "$TYPED_A" "$TYPED_B" "typedinv-$MARK-c"; do
+  tid=$(dbq "SELECT id FROM wp_wfblocks7 WHERE reason LIKE '%$typed%' LIMIT 1")
+  case "$tid" in ''|*[!0-9]*) ;; *) wpc eval 'wfBlock::removeBlockIDs( [ '"$tid"' ] );' >/dev/null 2>&1 ;; esac
+done
+check "put back: only the first fixture is left" "$(dbq 'SELECT COUNT(*) FROM wp_wfblocks7')" "$((BEFORE_BLOCKS + 1))"
+
 # A country block names no single address, and its all-zero IP column comes out of inet_ntop
 # as '::'. The tool must not list it as an address, and must count it where it belongs.
 wpc eval 'wfBlock::createCountry("'"$MARK"' country block",true,false,["XX"]);' >/dev/null 2>&1
