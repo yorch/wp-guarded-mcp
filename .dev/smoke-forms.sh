@@ -838,6 +838,7 @@ check "STORED: the submission, its revision and its upload are all still there, 
   "$(wpe 'echo get_post('"$SUB"')?"sub":"nosub","|",get_post('"$SUBREV"')?"rev":"norev","|",(int) get_post('"$SUBATT"')->post_parent==='"$SUB"'?"att":"orphan";')" "sub|rev|att"
 callas "$TOK" x5 "$(tc wp_delete_media "{\"ID\":$SUBATT,\"force\":true}")"
 check "deleting a submission's upload through wp_delete_media is refused" "$(verdict x5)" "error"
+check "and the refusal says \"an attachment\", not \"a attachment\"" "$(has x5 "it is an attachment that hangs from a flamingo_inbound")/$(has x5 "a attachment")" "yes/no"
 check "STORED: the upload is still there" "$(wpe 'echo get_post('"$SUBATT"')?"there":"gone";')" "there"
 callas "$TOK" x6 "$(tc gmcp_smoke_rawwrite "{\"op\":\"title\",\"id\":$SUBATT,\"value\":\"x\"}")"
 check "the net refuses a raw edit of the upload" "$(verdict x6)" "error"
@@ -914,7 +915,6 @@ callas "$RW" y8 "$(tc update_pages "{\"id\":$PG,\"parent\":$PG2}")"
 check "CONTROL: update_pages parenting it under an ordinary page succeeds" "$(verdict y8)" "ok"
 check "CONTROL: and STORED: it moved" "$(parent_of $PG)" "$PG2"
 wpe 'wp_update_post(["ID"=>'"$PG"',"post_parent"=>0]);' >/dev/null
-setrest false
 
 echo "-- a REST create that is refused leaves nothing behind, and no create tool can hide its own page --"
 # The controller inserts the row and then applies the featured image, the parent-like fields and the meta,
@@ -953,6 +953,7 @@ wpe 'update_option("gmcp_smoke_late_att",0);' >/dev/null
 callas "$RW" z8 "$(tc create_posts "{\"title\":\"$M2-late\",\"status\":\"draft\"}")"
 check "CONTROL: with the hook idle, the same call stores one post (the removal above was the refusal's doing)" "$(verdict z8)/$(rows_titled "$M2-late")" "ok/1"
 wpe 'foreach ( get_posts( [ "post_type" => "any", "post_status" => "any", "numberposts" => -1, "s" => "'"$M2"'-z" ] ) as $p ) { wp_delete_post( $p->ID, true ); } foreach ( get_posts( [ "post_type" => "any", "post_status" => "any", "numberposts" => -1, "s" => "'"$M2"'-late" ] ) as $p ) { wp_delete_post( $p->ID, true ); } delete_option( "gmcp_smoke_late_att" ); delete_post_meta( '"$SUBATT"', "_wp_attached_file" ); wp_update_post( [ "ID" => '"$SUBATT"', "post_mime_type" => "'"$SUBATT_MIME"'" ] );' >/dev/null
+setrest false
 
 echo "-- below admin a guarded post is answered exactly as one that does not exist --"
 MISSING=987654321

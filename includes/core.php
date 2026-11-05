@@ -1757,6 +1757,11 @@ class GMCP_Core {
     ] );
   }
 
+  /** "a flamingo_inbound", "an attachment": a type name with the right indefinite article. */
+  private static function with_article( string $noun ): string {
+    return ( preg_match( '/^[aeiou]/i', $noun ) === 1 ? 'an ' : 'a ' ) . $noun;
+  }
+
   /**
   * @param int    $post_id The post a read is aimed at.
   * @param string $type    A post type named directly, for a listing that names no post.
@@ -1781,7 +1786,7 @@ class GMCP_Core {
       return true;
     }
     return 'A ' . $hit . ' is a form submission: personal data a member of the public typed, stored as a post. The generic post readers do not return it, because they are available to a read-only key and a submission is admin-level data. '
-      . ( $chain[0] !== $hit ? 'This post belongs to one (it is a ' . $chain[0] . ' under it), and a revision, an upload or a child of a submission carries the same data. ' : '' )
+      . ( $chain[0] !== $hit ? 'This post belongs to one (it is ' . self::with_article( $chain[0] ) . ' under it), and a revision, an upload or a child of a submission carries the same data. ' : '' )
       . 'Use the form tools for that plugin (cf7_, fluentform_ or ninjaform_), which return it at admin level, never return passwords, file uploads, IP addresses or user agents, and report whether the store is there at all.';
   }
 
@@ -1960,7 +1965,7 @@ class GMCP_Core {
       return true;
     }
     return $verb . ' post #' . $post_id . ' is refused: '
-      . ( $own === $hit ? 'it is a ' . $hit : 'it is a ' . $own . ' that hangs from a ' . $hit ) . ', a form submission. '
+      . ( $own === $hit ? 'it is ' . self::with_article( $hit ) : 'it is ' . self::with_article( $own ) . ' that hangs from ' . self::with_article( $hit ) ) . ', a form submission. '
       . 'Nothing here edits, moves, annotates or deletes a visitor\'s submission or anything in its tree (its revisions, uploads and comments), at any access level: '
       . 'the form tools only read, and a write through the generic tools would change what the readers return, move a row out of the tree they keep from the readers, or destroy the only record of what the visitor sent. '
       . 'Handle submissions in wp-admin or with the form plugin.';

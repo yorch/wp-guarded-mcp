@@ -68,8 +68,8 @@ tools, the briefing, the resources, the featured image in the snapshot and the t
 item. Below admin it answers a submission with the sentence a post that does not exist gets
 (`post_not_found_text()`), so a key that can only read cannot walk ids and map which are
 submissions and which hang from one; a tool that has its own "not found" wording uses the same
-function for both. A listing never fetches a page and then drops rows: it skips what the caller
-may not read while it fills the page (`collect_readable()`), or judges the chain in SQL
+function for both. A listing never fetches a page and then drops rows, and never pages by loading
+rows up to its offset to skip the unreadable ones: it leaves them out in SQL
 (`unreadable_post_clauses()`, joins and not nested subqueries: the SQLite driver overflows its
 parser on seven nested `EXISTS`), through `with_readable_posts_sql()` and
 `with_readable_comments_sql()` for the listing tools so the offset is the database's (measured:

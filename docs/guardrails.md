@@ -1416,6 +1416,20 @@ re-read.
     asking the live column collation instead is not done, because LIKE and prefix comparison
     under expansions are not reliable and SQLite cannot answer. An id inside any other value (an ACF relationship field, an Elementor widget naming a
     post, a plugin's own table) is neither refused when written nor filtered when read.
+    **That includes ids written into `post_content`, which is not covered, and was measured:**
+    on a published page, `[gallery ids="<id of a submission's upload>"]` printed the upload's
+    `<img>` to an anonymous visitor, and the same shortcode on a draft printed it through a
+    preview link; a Query Loop block with `"parents":[<submission id>]` and `"postType":"page"`
+    printed the title of a published page that hangs from the submission. (`[gallery id="<submission id>"]`
+    printed nothing on the same site, so the `id` form is not the route there, which is a fact
+    about that WordPress version's gallery query and not a guard.) A write-time scan of post
+    content for `[gallery ids|include|exclude|id]` pointing into a guarded tree was considered and
+    not added: it would cover one shortcode of the many that take ids (`[audio]`, `[video]`,
+    `[playlist]`, plugin shortcodes), none of the block attributes or page-builder widgets
+    that do, and every writer of content, and a guard that names one route reads as covering
+    the others. So a write key that guesses an id (ids are small integers, and a write refusal
+    names an id as a submission) can publish that upload by naming the id in content it writes;
+    the read guards keep the submission's data from the readers, not from that.
   - A writer that is not one of the generic tools can still write a submission's own row (its
     title, body, meta and terms) while a tool call is in flight, because the net covers what
     hangs from a submission and not the row itself. That cannot move data out of the tree, which
@@ -1452,6 +1466,11 @@ re-read.
     log), which are gated by their own tools and levels and not by this guard.
 
   WooCommerce orders stored as posts ARE covered by `commerce_post_read_guard()` in
+  `wp_get_posts`, `wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`,
+  `wp_read_post_meta_chunk`, `wp_get_comments`, `wp_get_media`, the copy tools, the resource,
+  the REST tools and the template-reference scans, and in the menu readers for an item whose
+  target is one. That guard applies below admin level only, whereas the form-submission guard
+  applies at every level (an admin key uses the form tools).
 - **Fluent Forms has a setting that keeps no entries, and `fluentform_briefing` reports it.**
   `formSettings.delete_entry_on_submission` (a form's settings JSON in `fluentform_form_meta`,
   default `no`) deletes each entry as it is stored, and `delete_after_x_days` with
