@@ -40,6 +40,11 @@ under WordPress that ask it again for writers that do not. A new tool that write
 the guard; the net is the backstop, not the plan. Attachments are filtered through
 `wp_insert_attachment_data`, not `wp_insert_post_data`, and the net needs both. The flag caps the
 key at `readwrite`; that cap is part of the guard.
+What it covers is posts, their meta, term assignments, featured image and attached media, and
+nothing else: comments, taxonomy terms, users, options and preview links are outside it, and
+every sentence that describes it (refusal text, key label, README, readme.txt, guardrails) must
+say so rather than "anything that is live". Media attached to no post is refused for edits as
+well as deletes, because a live page may be showing it and nothing can find which.
 
 **A deletion is not always a delete tool.** WordPress deletes on markers it reads from
 ordinary rows: `wp_scheduled_delete()` removes every post with an old `_wp_trash_meta_time`

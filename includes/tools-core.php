@@ -4242,7 +4242,10 @@ class GMCP_Tools_Core {
         // The status this call would leave the post in is only known now that fields and
         // schedule_for are both folded into $c, and it is asked before anything is written:
         // the trash and restore steps below write before wp_update_post does.
-        $drafts = GMCP_Core::drafts_only_guard( $post_id, 'Updating', (string) ( $c['post_status'] ?? '' ) );
+        // An attachment is judged as hard as a deletion would be, for the reason given at
+        // wp_update_media: with no parent it may be the featured image or an embed of a live
+        // page. @see GMCP_Core::drafts_only_guard().
+        $drafts = GMCP_Core::drafts_only_guard( $post_id, 'Updating', (string) ( $c['post_status'] ?? '' ), get_post_type( $post_id ) === 'attachment' );
         if ( $drafts !== true ) {
           $r = $this->error( $r, $drafts, -32600 );
           break;
@@ -5324,7 +5327,10 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'No attachment with ID ' . intval( $a['ID'] ) . '. This tool edits media only; use wp_update_post for other posts.', -32602 );
           break;
         }
-        $drafts = GMCP_Core::drafts_only_guard( intval( $a['ID'] ), 'Updating' );
+        // $removing is true although this edits: the title, caption and alt text of a file with
+        // no parent change what every live page showing it displays, and nothing here can find
+        // those pages. Only media attached to a draft is the key's to edit.
+        $drafts = GMCP_Core::drafts_only_guard( intval( $a['ID'] ), 'Updating', '', true );
         if ( $drafts !== true ) {
           $r = $this->error( $r, $drafts, -32600 );
           break;

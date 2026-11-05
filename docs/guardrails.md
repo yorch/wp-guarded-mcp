@@ -1248,9 +1248,12 @@ private statuses count, and the comparison ignores case and trailing spaces, bec
 the posts table does and a stricter PHP check would call "Publish " a draft that every
 query finds. Unpublishing a live post is refused as well as publishing: taking a page
 down is a change to what the public sees. An attachment takes its parent's visibility,
-so media on a live page is protected and media on a draft, or on nothing, can be made
-and edited. Deleting unattached media is refused, because it can be a live page's
-featured image.
+so media attached to a live page is protected, and media attached to a draft can be made
+and edited. Media attached to NOTHING can be uploaded but neither edited (`wp_update_media`,
+or `wp_update_post` on an attachment) nor deleted: such a file can be a live page's featured
+image or an embed, and nothing here can find the pages that use it, so the guard refuses the
+case it cannot judge. An earlier version allowed the edit and said so in this paragraph;
+retitling or re-captioning a file changes what every live page showing it displays.
 
 **A net sits under the tools.** The tool-level checks give a clear sentence and stop
 before anything is half written, but a list of tools is not a proof that none was
@@ -1268,9 +1271,21 @@ because a pre-filter that returns false makes the caller believe it wrote.
 tools does either for content. That is why a drafts-only key is capped at read and
 write: the groups that reach third-party code (options, menus, the page builders, SEO
 and form plugins) are admin-level and are not offered to it. The
-cap is applied when the key is made and again whenever the key is presented. Comments,
-orders, taxonomy terms, users and options are not posts and are not covered. Pair the
-flag with a tool list when the key should do less than that.
+cap is applied when the key is made and again whenever the key is presented.
+
+**What it covers, and what it does not.** Covered: posts and what is stored as posts
+(pages, products, menu items), their custom fields, term assignments, featured image, and
+attachments attached to a post. Not covered, so a drafts-only key can still do these:
+create, approve and edit comments (`wp_create_comment`, `wp_update_comment`); create and
+rename taxonomy terms (`wp_create_term`, `wp_update_term`: renaming a category changes every
+live post in it, and deleting one needs `admin`); change users and options (`admin`, capped
+away); act on orders and subscriptions (the generic post tools refuse those for every
+key, the shop tools are `admin`); and share a draft by preview link, which shows it to
+whoever holds the URL. Edits to media attached to no post are refused (see above), and a
+draft can still embed media or shortcodes that render live data. An earlier version of the
+refusal text and the key's label said the key cannot touch "anything that is live", which
+was wider than any of this and has been narrowed to what is true. Pair the flag with a
+tool list when the key should do less than that.
 
 A refusal is an ordinary tool failure, so the audit log records it as a refusal under
 the key's label. Keys made before the flag exist have no `drafts_only` field, which
@@ -1397,13 +1412,13 @@ the second half.
   previews, because the setting cannot tell the two apart.
 - **An undo is the write it repeats.** `wp_undo_change` is a write-level tool, so on its name
   alone it never waits, but it replays earlier values: in the wider mode a key held for
-  `wp_update_option` could put an option back, unheld (reproduced). `classify_call()` looks the
-  recorded entry up (by `id`, or every entry of a `call`) and holds the undo as the strictest
-  tool that made the change, using the same list the undo itself asks "can this caller call it"
-  about (`GMCP_Journal::undo_tools()`). An entry it cannot find, a call naming both `id` and
-  `call`, or a recorded tool with no registration here is `unknown`, held in every mode. So an
-  undo of a post or meta edit waits where writing it would (never), and an undo of an option
-  waits where writing the option does (the wider mode).
+  `wp_update_option` could put an option back, unheld. `classify_call()` looks the recorded
+  entry up (by `id`, or every entry of a `call`) and holds the undo as the strictest tool that
+  made the change, using the same list the undo itself asks "can this caller call it" about
+  (`GMCP_Journal::undo_tools()`). An entry it cannot find, a call naming both `id` and `call`,
+  or a recorded tool with no registration here is `unknown`, held in every mode. So an undo of
+  a post or meta edit waits where writing it would (never), and an undo of an option waits
+  where writing the option does (the wider mode).
 - **An account the agent made cannot answer for the agent.** In mode `deletes` an admin key
   could create an administrator with a password it chose (`wp_create_user` and
   `wp_update_user` were `site` changes, which wait only in the wider mode), sign in at

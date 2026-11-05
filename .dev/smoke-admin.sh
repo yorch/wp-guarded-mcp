@@ -3403,6 +3403,13 @@ ap_decide() { # ap_decide <verdict> <request id> [request-nonce override]
 if grep -q wordpress_logged_in "$AP_JAR"; then
   check "the Approvals page renders" \
     "$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null | grep -o '<h1>[^<]*</h1>' | head -n 1)" "<h1>Approvals</h1>"
+  AP_KEYS_PAGE=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-access" 2>/dev/null)
+  check "CONTROL: the keys page was fetched and has the drafts-only option" \
+    "$([ "$(printf '%s' "$AP_KEYS_PAGE" | grep -c 'name="key_drafts_only"')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "its label says a post that is live, not anything that is live" \
+    "$(printf '%s' "$AP_KEYS_PAGE" | grep -c 'Never publish, schedule or change a post that is live')/$(printf '%s' "$AP_KEYS_PAGE" | grep -c 'anything that is live')" "1/0"
+  check "and its help names what is NOT covered" \
+    "$(printf '%s' "$AP_KEYS_PAGE" | grep -c 'does NOT cover comments, taxonomy terms')" "1"
   check "CONTROL: the form parser finds the Approve form for a pending request" \
     "$([ -n "$(ap_form approve "$AP_R1")" ] && echo found || echo MISSING)" "found"
   AP_PAGE=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null)

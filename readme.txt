@@ -86,7 +86,7 @@ Not any more, and that is deliberate. Earlier versions answered on a URL contain
 
 = Can I limit what an agent is allowed to do? =
 
-Yes, three ways. A named key carries one of three access levels. The administration and WooCommerce tools are separate switches, both off by default. A named key can be limited to a specific list of tools and given an expiry date, and can be marked drafts-only so it can write drafts but never publish, schedule or change a post that is already live. An OAuth connection can be approved as read-only on the consent screen. Drafts-only covers posts and what is stored as posts; it does not cover comments, orders, users or options. Developers can go further with filters: `gmcp_tools` to change the catalog and `gmcp_allow` to override the auth decision.
+Yes, three ways. A named key carries one of three access levels. The administration and WooCommerce tools are separate switches, both off by default. A named key can be limited to a specific list of tools and given an expiry date, and can be marked drafts-only so it can write drafts but never publish, schedule or change a post that is already live. An OAuth connection can be approved as read-only on the consent screen. Drafts-only covers posts and what is stored as posts (their custom fields, term assignments, featured image and attached media); it does not cover comments, taxonomy terms, users or options, and media attached to no post cannot be edited by such a key at all. Developers can go further with filters: `gmcp_tools` to change the catalog and `gmcp_allow` to override the auth decision.
 
 = Can I undo something an agent did? =
 
@@ -129,7 +129,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * Connection test on the settings screen and in Site Health, which distinguishes an unreachable endpoint from credentials that never arrived.
 * WooCommerce tools on their own switch: products, stock, orders, order notes, customers and sales figures. No refunds.
 * Named keys with their own access level, expiry date and tool list, stored hashed.
-* Drafts-only keys, which cannot publish, schedule, or change anything already live, and a Read-only choice on the OAuth consent screen.
+* Drafts-only keys, which cannot publish, schedule, or change a post that is already live (posts, their custom fields, term assignments, featured image and attached media; not comments, taxonomy terms, users or options), and a Read-only choice on the OAuth consent screen.
 * A change journal, so a setting or post an agent modified can be put back.
 * Preview mode on the six riskiest tools, which describes what would happen and changes nothing.
 * MCP prompts for common upkeep jobs, and MCP resources for attaching site content to a conversation.

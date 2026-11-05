@@ -1159,10 +1159,10 @@ class GMCP_Settings {
           <td>
             <label for="key_drafts_only">
               <input type="checkbox" id="key_drafts_only" name="key_drafts_only" value="1">
-              <?php esc_html_e( 'Never publish, schedule or change anything that is live', 'guarded-mcp' ); ?>
+              <?php esc_html_e( 'Never publish, schedule or change a post that is live', 'guarded-mcp' ); ?>
             </label>
             <p class="description">
-              <?php esc_html_e( 'The key can create and edit drafts and pending posts, and upload media for them. It is refused any write that would publish, schedule or make a post private, and any edit, deletion or unpublishing of a post that is already live, whichever tool is used. Comments, orders, terms and users are not posts and are not covered by this setting. Because full administration reaches tools this cannot police, a drafts-only key is held to read and write.', 'guarded-mcp' ); ?>
+              <?php esc_html_e( 'The key can create and edit drafts and pending posts, and upload media for them. It is refused any write that would publish, schedule or make a post private, and any edit, deletion or unpublishing of a post that is already live, whichever tool is used. That covers posts and what is stored as posts, their custom fields, categories and tags, featured image and attached media. Media attached to no post cannot be edited or deleted by this key, because a live page may be showing it. It does NOT cover comments, taxonomy terms (renaming a category changes every live post in it), users or options, and it does not stop a preview link being made for a draft. Because full administration reaches tools this cannot police, a drafts-only key is held to read and write.', 'guarded-mcp' ); ?>
             </p>
           </td>
         </tr>

@@ -928,7 +928,8 @@ class GMCP_Core {
 
   private static function drafts_only_explanation(): string {
     return 'This key is drafts-only: it can create and edit drafts and pending posts, but it cannot publish, schedule, '
-      . 'make private, edit, delete or unpublish anything that is live. '
+      . 'make private, edit, delete or unpublish a post that is live, or edit or delete media that is not attached to a draft. '
+      . 'That covers posts, their custom fields, terms and featured image, and attached media; comments, taxonomy terms, users and options are outside this setting. '
       . 'Ask an administrator to make the change, or use a key that is not drafts-only.';
   }
 

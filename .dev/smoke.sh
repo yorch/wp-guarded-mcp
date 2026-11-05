@@ -1580,6 +1580,44 @@ unmode "$UN_MODE_WAS"
 wpe 'update_option("blogdescription", base64_decode("'"$(printf '%s' "$UN_DESC_WAS" | base64 | tr -d '\n')"'")); wp_delete_post('"$UN_POST"', true); global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_approvals WHERE tool IN (\"wp_undo_change\",\"wp_update_option\")");' >/dev/null
 check "put back: the description and the mode" "$(wpe 'echo get_option("blogdescription");')/$(wpe 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "never";')" "$UN_DESC_WAS/$UN_MODE_WAS"
 
+echo "-- drafts-only: media attached to nothing is not the key's to edit, and the refusal says what is covered --"
+# The key was documented as unable to touch "anything that is live". It could still edit a
+# file attached to no post, which a live page may be showing as its featured image or an
+# embed, and nothing can find those pages. The case it cannot judge is refused. Fixtures are
+# made here: the earlier block publishes the draft it attached its media to.
+DM_FIX=$(wpe '
+  $d = wp_insert_post( [ "post_title" => "DM draft", "post_status" => "draft" ] );
+  $at = function ( $t, $parent ) { $id = wp_insert_attachment( [ "post_title" => $t, "post_mime_type" => "image/png", "post_status" => "inherit" ], false, $parent ); update_post_meta( $id, "_wp_attached_file", "dm-fixture.png" ); return $id; };
+  echo implode( " ", [ $d, $at( "DM att draft", $d ), $at( "DM att free", 0 ) ] );')
+read -r DM_DRAFT DM_ATD DM_ATF <<< "$DM_FIX"
+check "CONTROL: the fixtures exist (a draft, media on it, media on nothing)" \
+  "$(pstatus $DM_DRAFT)/$(wpe "echo (int) get_post($DM_ATD)->post_parent === $DM_DRAFT ? 'attached' : 'wrong';")/$(wpe "echo (int) get_post($DM_ATF)->post_parent;")" "draft/attached/0"
+callk dm "$K_DO" "$(tool_json 1 wp_update_media "{\"ID\":$DM_ATF,\"title\":\"DM hijack\",\"alt\":\"DM alt hijack\"}")"
+check "drafts-only: wp_update_media on a file attached to nothing is refused, and nothing changed" \
+  "$(verdict dm)/$(ptitle $DM_ATF)/$(pmeta $DM_ATF _wp_attachment_image_alt)" "error/DM att free/absent"
+callk dm "$K_DO" "$(tool_json 2 wp_update_post "{\"ID\":$DM_ATF,\"fields\":{\"post_title\":\"DM hijack two\"}}")"
+check "  and so is wp_update_post aimed at the same attachment" "$(verdict dm)/$(ptitle $DM_ATF)" "error/DM att free"
+callk dm "$K_DO" "$(tool_json 3 wp_update_media "{\"ID\":$DM_ATD,\"title\":\"DM draft media edited\"}")"
+check "CONTROL: media attached to a draft is still editable by the same key" "$(verdict dm)/$(ptitle $DM_ATD)" "ok/DM draft media edited"
+callk dm "$K_PW" "$(tool_json 4 wp_update_media "{\"ID\":$DM_ATF,\"title\":\"DM plain edit\"}")"
+check "CONTROL: a key without the flag edits the unattached file, so the refusal was the flag's" "$(verdict dm)/$(ptitle $DM_ATF)" "ok/DM plain edit"
+
+callk dm "$K_DO" "$(tool_json 5 wp_update_post "{\"ID\":$DO_LIVE,\"fields\":{\"post_title\":\"DM refused\"}}")"
+DM_TEXT=$(py 'import json,sys;d=json.load(sys.stdin);print(d["result"]["content"][0]["text"] if "result" in d else d["error"]["message"])' dm)
+check "the refusal for a live post names what is and is not covered" \
+  "$(printf '%s' "$DM_TEXT" | grep -c 'comments, taxonomy terms, users and options are outside this setting')" "1"
+check "  and no longer claims the key cannot touch anything that is live" "$(printf '%s' "$DM_TEXT" | grep -c 'anything that is live')" "0"
+check "CONTROL: the text probe sees the refusal at all" "$(printf '%s' "$DM_TEXT" | grep -c 'This key is drafts-only')" "1"
+# What the sentence says is NOT covered really is not: a drafts-only key still edits a comment
+# and renames a term, so the documentation is true to the code and not just carefully worded.
+DM_CT=$(wpe '$c=wp_insert_comment(["comment_post_ID"=>'"$DO_LIVE"',"comment_content"=>"DM comment","comment_approved"=>"1"]); $t=wp_insert_term("DM term","category"); echo $c," ",$t["term_id"];')
+read -r DM_COMMENT DM_TERM <<< "$DM_CT"
+callk dm "$K_DO" "$(tool_json 6 wp_update_comment "{\"comment_ID\":$DM_COMMENT,\"fields\":{\"comment_content\":\"DM comment edited\"}}")"
+check "outside the setting, stated: a drafts-only key edits a comment on a live post" "$(wpe "wp_cache_flush(); echo get_comment($DM_COMMENT)->comment_content;")" "DM comment edited"
+callk dm "$K_DO" "$(tool_json 7 wp_update_term "{\"term_id\":$DM_TERM,\"taxonomy\":\"category\",\"name\":\"DM term renamed\"}")"
+check "  and renames a taxonomy term" "$(wpe "wp_cache_flush(); echo get_term($DM_TERM)->name;")" "DM term renamed"
+wpe 'wp_delete_term('"$DM_TERM"',"category"); wp_delete_comment('"$DM_COMMENT"',true); foreach(get_posts(["post_status"=>"any","post_type"=>["post","attachment"],"numberposts"=>-1,"s"=>"DM "]) as $p){ if(strpos($p->post_title,"DM ")===0){wp_delete_post($p->ID,true);} }' >/dev/null
+
 echo "-- OAuth: the consent screen offers full or read-only, and the grant carries it --"
 JAR="$OUT/oauth.jar"
 curl -sS -c "$JAR" -b "$JAR" -d 'log=admin&pwd=admin&rememberme=forever&testcookie=1' "$BASE/wp-login.php" -o /dev/null 2>/dev/null
