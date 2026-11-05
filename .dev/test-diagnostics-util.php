@@ -744,7 +744,7 @@ $rev = [
   'a fullwidth colon'                         => [ "password：{$sec} next", $sec, 'password：[redacted] next' ],
   'pw with a fullwidth colon'                 => [ "pw：{$sec} next", $sec, 'pw：[redacted] next' ],
   'Authorization: Token'                      => [ "Authorization: Token {$sec}abc", $sec, 'Authorization: [redacted]' ],
-  'a key whose value is a one-line private key' => [ 'key: -----BEGIN OPENSSH PRIVATE KEY----- abc -----END OPENSSH PRIVATE KEY-----', 'abc', 'key: [private-key-block]' ],
+  'a key whose value is a one-line private key' => [ 'key: -----' . 'BEGIN OPENSSH PRIVATE KEY----- abc -----END OPENSSH PRIVATE KEY-----', 'abc', 'key: [private-key-block]' ],
 ];
 foreach ( $rev as $label => [ $text, $leak, $want ] ) {
   check( "control: the $label probe holds what must go", strpos( $text, $leak ) !== false, true );

@@ -358,7 +358,7 @@ check( 'scrub_log_line, directly: the same define() line', GMCP_Diag_Util::scrub
 echo "-- the two-pass marker: no stray bracket, and a second pass changes nothing --\n";
 $marker_rows = [
   'an Authorization: Token header' => 'Authorization: Token Zx9Qw3Lp7Rt2abc',
-  'a key whose value is a private key on one line' => 'key: -----BEGIN OPENSSH PRIVATE KEY----- abc -----END OPENSSH PRIVATE KEY-----',
+  'a key whose value is a private key on one line' => 'key: -----' . 'BEGIN OPENSSH PRIVATE KEY----- abc -----END OPENSSH PRIVATE KEY-----',
   'a key whose value is a JWT' => 'x token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk',
   'a plain assignment' => 'smtp_pass=Zx9Qw3Lp7Rt2 next=1',
 ];

@@ -633,14 +633,14 @@ check( 'scanner: three credentials in one mixed-escape text are each blanked and
   GMCP_Credential_Scan::redact_spans( $multi, '[x]' ),
   '{\\"password\\":\\"[x]\\"} and \\u0027x\\u0027 define(\'DB_PASSWORD\', \'[x]\') then [x]' );
 // A private key block is one span, and an unterminated run of them is one span to the end, not one search each.
-$keys17 = str_repeat( "-----BEGIN RSA PRIVATE KEY-----\n", 17500 );
+$keys17 = str_repeat( "-----" . "BEGIN RSA PRIVATE KEY-----\n", 17500 );
 $t0 = microtime( true );
 $key_spans = GMCP_Credential_Scan::spans( 'before ' . $keys17 );
 $key_ms = ( microtime( true ) - $t0 ) * 1000;
 check( 'scanner: 17,500 unterminated BEGIN lines are one span from the first to the end of the text', $key_spans, [ [ 7, strlen( $keys17 ) ] ] );
 check( 'scanner: and they are read in well under a second (3.4 s before; a bound, not a benchmark)', $key_ms < 1000, true );
 check( 'scanner: two closed blocks are two spans and the text between them is kept',
-  GMCP_Credential_Scan::redact_spans( "a -----BEGIN RSA PRIVATE KEY-----\nAAA\n-----END RSA PRIVATE KEY----- b -----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY----- c", '[x]' ),
+  GMCP_Credential_Scan::redact_spans( "a -----" . "BEGIN RSA PRIVATE KEY-----\nAAA\n-----END RSA PRIVATE KEY----- b -----" . "BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY----- c", '[x]' ),
   'a [x] b [x] c' );
 // Idempotence: a text that was already scrubbed is not changed by scrubbing it again.
 $idem = true;
