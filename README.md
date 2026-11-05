@@ -87,9 +87,9 @@ An access level belongs to a named key, or to an OAuth grant. A key carries the 
 
 | Level | Content only | + administration | + WooCommerce | What it can do |
 |---|---|---|---|---|
-| `admin` | 55 | 94 | 106 | Everything, including deletes, users and options |
-| `readwrite` | 38 | 51 | 60 | Create and update, no destructive tools |
-| `readonly` | 18 | 28 | 32 | Reads only |
+| `admin` | 56 | 95 | 107 | Everything, including deletes, users and options |
+| `readwrite` | 39 | 52 | 61 | Create and update, no destructive tools |
+| `readonly` | 19 | 29 | 33 | Reads only |
 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
 nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO,
