@@ -2638,6 +2638,47 @@ class GMCP_Core {
     return self::log_line( (string) $value );
   }
 
+  /**
+  * What the debug line for a tool call prints in place of an identifier argument's own name.
+  * Free of every credential word on purpose: the line is scrubbed as text afterwards, and text
+  * that says `"key":"x_pwd"` reads as a value assigned to a secret-named field.
+  */
+  const IDENTIFIER_LOG_LABELS = [ 'key' => 'target', 'meta_key' => 'meta_target', 'option_key' => 'option_target' ];
+
+  /**
+  * A tool call's arguments as the debug log prints them: redact_call_args()'s answer for what each
+  * argument may say, in a line that still says WHICH row a call named.
+  *
+  * The top-level "key" of wp_update_option and the meta tools is the name of the row, so it is
+  * judged by its VALUE, as the audit log and the approval view judge it: kept unless it is
+  * credential-shaped (a vendor key, an assignment, a token) and then hidden by the same scrub as
+  * every other string in the line. Passing the result of redact_call_args() to log_text() as an
+  * array did not do that: log_text() redacts an array by field name, which blanked "key" (the
+  * option's name, "x_pwd") whatever it held, and the scrub after it read `"key":"x_pwd"` as a
+  * secret-named assignment. So the identifiers are printed under labels with no credential word
+  * in them (IDENTIFIER_LOG_LABELS), and everything else goes through redact() as before: a nested
+  * field named "key" and every other secret-named argument are still redacted by name.
+  *
+  * The result is a string; the call site hands it to log_text() as every client-derived line
+  * does, which scrubs it a second time and leaves it as it is.
+  *
+  * @param array $args The arguments the client sent.
+  */
+  public static function log_call_args( array $args ): string {
+    $safe = self::redact_call_args( $args );
+    $named = [];
+    foreach ( self::IDENTIFIER_ARGS as $field ) {
+      if ( array_key_exists( $field, $safe ) && is_scalar( $safe[ $field ] ) ) {
+        $named[ self::IDENTIFIER_LOG_LABELS[ $field ] ?? 'target' ] = $safe[ $field ];
+        unset( $safe[ $field ] );
+      }
+    }
+    $unused = 0;
+    $budget = self::LOG_READ_BYTES * 4;
+    $json = wp_json_encode( $named + self::redact( self::cut_leaves( $safe, self::LOG_READ_BYTES, $unused, 0, $budget ) ) );
+    return self::log_line( is_string( $json ) ? $json : '' );
+  }
+
   /** The longest stretch of one value that is read for a debug line; the line itself is shorter. */
   const LOG_READ_BYTES = 2500;
 

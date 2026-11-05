@@ -683,7 +683,7 @@ class GMCP_Server {
 
           if ( $this->logging ) {
             error_log( '[Guarded MCP Direct] 🔧 tools/call - Tool: ' . GMCP_Core::log_text( $tool ) );
-            error_log( '[Guarded MCP Direct] 🔧 tools/call - Arguments: ' . GMCP_Core::log_text( GMCP_Core::redact_call_args( is_array( $arguments ) ? $arguments : [] ) ) );
+            error_log( '[Guarded MCP Direct] 🔧 tools/call - Arguments: ' . GMCP_Core::log_text( GMCP_Core::log_call_args( is_array( $arguments ) ? $arguments : [] ) ) );
           }
 
           try {

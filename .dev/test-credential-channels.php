@@ -445,5 +445,42 @@ $described->setAccessible( true );
 check( 'the changes column describes a value of 150,000 leaves by size, unread', has( (string) $described->invoke( null, 'items', array_fill( 0, 150000, 'a' ) ), 'too large to read' ), true );
 check( 'CONTROL: and a short list by its content', $described->invoke( null, 'items', [ 'a', 'b' ] ), '["a","b"]' );
 
+echo "-- the name of the row a call names is printed; the credential-shaped value of it is not --\n";
+// The debug line for a tool call. Before log_call_args() the server printed
+// log_text( redact_call_args( $args ) ), and log_text() redacts an array again, by field NAME, so the
+// "key" of wp_update_option (which is the option's name) came out as [redacted] and the line no
+// longer said what changed. This is the expression the server runs, so the test fails on the old one.
+function debug_args_line( array $args ): string {
+  return method_exists( 'GMCP_Core', 'log_call_args' )
+    ? GMCP_Core::log_text( GMCP_Core::log_call_args( $args ) )
+    : GMCP_Core::log_text( GMCP_Core::redact_call_args( $args ) );
+}
+$cred_a = 'sk_' . 'live_4eC39HqLyjWDarjtT1zdp7dc';
+$cred_b = 'ghp_' . 'aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789';
+$l = debug_args_line( [ 'key' => 'x_pwd', 'value' => 'hunter2-longer' ] );
+check( 'the option name under "key" is in the debug line, though the name looks like a secret', has( $l, 'x_pwd' ), true );
+check( '...and the value stored under it is not', has( $l, 'hunter2-longer' ), false );
+check( 'CONTROL: an ordinary option name and value are both printed', [ has( debug_args_line( [ 'key' => 'blogdescription', 'value' => 'VISIBLEVAL' ] ), 'blogdescription' ), has( debug_args_line( [ 'key' => 'blogdescription', 'value' => 'VISIBLEVAL' ] ), 'VISIBLEVAL' ) ], [ true, true ] );
+check( 'meta_key and option_key are printed the same way', [ has( debug_args_line( [ 'meta_key' => 'x_token', 'meta_value' => 'tok123456' ] ), 'x_token' ), has( debug_args_line( [ 'meta_key' => 'x_token', 'meta_value' => 'tok123456' ] ), 'tok123456' ), has( debug_args_line( [ 'option_key' => 'x_secret', 'value' => 'sec123456' ] ), 'x_secret' ) ], [ true, false, true ] );
+check( 'a "key" whose VALUE is a vendor credential is hidden (judged by shape, not by the field name)', [ has( debug_args_line( [ 'key' => $cred_a, 'value' => 'v' ] ), '4eC39HqLyjWDarjtT1zdp7dc' ), has( debug_args_line( [ 'key' => $cred_b, 'value' => 'v' ] ), 'aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789' ) ], [ false, false ] );
+check( 'a "key" holding an assignment is hidden too', has( debug_args_line( [ 'key' => 'api_key=abcd1234efgh', 'value' => 'v' ] ), 'abcd1234efgh' ), false );
+check( 'CONTROL: the line is still one JSON-looking line with the call\'s other fields', [ has( debug_args_line( [ 'key' => 'x_pwd', 'ID' => 7 ] ), '"ID":7' ), preg_match( '/[\r\n]/', debug_args_line( [ 'key' => "a\nb", 'ID' => 7 ] ) ) ], [ true, 0 ] );
+check( 'a nested field named key is still redacted by name (only the top-level argument is an identifier)', has( debug_args_line( [ 'ID' => 3, 'settings' => [ 'key' => 'NESTEDKEYVAL99' ] ] ), 'NESTEDKEYVAL99' ), false );
+check( 'other secret-named arguments are still redacted by name', [ has( debug_args_line( [ 'smtp_password' => 'PWVAL123456' ] ), 'PWVAL123456' ), has( debug_args_line( [ 'api_token' => 'TOKVAL123456' ] ), 'TOKVAL123456' ), has( debug_args_line( [ 'password' => 'PW2VAL123456' ] ), 'PW2VAL123456' ) ], [ false, false, false ] );
+check( 'CONTROL: "name" and "option" arguments are printed (they never matched a secret word)', [ has( debug_args_line( [ 'name' => 'Spring sale', 'option' => 'blogname' ] ), 'Spring sale' ), has( debug_args_line( [ 'name' => 'Spring sale', 'option' => 'blogname' ] ), 'blogname' ) ], [ true, true ] );
+$server_src = (string) file_get_contents( __DIR__ . '/../includes/server.php' );
+check( 'the server prints a call\'s arguments through log_call_args()', preg_match( '/tools\/call - Arguments: \' \. GMCP_Core::log_text\( GMCP_Core::log_call_args\(/', $server_src ), 1 );
+
+echo "-- the other two channels answer the same way for a call's \"key\" --\n";
+$def_key = [ 'name' => 'wp_update_option', 'inputSchema' => [ 'properties' => [ 'key' => [], 'value' => [] ] ] ];
+$ac = GMCP_Audit::storable_args( [ 'key' => 'x_pwd', 'value' => 'hunter2-longer' ] );
+$vw = GMCP_Approvals::build_view( [ 'key' => 'x_pwd', 'value' => 'hunter2-longer' ], $def_key );
+check( 'audit args and the approval view both keep the option name and hide the value', [ has( $ac, 'x_pwd' ), has( $ac, 'hunter2-longer' ), has( $vw['text'], 'x_pwd' ), has( $vw['text'], 'hunter2-longer' ) ], [ true, false, true, false ] );
+$ac2 = GMCP_Audit::storable_args( [ 'key' => $cred_a, 'value' => 'v' ] );
+$vw2 = GMCP_Approvals::build_view( [ 'key' => $cred_a, 'value' => 'v' ], $def_key );
+check( 'audit args and the approval view both hide a credential-shaped "key" value, by shape', [ has( $ac2, '4eC39HqLyjWDarjtT1zdp7dc' ), has( $vw2['text'], '4eC39HqLyjWDarjtT1zdp7dc' ), has( json_encode( GMCP_Core::redact_call_args( [ 'key' => $cred_a ] ) ), '4eC39HqLyjWDarjtT1zdp7dc' ) ], [ false, false, false ] );
+check( 'CONTROL: the same two channels print an ordinary "key" value', [ has( GMCP_Audit::storable_args( [ 'key' => 'blogname' ] ), 'blogname' ), has( GMCP_Approvals::build_view( [ 'key' => 'blogname' ], $def_key )['text'], 'blogname' ) ], [ true, true ] );
+check( 'the three channels share one list of identifier arguments', GMCP_Audit::IDENTIFIER_ARGS, GMCP_Core::IDENTIFIER_ARGS );
+
 echo "\n$total checks, $fails failed\n";
 exit( min( 255, $fails ) );

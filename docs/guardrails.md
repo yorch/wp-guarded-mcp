@@ -447,9 +447,14 @@ something that looks harmless and is not, so each says what it cannot promise.
   tool returns to its caller: a stored theme mod or field that happens to contain
   the text is the site's own
   data, and the readers pass `scrub_preview = false` so it comes back as stored. The
-  debug trace prints a call's arguments through `redact_call_args()`, the same answer
-  the audit log gives, so a value under a credential-named option or meta key is not
-  printed there either. Every other value the trace writes that a client sent (the
+  debug trace prints a call's arguments through `log_call_args()`, which starts from
+  `redact_call_args()`, the same answer the audit log gives, so a value under a
+  credential-named option or meta key is not printed there either. The name of the row
+  itself (the top-level `key`, `meta_key` or `option_key`, which names a row and does not
+  authenticate to anything) is printed under the labels `target`, `meta_target` and
+  `option_target` unless its own text is credential-shaped, and then it is hidden; the audit
+  arguments and the approval view make the same decision about it. A `key` nested inside a
+  settings value, and every other argument named like a secret, are still redacted by name. Every other value the trace writes that a client sent (the
   tool name, the client's own name and version, a requested redirect URI, a grant
   type, an exception message, the reason an authorize request was refused) goes through
   `GMCP_Core::log_text()`, and a session id is written as its first eight characters.

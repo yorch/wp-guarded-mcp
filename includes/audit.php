@@ -269,8 +269,11 @@ class GMCP_Audit {
   *
   * Restored only at the top level and only for scalars, so a nested "key" inside a
   * settings array is still redacted and the change journal's stricter test is untouched.
+  * What the name itself says is judged by its shape afterwards (redact_credential_spans), so a
+  * "key" that is a vendor credential is still hidden. One list for every channel: the debug
+  * log and the approval view read GMCP_Core::IDENTIFIER_ARGS.
   */
-  const IDENTIFIER_ARGS = [ 'key', 'meta_key', 'option_key' ];
+  const IDENTIFIER_ARGS = GMCP_Core::IDENTIFIER_ARGS;
 
   /** Arguments as they will be stored: redacted, size-capped, and honest about both. */
   public static function storable_args( array $args, bool $failed = false ): string {
