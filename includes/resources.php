@@ -90,6 +90,12 @@ class GMCP_Resources {
       'suppress_filters' => false,
     ] );
     foreach ( $recent as $post ) {
+      // Named in the attach menu by title, so the same question as reading it. The types
+      // above are post and page, which carry no policy of their own, but a page can hang
+      // from a post that does.
+      if ( GMCP_Core::post_read_guard( (int) $post->ID ) !== true ) {
+        continue;
+      }
       $out[] = [
         'uri' => 'gmcp://post/' . $post->ID,
         'name' => $post->post_title !== '' ? $post->post_title : '(untitled)',

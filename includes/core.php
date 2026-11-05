@@ -958,23 +958,80 @@ class GMCP_Core {
       return true;
     }
     if ( $post instanceof WP_Post ) {
-      $type = $post->post_type;
+      $types = self::post_chain_types( $post );
     }
     elseif ( is_int( $post ) || ( is_string( $post ) && ctype_digit( $post ) ) ) {
-      $type = get_post_type( (int) $post );
+      $types = self::post_chain_types( (int) $post );
     }
     else {
-      $type = $post;
+      $types = [ $post ];
     }
-    if ( !self::is_commerce_post_type( $type ) ) {
-      // Another plugin's configuration row: below admin it is not returned either, for the
-      // reason the write guard gives one function up.
-      return self::plugin_config_post_refusal( (string) $type, 'Changing', true );
+    $type = null;
+    foreach ( $types as $candidate ) {
+      if ( self::is_commerce_post_type( $candidate ) ) {
+        $type = $candidate;
+        break;
+      }
+    }
+    if ( $type === null ) {
+      // Not a commerce post, but possibly another plugin's configuration row, or a revision,
+      // media row or child hanging from one: below admin it is not returned either, for the
+      // reason the write guard gives. Followed up the chain for the same reason the commerce
+      // types are, since a revision of a form holds the form's JSON.
+      foreach ( $types as $candidate ) {
+        $held = self::plugin_config_post_refusal( (string) $candidate, 'Changing', true );
+        if ( $held !== true ) {
+          return $held;
+        }
+      }
+      return true;
     }
     return 'Reading a ' . strtolower( (string) $type ) . ' through the generic post tools needs an admin-level key. '
       . 'Orders and subscriptions carry customers\' names, email addresses, phone numbers, postal addresses and IP addresses in their meta, '
       . 'which is why the WooCommerce tools that read them on purpose (wc_get_order, wc_list_orders) are admin-level too. '
+      . ( $types[0] !== $type ? 'This post belongs to one: a revision, a media row or a child of an order is read under the order\'s policy. ' : '' )
       . 'This key is ' . self::caller_access_level() . '.';
+  }
+
+  /**
+  * The post type of a post and of every post above it, nearest first, lowercased.
+  *
+  * A read policy about a post type has to follow what hangs off it. A revision of a form
+  * submission holds the submission's body, a media row attached to one is a file a visitor
+  * uploaded, and a child post is part of it, yet each is an ordinary row of another type
+  * ("revision", "attachment", "page") that asked of itself alone passes every type check.
+  * Walked rather than looked up one level because a revision of a media row's parent is
+  * two steps from the post that carries the policy, and bounded because post_parent is
+  * data and a loop in it must not hang a read.
+  *
+  * @param int|WP_Post $post
+  * @return string[] Empty when the post does not exist.
+  */
+  public static function post_chain_types( $post ): array {
+    $post = $post instanceof WP_Post ? $post : get_post( (int) $post );
+    $types = [];
+    $seen = [];
+    for ( $depth = 0; $post instanceof WP_Post && $depth < 8 && !isset( $seen[ $post->ID ] ); $depth++ ) {
+      $seen[ $post->ID ] = true;
+      $types[] = strtolower( (string) $post->post_type );
+      $post = $post->post_parent ? get_post( (int) $post->post_parent ) : null;
+    }
+    return $types;
+  }
+
+  /**
+  * Post types a SQL query that reads posts for the current caller must leave out: the
+  * form-submission types always, the commerce types below admin. For a query that cannot ask
+  * a guard row by row. Lowercased; empty is possible only if both filters empty the lists.
+  *
+  * @return string[]
+  */
+  public static function read_excluded_post_types(): array {
+    $types = array_map( 'strtolower', array_map( 'strval', self::personal_data_post_types() ) );
+    if ( self::caller_access_level() !== 'admin' ) {
+      $types = array_merge( $types, self::commerce_post_types() );
+    }
+    return array_values( array_unique( $types ) );
   }
 
   #region Drafts-only keys
@@ -1541,14 +1598,55 @@ class GMCP_Core {
   * @return true|string True when the read is allowed, otherwise the refusal.
   */
   public static function personal_data_post_guard( int $post_id, string $type = '' ) {
-    if ( $type === '' ) {
-      $type = $post_id > 0 ? (string) get_post_type( $post_id ) : '';
+    $held = array_map( 'strtolower', array_map( 'strval', self::personal_data_post_types() ) );
+    if ( $type !== '' ) {
+      $chain = [ strtolower( $type ) ];
     }
-    if ( $type === '' || !in_array( $type, self::personal_data_post_types(), true ) ) {
+    else {
+      $chain = $post_id > 0 ? self::post_chain_types( $post_id ) : [];
+    }
+    $hit = null;
+    foreach ( $chain as $candidate ) {
+      if ( $candidate !== '' && in_array( $candidate, $held, true ) ) {
+        $hit = $candidate;
+        break;
+      }
+    }
+    if ( $hit === null ) {
       return true;
     }
-    return 'A ' . $type . ' is a form submission: personal data a member of the public typed, stored as a post. The generic post readers do not return it, because they are available to a read-only key and a submission is admin-level data. '
+    return 'A ' . $hit . ' is a form submission: personal data a member of the public typed, stored as a post. The generic post readers do not return it, because they are available to a read-only key and a submission is admin-level data. '
+      . ( $chain[0] !== $hit ? 'This post belongs to one (it is a ' . $chain[0] . ' under it), and a revision, an upload or a child of a submission carries the same data. ' : '' )
       . 'Use the form tools for that plugin (cf7_, fluentform_ or ninjaform_), which return it at admin level, never return passwords, file uploads, IP addresses or user agents, and report whether the store is there at all.';
+  }
+
+  /**
+  * Whether a taxonomy exists only to classify form submissions, and the refusal if so.
+  *
+  * Asked by the term LISTING, which names no post and so cannot ask the post guard. A term
+  * attached to a submission is not visitor data in the plugins checked (Flamingo assigns a
+  * channel only when the term already exists, and its contact tags are taken from existing
+  * terms), but a taxonomy whose every object type is a submission type is, by construction,
+  * a vocabulary about submissions, and a plugin that mints its terms from what a visitor
+  * typed would put that text in the listing. A taxonomy shared with an ordinary type is not
+  * refused: its terms are ordinary content, and which of them sit on a submission is only
+  * reachable through the post, which the post guard refuses.
+  *
+  * @return true|string
+  */
+  public static function personal_data_taxonomy_guard( string $taxonomy ) {
+    $tax = get_taxonomy( $taxonomy );
+    if ( !$tax || empty( $tax->object_type ) ) {
+      return true;
+    }
+    $held = array_map( 'strtolower', array_map( 'strval', self::personal_data_post_types() ) );
+    foreach ( (array) $tax->object_type as $object_type ) {
+      if ( !in_array( strtolower( (string) $object_type ), $held, true ) ) {
+        return true;
+      }
+    }
+    return 'The ' . $taxonomy . ' taxonomy classifies form submissions only, and the terms of such a taxonomy are not listed through the generic term tools: a submission is personal data, and what a vocabulary built around submissions holds is not something a read-only key is shown. '
+      . 'The form tools for that plugin (cf7_, fluentform_ or ninjaform_) report on submissions at admin level.';
   }
 
   /**

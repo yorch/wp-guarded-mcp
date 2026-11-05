@@ -218,6 +218,176 @@ check "and the refusal is the personal-data guard's" "$(has w8b "form submission
 docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-forms-type.php >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------------------------
+echo "== Block 0c: what hangs off a submission, and the other readers of a post =="
+# The guards above ask a post's own type. A revision of a submission, a file attached to one, a
+# comment on one, its terms, the change journal that names it, the briefing that quotes the newest
+# post and the REST-generated tools all reach the same data through something that is not of that
+# type. Every hostile call is made with a read-only key against a SEEDED submission (a
+# flamingo_inbound registered by a mu-plugin, so no form plugin is needed), and every check that
+# something is absent is paired with a control that the same call finds the marker on an ordinary
+# post. A shop order stands in for the commerce half, below admin.
+M2="H2MARK-$RANDOM"
+docker compose exec -T cli sh -c 'cat > /var/www/html/wp-content/mu-plugins/gmcp-smoke-forms-rel.php' <<'PHP'
+<?php
+// A submission type with a taxonomy, revisions and comments; a vocabulary shared with ordinary
+// posts; a stand-in order type when no shop plugin registers one.
+add_action( 'init', function () {
+  if ( !post_type_exists( 'flamingo_inbound' ) ) {
+    register_post_type( 'flamingo_inbound', [ 'public' => true, 'show_in_rest' => false, 'label' => 'smoke submission',
+      'supports' => [ 'title', 'editor', 'excerpt', 'comments', 'revisions', 'custom-fields' ] ] );
+  }
+  register_taxonomy( 'gmcp_smoke_channel', [ 'flamingo_inbound' ], [ 'public' => true, 'hierarchical' => true, 'label' => 'smoke channel' ] );
+  register_taxonomy( 'gmcp_smoke_shared', [ 'flamingo_inbound', 'post' ], [ 'public' => true, 'hierarchical' => true, 'label' => 'smoke shared' ] );
+  if ( !post_type_exists( 'shop_order' ) ) {
+    register_post_type( 'shop_order', [ 'public' => true, 'show_in_rest' => false, 'label' => 'smoke order', 'supports' => [ 'title', 'editor', 'comments', 'custom-fields' ] ] );
+  }
+}, 99 );
+// Lets the suite make a page type look like a form-submission type, to prove that a REST route
+// belonging to a guarded type is not turned into tools.
+add_filter( 'gmcp_personal_data_post_types', function ( $types ) {
+  if ( get_option( 'gmcp_smoke_guard_pages' ) ) {
+    $types[] = 'page';
+  }
+  return $types;
+} );
+function gmcp_smoke_seed( $m ) {
+  $out = [];
+  foreach ( [ 'sub' => 'flamingo_inbound', 'ctl' => 'post', 'ord' => 'shop_order' ] as $k => $type ) {
+    $tag = $m . '-' . $k;
+    $id = wp_insert_post( [ 'post_type' => $type, 'post_status' => 'publish', 'post_title' => $tag . '-title', 'post_content' => $tag . '-content [elementor-template id="7771"]', 'post_excerpt' => $tag . '-excerpt', 'comment_status' => 'open' ] );
+    update_post_meta( $id, '_field_message', $tag . '-meta' );
+    $cid = wp_insert_comment( [ 'comment_post_ID' => $id, 'comment_content' => $tag . '-comment', 'comment_author' => 'a', 'comment_approved' => 1 ] );
+    $tax = $type === 'flamingo_inbound' ? 'gmcp_smoke_channel' : 'category';
+    $term = wp_insert_term( $tag . '-term', $tax );
+    wp_set_object_terms( $id, [ (int) $term['term_id'] ], $tax );
+    wp_update_post( [ 'ID' => $id, 'post_content' => $tag . '-content-v2 [elementor-template id="7771"]' ] );
+    $revs = array_keys( wp_get_post_revisions( $id ) );
+    $att = wp_insert_post( [ 'post_type' => 'attachment', 'post_status' => 'inherit', 'post_parent' => $id, 'post_title' => $tag . '-att-title', 'post_mime_type' => 'text/plain', 'guid' => home_url( '/' . $tag . '-att.txt' ) ] );
+    $out[ $k ] = [ 'id' => $id, 'comment' => (int) $cid, 'rev' => $revs ? (int) $revs[0] : 0, 'att' => (int) $att, 'term' => (int) $term['term_id'], 'tax' => $tax ];
+  }
+  return $out;
+}
+PHP
+SEED=$(wpe 'echo wp_json_encode(gmcp_smoke_seed("'"$M2"'"));')
+sid() { python3 -c 'import json,sys;print(json.loads(sys.argv[1])[sys.argv[2]][sys.argv[3]])' "$SEED" "$1" "$2"; }
+SUB=$(sid sub id); SUBREV=$(sid sub rev); SUBATT=$(sid sub att); SUBCOM=$(sid sub comment)
+CTL=$(sid ctl id); CTLREV=$(sid ctl rev); CTLATT=$(sid ctl att)
+ORD=$(sid ord id); ORDATT=$(sid ord att)
+CLEAN="$CLEAN $SUB $SUBATT $CTL $CTLATT $ORD $ORDATT"
+deny() { # deny <label> <key> <tool> <args> <marker>: refused, and the marker is not in the reply
+  callas "$2" d0 "$(tc "$3" "$4")"
+  check "$1: refused" "$(verdict d0)" "error"
+  check "$1: the reply carries no marker" "$(has d0 "$5")" "no"
+}
+quiet() { # quiet <label> <key> <tool> <args> <marker>: answers, and the marker is not in the reply
+  callas "$2" d0 "$(tc "$3" "$4")"
+  check "$1: answers" "$(verdict d0)" "ok"
+  check "$1: the reply carries no marker" "$(has d0 "$5")" "no"
+}
+allow() { # allow <label> <key> <tool> <args> <marker>: answers and the marker IS in the reply
+  callas "$2" d0 "$(tc "$3" "$4")"
+  check "CONTROL $1: answers" "$(verdict d0)" "ok"
+  check "CONTROL $1: the probe finds the marker" "$(has d0 "$5")" "yes"
+}
+check "CONTROL: the seed stored a marker on the submission, its revision, its upload and its comment" \
+  "$(wpe 'echo get_post_meta('"$SUB"',"_field_message",true),"|",get_post('"$SUBREV"')->post_parent==='"$SUB"'?"rev":"norev","|",get_post('"$SUBATT"')->post_parent==='"$SUB"'?"att":"noatt","|",get_comment('"$SUBCOM"')->comment_post_ID=='"$SUB"'?"com":"nocom";')" "$M2-sub-meta|rev|att|com"
+check "CONTROL: the order type has the same rows" \
+  "$(wpe 'echo get_post_type('"$ORD"'),"|",get_post('"$ORDATT"')->post_parent==='"$ORD"'?"att":"noatt";')" "shop_order|att"
+
+echo "-- a revision, an upload or a comment of a submission is the submission --"
+deny "wp_get_post on a revision of a submission" "$RO" wp_get_post "{\"ID\":$SUBREV}" "$M2-sub"
+deny "wp_get_post on a file attached to a submission" "$RO" wp_get_post "{\"ID\":$SUBATT}" "$M2-sub"
+deny "wp_get_post_snapshot on a file attached to a submission" "$RO" wp_get_post_snapshot "{\"ID\":$SUBATT}" "$M2-sub"
+deny "wp_get_post_meta on a revision of a submission" "$RO" wp_get_post_meta "{\"ID\":$SUBREV}" "$M2-sub"
+allow "wp_get_post on a revision of an ordinary post" "$RO" wp_get_post "{\"ID\":$CTLREV}" "$M2-ctl"
+allow "wp_get_post on a file attached to an ordinary post" "$RO" wp_get_post "{\"ID\":$CTLATT}" "$M2-ctl"
+quiet "wp_get_posts listing revisions" "$RO" wp_get_posts '{"post_type":"revision","post_status":"inherit","limit":200}' "$M2-sub"
+allow "wp_get_posts listing revisions" "$RO" wp_get_posts '{"post_type":"revision","post_status":"inherit","limit":200}' "$M2-ctl"
+quiet "wp_get_posts listing attachments" "$RO" wp_get_posts '{"post_type":"attachment","post_status":"inherit","limit":200}' "$M2-sub"
+allow "wp_get_posts listing attachments" "$RO" wp_get_posts '{"post_type":"attachment","post_status":"inherit","limit":200}' "$M2-ctl"
+quiet "wp_get_media" "$RO" wp_get_media '{"search":"'"$M2"'","limit":200}' "$M2-sub"
+allow "wp_get_media" "$RO" wp_get_media '{"search":"'"$M2"'","limit":200}' "$M2-ctl"
+quiet "wp_get_comments with no post named" "$RO" wp_get_comments '{"search":"'"$M2"'","limit":500}' "$M2-sub"
+allow "wp_get_comments with no post named" "$RO" wp_get_comments '{"search":"'"$M2"'","limit":500}' "$M2-ctl"
+quiet "wp_get_comments naming the submission" "$RO" wp_get_comments "{\"post_id\":$SUB}" "$M2-sub"
+allow "wp_get_comments naming the ordinary post" "$RO" wp_get_comments "{\"post_id\":$CTL}" "$M2-ctl"
+quiet "wp_get_comments by an ADMIN key naming the submission (the guard applies at every level)" "$TOK" wp_get_comments "{\"post_id\":$SUB}" "$M2-sub"
+callas "$RW" d1 "$(tc wp_duplicate_post "{\"ID\":$SUBATT}")"
+check "wp_duplicate_post of a file attached to a submission is refused" "$(verdict d1)" "error"
+callas "$RW" d1 "$(tc wp_duplicate_post "{\"ID\":$SUBREV}")"
+check "wp_duplicate_post of a revision of a submission is refused" "$(verdict d1)" "error"
+check "STORED: neither made a copy carrying the marker" \
+  "$(wpe 'echo count(get_posts(["post_type"=>"any","post_status"=>"any","numberposts"=>-1,"s"=>"'"$M2"'-sub","post__not_in"=>['"$SUB"','"$SUBATT"']]));')" "0"
+callas "$RW" d1 "$(tc wp_duplicate_post "{\"ID\":$CTL}")"
+check "CONTROL: wp_duplicate_post of an ordinary post succeeds" "$(verdict d1)" "ok"
+CLEAN="$CLEAN $(wpe 'echo (int) get_posts(["post_type"=>"post","post_status"=>"draft","numberposts"=>1,"orderby"=>"ID","order"=>"DESC","fields"=>"ids"])[0];')"
+
+echo "-- below admin, the same for what hangs off an order --"
+deny "wp_get_post on a file attached to an order" "$RO" wp_get_post "{\"ID\":$ORDATT}" "$M2-ord"
+quiet "wp_get_media" "$RO" wp_get_media '{"search":"'"$M2"'","limit":200}' "$M2-ord"
+quiet "wp_get_comments naming the order" "$RO" wp_get_comments "{\"post_id\":$ORD}" "$M2-ord"
+allow "wp_get_post on a file attached to an order, by an ADMIN key (orders are admin-level data, not unreadable)" "$TOK" wp_get_post "{\"ID\":$ORDATT}" "$M2-ord"
+
+echo "-- terms: the terms of a submission, and a vocabulary that exists for submissions --"
+SUBTAX=$(sid sub tax)
+deny "wp_get_post_terms on a submission" "$RO" wp_get_post_terms "{\"ID\":$SUB,\"taxonomy\":\"$SUBTAX\"}" "$M2-sub"
+allow "wp_get_post_terms on an ordinary post" "$RO" wp_get_post_terms "{\"ID\":$CTL,\"taxonomy\":\"category\"}" "$M2-ctl"
+deny "wp_get_terms of a taxonomy attached to submissions only" "$RO" wp_get_terms "{\"taxonomy\":\"$SUBTAX\",\"search\":\"$M2\"}" "$M2-sub"
+deny "the same by an ADMIN key" "$TOK" wp_get_terms "{\"taxonomy\":\"$SUBTAX\",\"search\":\"$M2\"}" "$M2-sub"
+allow "wp_get_terms of an ordinary taxonomy" "$RO" wp_get_terms '{"taxonomy":"category","search":"'"$M2"'"}' "$M2-ctl"
+callas "$RO" d2 "$(tc wp_get_terms '{"taxonomy":"gmcp_smoke_shared"}')"
+check "CONTROL: a taxonomy shared with an ordinary post type is still listed (the guard is not a blanket)" "$(verdict d2)" "ok"
+BEFORE_T=$(wpe 'echo count(wp_get_object_terms('"$SUB"',"'"$SUBTAX"'",["fields"=>"ids"]));')
+deny "wp_add_post_terms on a submission (its reply lists the terms the post now holds)" "$RW" wp_add_post_terms "{\"ID\":$SUB,\"taxonomy\":\"$SUBTAX\",\"terms\":[$(sid sub term)]}" "$M2-sub"
+check "STORED: the submission's terms are unchanged" "$(wpe 'echo count(wp_get_object_terms('"$SUB"',"'"$SUBTAX"'",["fields"=>"ids"]));')" "$BEFORE_T"
+callas "$RW" d2 "$(tc wp_create_term "{\"term_name\":\"$M2-extra\",\"taxonomy\":\"category\"}")"
+EXTRA=$(wpe 'echo (int) term_exists("'"$M2"'-extra","category")["term_id"];')
+callas "$RW" d2 "$(tc wp_add_post_terms "{\"ID\":$CTL,\"taxonomy\":\"category\",\"terms\":[$EXTRA]}")"
+check "CONTROL: wp_add_post_terms on an ordinary post succeeds" "$(verdict d2)" "ok"
+check "CONTROL: and STORED: the term is on the ordinary post" "$(wpe 'echo in_array('"$EXTRA"',wp_get_object_terms('"$CTL"',"category",["fields"=>"ids"]))?"yes":"no";')" "yes"
+wpe 'wp_delete_term('"$EXTRA"',"category");' >/dev/null
+
+echo "-- counts are an existence oracle and are kept --"
+callas "$RO" d3 "$(tc wp_count_posts '{"post_type":"flamingo_inbound"}')"
+check "wp_count_posts for a submission type answers (a number, never a row)" "$(verdict d3)" "ok"
+check "and it carries no marker" "$(has d3 "$M2")" "no"
+
+echo "-- the briefing quotes the newest post --"
+wpe 'wp_update_post(["ID"=>'"$SUB"',"post_title"=>"'"$M2"'-sub-title"]);global $wpdb;$wpdb->update($wpdb->posts,["post_modified"=>"2099-01-01 00:00:00","post_modified_gmt"=>"2099-01-01 00:00:00"],["ID"=>'"$SUB"']);clean_post_cache('"$SUB"');' >/dev/null
+check "CONTROL: the submission is the most recently modified post" \
+  "$(wpe 'echo get_posts(["post_type"=>"any","post_status"=>["publish","draft","pending","private"],"numberposts"=>1,"orderby"=>"modified","order"=>"DESC","fields"=>"ids","suppress_filters"=>false])[0]=='"$SUB"'?"yes":"no";')" "yes"
+callas "$RO" d4 "$(tc wp_site_briefing '{}')"
+if [ "$(verdict d4)" = "ok" ]; then
+  check "wp_site_briefing does not quote the submission's title as the latest change" "$(has d4 "$M2-sub")" "no"
+  wpe 'global $wpdb;$wpdb->update($wpdb->posts,["post_modified"=>"2099-06-01 00:00:00","post_modified_gmt"=>"2099-06-01 00:00:00"],["ID"=>'"$CTL"']);clean_post_cache('"$CTL"');' >/dev/null
+  callas "$RO" d4 "$(tc wp_site_briefing '{}')"
+  check "CONTROL: once an ordinary post is newer the briefing quotes it" "$(has d4 "$M2-ctl")" "yes"
+else
+  echo "  SKIP  wp_site_briefing is not offered (the admin tool group is off); its guard was not exercised"
+fi
+wpe 'global $wpdb;$wpdb->update($wpdb->posts,["post_modified"=>current_time("mysql"),"post_modified_gmt"=>current_time("mysql",true)],["ID"=>'"$SUB"']);$wpdb->update($wpdb->posts,["post_modified"=>current_time("mysql"),"post_modified_gmt"=>current_time("mysql",true)],["ID"=>'"$CTL"']);clean_post_cache('"$SUB"');clean_post_cache('"$CTL"');' >/dev/null
+
+echo "-- a scan that returns the titles of posts --"
+check "CONTROL: a post that quotes a template shortcode is reported by the scan" \
+  "$(wpe 'add_filter("gmcp_caller_access_level",function(){return "readonly";});$r=GMCP_Tools_Elementor::shortcode_references(7771,50);echo strpos(json_encode($r),"'"$M2"'-ctl")!==false?"found":"missing";')" "found"
+check "the scan reports neither a submission nor an order that quotes it, below admin" \
+  "$(wpe 'add_filter("gmcp_caller_access_level",function(){return "readonly";});$r=GMCP_Tools_Elementor::shortcode_references(7771,50);echo strpos(json_encode($r),"'"$M2"'-sub")===false&&strpos(json_encode($r),"'"$M2"'-ord")===false?"clean":"quoted";')" "clean"
+check "an admin key's scan still reports an order but not a submission" \
+  "$(wpe '$r=GMCP_Tools_Elementor::shortcode_references(7771,50);$j=json_encode($r);echo strpos($j,"'"$M2"'-ord")!==false?"order":"noorder","|",strpos($j,"'"$M2"'-sub")===false?"clean":"quoted";')" "order|clean"
+
+echo "-- resources --"
+callas "$RO" r1 '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"gmcp://post/'"$SUBATT"'"}}'
+check "a gmcp://post resource for a file attached to a submission returns nothing" "$(rawhas r1 "$M2-sub")" "no"
+callas "$RO" r1 '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"gmcp://post/'"$CTLATT"'"}}'
+check "CONTROL: the same for a file attached to an ordinary post returns it" "$(rawhas r1 "$M2-ctl")" "yes"
+callas "$RO" r2 '{"jsonrpc":"2.0","id":1,"method":"resources/list"}'
+check "resources/list names no submission" "$(rawhas r2 "$M2-sub")" "no"
+check "CONTROL: and does list the ordinary post (the probe sees a row)" "$(rawhas r2 "$M2-ctl")" "yes"
+
+wpe 'foreach(["gmcp_smoke_channel","gmcp_smoke_shared","category"] as $tx){foreach(get_terms(["taxonomy"=>$tx,"hide_empty"=>false,"search"=>"'"$M2"'"]) as $t){wp_delete_term($t->term_id,$tx);}}foreach(get_comments(["search"=>"'"$M2"'","status"=>"all"]) as $c){wp_delete_comment($c->comment_ID,true);}' >/dev/null
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-forms-rel.php >/dev/null 2>&1
+
+# ---------------------------------------------------------------------------------------------
 echo "== Contact Form 7 + Flamingo =="
 if ! docker compose exec -T cli wp plugin is-active contact-form-7 >/dev/null 2>&1 || ! docker compose exec -T cli wp plugin is-active flamingo >/dev/null 2>&1; then
   echo "  SKIP  Contact Form 7 and Flamingo are not both active"

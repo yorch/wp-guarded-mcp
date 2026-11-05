@@ -1150,6 +1150,26 @@ class GMCP_Tools_Elementor {
     ] );
   }
 
+  /**
+  * A SQL fragment keeping the scans below out of posts the caller may not read: a form
+  * submission, whatever the level, and an order below admin. These scans are read-level and
+  * return the title of every post that references a template, and a visitor controls what a
+  * submission's body says, so a message that quotes a template shortcode would be listed
+  * with its subject line. Asked once here because the scans are SQL and cannot ask the
+  * post guard row by row; the type list is the one that guard reads.
+  * @see GMCP_Core::read_excluded_post_types()
+  */
+  private static function unreadable_types_sql( string $column ): string {
+    $types = GMCP_Core::read_excluded_post_types();
+    if ( !$types ) {
+      return '';
+    }
+    $quoted = array_map( function ( $type ) {
+      return "'" . esc_sql( $type ) . "'";
+    }, $types );
+    return ' AND ' . $column . ' NOT IN (' . implode( ',', $quoted ) . ')';
+  }
+
   /** Posts whose content holds [elementor-template id="N"], parsed rather than matched. */
   public static function shortcode_references( int $template_id, int $limit ): array {
     global $wpdb;
@@ -1157,7 +1177,7 @@ class GMCP_Tools_Elementor {
     $like = '%' . $wpdb->esc_like( '[' . self::TEMPLATE_SHORTCODE ) . '%';
     $candidates = $wpdb->get_results( $wpdb->prepare(
       "SELECT ID, post_title, post_type, post_status, post_content FROM {$wpdb->posts}
-        WHERE post_content LIKE %s AND post_type != 'revision' AND post_status != 'auto-draft'
+        WHERE post_content LIKE %s AND post_type != 'revision' AND post_status != 'auto-draft'" . self::unreadable_types_sql( 'post_type' ) . "
         ORDER BY ID ASC LIMIT %d",
       $like,
       self::SCAN_LIMIT + 1
@@ -1244,7 +1264,7 @@ class GMCP_Tools_Elementor {
       "SELECT p.ID, p.post_title, p.post_type, p.post_status, m.meta_value
         FROM {$wpdb->postmeta} m INNER JOIN {$wpdb->posts} p ON p.ID = m.post_id
         WHERE m.meta_key = %s AND ( {$where} )
-          AND p.post_type != 'revision' AND p.post_status != 'auto-draft'
+          AND p.post_type != 'revision' AND p.post_status != 'auto-draft'" . self::unreadable_types_sql( 'p.post_type' ) . "
         ORDER BY p.ID ASC LIMIT %d",
       array_merge( [ self::DATA_META ], $likes, [ self::SCAN_LIMIT + 1 ] )
     ) );
@@ -1755,7 +1775,7 @@ class GMCP_Tools_Elementor {
         "SELECT p.ID, p.post_title, p.post_type, p.post_status, m.meta_value
           FROM {$wpdb->postmeta} m INNER JOIN {$wpdb->posts} p ON p.ID = m.post_id
           WHERE m.meta_key = %s AND m.meta_value LIKE %s
-            AND p.post_type != 'revision' AND p.post_status != 'auto-draft'
+            AND p.post_type != 'revision' AND p.post_status != 'auto-draft'" . self::unreadable_types_sql( 'p.post_type' ) . "
           ORDER BY p.ID ASC LIMIT %d OFFSET %d",
         self::DATA_META,
         $like,

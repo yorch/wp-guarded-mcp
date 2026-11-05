@@ -272,6 +272,14 @@ class GMCP_Tools_Seo {
     if ( !$post ) {
       return 'Post ' . $post_id . ' does not exist.';
     }
+    // The read policies about the post's type, ahead of everything that would return a value
+    // from it: a form submission is never read through these tools, and an order only by an
+    // admin key. Reads and writes alike, since a write's reply and the SEO fields it reports
+    // are a read of the same post.
+    $read_policy = GMCP_Core::post_read_guard( $post_id );
+    if ( $read_policy !== true ) {
+      return $read_policy;
+    }
     // Asked first, so that on a site where a filter has made an order type viewable the policy
     // about the object is still the thing that answers.
     //

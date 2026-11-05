@@ -2261,11 +2261,17 @@ class GMCP_Tools_Admin {
     $latest = get_posts( [
       'post_type' => 'any',
       'post_status' => [ 'publish', 'draft', 'pending', 'private' ],
-      'numberposts' => 1,
+      // More than one, because the newest may be one this key must not be told about: the
+      // title of a form submission is the visitor's subject line, and "any" returns a type a
+      // plugin has not excluded from search. The first readable one is what is reported.
+      'numberposts' => 25,
       'orderby' => 'modified',
       'order' => 'DESC',
       'suppress_filters' => false,
     ] );
+    $latest = array_values( array_filter( $latest, function ( $candidate ) {
+      return GMCP_Core::post_read_guard( (int) $candidate->ID ) === true;
+    } ) );
 
     return $this->json( $r, [
       'site' => [
@@ -2726,6 +2732,12 @@ class GMCP_Tools_Admin {
       $post = $object_id ? get_post( $object_id ) : null;
       if ( !$post ) {
         return $this->error( $r, 'A post_type item needs object_id set to an existing post or page id.' );
+      }
+      // A form submission is "publish" as far as its status goes, and its title is what the
+      // visitor typed. A menu item would copy that into the public navigation.
+      $menu_target = GMCP_Core::personal_data_post_guard( $object_id );
+      if ( $menu_target !== true ) {
+        return $this->error( $r, $menu_target );
       }
       // The item stores its own copy of the title, and core's front-end filter
       // (_is_valid_nav_menu_item) only drops items whose target is missing or trashed.

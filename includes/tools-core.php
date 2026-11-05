@@ -2595,10 +2595,17 @@ class GMCP_Tools_Core {
     // wp_alter_post and the previews are readers too. A regular-expression replace answers
     // "how many places matched" (an oracle over the body of a message), and a preview of an
     // update or a delete prints the title and the start of the body it is about to change.
-    $reads_one = in_array( $tool, [ 'wp_get_post', 'wp_get_post_snapshot', 'wp_get_post_meta', 'wp_read_post_meta_chunk', 'wp_alter_post' ], true )
+    //
+    // wp_get_post_terms and wp_add_post_terms are on it for the same reason: the terms of a
+    // submission say which form it came through, and the second one's reply lists the terms
+    // the post now holds, which is a read of them. It asks post_read_guard(), the
+    // personal-data policy and the commerce read policy together, and both follow the post's
+    // parents: a revision, an upload or a child of a guarded post is judged as the post it
+    // hangs from. @see GMCP_Core::post_chain_types().
+    $reads_one = in_array( $tool, [ 'wp_get_post', 'wp_get_post_snapshot', 'wp_get_post_meta', 'wp_read_post_meta_chunk', 'wp_alter_post', 'wp_get_post_terms', 'wp_add_post_terms' ], true )
       || ( !empty( $a['preview'] ) && in_array( $tool, [ 'wp_update_post', 'wp_delete_post' ], true ) );
     if ( $reads_one ) {
-      $held = GMCP_Core::personal_data_post_guard( (int) ( $a['ID'] ?? 0 ) );
+      $held = GMCP_Core::post_read_guard( (int) ( $a['ID'] ?? 0 ) );
       if ( $held !== true ) {
         return $this->error( $r, $held, -32600 );
       }
@@ -2883,7 +2890,9 @@ class GMCP_Tools_Core {
         foreach ( get_comments( $args ) as $c ) {
           // Order notes are comments on the order post, and they quote the order: status
           // changes, refunds, the customer's own note. Same rule as reading the order.
-          if ( (int) $c->comment_post_ID > 0 && GMCP_Core::commerce_post_read_guard( (int) $c->comment_post_ID ) !== true ) {
+          // Comments on a form submission are the same: they sit on a post whose body no
+          // generic reader returns, and ask the same question, personal-data policy included.
+          if ( (int) $c->comment_post_ID > 0 && GMCP_Core::post_read_guard( (int) $c->comment_post_ID ) !== true ) {
             continue;
           }
           $list[] = [
@@ -3594,12 +3603,11 @@ class GMCP_Tools_Core {
           // "any" can still reach a commerce row: WordPress expands it to the registered
           // types not excluded from search, which says nothing about a type registered by a
           // plugin that sets it differently. Filtered per row rather than trusted.
-          if ( GMCP_Core::commerce_post_read_guard( $p ) !== true ) {
-            continue;
-          }
-          // The same for a form submission: the type check above only sees a type named in
-          // the request, and "any" names none.
-          if ( GMCP_Core::personal_data_post_guard( (int) $p->ID ) !== true ) {
+          //
+          // Both policies, and both follow the post's parents: a revision or a media row of
+          // a submission is an ordinary type on its own, and naming "revision" or
+          // "attachment" as the type reached it through a check that only saw the name.
+          if ( GMCP_Core::post_read_guard( (int) $p->ID ) !== true ) {
             continue;
           }
           $rows[] = [
@@ -5076,6 +5084,11 @@ class GMCP_Tools_Core {
 
       case 'wp_get_terms':
         $tax = sanitize_key( $a['taxonomy'] );
+        $tax_held = GMCP_Core::personal_data_taxonomy_guard( $tax );
+        if ( $tax_held !== true ) {
+          $r = $this->error( $r, $tax_held, -32600 );
+          break;
+        }
         $args = [
           'taxonomy' => $tax,
           'hide_empty' => false,
@@ -5279,6 +5292,11 @@ class GMCP_Tools_Core {
         }
         $list = [];
         foreach ( get_posts( $q ) as $m ) {
+          // A file attached to a form submission or an order is what a visitor uploaded, and
+          // is judged as the post it hangs from. Media attached to nothing is ordinary.
+          if ( GMCP_Core::post_read_guard( (int) $m->ID ) !== true ) {
+            continue;
+          }
           $list[] = [ 'ID' => $m->ID, 'title' => $m->post_title, 'url' => wp_get_attachment_url( $m->ID ) ];
         }
         $this->add_result_text( $r, wp_json_encode( $list, JSON_PRETTY_PRINT ) );

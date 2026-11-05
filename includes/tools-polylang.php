@@ -162,6 +162,11 @@ class GMCP_Tools_Polylang {
     if ( !$post ) {
       return $this->error( $r, 'No post with ID ' . $post_id . ' exists.' );
     }
+    // A submission's id, type and translation group are not for a key that cannot read it.
+    $read_policy = GMCP_Core::post_read_guard( $post_id );
+    if ( $read_policy !== true ) {
+      return $this->error( $r, $read_policy );
+    }
     $rows = $this->languages();
     if ( is_string( $rows ) ) {
       return $this->error( $r, $rows );
