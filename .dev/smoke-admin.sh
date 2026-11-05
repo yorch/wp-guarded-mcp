@@ -1633,8 +1633,13 @@ check "a creation is not, which the readmes now say" \
   "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_create_post' and x['what'].startswith('Post ')))" jb_list)" "0"
 call jb_del "{\"jsonrpc\":\"2.0\",\"id\":223,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$JB_ID,\"force\":true}}}"
 call jb_list2 '{"jsonrpc":"2.0","id":224,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+# A post's own custom fields are not the post: with Beaver Builder active, deleting a post makes the
+# builder write and remove its layout keys on the row being deleted, and the journal rightly lists
+# those under the tool that was running ('Post "x" custom field "_fl_builder_data" removed'). Counting
+# them read an unrelated plugin's bookkeeping as "the deletion is journalled" (measured: 4 entries).
+# The control is the line above: an edit of the same post is counted, so the filter is not what hides it.
 check "nor is a deletion" \
-  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_delete_post' and x['what'].startswith('Post ')))" jb_list2)" "0"
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_delete_post' and x['what'].startswith('Post ') and 'custom field' not in x['what']))" jb_list2)" "0"
 # The audit log is the complete record, which is the reason the readmes can point at it.
 check "but the audit log has all three" \
   "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(DISTINCT tool) FROM {$wpdb->prefix}gmcp_audit WHERE tool IN (\"wp_create_post\",\"wp_update_post\",\"wp_delete_post\")");' 2>/dev/null | tr -d '\r\n')" "3"
