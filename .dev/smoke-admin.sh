@@ -1620,15 +1620,21 @@ call jb_new '{"jsonrpc":"2.0","id":220,"method":"tools/call","params":{"name":"w
 JB_ID=$(py "import json,sys,re;print(re.search(r'\d+',json.load(sys.stdin)['result']['content'][0]['text']).group())" jb_new)
 call jb_edit "{\"jsonrpc\":\"2.0\",\"id\":221,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$JB_ID,\"post_title\":\"Renamed\"}}}"
 call jb_list '{"jsonrpc":"2.0","id":222,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+# The assertions below are about the POST, not about the tool name. Publishing or deleting a
+# published post makes WordPress core rewrite the wp_calendar_block_has_published_posts
+# option during the same call, and the journal rightly records that option under the tool
+# that was running. Counting by tool name alone read that incidental row as "the creation
+# is journalled" on a WordPress that does the rewrite on every publish. A post's own entry
+# is the one whose description begins "Post ".
 # The control. Without it, "creation absent" would pass on an empty journal for any reason.
 check "an edit is journalled" \
   "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_update_post'))" jb_list)" "1"
 check "a creation is not, which the readmes now say" \
-  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_create_post'))" jb_list)" "0"
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_create_post' and x['what'].startswith('Post ')))" jb_list)" "0"
 call jb_del "{\"jsonrpc\":\"2.0\",\"id\":223,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$JB_ID,\"force\":true}}}"
 call jb_list2 '{"jsonrpc":"2.0","id":224,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
 check "nor is a deletion" \
-  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_delete_post'))" jb_list2)" "0"
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_delete_post' and x['what'].startswith('Post ')))" jb_list2)" "0"
 # The audit log is the complete record, which is the reason the readmes can point at it.
 check "but the audit log has all three" \
   "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(DISTINCT tool) FROM {$wpdb->prefix}gmcp_audit WHERE tool IN (\"wp_create_post\",\"wp_update_post\",\"wp_delete_post\")");' 2>/dev/null | tr -d '\r\n')" "3"
