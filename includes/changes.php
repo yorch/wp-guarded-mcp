@@ -274,14 +274,20 @@ class GMCP_Changes {
   * @return array
   */
   private static function withhold_personal_data( array $record ): array {
+    // Set by an observer that held the post as it was BEFORE the write. A record is judged on
+    // both states, because a write can move a post out of a submission's tree (a revision or an
+    // upload given another parent) and the row, read afterwards, is then an ordinary one whose
+    // title and values this record would quote.
+    $was_personal = !empty( $record['personal_before'] );
+    unset( $record['personal_before'] );
     if ( !in_array( $record['kind'] ?? '', [ 'post', 'meta', 'termrel' ], true ) ) {
       return $record;
     }
     $post = get_post( (int) ( $record['id'] ?? 0 ) );
-    if ( !( $post instanceof WP_Post ) || !self::is_personal_post( $post ) ) {
+    if ( !$was_personal && ( !( $post instanceof WP_Post ) || !self::is_personal_post( $post ) ) ) {
       return $record;
     }
-    $record['label'] = '#' . (int) $post->ID;
+    $record['label'] = '#' . (int) ( $record['id'] ?? 0 );
     foreach ( (array) ( $record['fields'] ?? [] ) as $field => $pair ) {
       $record['fields'][ $field ] = [ 'from' => '[withheld]', 'to' => '[withheld]' ];
     }
@@ -517,6 +523,7 @@ class GMCP_Changes {
       'subject' => $this->post_subject( $after ),
       'label' => $this->post_label( $after ),
       'fields' => $changed,
+      'personal_before' => self::is_personal_post( $before ),
     ] );
   }
 
@@ -728,6 +735,7 @@ class GMCP_Changes {
       'subject' => $this->post_subject( $post ),
       'label' => $this->post_label( $post ),
       'fields' => [],
+      'personal_before' => self::is_personal_post( $post ),
     ] );
   }
 

@@ -700,6 +700,37 @@ callas "$TOK" se2 "$(tc wp_update_user "{\"ID\":$SEU,\"fields\":{\"display_name\
 check "and a second call, which UPDATES the row the first created, succeeds as well" "$(verdict se2)" "ok"
 wpe 'wp_delete_post((int) get_option("gmcp_smoke_contact"),true);delete_option("gmcp_smoke_contact");delete_option("gmcp_smoke_sideeffect");wp_delete_user('"$SEU"');' >/dev/null
 
+echo "-- the change records quote neither state of a post that moved out of a submission --"
+# The writer here asks no guard and the net is taken out, so the move happens. The records are
+# built after the write, and read afterwards the upload is an ordinary row: the record has to be
+# judged on the state BEFORE as well, or it quotes the title and names the submission as the
+# parent it came from.
+JOURNAL_WAS2=$(wpe 'echo get_option("gmcp_options",[])["mcp_change_journal"]??"unset";')
+wpe '$o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=true;update_option("gmcp_options",$o,false);GMCP_Journal::clear();' >/dev/null
+callas "$RW" r1 "$(tc gmcp_smoke_rawwrite "{\"op\":\"parent\",\"id\":$SUBATT,\"parent\":$CTL,\"net\":\"off\"}")"
+check "CONTROL: with the net out, the raw writer does move the upload (so the records below are about a real move)" "$(parent_of $SUBATT)" "$CTL"
+wpe 'global $wpdb;$wpdb->update($wpdb->posts,["post_parent"=>'"$SUB"'],["ID"=>'"$SUBATT"']);clean_post_cache('"$SUBATT"');' >/dev/null
+callas "$RW" r2 "$(tc gmcp_smoke_rawwrite "{\"op\":\"parent\",\"id\":$CTLATT,\"parent\":0,\"net\":\"off\"}")"
+callas "$RO" r3 "$(tc wp_list_changes '{"limit":40}')"
+check "CONTROL: wp_list_changes names the ordinary upload's change (the probe sees an entry)" "$(has r3 "$M2-ctl-att-title")" "yes"
+check "wp_list_changes does not name the submission's upload" "$(has r3 "$M2-sub-att")" "no"
+check "STORED: the journal option holds nothing of the upload's title" \
+  "$(wpe 'echo strpos(serialize(get_option(GMCP_Journal::OPTION,[])),"'"$M2"'-sub-att")===false?"clean":"quoted";')" "clean"
+check "CONTROL: it does hold the ordinary upload's title (the probe sees a row)" \
+  "$(wpe 'echo strpos(serialize(get_option(GMCP_Journal::OPTION,[])),"'"$M2"'-ctl-att")!==false?"kept":"missing";')" "kept"
+check "STORED: no audit row quotes it, in the changes or the detail column" \
+  "$(wpe 'global $wpdb;$t=GMCP_Audit::table();echo (int) $wpdb->get_var("SELECT COUNT(*) FROM $t WHERE (changes LIKE \"%'"$M2"'-sub-att%\" OR detail LIKE \"%'"$M2"'-sub-att%\")");')" "0"
+check "CONTROL: an audit row does quote the ordinary upload (the probe sees a row)" \
+  "$(wpe 'global $wpdb;$t=GMCP_Audit::table();echo (int) $wpdb->get_var("SELECT COUNT(*) FROM $t WHERE changes LIKE \"%'"$M2"'-ctl-att%\"")>0?"quoted":"none";')" "quoted"
+check "STORED: and no journal snapshot was kept for it" \
+  "$(wpe 'global $wpdb;echo (int) $wpdb->get_var("SELECT COUNT(*) FROM ".GMCP_Journal::snapshot_table()." WHERE post_id='"$SUBATT"'");')" "0"
+wpe 'wp_update_post(["ID"=>'"$CTLATT"',"post_parent"=>'"$CTL"']);GMCP_Journal::clear();' >/dev/null
+if [ "$JOURNAL_WAS2" = unset ]; then
+  wpe '$o=get_option("gmcp_options",[]);unset($o["mcp_change_journal"]);update_option("gmcp_options",$o,false);' >/dev/null
+else
+  wpe '$o=get_option("gmcp_options",[]);$o["mcp_change_journal"]='"$JOURNAL_WAS2"';update_option("gmcp_options",$o,false);' >/dev/null
+fi
+
 echo "-- a featured image is a read: nothing makes a visitor's upload a public page's thumbnail --"
 callas "$RW" f1 "$(tc wp_set_featured_image "{\"post_id\":$PG,\"media_id\":$SUBATT}")"
 check "setting a submission's upload as a page's featured image is refused" "$(verdict f1)" "error"

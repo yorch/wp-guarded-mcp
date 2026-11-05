@@ -739,5 +739,17 @@ $res = GMCP_Journal::revert( 'leg-sub' );
 check( 'an old entry about a submission is not put back', $res['ok'], false );
 check( 'and nothing was written', $GLOBALS['gmcp_t_post_writes'], [] );
 
+// A record whose values were withheld holds "[withheld]" where the previous values were. The post
+// can be an ordinary row by the time the record is made (it was moved out of a submission's tree by
+// a writer that asked no guard), so the journal cannot rely on the current type to refuse it.
+$GLOBALS['gmcp_t_options'][ GMCP_Journal::OPTION ] = [];
+$GLOBALS['gmcp_t_posts'][91] = [ 'post_status' => 'inherit', 'post_type' => 'attachment', 'post_title' => 'Moved upload' ];
+$observer->observe( [ 'kind' => 'post', 'op' => 'updated', 'id' => 91, 'subject' => 'attachment', 'label' => '#91', 'tool' => 'wp_update_post', 'call' => 'w1',
+  'withheld' => true, 'fields' => [ 'post_title' => [ 'from' => '[withheld]', 'to' => '[withheld]' ] ] ] );
+check( 'a withheld record is not journalled, so no undo can write the markers over a post', count( journal() ), 0 );
+$observer->observe( [ 'kind' => 'post', 'op' => 'updated', 'id' => 91, 'subject' => 'attachment', 'label' => 'Moved upload', 'tool' => 'wp_update_post', 'call' => 'w2',
+  'fields' => [ 'post_title' => [ 'from' => 'Before', 'to' => 'Moved upload' ] ] ] );
+check( 'CONTROL: the same record without the flag is journalled (the probe sees an entry)', count( journal() ), 1 );
+
 echo "\n$total checks, $fails failed\n";
 exit( min( 255, $fails ) );

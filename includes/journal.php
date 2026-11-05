@@ -222,6 +222,14 @@ class GMCP_Journal {
       return;
     }
     $kind = (string) ( $change['kind'] ?? '' );
+    // A record whose values were withheld (a post that is, or was before this write, part of a
+    // form submission's tree) holds markers where the previous values were. Recording one
+    // would offer an undo that writes the markers over the post, and the post may no longer
+    // look like a submission's now, so the current state cannot be what decides this.
+    // @see GMCP_Changes::withhold_personal_data()
+    if ( !empty( $change['withheld'] ) ) {
+      return;
+    }
     if ( $kind === 'meta' ) {
       $this->observe_meta( $change );
     }
