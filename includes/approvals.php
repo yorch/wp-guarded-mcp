@@ -82,7 +82,13 @@ class GMCP_Approvals {
   * widens the gate: a tool that annotation or level already calls destructive stays so.
   */
   const DESTRUCTIVE_VERBS = [ 'delete', 'remove', 'unenroll', 'unschedule', 'trash', 'purge',
-    'uninstall', 'cancel', 'drop', 'erase', 'wipe', 'destroy', 'revoke', 'reset', 'run' ];
+    'uninstall', 'cancel', 'drop', 'erase', 'wipe', 'destroy', 'reset', 'run' ];
+  // 'revoke' is deliberately not here. It was, and it classified wp_revoke_preview_links, a
+  // write-level tool, as destructive: the gate then held the one action that withdraws access
+  // and destroys nothing, and the contract check in smoke-admin.sh ("no read- or write-level
+  // tool is destructive") failed on it. A future tool that revokes a credential must say so
+  // through its level (admin, held in 'site' mode) or a destructiveHint; the verb is not the
+  // place to decide it.
 
   /** The verbs of tools that only look. Used for admin-level tools, which carry no annotation in the optional groups. */
   const READ_VERBS = [ 'get', 'list', 'count' ];
