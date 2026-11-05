@@ -1268,7 +1268,7 @@ from taste, since it holds forty entries for the whole site and an oversized
 batch would evict everyone else's undo history rather than merely crowding its
 own. Every guard the single create applies is applied per item; a batch is not a
 way to write content a single call would have filtered. It cannot be undone as a
-unit, because creations are not journalled, and the reply says so and points at
+unit, because the creation of a post is not journalled (the options WordPress writes as a side effect of it are, as ordinary option changes), and the reply says so and points at
 the ids it returned.
 
 ## Preview
@@ -1309,8 +1309,11 @@ audit log keeps a description of the difference so a reader can see what moved.
 Two copies of the same diff would drift, and the day somebody added a field to
 one list the other would quietly stop mentioning it.
 
-Undo records modifications and not creations or deletions, of posts, terms,
-menus, menu items or users, and that is a real limit rather than a nicety. The
+Undo records modifications and not the creation or deletion of a post, term,
+menu, menu item or user, and that is a real limit rather than a nicety. The options
+WordPress writes itself while it does one (for example
+`wp_calendar_block_has_published_posts` under `wp_create_post`) are ordinary option
+writes and are journalled under the tool that ran; the thing created or deleted is not. The
 capture layer reports them and the journal declines them: putting back a
 creation means deleting something, and putting back a deletion means recreating
 it with its old id, its children, its relationships and its meta, and neither is

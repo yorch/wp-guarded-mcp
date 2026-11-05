@@ -425,8 +425,10 @@ a setting, a post, a custom field, a term's name, slug, description or parent (w
 includes renaming a menu), which terms a post carries, and an individual theme setting
 (a menu-location assignment is one). A menu item's edit is covered because a menu item is a
 post and some custom fields. Only writes made during a tool call are recorded, never a
-person's own edits. **Creations, deletions and users are not covered**, and adding or
-deleting a menu item is a creation or a deletion. An undo is itself recorded, so
+person's own edits. **The creation or deletion of a post, term, menu or menu item, and changes to users, are not covered**, and adding or
+deleting a menu item is a creation or a deletion. The options WordPress itself writes as a side effect of a creation
+(`wp_calendar_block_has_published_posts` under `wp_create_post`, for one) are ordinary option writes and are journalled
+under the tool that ran; the created post is not. An undo is itself recorded, so
 reverting the undo puts the edit back; that second step is refused if the thing has
 changed since, so it cannot overwrite newer work with an older copy. For a custom
 field that includes a row someone added to the same key in the meantime.
