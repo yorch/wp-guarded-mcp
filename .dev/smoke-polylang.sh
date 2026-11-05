@@ -1,9 +1,10 @@
 #!/bin/bash
 # Smoke test for the Polylang tools (read only).
 #
-# STATUS WHEN WRITTEN: NOT RUN. Authored without a Docker daemon and without Polylang
-# installed. Seeding goes through Polylang's own writers (pll_save_post_translations,
-# pll_set_post_language), which are assumed to exist; correct them on first run if not.
+# STATUS: written blind, then run against the real Polylang 3.9.1 (no Docker: SQLite and
+# php -S). pll_set_post_language and pll_get_post_translations exist and behave as seeded. One
+# fault of the suite's own was found: Polylang assigns the default language to every new post, so
+# the "no language" post had one; the fixture now takes the language term off it.
 #
 #   docker compose exec -T cli wp plugin install polylang --activate
 #   ./smoke-polylang.sh
@@ -79,6 +80,12 @@ A=$(wpc post create --post_title="pll smoke en" --post_status=publish --porcelai
 B=$(wpc post create --post_title="pll smoke de" --post_status=draft --porcelain)
 C=$(wpc post create --post_title="pll smoke nolang" --post_status=publish --porcelain)
 docker compose exec -T cli wp eval 'pll_set_post_language( '"$A"', "en" ); pll_set_post_language( '"$B"', "de" );' >/dev/null 2>&1
+# Polylang gives every new post the default language, even from WP-CLI (measured on 3.9.1:
+# a post made with wp_insert_post answered "en"), so a post with NO language has to have the
+# language term taken off it. The control proves the fixture is what the check below needs.
+docker compose exec -T cli wp eval 'wp_set_object_terms( '"$C"', [], "language" );' >/dev/null 2>&1
+check "CONTROL: the third post really has no language" \
+  "$(docker compose exec -T cli wp eval 'var_dump( pll_get_post_language( '"$C"' ) );' 2>/dev/null | tr -d '\r\n')" "bool(false)"
 
 echo "-- the three empty answers stay apart --"
 tool p_a pll_get_post_translations "{\"post_id\":$A}"
@@ -113,5 +120,5 @@ docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_too
 
 for id in $A $B $C ${P0:-}; do [ -n "$id" ] && wpc post delete "$id" --force >/dev/null 2>&1; done
 echo
-echo "$pass passed, $fail failed  (UNRUN: written without a Docker daemon or Polylang installed)"
+echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

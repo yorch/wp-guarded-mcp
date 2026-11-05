@@ -2,12 +2,12 @@
 # Smoke test for the form-submission tools: Contact Form 7 (with Flamingo), Fluent Forms and
 # Ninja Forms, plus the generic-reader guard they depend on.
 #
-# STATUS: UNRUN. Written on a machine with no Docker daemon and none of the three plugins
-# installed, from memory of how each stores a submission. Every storage assumption is marked
-# UNVERIFIED in includes/tools-forms.php. The seeding code below calls each plugin's own
-# writer where one is believed to exist, and those calls are the likeliest lines to be wrong:
-# a seeding failure here is reported as a seeding failure, not as a failure of the tool. Run
-# it, read each failure, and decide which it is.
+# STATUS: written blind, then run against the real Contact Form 7 6.2.4.1 + Flamingo 2.6.4,
+# Fluent Forms 6.2.17 and Ninja Forms 3.16.0 on a SQLite stack (no Docker). Their storage matched
+# what the tools read. Two checks fail there for an environmental reason: the Fluent block
+# simulates a missing table with RENAME TABLE, which the SQLite drop-in does not perform, so
+# "readable is false" and "counts are null" need MySQL or MariaDB. Seeds go through each
+# plugin's own writer where one exists (Flamingo_Inbound_Message::add, wpcf7_flamingo_add_channel).
 #
 # BLOCK 0 needs no form plugin at all. It builds posts of the submission post types by hand
 # and proves the generic readers refuse them, because that guard is in the always-on content
@@ -35,7 +35,8 @@ gmcp_make_key() { # gmcp_make_key <label> <level>
 }
 TOK=$(gmcp_make_key "smoke forms" admin)
 RO=$(gmcp_make_key "smoke forms readonly" readonly)
-for k in "$TOK" "$RO"; do
+RW=$(gmcp_make_key "smoke forms readwrite" readwrite)
+for k in "$TOK" "$RO" "$RW"; do
   case "$k" in
     gmcp_*) ;;
     *) echo "Could not create an API key for the suite. Is the plugin active?" >&2; exit 1 ;;
@@ -115,6 +116,98 @@ callas "$RO" g0 "$(tc wp_get_post "{\"ID\":$NORMAL}")"
 check "CONTROL: wp_get_post on an ordinary post succeeds" "$(verdict g0)" "ok"
 
 # ---------------------------------------------------------------------------------------------
+echo "== Block 0b: a write tool is not a way round the read guard =="
+# A readwrite key cannot read a submission. These are the routes that would let it read one
+# anyway: copy the meta onto its own draft, retype the post into an ordinary type, duplicate it,
+# or read it through a URI. Each hostile call is followed by reading the STORED state, and the
+# state is put back before comparing. Controls run the same call on an ordinary post.
+docker compose exec -T cli sh -c 'cat > /var/www/html/wp-content/mu-plugins/gmcp-smoke-forms-type.php' <<'PHP'
+<?php
+// A form-submission type that "any" will return, which is how a per-row check is reached.
+add_action( 'init', function () {
+  register_post_type( 'flamingo_inbound', [ 'public' => true, 'show_in_rest' => false, 'label' => 'smoke submission' ] );
+}, 99 );
+PHP
+DRAFT=$(wpe 'echo wp_insert_post(["post_title"=>"smoke draft","post_type"=>"post","post_status"=>"draft"]);')
+SUBID=$(wpe 'echo wp_insert_post(["post_title"=>"smoke submission","post_type"=>"flamingo_inbound","post_status"=>"publish","post_content"=>"'"$MARK"'-body"]);')
+SUBID2=$(wpe 'echo wp_insert_post(["post_title"=>"smoke submission 2","post_type"=>"flamingo_inbound","post_status"=>"draft","post_content"=>"'"$MARK"'-body2"]);')
+CLEAN="$CLEAN $DRAFT $SUBID $SUBID2"
+wpe 'update_post_meta('"$SUBID"',"_meta",["remote_ip"=>"'"$MARK"'-ip"]);update_post_meta('"$SUBID"',"_field_message","'"$MARK"'-field");' >/dev/null
+check "CONTROL: the submission carries the marker in its meta, and the draft starts with none" \
+  "$(wpe 'echo get_post_meta('"$SUBID"',"_field_message",true), "|", count(get_post_meta('"$DRAFT"'));')" "$MARK-field|0"
+
+callas "$RW" w1 "$(tc wp_copy_post_meta "{\"from_id\":$SUBID,\"to_id\":$DRAFT}")"
+check "wp_copy_post_meta FROM a submission is refused" "$(verdict w1)" "error"
+check "STORED: the draft holds none of the submission's keys" \
+  "$(wpe 'echo count(array_intersect(array_keys(get_post_meta('"$DRAFT"')), ["_meta","_field_message"]));')" "0"
+check "and the refusal is the personal-data guard's" "$(has w1 "form submission")" "yes"
+callas "$RW" w1b "$(tc wp_copy_post_meta "{\"from_id\":$SUBID,\"to_id\":$DRAFT,\"keys\":[\"_meta\"]}")"
+check "naming the key does not help" "$(verdict w1b)" "error"
+check "STORED: still no _meta on the draft" "$(wpe 'echo metadata_exists("post",'"$DRAFT"',"_meta")?"yes":"no";')" "no"
+callas "$RW" w1c "$(tc wp_copy_post_meta "{\"from_id\":$NORMAL,\"to_id\":$DRAFT}")"
+check "CONTROL: copying from an ordinary post onto the same draft succeeds" "$(verdict w1c)" "ok"
+check "CONTROL: and STORED: the draft now holds the ordinary post's key (the probe can see a copy)" \
+  "$(wpe 'echo get_post_meta('"$DRAFT"',"_field_1",true);')" "$MARK-meta"
+
+callas "$RW" w2 "$(tc wp_update_post "{\"ID\":$SUBID,\"fields\":{\"post_type\":\"post\"}}")"
+check "retyping a submission to an ordinary type is refused" "$(verdict w2)" "error"
+check "STORED: its type is unchanged" "$(wpe 'echo get_post_type('"$SUBID"');')" "flamingo_inbound"
+callas "$RW" w2b "$(tc wp_update_post "{\"ID\":$SUBID,\"post_type\":\"page\"}")"
+check "the same with post_type at the top level" "$(verdict w2b)" "error"
+check "STORED: its type is still unchanged" "$(wpe 'echo get_post_type('"$SUBID"');')" "flamingo_inbound"
+callas "$RW" w2c "$(tc wp_get_post "{\"ID\":$SUBID}")"
+check "and wp_get_post still refuses it" "$(has w2c "$MARK")" "no"
+callas "$RW" w3 "$(tc wp_update_post "{\"ID\":$NORMAL,\"fields\":{\"post_type\":\"flamingo_inbound\"}}")"
+check "retyping an ordinary post INTO a submission type is refused" "$(verdict w3)" "error"
+check "STORED: it is still a post" "$(wpe 'echo get_post_type('"$NORMAL"');')" "post"
+callas "$RW" w3b "$(tc wp_update_post "{\"ID\":$NORMAL,\"fields\":{\"post_type\":\"page\"}}")"
+check "CONTROL: retyping an ordinary post to page succeeds" "$(verdict w3b)" "ok"
+check "CONTROL: and STORED: it is a page" "$(wpe 'echo get_post_type('"$NORMAL"');')" "page"
+wpe 'wp_update_post(["ID"=>'"$NORMAL"',"post_type"=>"post"]);' >/dev/null
+check "restored: the ordinary post is a post again" "$(wpe 'echo get_post_type('"$NORMAL"');')" "post"
+
+BEFORE=$(wpe 'echo count(get_posts(["post_type"=>"flamingo_inbound","post_status"=>"any","numberposts"=>-1]));')
+callas "$RW" w4 "$(tc wp_create_post '{"post_title":"forged","post_type":"flamingo_inbound"}')"
+check "creating a submission-type post is refused" "$(verdict w4)" "error"
+callas "$RW" w4b "$(tc wp_duplicate_post "{\"ID\":$SUBID}")"
+check "duplicating a submission is refused" "$(verdict w4b)" "error"
+check "STORED: no submission-type post was added by either" \
+  "$(wpe 'echo count(get_posts(["post_type"=>"flamingo_inbound","post_status"=>"any","numberposts"=>-1]));')" "$BEFORE"
+callas "$RW" w4c "$(tc wp_duplicate_post "{\"ID\":$NORMAL}")"
+check "CONTROL: duplicating an ordinary post succeeds" "$(verdict w4c)" "ok"
+DUPID=$(wpe 'echo (int) get_posts(["post_type"=>"post","post_status"=>"draft","numberposts"=>1,"orderby"=>"ID","order"=>"DESC","fields"=>"ids"])[0];')
+CLEAN="$CLEAN $DUPID"
+
+callas "$RW" w5 "$(tc wp_update_post "{\"ID\":$SUBID,\"post_title\":\"x\",\"preview\":true}")"
+check "previewing an update to a submission is refused (a preview prints the start of the body)" "$(verdict w5)" "error"
+callas "$RW" w5b "$(tc wp_alter_post "{\"ID\":$SUBID,\"field\":\"post_content\",\"search\":\"$MARK\",\"replace\":\"x\",\"preview\":true}")"
+check "previewing a search-and-replace on a submission is refused (a match count is an oracle)" "$(verdict w5b)" "error"
+callas "$RW" w5c "$(tc wp_alter_post "{\"ID\":$SUBID,\"field\":\"post_content\",\"search\":\"$MARK\",\"replace\":\"x\"}")"
+check "and so is the real one" "$(verdict w5c)" "error"
+check "STORED: the body is unchanged" "$(wpe 'echo get_post('"$SUBID"')->post_content;')" "$MARK-body"
+callas "$RW" w5d "$(tc wp_alter_post "{\"ID\":$NORMAL,\"field\":\"post_content\",\"search\":\"$MARK\",\"replace\":\"$MARK\",\"preview\":true}")"
+check "CONTROL: the same preview on an ordinary post succeeds" "$(verdict w5d)" "ok"
+
+callas "$RO" w6 "$(tc wp_get_posts '{"post_type":"any","post_status":"any","limit":50}')"
+check "CONTROL: wp_get_posts type any succeeds and lists the ordinary post (the probe sees a row)" \
+  "$(has w6 "\"ID\": $NORMAL")" "yes"
+check "wp_get_posts type any does not list a submission row" "$(has w6 "\"ID\": $SUBID")" "no"
+callas "$RO" w7 '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"gmcp://post/'"$SUBID2"'"}}'
+# resources/read answers under result.contents, which has() does not look at, so these two
+# search the raw reply. The control below proves the probe sees a body that is there.
+rawhas() { grep -qF -- "$2" "$OUT/$1" && echo yes || echo no; }
+check "reading a submission through a gmcp://post resource returns nothing" "$(rawhas w7 "$MARK-body2")" "no"
+check "CONTROL: that submission's body is stored, so its absence above is the guard's" "$(wpe 'echo get_post('"$SUBID2"')->post_content;')" "$MARK-body2"
+callas "$RO" w7b '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"gmcp://post/'"$NORMAL"'"}}'
+check "CONTROL: the same resource for an ordinary post returns its body" "$(rawhas w7b "$MARK-body")" "yes"
+callas "$RW" w8 "$(tc wp_create_preview_link "{\"post_id\":$DRAFT}")"
+check "CONTROL: a preview link for an ordinary draft is minted" "$(verdict w8)" "ok"
+callas "$RW" w8b "$(tc wp_create_preview_link "{\"post_id\":$SUBID2}")"
+check "a preview link to an unpublished submission is not minted" "$(verdict w8b)" "error"
+check "and the refusal is the personal-data guard's" "$(has w8b "form submission")" "yes"
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-forms-type.php >/dev/null 2>&1
+
+# ---------------------------------------------------------------------------------------------
 echo "== Contact Form 7 + Flamingo =="
 if ! docker compose exec -T cli wp plugin is-active contact-form-7 >/dev/null 2>&1 || ! docker compose exec -T cli wp plugin is-active flamingo >/dev/null 2>&1; then
   echo "  SKIP  Contact Form 7 and Flamingo are not both active"
@@ -123,10 +216,23 @@ else
   check "the cf7 tools are offered" \
     "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"cf7_messages_briefing","cf7_list_messages","cf7_get_message"}-n) or True)' cf_list)" "True"
   # A form with a typed field and one whose name looks credential-shaped, saved through CF7.
-  FORM_SLUG=$(wpe '$f=WPCF7_ContactForm::get_template();$f->set_title("Smoke form");$f->set_properties(["form"=>"[text* your-name] [email* your-email] [text api-key] [textarea your-message]"]);$f->save();echo $f->name();')
-  echo "  Form slug: $FORM_SLUG"
-  # Seeded through Flamingo's own writer (signature UNVERIFIED).
-  MID=$(wpe '$m=Flamingo_Inbound_Message::add(["channel"=>"'"$FORM_SLUG"'","subject"=>"Smoke subject","from"=>"Ann <ann@example.test>","from_name"=>"Ann","from_email"=>"ann@example.test","fields"=>["your-name"=>"Ann Smoke","your-email"=>"ann@example.test","api-key"=>"CF7KEYLEAK","your-message"=>"hello there","not-in-form"=>"CF7ORPHAN"],"meta"=>["remote_ip"=>"203.0.113.77","user_agent"=>"UA-SMOKE-MARK"],"akismet"=>null,"spam"=>false]);echo is_object($m)?$m->id():0;')
+  # A form is saved through CF7, and given a Flamingo channel the way CF7 itself does it on the
+  # first stored message (modules/flamingo.php, wpcf7_flamingo_submit): the channel term is
+  # made by wpcf7_flamingo_add_channel() and its id is kept in the form post's _flamingo meta.
+  # That link, not the slug, is what ties a message to its form. Verified against Contact
+  # Form 7 6.2.4.1 and Flamingo 2.6.4. cf7_seed <title> <form-template> <additional-settings>
+  # prints "form_id:slug".
+  cf7_seed() {
+    local php='$f=WPCF7_ContactForm::get_template();$f->set_title("__T__");$f->set_properties(["form"=>"__F__","additional_settings"=>"__S__"]);$f->save();$id=$f->id();$slug=get_post($id)->post_name;$ch=wpcf7_flamingo_add_channel($slug,"__T__");update_post_meta($id,"_flamingo",["channel"=>$ch]);echo $id.":".$slug;'
+    php="${php//__T__/$1}"; php="${php//__F__/$2}"; php="${php//__S__/$3}"
+    wpe "$php"
+  }
+  FORM_SEED=$(cf7_seed "Smoke form" "[text* your-name] [email* your-email] [text api-key] [textarea your-message] [text your-subject]" "")
+  FORM_ID="${FORM_SEED%%:*}"; FORM_SLUG="${FORM_SEED#*:}"
+  echo "  Form $FORM_ID, slug: $FORM_SLUG"
+  CLEAN="$CLEAN $FORM_ID"
+  # Seeded through Flamingo's own writer (signature verified against Flamingo 2.6.4).
+  MID=$(wpe '$m=Flamingo_Inbound_Message::add(["channel"=>"'"$FORM_SLUG"'","subject"=>"Smoke subject","from"=>"Ann <ann@example.test>","from_name"=>"Ann","from_email"=>"ann@example.test","fields"=>["your-name"=>"Ann Smoke","your-email"=>"ann@example.test","api-key"=>"CF7KEYLEAK","your-message"=>"hello there","your-subject"=>"Smoke subject","not-in-form"=>"CF7ORPHAN"],"meta"=>["remote_ip"=>"203.0.113.77","user_agent"=>"UA-SMOKE-MARK"],"akismet"=>null,"spam"=>false]);echo is_object($m)?$m->id():0;')
   echo "  Message: $MID"
   CLEAN="$CLEAN $MID"
   if [ "${MID:-0}" = "0" ]; then
@@ -167,6 +273,55 @@ else
     call cf_s "$(tc cf7_list_messages '{"search":"Ann"}')"
     check "an extra search argument does not turn into a search (the unfiltered count is returned)" \
       "$(jget cf_s total)" "$(jget cf_list_a total)"
+
+    echo "-- the subject is only returned when it is the visitor's own your-subject --"
+    check "CONTROL: a default form returns its subject (the probe sees one that is allowed)" "$(jget cf_get message.subject)" "Smoke subject"
+    # A form whose flamingo_subject template carries the IP address and user agent, so the
+    # stored _subject (what Flamingo builds with wpcf7_mail_replace_tags) contains both.
+    SEED2=$(cf7_seed "Smoke form tpl" "[text your-name] [text your-subject]" 'flamingo_subject: \"Enquiry from [_remote_ip] [_user_agent]\"')
+    F2ID="${SEED2%%:*}"; F2SLUG="${SEED2#*:}"; CLEAN="$CLEAN $F2ID"
+    MID2=$(wpe '$m=Flamingo_Inbound_Message::add(["channel"=>"'"$F2SLUG"'","subject"=>"Enquiry from 203.0.113.99 UA-TPL-MARK","from"=>"Bo <bo@example.test>","from_name"=>"Bo","from_email"=>"bo@example.test","fields"=>["your-name"=>"Bo Smoke","your-subject"=>"typed subject"],"meta"=>["remote_ip"=>"203.0.113.99","user_agent"=>"UA-TPL-MARK"],"akismet"=>null,"spam"=>false]);echo is_object($m)?$m->id():0;')
+    CLEAN="$CLEAN $MID2"
+    check "CONTROL: the template really is stored on the form, and the IP really is in the stored subject" \
+      "$(wpe 'echo get_post_meta('"$MID2"',"_subject",true);')" "Enquiry from 203.0.113.99 UA-TPL-MARK"
+    check "CONTROL: the form reports that template" "$(wpe 'echo wpcf7_strip_quote(WPCF7_ContactForm::get_instance('"$F2ID"')->pref("flamingo_subject"));')" "Enquiry from [_remote_ip] [_user_agent]"
+    call cf_get2 "$(tc cf7_get_message "{\"message_id\":$MID2}")"
+    check "get succeeds" "$(verdict cf_get2)" "ok"
+    check "the subject is not returned when the template is not the default" "$(jget cf_get2 message.subject)" "null"
+    check "the IP address from the subject is not in the reply" "$(has cf_get2 "203.0.113.99")" "no"
+    check "the user agent from the subject is not in the reply" "$(has cf_get2 "UA-TPL-MARK")" "no"
+    check "and the reply says the subject was withheld" "$(has cf_get2 "Withheld")" "yes"
+    check "CONTROL: the ordinary answer on that form is still returned" "$(has cf_get2 "Bo Smoke")" "yes"
+
+    echo "-- a form is found through its channel link, not its slug --"
+    # F1 owns the message through its _flamingo link and types doc as a FILE (never returned).
+    # F1 is then renamed, and F3 takes F1's old slug and types the same name as plain text.
+    SEED1=$(cf7_seed "Smoke linked form" "[file doc] [text who]" "")
+    F1ID="${SEED1%%:*}"; F1SLUG="${SEED1#*:}"; CLEAN="$CLEAN $F1ID"
+    MID3=$(wpe '$m=Flamingo_Inbound_Message::add(["channel"=>"'"$F1SLUG"'","subject"=>"s","from"=>"c <c@example.test>","from_name"=>"c","from_email"=>"c@example.test","fields"=>["doc"=>"DOCVALUE-FROM-FILE-FIELD","who"=>"Cy Smoke"],"meta"=>["remote_ip"=>"203.0.113.5","user_agent"=>"u"],"akismet"=>null,"spam"=>false]);echo is_object($m)?$m->id():0;')
+    CLEAN="$CLEAN $MID3"
+    wpe 'wp_update_post(["ID"=>'"$F1ID"',"post_name"=>"smoke-renamed-'"$RANDOM"'"]);' >/dev/null
+    SEED3=$(cf7_seed "Smoke impostor form" "[text doc] [text who]" "")
+    F3ID="${SEED3%%:*}"; CLEAN="$CLEAN $F3ID"
+    wpe 'delete_post_meta('"$F3ID"',"_flamingo");wp_update_post(["ID"=>'"$F3ID"',"post_name"=>"'"$F1SLUG"'"]);' >/dev/null
+    check "CONTROL: the impostor form now holds the message channel's slug, and the real one does not" \
+      "$(wpe 'echo get_post('"$F3ID"')->post_name==="'"$F1SLUG"'" && get_post('"$F1ID"')->post_name!=="'"$F1SLUG"'" ? "swapped":"not swapped";')" "swapped"
+    call cf_get3 "$(tc cf7_get_message "{\"message_id\":$MID3}")"
+    check "get succeeds" "$(verdict cf_get3)" "ok"
+    check "the answer the LINKED form types as a file is withheld, not typed by the slug-matched form" "$(has cf_get3 "DOCVALUE-FROM-FILE-FIELD")" "no"
+    check "CONTROL: a plain-text answer on the linked form is returned" "$(has cf_get3 "Cy Smoke")" "yes"
+
+    echo "-- a field name with capitals is answered under its lower-cased stored key --"
+    # Flamingo stores sanitize_key( '_field_' . name ), so Your-Name is _field_your-name. The
+    # answer must be returned, and a credential-shaped capitalised name must still be withheld.
+    SEED4=$(cf7_seed "Smoke caps form" "[text Your-Name] [text API-Key]" "")
+    F4ID="${SEED4%%:*}"; F4SLUG="${SEED4#*:}"; CLEAN="$CLEAN $F4ID"
+    MID4=$(wpe '$m=Flamingo_Inbound_Message::add(["channel"=>"'"$F4SLUG"'","subject"=>"s","from"=>"d <d@example.test>","from_name"=>"d","from_email"=>"d@example.test","fields"=>["Your-Name"=>"Dee Capital","API-Key"=>"CAPSKEYLEAK"],"meta"=>["remote_ip"=>"203.0.113.6","user_agent"=>"u"],"akismet"=>null,"spam"=>false]);echo is_object($m)?$m->id():0;')
+    CLEAN="$CLEAN $MID4"
+    check "CONTROL: Flamingo stored the answer under the lower-cased key" "$(wpe 'echo get_post_meta('"$MID4"',"_field_your-name",true);')" "Dee Capital"
+    call cf_get4 "$(tc cf7_get_message "{\"message_id\":$MID4}")"
+    check "the capitalised field's answer is returned" "$(has cf_get4 "Dee Capital")" "yes"
+    check "the capitalised credential-shaped answer is still withheld" "$(has cf_get4 "CAPSKEYLEAK")" "no"
   fi
 
   echo "-- log_state: Flamingo gone --"
@@ -210,6 +365,14 @@ else
     check "the briefing works at read and is counts only" "$(verdict ff_bro)" "ok"
     check "and carries a readable log_state" "$(jget ff_bro log_state.readable)" "true"
     check "and returns no answer" "$(has ff_bro "Fiona Smoke")" "no"
+    # delete_entry_on_submission exists in Fluent Forms (formSettings in fluentform_form_meta).
+    # A form set to it keeps nothing, so log_state names it instead of letting a zero stand.
+    check "log_state lists no form that deletes entries when none is set" "$(jget ff_bro log_state.forms_that_delete_entries_on_submission)" "[]"
+    wpe 'wpFluent()->table("fluentform_form_meta")->insert(["form_id"=>'"$FFID"',"meta_key"=>"formSettings","value"=>json_encode(["delete_entry_on_submission"=>"yes"])]);' >/dev/null
+    check "CONTROL: the setting is stored where Fluent keeps it" "$(wpe 'global $wpdb;echo $wpdb->get_var("SELECT value FROM '"${PFX}"'fluentform_form_meta WHERE form_id='"$FFID"' AND meta_key=\"formSettings\"");')" '{"delete_entry_on_submission":"yes"}'
+    callas "$RO" ff_bro2 "$(tc fluentform_briefing '{}')"
+    check "log_state now names the form that deletes entries on submission" "$(jget ff_bro2 log_state.forms_that_delete_entries_on_submission)" "[$FFID]"
+    wpe 'wpFluent()->table("fluentform_form_meta")->where("form_id",'"$FFID"')->where("meta_key","formSettings")->delete();' >/dev/null
     # A form whose definition is broken fails closed.
     wpe 'wpFluent()->table("fluentform_forms")->where("id",'"$FFID"')->update(["form_fields"=>"{broken"]);' >/dev/null
     call ff_badform "$(tc fluentform_get_entry "{\"entry_id\":$FSID}")"

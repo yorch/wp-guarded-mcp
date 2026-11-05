@@ -827,14 +827,40 @@ regular-expression redirect a `$1` that starts the target is the classic open re
 request `//evil.com` is copied in), so a capture is accepted only after a fixed first path
 segment.
 
+**The target is what `wp_redirect()` will send, not what was typed.** Redirection hands the
+stored target to `wp_redirect()`, whose `wp_sanitize_redirect()` DELETES every character outside
+`a-z 0-9 - ~ + _ . ? # = & ; , / : % ! * [ ] ( ) @`. Deleting is an open redirect: `/^/evil.com`
+begins with a single `/`, passes a check of its first two characters, is stored unchanged
+(Redirection's `sanitize_url` only strips newlines and control characters), and leaves
+`wp_redirect()` as `//evil.com`; the same for `'` `"` `{` `}` `|` `$` `` ` `` `<` `>` and `%0a`/`%0d`
+(`/%0a/evil.com`). A target is therefore accepted only if `wp_sanitize_redirect()` leaves it
+unchanged, and the `//`, host and scheme checks then run on exactly that text. The rule is in
+`problems_for()`, so create, update, enable and the read-back of a stored row all ask it. A
+non-ASCII path must be percent-encoded for the same reason (the sanitiser would encode it).
+In a regular-expression redirect `$1` is replaced before `wp_redirect()` sees the target, so
+it is stood in for with a digit when the rule is applied.
+
 **Sources.** A literal path, compared after percent-decoding to a fixed point, lower-casing,
 and rejecting `.`, `..` and empty segments; the site's subdirectory and a leading `index.php`
 are peeled off before the protected list is applied, and the protected paths are taken from
 WordPress (`wp_login_url()`, `admin_url()`, `rest_url()`, this plugin's endpoint) rather than
-hard-coded, so a moved login page is covered. A `rest_route` query is refused on any path.
+hard-coded, so a moved login page is covered. `/wp-cron.php` and `/xmlrpc.php` are protected
+too: neither is a page, and a redirect on either stops scheduled posts, updates and
+WooCommerce jobs, or remote publishing, with nothing on screen. A `rest_route` query is refused
+on any path.
 Regular-expression sources are off by default because a pattern cannot be proven not to cover
 the login page; when a site allows them, the pattern is tested against the protected paths
 and refused if it matches one. That test is best effort and is the reason the default is off.
+What it knows about Redirection's own handling of a pattern (read in 5.10.1): the source is
+`rawurldecode`d once when it is saved (`Red_Item_Sanitize::sanitize_url`) and the stored form is
+`rawurldecode`d again every time a request is matched (`Red_Regex::__construct`), then wrapped as
+`'@' . pattern . '@s'` with an `i` appended only when the redirect ignores case (not `'@..@i'`).
+So `^/wp-login%255c.php` is stored as `^/wp-login%5c.php` and matches `/wp-login.php`, and a probe of
+the text as typed, or of the stored text, never sees it. A `%` in a regular-expression source is
+therefore refused, the decoded forms are probed as well (for rows made in the admin screen), both
+wrapper flavours are used, and the probes include query-string variants
+(`/wp-login.php?a=1`) and the cron and XML-RPC paths. A backslash is refused in any source, so a
+literal dot is written `[.]`, not `\.`.
 
 **The policy belongs to the redirect, not to the call.** It is evaluated on the stored row
 after every write, and a row that fails is switched off, because Redirection sanitises what it
@@ -844,6 +870,16 @@ tool. Disabling asks nothing. Only the plain URL match and redirect action are m
 because match types that depend on the visitor (agent, referrer, cookie, IP, login status)
 are how a redirect is shown to a crawler and hidden from the owner, and an update that
 rebuilt one would drop its conditions without saying.
+
+**Facts about Redirection's API that these tools were corrected against (5.10.1).**
+`Red_Item::get_filtered` clamps `per_page` to at least 5 and offsets by `page * clamped size`, so
+asking for 3 returned 5 and page 2 started at row 10; the list now asks only for sizes it
+honours and cuts the requested page out locally. `to_json()` reports a redirect nobody has
+followed with `last_access` of `-`, which is reported as `null`. `Red_Item::create` honours
+`enabled => false`, so a redirect meant to be off is inserted off and not disabled afterwards
+(that left it live in between). `Red_Item_Sanitize::get_position()` answers 0 when no position
+is given, so an update carries the stored position over instead of moving the redirect to the
+front of its group.
 
 **No delete.** Disabling is the reversible removal and loses nothing. A deletion also loses
 the hit count and cannot be undone, and no task needs it. Adding one later means giving it
@@ -866,9 +902,11 @@ functions, its "not configured" state has several shapes, and it could not be in
 measure. A reader written from memory is how a confident "no translations" is produced.
 ## Rank Math and All in One SEO
 
-Every statement here about how those plugins store their data was written from memory of
-their source, on a machine where neither could be installed, and is marked UNVERIFIED in
-`includes/tools-seo.php`. It needs checking against a running copy before it is believed.
+How those plugins store their data was written from memory of their source, and has since been
+checked by running `smoke-seo.sh` against Rank Math 1.0.281 and All in One SEO 5.0.5: the post
+meta keys, the robots array and AIOSEO's table and robots columns are as described. Anything
+still marked UNVERIFIED in `includes/tools-seo.php` was not re-read. (Two checks of the suite
+simulate a missing table with `RENAME TABLE` and cannot pass on a SQLite stack.)
 
 - **The two plugins keep the data in different places, and that decides how each is
   written.** Rank Math keeps per-post SEO in ordinary post meta (`rank_math_title`,
@@ -896,14 +934,30 @@ their source, on a machine where neither could be installed, and is marked UNVER
   it can already do more to its search presence than any field here. The honest remainder is
   All in One SEO: its table is reachable only through this group, so a `write` key gains a
   capability it did not have. That is accepted, not denied. What narrows it: `robots` is a
-  three-way enum (`index`, `noindex`, `default`) with no free-text directives, other robots
-  directives on the post are left exactly as found, and a canonical must be on this site
+  three-way enum (`index`, `noindex`, `default`) with no free-text directives, `index` and
+  `noindex` leave the other robots directives on the post as found (Rank Math) or switch the
+  row's other flags on from a clean slate (All in One SEO, below), and a canonical must be on this site
   unless the site names another host through `gmcp_seo_canonical_hosts`. A canonical on
   another host hands the page's ranking to that host, which is the one field in the group
   with an attacker-shaped use.
-- **The commerce post guard applies**, and is asked before the "is this a public post type"
+- **`default` means different things, and the reply says so.** Rank Math falls back to the
+  post type's setting only when the stored robots array is EMPTY (checked in its
+  `Paper::get_robots()`), and its `validate_robots()` adds `index` to any non-empty array that
+  lacks one, so a stray `nofollow` left behind would pin the page to `index` instead of handing
+  the decision back. `robots: default` therefore removes every robots directive on the post and
+  the reply names what it removed, and the reader reports `index` for a stored set with no
+  `noindex`. In All in One SEO an explicit `index` or `noindex` sets `robots_default` to 0, which
+  makes the plugin read the row's other robots flags (`robots_nofollow`, `robots_noarchive`,
+  `robots_nosnippet` ...), so a flag that did nothing while the row followed the site-wide
+  setting would start to apply; going from default to an explicit decision resets them to off and
+  says which were set. A row that already made an explicit decision keeps its flags.
+- **The commerce post guard and the drafts-only guard apply** (`GMCP_Core::post_write_guard()`),
+  and are asked before the "is this a public post type"
   check, so on a site where a filter has made an order type viewable the policy about the
-  object is still what answers. No tool here writes an option, so the option write policy is
+  object is still what answers. The drafts-only half is the only thing holding a drafts-only key
+  on All in One SEO: it writes its own table through its own database layer, which no hook of
+  the net under WordPress sees. A refusal thrown by that net is reported as the policy's sentence,
+  not as "the SEO plugin threw an error". No tool here writes an option, so the option write policy is
   not bypassed because it is never reached; site-wide SEO settings are options and stay
   behind it.
 - **No nofollow, noarchive, snippet-length, schema or redirect controls, and the All in One
@@ -921,8 +975,12 @@ Read only, and the absence of a write is the design. As with Gravity Forms, a su
 the one record on the site a member of the public wrote. Unlike Gravity Forms there is no
 tool here that edits, trashes, marks as spam or deletes one, because nothing in this plugin
 can verify such a write against these three plugins and there is no restore tool behind it.
-As with the other groups, the storage described below is from memory and marked UNVERIFIED in
-`includes/tools-forms.php`; the suite `smoke-forms.sh` was written and not run.
+The storage of Contact Form 7 + Flamingo, Fluent Forms and Ninja Forms was checked against the
+real plugins (Contact Form 7 6.2.4.1, Flamingo 2.6.4, Fluent Forms 6.2.17, Ninja Forms 3.16.0)
+by running `smoke-forms.sh` on them; two of its checks (the ones that simulate a missing table
+with `RENAME TABLE`) cannot pass on a SQLite stack, which does not perform that statement, and
+need MySQL or MariaDB. Items still marked UNVERIFIED in `includes/tools-forms.php` were not
+re-read.
 
 - **The three briefings are `read` and return counts only; every tool that returns a
   submission is `admin`.** Same split as `gf_forms_briefing` against `gf_list_entries`. A
@@ -941,12 +999,30 @@ As with the other groups, the storage described below is from memory and marked 
   file-upload fields fail by not being on the list, and are named in a `withheld` list so the
   absence is visible. A field that was answered but has since been removed from the form is
   withheld, because nothing says what it was. If the definition cannot be read, no answer is
-  returned. This is the shape the WP Activity Log group arrived at after a denylist returned
+  returned. Two details of Contact Form 7 matter and were found by reading its source and
+  Flamingo's. The form a message belongs to is found through the form post's own
+  `_flamingo` meta (`['channel' => term id]`, written when the form first stores a message),
+  not through the channel's slug: a slug is only the form's name when the term was made, and
+  `get_page_by_path()` on it picks a different form once one is renamed and another takes the
+  old name, whose field types would then decide what is returned. The slug is used only for a
+  form with no channel link at all (an imported or hand-made message), never for one linked
+  elsewhere. And Flamingo stores each answer under `sanitize_key( '_field_' . name )`, which
+  lower-cases, so the allowlist is keyed the same way: a field named `Your-Name` is returned
+  and one named `API-Key` is still withheld as credential-shaped. Before this, a capitalised
+  name matched nothing and its answer was withheld for the wrong reason. This is the shape the WP Activity Log group arrived at after a denylist returned
   a credential, and it costs the same: a legitimate field is occasionally withheld, because
   its name contains `pass`, `key` or `auth`. That is the right way round.
 - **No IP address, user agent or referring URL is returned, at any level.** They are in the
   plugins' storage and are never selected: the Fluent and Ninja queries name their columns,
   and the Flamingo reader takes only `_field_*` meta, never the `_meta` row that holds them.
+  The one other place they can get in is the message's mail **subject**, and it is handled:
+  Flamingo does not store what a visitor typed, it stores `wpcf7_mail_replace_tags()` of the
+  form's `flamingo_subject` setting, which may be `Enquiry from [_remote_ip] ([_user_agent])` or
+  contain any answer. `cf7_get_message` therefore returns the subject only when the form's
+  template is exactly the default `[your-subject]` and that field is one the answer filter
+  would return; otherwise `subject` is `null` and `subject_note` says it was withheld. A site
+  that filters `wpcf7_flamingo_get_value` can make the stored text anything, which is not
+  visible from here.
 - **No search over answers.** A text search over submissions is an oracle: "does any entry
   contain `diff@`" confirms a value no tool will print, one guess at a time. Filters are by
   form, status and date only. This is the reason Gravity Forms' own search was rebuilt
@@ -959,17 +1035,43 @@ As with the other groups, the storage described below is from memory and marked 
   could therefore read every answer, and for Flamingo the visitor's IP address, through the
   tool beside the admin-only ones. `GMCP_Core::personal_data_post_guard()` is asked, ahead of
   the dispatch switch, by `wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`,
-  `wp_read_post_meta_chunk` and, for the post type it names, `wp_get_posts`. It is on whether
-  or not the forms group is. The type list is filterable through
+  `wp_read_post_meta_chunk`, `wp_alter_post` (a match count over a body is an oracle) and the
+  previews of `wp_update_post` and `wp_delete_post` (which print a title and the start of the
+  body), for the post type `wp_get_posts` names, and per row in a `wp_get_posts` listing (type
+  `any` names none). The `gmcp://post/{id}` resource and `wp_create_preview_link` ask it too.
+  It is on whether or not the forms group is. The type list is filterable through
   `gmcp_personal_data_post_types`.
-- **What that guard does not cover.** It is a list of readers, not a property of the data,
+- **A tool that copies from a post is a reader.** `wp_copy_post_meta` used to ask the write
+  guards about the post it wrote TO and nothing about the post it read FROM, so a `readwrite`
+  key copied every meta key of a Flamingo message (its `_meta` holds the IP address and user
+  agent) or of a `shop_order` (HPOS off) onto a draft of its own and read the draft with
+  `wp_get_post_meta`. `GMCP_Core::post_read_guard()` (the personal-data guard, then the
+  commerce read guard, which only lets an admin key read an order's rows) is now asked about the
+  source by `wp_copy_post_meta` and `wp_duplicate_post`, and again inside the one function that
+  moves the rows. `wp_update_post` and `wp_create_post(s)` refuse to retype a post out of, or
+  into, a form-submission type (`GMCP_Core::personal_data_retype_guard()`): the read guards ask
+  what type a post is, so a message retyped to `post` was an ordinary post whose body
+  `wp_get_post` returns, and Flamingo builds that body from the fields, consent and meta. A
+  commerce post is not retypable either, because `commerce_post_guard()` refuses every generic
+  write to one.
+- **What the guards do not cover.** They are a list of readers, not a property of the data,
   and the same weakness the commerce guard has: a reader added later has to be added to it.
-  Not covered today: `wp_get_post_terms` (channel terms only), the REST-route tools when that
-  group is on and a plugin exposes the type through REST, the change journal (which records a
-  changed meta key, and withholds values that look credential-shaped), and every route to the
-  database that is not a post reader. WooCommerce orders stored as posts are in the same
-  position, and are not added to this list: that is a broader decision about generic
-  post-meta reads and is not made here.
+  Not covered today: `wp_get_post_terms` and the terms of a post in the resource header
+  (channel terms only), the REST-route tools when that group is on and a plugin exposes the
+  type through REST, the change journal (it records a changed meta key and withholds values
+  that look credential-shaped, and only for posts a tool changed), and every route to the
+  database that is not a post reader. WooCommerce orders stored as posts ARE covered by
+  `commerce_post_read_guard()` in `wp_get_posts`, `wp_get_post`, `wp_get_post_snapshot`,
+  `wp_get_post_meta`, `wp_read_post_meta_chunk`, `wp_get_comments` and, now, the copy tools
+  and the resource; that guard applies below admin level only, whereas the form-submission
+  guard applies at every level (an admin key uses the form tools).
+- **Fluent Forms has a setting that keeps no entries, and `fluentform_briefing` reports it.**
+  `formSettings.delete_entry_on_submission` (a form's settings JSON in `fluentform_form_meta`,
+  default `no`) deletes each entry as it is stored, and `delete_after_x_days` with
+  `auto_delete_days` purges old ones. A zero for such a form means nothing, so `log_state` lists
+  the forms with the first setting and the forms with the second (and a `null` means the settings
+  could not be read, not that none is set). Ninja Forms' equivalent is the "has an active action
+  that records submissions" check below.
 - **Fluent Forms and Ninja Forms tables are checked for existence before a count.**
   Fluent stores answers as one JSON document per submission and the schema as JSON on the
   form; a schema that does not parse means no answers. Ninja Forms is told whether each form

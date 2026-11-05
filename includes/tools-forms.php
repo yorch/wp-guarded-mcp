@@ -186,7 +186,7 @@ class GMCP_Tools_Forms {
       ],
       'cf7_get_message' => [
         'name' => 'cf7_get_message',
-        'description' => 'Read one Flamingo message: date, form, status, the mail subject and every returnable answer.' . $withheld,
+        'description' => 'Read one Flamingo message: date, form, status, every returnable answer, and the mail subject only when it is exactly the visitor\'s own your-subject answer (a form can build the subject from a template that includes the IP address or any answer, and then it is withheld and subject_note says so).' . $withheld,
         'inputSchema' => [
           'type' => 'object',
           'properties' => [ 'message_id' => [ 'type' => 'integer', 'description' => 'The Flamingo message (post) ID.' ] ],
@@ -197,7 +197,7 @@ class GMCP_Tools_Forms {
 
       'fluentform_briefing' => [
         'name' => 'fluentform_briefing',
-        'description' => 'Count Fluent Forms submissions: by status and by form over a window of at most ' . self::MAX_WINDOW_DAYS . ' days. Counts only, no content and no personal data. Every reply carries a log_state block separating "no submissions" from "the submissions table does not exist" and from "Fluent Forms is not loaded". A form can be set not to keep entries; this tool cannot see that setting, so a form with zero is not proven to have received nothing.',
+        'description' => 'Count Fluent Forms submissions: by status and by form over a window of at most ' . self::MAX_WINDOW_DAYS . ' days. Counts only, no content and no personal data. Every reply carries a log_state block separating "no submissions" from "the submissions table does not exist" and from "Fluent Forms is not loaded". log_state lists the forms set to delete entries on submission or after some days (Fluent Forms\' own settings), because a zero for such a form means nothing; a form that has no such setting and zero entries has simply received none that are still stored.',
         'inputSchema' => [ 'type' => 'object', 'properties' => $window ],
         'accessLevel' => 'read',
       ],
@@ -596,44 +596,153 @@ class GMCP_Tools_Forms {
     ] );
   }
 
+  /** @var array<int,\WP_Post>|null channel term id => the form linked to it, built on first use. */
+  private $cf7_channel_map = null;
+
   /**
-  * A schema for a Flamingo message: tag name => label/type/ok, from its Contact Form 7 form.
+  * The Contact Form 7 form a Flamingo message came from.
   *
-  * Returns [] when the form cannot be found, which filter_answers() turns into "everything
-  * withheld" rather than "everything returned". The channel terms are tried in turn because a
-  * message can carry a parent channel as well as the form's own (UNVERIFIED).
+  * Flamingo files a message under a channel term, and Contact Form 7 records which term is a
+  * form's in the form post's own `_flamingo` meta (['channel' => term_id]), written the first
+  * time the form stores a message (modules/flamingo.php, wpcf7_flamingo_submit). That link is
+  * what says which form a message belongs to. The channel's SLUG is only the form's slug as it
+  * was when the term was made: rename a form, or make a new one that takes the old slug, and
+  * get_page_by_path() on the message's slug finds a different form, whose field types then
+  * decide what of this message is returned. So the link is followed first; the slug is used only
+  * for a form that has never stored a message (no `_flamingo` channel at all, which an imported
+  * or hand-made message looks like), and never for a form that is linked to another channel.
+  *
+  * @return \WP_Post|null
   */
-  private function cf7_schema( int $message_id, bool &$typed ): array {
-    $typed = false;
-    if ( !$this->cf7_loaded() ) {
-      return [];
+  private function cf7_form_post( int $message_id ) {
+    $terms = wp_get_object_terms( $message_id, self::FLAMINGO_CHANNEL );
+    if ( is_wp_error( $terms ) || !$terms ) {
+      return null;
     }
-    $slugs = wp_get_object_terms( $message_id, self::FLAMINGO_CHANNEL, [ 'fields' => 'slugs' ] );
-    if ( is_wp_error( $slugs ) || !$slugs ) {
-      return [];
+    $term_ids = array_map( function ( $t ) {
+      return (int) $t->term_id;
+    }, $terms );
+    // One scan of the forms per request, not one per message in a listing.
+    if ( $this->cf7_channel_map === null ) {
+      $this->cf7_channel_map = [];
+      $forms = get_posts( [ 'post_type' => 'wpcf7_contact_form', 'post_status' => 'any', 'numberposts' => -1, 'suppress_filters' => true ] );
+      foreach ( $forms as $form_post ) {
+        $link = get_post_meta( $form_post->ID, '_flamingo', true );
+        if ( is_array( $link ) && !empty( $link['channel'] ) ) {
+          $this->cf7_channel_map[ (int) $link['channel'] ] = $form_post;
+        }
+      }
     }
-    foreach ( $slugs as $slug ) {
-      $form_post = get_page_by_path( (string) $slug, OBJECT, 'wpcf7_contact_form' );
+    foreach ( $term_ids as $term_id ) {
+      if ( isset( $this->cf7_channel_map[ $term_id ] ) ) {
+        return $this->cf7_channel_map[ $term_id ];
+      }
+    }
+    foreach ( $terms as $term ) {
+      $form_post = get_page_by_path( (string) $term->slug, OBJECT, 'wpcf7_contact_form' );
       if ( !$form_post ) {
         continue;
       }
-      $form = \WPCF7_ContactForm::get_instance( $form_post );
-      if ( !$form || !method_exists( $form, 'scan_form_tags' ) ) {
+      $link = get_post_meta( $form_post->ID, '_flamingo', true );
+      if ( !is_array( $link ) || empty( $link['channel'] ) ) {
+        return $form_post;
+      }
+    }
+    return null;
+  }
+
+  /**
+  * A schema for a Flamingo message: stored answer name => label/type/ok, from its Contact Form 7 form.
+  *
+  * Returns [] when the form cannot be found, which filter_answers() turns into "everything
+  * withheld" rather than "everything returned".
+  *
+  * Keyed the way Flamingo STORES the answer. It writes each field to the meta key
+  * sanitize_key( '_field_' . name ), which lower-cases, so a tag named Your-Name is answered
+  * under `_field_your-name`. Keyed by the raw tag name, the answer would match nothing and be
+  * withheld as "not in the form's current definition": it fails closed, and the data is lost to
+  * the reader for no reason. Two tags that differ only in case share a stored key, so the
+  * stricter of the two decides.
+  *
+  * @param \WPCF7_ContactForm|null $form_out Set to the form when one was found.
+  */
+  private function cf7_schema( int $message_id, bool &$typed, &$form_out = null ): array {
+    $typed = false;
+    $form_out = null;
+    if ( !$this->cf7_loaded() ) {
+      return [];
+    }
+    $form_post = $this->cf7_form_post( $message_id );
+    if ( !$form_post ) {
+      return [];
+    }
+    $form = \WPCF7_ContactForm::get_instance( $form_post );
+    if ( !$form || !method_exists( $form, 'scan_form_tags' ) ) {
+      return [];
+    }
+    $schema = [];
+    foreach ( (array) $form->scan_form_tags() as $tag ) {
+      $name = is_object( $tag ) ? (string) ( $tag->name ?? '' ) : '';
+      if ( $name === '' ) {
         continue;
       }
-      $schema = [];
-      foreach ( (array) $form->scan_form_tags() as $tag ) {
-        $name = is_object( $tag ) ? (string) ( $tag->name ?? '' ) : '';
-        if ( $name === '' ) {
-          continue;
-        }
-        $base = (string) ( $tag->basetype ?? rtrim( (string) ( $tag->type ?? '' ), '*' ) );
-        $schema[ $name ] = [ 'label' => $name, 'type' => $base, 'ok' => in_array( $base, self::CF7_TYPES, true ) ];
+      $base = (string) ( $tag->basetype ?? rtrim( (string) ( $tag->type ?? '' ), '*' ) );
+      $key = substr( sanitize_key( '_field_' . $name ), 7 );
+      if ( $key === '' ) {
+        continue;
       }
-      $typed = true;
-      return $schema;
+      $ok = in_array( $base, self::CF7_TYPES, true );
+      $secret = GMCP_Core::field_looks_secret( $name );
+      if ( isset( $schema[ $key ] ) ) {
+        $ok = $ok && $schema[ $key ]['ok'] && !$secret;
+        // Keep the credential-shaped spelling as the hint, so the name check below sees it.
+        $hint = $secret ? $name : (string) ( $schema[ $key ]['hint'] ?? '' );
+      } else {
+        $hint = $name;
+      }
+      $schema[ $key ] = [ 'label' => $name, 'type' => $base, 'ok' => $ok, 'hint' => $hint ];
     }
-    return [];
+    $typed = true;
+    $form_out = $form;
+    return $schema;
+  }
+
+  /**
+  * The mail subject of a message, or null with the reason it is withheld.
+  *
+  * Flamingo does not store what the visitor typed as the subject. It stores
+  * wpcf7_mail_replace_tags( the form's flamingo_subject setting ), and that template is the
+  * form owner's to write: "[your-subject]" by default, but it may as well be
+  * "Enquiry from [_remote_ip] ([_user_agent]) [your-password]". Returned as it stands, it
+  * would carry the visitor's IP address and user agent, or an answer the field filter
+  * withholds, past every rule this group states. So the subject is returned only when the
+  * template is exactly "[your-subject]" and that field is one the answer filter would return;
+  * for any other template there is no way to tell what the stored text was built from.
+  *
+  * A site that filters wpcf7_flamingo_get_value can still make the stored text anything, and
+  * that is not visible from here.
+  *
+  * @param array<string,array> $schema
+  * @return array{0:?string,1:?string}
+  */
+  private function cf7_subject( int $message_id, array $schema, $form ): array {
+    $stored = (string) get_post_meta( $message_id, '_subject', true );
+    if ( $stored === '' ) {
+      return [ '', null ];
+    }
+    if ( !$form || !method_exists( $form, 'pref' ) ) {
+      return [ null, 'Withheld: the form this message came from could not be found, so what the subject was built from is not known.' ];
+    }
+    $template = $form->pref( 'flamingo_subject' );
+    $template = $template === null ? '[your-subject]' : trim( function_exists( 'wpcf7_strip_quote' ) ? wpcf7_strip_quote( (string) $template ) : (string) $template );
+    if ( $template !== '[your-subject]' ) {
+      return [ null, 'Withheld: this form builds the subject from a template (flamingo_subject) other than the default [your-subject], and a template can include the visitor\'s IP address, user agent or any answer, so what the subject holds cannot be told from here.' ];
+    }
+    $def = $schema['your-subject'] ?? null;
+    if ( !$def || !$def['ok'] || GMCP_Core::field_looks_secret( 'your-subject' ) ) {
+      return [ null, 'Withheld: the subject comes from the your-subject field, which is not one of the fields this tool returns.' ];
+    }
+    return [ $stored, null ];
   }
 
   /** The answers stored on a Flamingo message: _field_<name> rows only, so _meta (IP, user agent) is never read. */
@@ -737,23 +846,25 @@ class GMCP_Tools_Forms {
       return $this->json( $r, [ 'log_state' => $state, 'message' => null, 'note' => 'No Flamingo message with ID ' . $mid . ' exists.' ] );
     }
     $typed = false;
-    $schema = $this->cf7_schema( $mid, $typed );
+    $form = null;
+    $schema = $this->cf7_schema( $mid, $typed, $form );
     $filtered = $this->filter_answers( $schema, $this->cf7_answers( $mid ) );
     $channels = wp_get_object_terms( $mid, self::FLAMINGO_CHANNEL, [ 'fields' => 'slugs' ] );
-    $subject = (string) get_post_meta( $mid, '_subject', true );
+    [ $subject, $subject_note ] = $this->cf7_subject( $mid, $schema, $form );
     $message = [
       'message_id' => $mid,
       'date' => (string) $rows[0]['date_gmt'] . ' UTC',
       'form_channels' => is_wp_error( $channels ) ? [] : array_values( $channels ),
       'status' => $this->flamingo_status_name( (string) $rows[0]['status'] ),
-      'subject' => $this->clip( $subject ),
+      'subject' => $subject === null ? null : $this->clip( $subject ),
+      'subject_note' => $subject_note,
       'fields' => $this->render_fields( $filtered, false ),
       'withheld' => $filtered['withheld'],
       'withheld_count' => $filtered['withheld_count'],
       'fields_typed_from_form' => $typed,
     ];
     if ( !$typed ) {
-      $message['warning'] = 'The Contact Form 7 form this message came from could not be found, so its fields cannot be typed and none of the answers are returned.';
+      $message['warning'] = 'The Contact Form 7 form this message came from could not be found (a form is matched through its stored Flamingo channel link), so its fields cannot be typed and none of the answers are returned.';
     }
     return $this->json( $r, [ 'log_state' => $state, 'message' => $message ] );
   }
@@ -789,10 +900,46 @@ class GMCP_Tools_Forms {
     $state['readable'] = true;
     $state['submissions'] = (int) $c[0]['n'];
     $state['forms'] = (int) $f[0]['n'];
-    $state['note'] = 'A form can be configured not to keep entries; this tool does not read that setting (UNVERIFIED that such a setting exists), so a form with no submissions is not proven to have received none. Timestamps are in the time zone Fluent Forms stored them in.';
+    // A form can be set to delete each entry as it is submitted (formSettings.delete_entry_on_submission,
+    // read in Fluent Forms 6.2.17), or after a number of days. Its submissions table then holds
+    // nothing for it however many people filled it in, so a zero for such a form is "not kept".
+    $keeps = $this->fluent_retention();
+    $state['forms_that_delete_entries_on_submission'] = $keeps === null ? null : $keeps['on_submission'];
+    $state['forms_that_delete_entries_after_days'] = $keeps === null ? null : $keeps['after_days'];
+    $state['note'] = 'A form with delete_entry_on_submission set keeps no entries at all, so a count of zero for it means nothing; forms_that_delete_entries_on_submission lists them (null means the setting could not be read, not that no form has it). forms_that_delete_entries_after_days lists forms that purge old entries, whose counts are a floor. Timestamps are in the time zone Fluent Forms stored them in.';
     // Fluent stores local time (UNVERIFIED), so the "gmt" parameter is a misnomer here and the
     // bucket is computed as if it were UTC; at worst it is off by the site's offset.
     return array_merge( $state, $this->newest_report( $c[0]['newest'] ) );
+  }
+
+  /**
+  * Forms whose Fluent settings delete entries, or null when the settings cannot be read.
+  *
+  * @return array{on_submission:int[],after_days:array<int,array{form_id:int,days:int}>}|null
+  */
+  private function fluent_retention(): ?array {
+    global $wpdb;
+    if ( !$this->table_exists( $wpdb->prefix . 'fluentform_form_meta' ) ) {
+      return null;
+    }
+    $rows = $this->rows( "SELECT form_id, value FROM {$wpdb->prefix}fluentform_form_meta WHERE meta_key = %s LIMIT 1000", [ 'formSettings' ] );
+    if ( is_string( $rows ) ) {
+      return null;
+    }
+    $out = [ 'on_submission' => [], 'after_days' => [] ];
+    foreach ( $rows as $row ) {
+      $settings = json_decode( (string) $row['value'], true );
+      if ( !is_array( $settings ) ) {
+        continue;
+      }
+      if ( ( $settings['delete_entry_on_submission'] ?? '' ) === 'yes' ) {
+        $out['on_submission'][] = (int) $row['form_id'];
+      }
+      elseif ( ( $settings['delete_after_x_days'] ?? '' ) === 'yes' && (int) ( $settings['auto_delete_days'] ?? 0 ) > 0 ) {
+        $out['after_days'][] = [ 'form_id' => (int) $row['form_id'], 'days' => (int) $settings['auto_delete_days'] ];
+      }
+    }
+    return $out;
   }
 
   private function fluent_briefing( array $args, array $r ): array {

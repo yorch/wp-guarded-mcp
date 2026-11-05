@@ -518,6 +518,11 @@ class GMCP_Tools_Diagnostics {
     if ( $guard !== true ) {
       return $this->error( $r, $guard );
     }
+    // A link is a read handed to whoever holds it, so the read policy of the post applies.
+    $readable = GMCP_Core::post_read_guard( (int) $post->ID );
+    if ( $readable !== true ) {
+      return $this->error( $r, $readable );
+    }
     $made = GMCP_Preview::create( $post, $hours, get_current_user_id() );
     if ( !$made['ok'] ) {
       return $this->error( $r, $made['error'] );

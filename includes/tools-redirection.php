@@ -19,8 +19,8 @@ if ( !defined( 'ABSPATH' ) ) {
 *    gmcp_redirect_allowed_hosts filter (default: empty). No wildcard, no userinfo, no port.
 *  - The source is a literal path. A regular expression is refused unless the site opts in with
 *    gmcp_redirect_allow_regex, and even then it is refused when it matches a protected path.
-*  - A source on wp-login, wp-admin, the REST API, this plugin's own route or the OAuth
-*    discovery documents is refused, however it is spelled.
+*  - A source on wp-login, wp-admin, wp-cron.php, xmlrpc.php, the REST API, this plugin's own route
+*    or the OAuth discovery documents is refused, however it is spelled.
 *  - Only the plain "URL" match with the plain "redirect" action is managed here. The other
 *    match types (agent, referrer, cookie, IP, login status...) make a redirect conditional on
 *    who is asking, which is how a redirect is shown to a crawler and hidden from the owner.
@@ -37,10 +37,13 @@ if ( !defined( 'ABSPATH' ) ) {
 * The plugin's own PHP classes are used for every read and write (Red_Item). Nothing here writes
 * SQL against its tables; the only query is SHOW TABLES, to tell "no redirects" from "no tables".
 *
-* Facts about Redirection's API that this file relies on were written from memory of its source
-* and could not be run against an install. Each is listed in the report that accompanied the
-* change, marked UNVERIFIED, and each call into the plugin is guarded so a wrong one produces a
-* sentence rather than a fatal or a silent success.
+* Facts about Redirection's API that this file relies on were first written from memory and
+* have since been checked by running smoke-redirection.sh against Redirection 5.10.1: Red_Item
+* get_by_id, create, update, get_filtered and to_json behave as used here, with the corrections
+* noted where they apply (get_filtered clamps per_page to at least 5, to_json reports a redirect
+* nobody has followed with last_access "-", and the regular-expression wrapper is '@..@s[i]').
+* Each call into the plugin is still guarded, so a version that differs produces a sentence
+* rather than a fatal or a silent success.
 */
 class GMCP_Tools_Redirection {
 
@@ -77,7 +80,7 @@ class GMCP_Tools_Redirection {
   }
 
   private function tools(): array {
-    $policy = 'The target must be a path on this site (starting with a single /) or an http(s) URL on this site\'s own host; an https URL on any other host is refused unless the site has listed that host through the gmcp_redirect_allowed_hosts filter, which is empty by default. A source on wp-login.php, wp-admin, the REST API, this plugin\'s endpoint or the OAuth discovery documents is refused, and so is a regular-expression source unless the site opts in through gmcp_redirect_allow_regex.';
+    $policy = 'The target must be a path on this site (starting with a single /) or an http(s) URL on this site\'s own host; an https URL on any other host is refused unless the site has listed that host through the gmcp_redirect_allowed_hosts filter, which is empty by default. The target must also come through WordPress\'s redirect sanitiser unchanged (it deletes characters such as ^ \' { | and $, so /^/evil.com would be sent as //evil.com). A source on wp-login.php, wp-admin, wp-cron.php, xmlrpc.php, the REST API, this plugin\'s endpoint or the OAuth discovery documents is refused, and so is a regular-expression source unless the site opts in through gmcp_redirect_allow_regex (a % is refused in a pattern).';
     return [
       'redirection_list' => [
         'name' => 'redirection_list',
@@ -221,6 +224,9 @@ class GMCP_Tools_Redirection {
       wp_login_url(), admin_url(), rest_url(), rest_url( 'mcp/v1/http' ),
       home_url( '/wp-login.php' ), home_url( '/wp-admin/' ), home_url( '/wp-json/' ),
       home_url( '/.well-known/' ),
+      // Neither is a page. WordPress and its hosts call them on a schedule, and a redirect on
+      // one stops scheduled posts, updates and WooCommerce jobs without anything on screen.
+      home_url( '/wp-cron.php' ), home_url( '/xmlrpc.php' ),
     ];
     $paths = [];
     foreach ( $urls as $url ) {
@@ -269,16 +275,46 @@ class GMCP_Tools_Redirection {
       if ( !$regex_ok ) {
         return [ 'Regular-expression sources are refused on this site: a pattern cannot be proven not to cover the login page or this plugin\'s endpoint. A site that accepts that risk can allow them through the gmcp_redirect_allow_regex filter.' ];
       }
-      // Allowed by the site, so hold it to the one thing that can be tested: it must compile and
-      // must not match any protected path. Redirection wraps the pattern in @...@ with i.
-      $pattern = '@' . str_replace( '@', '\\@', $source ) . '@i';
-      if ( @preg_match( $pattern, '' ) === false ) {
-        return [ 'The regular expression does not compile.' ];
+      // Allowed by the site, so hold it to the one thing that can be tested: it must compile
+      // and must not match any protected path.
+      //
+      // The pattern is decoded twice before it runs, and neither decode is visible from here:
+      // Redirection's sanitiser rawurldecodes the source once when it is saved, and
+      // Red_Regex::__construct rawurldecodes the stored form again when a request is matched.
+      // So '^/wp%252dlogin\.php' is stored as '^/wp%2dlogin\.php' and matches /wp-login.php at
+      // runtime, and a probe of the text as typed never sees it. A '%' in a regular expression
+      // is therefore refused outright (a literal percent sign is written \x25), and the
+      // decoded forms are probed as well, in case a stored row from the admin screen has one.
+      if ( strpos( $source, '%' ) !== false ) {
+        return [ 'A regular-expression source may not contain "%": Redirection percent-decodes the pattern twice, once when it is saved and once when it matches, so the pattern it runs is not the one that was checked. Write a literal percent sign as \\x25.' ];
       }
-      $probes = array_merge( $protected, [ '/wp-login.php', '/wp-admin/', '/wp-admin/admin-ajax.php', '/wp-json/', '/wp-json/mcp/v1/http', '/index.php?rest_route=/mcp/v1/http', '/.well-known/oauth-protected-resource' ] );
+      $forms = array_unique( [ $source, rawurldecode( $source ), rawurldecode( rawurldecode( $source ) ) ] );
+      // Redirection's own wrapper (Red_Regex::get_regex) is '@' . pattern . '@s' with an 'i' only
+      // when the redirect ignores case. Both are probed: 'i' matches a superset, 's' is the default.
+      $patterns = [];
+      foreach ( $forms as $form ) {
+        foreach ( [ 's', 'si' ] as $flags ) {
+          $patterns[] = '@' . str_replace( '@', '\\@', $form ) . '@' . $flags;
+        }
+      }
+      foreach ( $patterns as $pattern ) {
+        if ( @preg_match( $pattern, '' ) === false ) {
+          return [ 'The regular expression does not compile.' ];
+        }
+      }
+      $bases = [ '/wp-login.php', '/wp-admin/', '/wp-admin/admin-ajax.php', '/wp-json/', '/wp-json/mcp/v1/http', '/index.php?rest_route=/mcp/v1/http', '/.well-known/oauth-protected-resource', '/wp-cron.php', '/xmlrpc.php' ];
+      $probes = $protected;
+      foreach ( $bases as $base ) {
+        // With a query string too: '^/wp-login\.php\?' only matches a request that has one.
+        $probes[] = $base;
+        $probes[] = $base . ( strpos( $base, '?' ) === false ? '?' : '&' ) . 'a=1';
+      }
       foreach ( array_unique( $probes ) as $probe ) {
-        if ( @preg_match( $pattern, $probe ) === 1 ) {
-          $problems[] = 'The regular expression matches ' . $probe . ', which a redirect must never cover.';
+        foreach ( $patterns as $pattern ) {
+          if ( @preg_match( $pattern, $probe ) === 1 ) {
+            $problems[] = 'The regular expression matches ' . $probe . ', which a redirect must never cover.';
+            break;
+          }
         }
       }
       return $problems;
@@ -323,11 +359,11 @@ class GMCP_Tools_Redirection {
         $variants[] = substr( $v, strlen( '/index.php' ) );
       }
     }
-    $first_segments = [ 'wp-admin', 'wp-login.php', 'wp-json', '.well-known' ];
+    $first_segments = [ 'wp-admin', 'wp-login.php', 'wp-json', '.well-known', 'wp-cron.php', 'xmlrpc.php' ];
     foreach ( array_unique( $variants ) as $v ) {
       $first = explode( '/', ltrim( $v, '/' ) )[0];
       if ( in_array( $first, $first_segments, true ) ) {
-        $problems[] = 'The source is under /' . $first . ', which a redirect must never cover: it would lock the operator out or break this plugin\'s connection.';
+        $problems[] = 'The source is under /' . $first . ', which a redirect must never cover: it would lock the operator out, stop scheduled work or break this plugin\'s connection.';
         break;
       }
     }
@@ -355,6 +391,18 @@ class GMCP_Tools_Redirection {
     // "//evil.com" and strip tabs and newlines from inside a URL.
     if ( preg_match( '/[\x00-\x20\x7f\\\\]/', $target ) ) {
       return [ 'The target contains a space, control character or backslash; encode it (a space is %20).' ];
+    }
+
+    // The target is handed to wp_redirect(), which runs wp_sanitize_redirect() on it and deletes
+    // every character outside a short allow-list. Deleting is the hole: '/^/evil.com' passes a
+    // check that looks only at the first two characters, is stored unchanged, and leaves
+    // wp_redirect() as '//evil.com', a protocol-relative URL to another site. So the target is
+    // only accepted if sanitising it changes nothing, and every check below then runs on text
+    // that is exactly what a browser will be sent. In a regular-expression redirect "$1" is
+    // replaced by the captured text before wp_redirect() sees it, so it is stood in for here.
+    $sent = $regex ? (string) preg_replace( '/\$(?:\d+|\{\d+\})/', '1', $target ) : $target;
+    if ( wp_sanitize_redirect( $sent ) !== $sent ) {
+      return [ 'The target contains a character WordPress deletes from a redirect location (anything outside letters, digits and - ~ + _ . ? # = & ; , / : % ! * [ ] ( ) @), and deleting it can turn the target into another one, for example "/^/evil.com" into "//evil.com". Percent-encode it.' ];
     }
 
     // In a regular-expression redirect "$1" copies what the visitor typed into the target. A
@@ -489,7 +537,9 @@ class GMCP_Tools_Redirection {
       'title'       => isset( $j['title'] ) ? (string) $j['title'] : '',
       'group_id'    => isset( $j['group_id'] ) ? (int) $j['group_id'] : 0,
       'hits'        => isset( $j['hits'] ) ? (int) $j['hits'] : null,
-      'last_access' => isset( $j['last_access'] ) && $j['last_access'] ? (string) $j['last_access'] : null,
+      // to_json() reports a redirect nobody has followed as the string '-', which is not a date.
+      'last_access' => isset( $j['last_access'] ) && $j['last_access'] && $j['last_access'] !== '-' ? (string) $j['last_access'] : null,
+      'position'    => isset( $j['position'] ) ? (int) $j['position'] : null,
       'match_data'  => $j['match_data'] ?? null,
       'incomplete'  => $incomplete,
     ];
@@ -498,7 +548,7 @@ class GMCP_Tools_Redirection {
   /** The shape, without the internal fields, plus the policy verdict. */
   private function public_shape( array $s ): array {
     $problems = $this->shape_problems( $s );
-    unset( $s['match_data'], $s['incomplete'] );
+    unset( $s['match_data'], $s['incomplete'], $s['position'] );
     $s['policy_violations'] = $problems;
     return $s;
   }
@@ -569,12 +619,27 @@ class GMCP_Tools_Redirection {
     $per_page = max( 1, min( self::MAX_PER_PAGE, (int) ( $args['per_page'] ?? 25 ) ) );
     $page = max( 1, (int) ( $args['page'] ?? 1 ) );
 
-    $result = \Red_Item::get_filtered( [ 'page' => $page - 1, 'per_page' => $per_page, 'orderby' => 'id', 'direction' => 'desc' ] );
+    // Red_Item::get_filtered clamps the page size to at least 5 and then offsets by page * that
+    // clamped size. Asking it for 3 rows therefore returns 5, and page 2 starts at row 10, not 3:
+    // rows were skipped. So it is only ever asked for a size it will honour, and the page this
+    // caller wants is cut out of what comes back.
+    $chunk = max( 5, $per_page );
+    $start = ( $page - 1 ) * $per_page;
+    $first = intdiv( $start, $chunk );
+    $local = $start - $first * $chunk;
+    $result = \Red_Item::get_filtered( [ 'page' => $first, 'per_page' => $chunk, 'orderby' => 'id', 'direction' => 'desc' ] );
     if ( !is_array( $result ) || !isset( $result['items'] ) || !is_array( $result['items'] ) ) {
       return $this->error( $r, 'Redirection\'s query layer returned something this plugin does not recognise (no items list), so no redirects are reported.' );
     }
+    $rows = array_values( $result['items'] );
+    if ( $local + $per_page > $chunk ) {
+      $more = \Red_Item::get_filtered( [ 'page' => $first + 1, 'per_page' => $chunk, 'orderby' => 'id', 'direction' => 'desc' ] );
+      if ( is_array( $more ) && isset( $more['items'] ) && is_array( $more['items'] ) ) {
+        $rows = array_merge( $rows, array_values( $more['items'] ) );
+      }
+    }
     // The cap is enforced here too: it must hold even if the plugin ignores per_page.
-    $items = array_slice( array_values( $result['items'] ), 0, $per_page );
+    $items = array_slice( $rows, $local, $per_page );
     $out = [];
     foreach ( $items as $item ) {
       $out[] = $this->public_shape( $this->item_shape( $item ) );
@@ -651,6 +716,10 @@ class GMCP_Tools_Redirection {
       'group_id'    => $group_id,
       'title'       => $title,
       'position'    => 0,
+      // Honoured by Red_Item::create at insert time. Disabling afterwards leaves the redirect
+      // live between the insert and the disable(), which on a request-per-visitor site is not
+      // a theoretical window, so a redirect meant to be off is never written on.
+      'enabled'     => $enabled,
     ] );
     if ( is_wp_error( $item ) ) {
       return $this->error( $r, 'Redirection refused to create the redirect: ' . $item->get_error_message() );
@@ -659,10 +728,6 @@ class GMCP_Tools_Redirection {
       return $this->error( $r, 'Redirection did not return the redirect it was asked to create, so whether one exists is unknown. Check redirection_list before retrying.', -32603 );
     }
     $new_id = (int) $item->get_id();
-
-    if ( !$enabled && method_exists( $item, 'disable' ) ) {
-      $item->disable();
-    }
 
     // Held to the policy as STORED. Redirection sanitises what it is given, so the row can
     // differ from the request, and the request was only ever a claim.
@@ -745,6 +810,9 @@ class GMCP_Tools_Redirection {
       'regex'       => $after['regex'],
       'group_id'    => $after['group_id'],
       'title'       => $after['title'],
+      // The sanitiser's get_position() answers 0 when none is given, which would move the
+      // redirect to the front of its group and change which of two overlapping rules wins.
+      'position'    => (int) ( $before['position'] ?? 0 ),
     ];
     // Source flags (ignore case, query, trailing slash) live in match_data; an update that
     // omits it would put them back to defaults and change which URLs the redirect matches.

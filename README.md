@@ -167,7 +167,9 @@ and the reply carries the previous values instead. Every write is read back from
 fails if it differs; the rendered page, page caches and sitemaps are not checked. `noindex`
 and a canonical URL change how a page appears in search, so a canonical must be on this site
 (another host needs the `gmcp_seo_canonical_hosts` filter), `robots` accepts only the three
-values, and orders are refused. The write level is a judgement, argued in
+values (`default` clears every robots directive on the post, because Rank Math only falls back
+to the site-wide setting when none is stored), a drafts-only key cannot write to a live page,
+and orders are refused. The write level is a judgement, argued in
 [docs/guardrails.md](docs/guardrails.md#rank-math-and-all-in-one-seo), and it is weaker for
 All in One SEO because no generic tool reaches its table. The All in One SEO focus keyphrase
 is readable and not writable. How each plugin stores its data was written without an installed
@@ -179,7 +181,10 @@ trashed or deleted.** A counts-only briefing per plugin at `read`; listing and r
 individual submissions at `admin`, because a submission is personal data a member of the
 public wrote. Only fields present in the form's current definition and of a plain-input type
 are returned (an allowlist), password and file-upload answers are named but never returned,
-and IP addresses, user agents and referring URLs are never returned at any level. There is
+and IP addresses, user agents and referring URLs are never returned at any level (which includes
+the Contact Form 7 mail subject: Flamingo builds it from a template that can contain them, so it is
+returned only when the form uses the default `[your-subject]`, and otherwise withheld with a note;
+Fluent Forms' own setting that deletes entries on submission is reported, since a zero for such a form means nothing). There is
 no search over answers, because a text search over submissions is an oracle for the values
 withheld. Every reply carries a `log_state` block that separates "none arrived" from "the
 plugin that stores them is not installed", "its table is missing" and, for Ninja Forms, "this
@@ -282,10 +287,13 @@ installed. Five tools: list and get at `write`, and create, update and switch on
 and lock you out of your own, so the tools keep a policy of their own. The **target** must be
 a path on this site or a URL on this site's own host; an `https` URL on any other host is
 refused unless the site lists that host through the `gmcp_redirect_allowed_hosts` filter,
-which is empty by default (exact host names, default port, no userinfo, no wildcard). The
+which is empty by default (exact host names, default port, no userinfo, no wildcard). The target
+must also survive `wp_sanitize_redirect()` unchanged: that function deletes characters, so
+`/^/evil.com` would be sent as `//evil.com`, and any target it would alter is refused. The
 **source** must be a literal path; regular-expression sources are refused unless the site opts
 in through `gmcp_redirect_allow_regex`, and are then still refused if the pattern matches a
-protected path. A source on `wp-login.php`, `wp-admin`, the REST API, this plugin's endpoint or
+protected path (a `%` is refused in a pattern, because Redirection decodes it twice). A source on
+`wp-login.php`, `wp-admin`, `wp-cron.php`, `xmlrpc.php`, the REST API, this plugin's endpoint or
 the OAuth discovery documents is refused however it is spelled (case, percent-encoding,
 `..` segments, `index.php/`, a `rest_route` query, a site in a subdirectory). Only the plain
 URL match with the plain redirect action is managed: the conditional match types (agent,
