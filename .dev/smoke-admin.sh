@@ -3319,6 +3319,76 @@ check "stored state: and the store is empty" "$(pv_posts)" ""
 kcall pv_make4 "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":416,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
 PV_LAST=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_make4)
 
+# A token is shown once and never again, to anyone. Three keys of different strength each make a
+# link and open it, and then every place the plugin writes to, and every tool that reads, is
+# searched for those exact tokens. The creation replies are the control: they DO hold their
+# token, so a zero below is a probe that can see one. (The 40-hex shape is not searched across
+# the whole options table: other plugins store 40-hex values there, so only this plugin's own
+# stores are asked about the shape.)
+K_PV_DO=$(docker compose exec -T cli wp eval '$a=GMCP_Tokens::create("Preview drafts-only","readwrite",0,[],0,true);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+case "$K_PV_DO" in gmcp_*) ;; *) echo "  FAIL  could not mint the drafts-only key for the preview-token block"; fail=$((fail+1));; esac
+PV_DBG_WAS=$(docker compose exec -T cli wp eval 'echo empty( get_option( "gmcp_options", [] )["mcp_debug_mode"] ) ? "off" : "on";' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_debug_mode"]=true;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_preview_links >/dev/null 2>&1
+kcall pv_t_rw "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":470,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+kcall pv_t_do "$K_PV_DO" "{\"jsonrpc\":\"2.0\",\"id\":471,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+call pv_t_adm "{\"jsonrpc\":\"2.0\",\"id\":472,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_B}}}"
+check "a drafts-only key can make a link for a draft" "$(verdict pv_t_do)" "ok"
+PV_T1=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_t_rw)
+PV_T2=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_t_do)
+PV_T3=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_t_adm)
+check "control: three tokens were extracted" "${#PV_T1}${#PV_T2}${#PV_T3}" "404040"
+check "control: each token opens its post (the opening is part of the run being searched)" \
+  "$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_T1")-$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_T2")-$(pv_status "/?p=$PV_B&post_type=post&gmcp_preview=$PV_T3")" "200-200-200"
+for who in rw do adm; do
+  case $who in rw) key="$K_PV_RW";; do) key="$K_PV_DO";; adm) key="$TOK";; esac
+  kcall "pv_lc_$who" "$key" '{"jsonrpc":"2.0","id":473,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":200}}}'
+  kcall "pv_ga_$who" "$key" '{"jsonrpc":"2.0","id":474,"method":"tools/call","params":{"name":"wp_get_audit_log","arguments":{"limit":500}}}'
+  kcall "pv_go_$who" "$key" '{"jsonrpc":"2.0","id":475,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"gmcp_preview_links","raw":true}}}'
+done
+check "control: wp_list_changes answers for all three keys" "$(verdict pv_lc_rw)-$(verdict pv_lc_do)-$(verdict pv_lc_adm)" "ok-ok-ok"
+check "a write-level key cannot read the audit log" "$(verdict pv_ga_rw)" "error"
+check "a drafts-only key cannot read the audit log" "$(verdict pv_ga_do)" "error"
+check "control: an admin key can, and the log holds the link-making calls" "$(verdict pv_ga_adm)-$(grep -c 'wp_create_preview_link' "$OUT/pv_ga_adm" | awk '{print ($1>0)?"yes":"no"}')" "ok-yes"
+check "no key can read the stored link table through the option tool" "$(verdict pv_go_rw)-$(verdict pv_go_do)-$(verdict pv_go_adm)" "error-error-error"
+PV_REPLY_HITS=0
+for f in pv_lc_rw pv_lc_do pv_lc_adm pv_ga_rw pv_ga_do pv_ga_adm pv_go_rw pv_go_do pv_go_adm; do
+  PV_REPLY_HITS=$((PV_REPLY_HITS + $(grep -c -e "$PV_T1" -e "$PV_T2" -e "$PV_T3" "$OUT/$f")))
+done
+check "no token in the reply of wp_list_changes, wp_get_audit_log or wp_get_option, for any of the three keys" "$PV_REPLY_HITS" "0"
+check "control: the same grep finds the token in the reply that created it" \
+  "$(grep -c -e "$PV_T1" "$OUT/pv_t_rw")$(grep -c -e "$PV_T2" "$OUT/pv_t_do")$(grep -c -e "$PV_T3" "$OUT/pv_t_adm")" "111"
+PV_SCAN=$(docker compose exec -T cli wp eval '
+  global $wpdb;
+  $tokens = explode( " ", "'"$PV_T1 $PV_T2 $PV_T3"'" );
+  $n = static function ( string $h ) use ( $tokens ) { $c = 0; foreach ( $tokens as $t ) { $c += substr_count( $h, $t ); } return $c; };
+  $hex = static function ( string $h ) { return (int) preg_match_all( "/(?<![a-f0-9])[a-f0-9]{40}(?![a-f0-9])/", $h ); };
+  $audit = ""; foreach ( $wpdb->get_results( "SELECT * FROM {$wpdb->prefix}gmcp_audit", ARRAY_A ) as $r ) { $audit .= wp_json_encode( $r ) . "\n"; }
+  $opts = ""; foreach ( $wpdb->get_results( "SELECT option_name, option_value FROM {$wpdb->options}" ) as $r ) { $opts .= $r->option_name . "\n" . $r->option_value . "\n"; }
+  $meta = ""; foreach ( $wpdb->get_results( "SELECT meta_key, meta_value FROM {$wpdb->postmeta}" ) as $r ) { $meta .= $r->meta_key . "\n" . $r->meta_value . "\n"; }
+  $journal = serialize( get_option( "gmcp_journal", [] ) );
+  $links = serialize( get_option( "gmcp_preview_links", [] ) );
+  $dbg = (string) ini_get( "error_log" ); $dbg = $dbg !== "" && is_readable( $dbg ) ? (string) file_get_contents( $dbg ) : "";
+  $hashes = 0; foreach ( $tokens as $t ) { $hashes += isset( ( (array) get_option( "gmcp_preview_links", [] ) )[ hash( "sha256", $t ) ] ) ? 1 : 0; }
+  echo implode( "|", [ $n( $audit ), $hex( $audit ), $n( $journal ), $hex( $journal ), $n( $opts ), $n( $meta ), $n( $links ), $hex( $links ), $n( $dbg ), $hex( $dbg ), $hashes, substr_count( $audit, "wp_create_preview_link" ), substr_count( $dbg, "wp_create_preview_link" ) ] );' 2>/dev/null | tr -d '\r\n')
+IFS='|' read -r S_AUDIT S_AUDIT_HEX S_JOURNAL S_JOURNAL_HEX S_OPTS S_META S_LINKS S_LINKS_HEX S_DBG S_DBG_HEX S_HASHES S_AUDIT_CALLS S_DBG_CALLS <<< "$PV_SCAN"
+check "control: the scan ran (it counted the audit rows that made the links)" "$([ "${S_AUDIT_CALLS:-0}" -ge 3 ] && echo yes || echo no)" "yes"
+check "control: the stored table holds the SHA-256 of each of the three tokens (the probe finds a link by its hash)" "${S_HASHES:-x}" "3"
+check "stored state: no token in any column of any audit row" "${S_AUDIT:-x}" "0"
+check "stored state: no 40-hex value in the audit table at all" "${S_AUDIT_HEX:-x}" "0"
+check "stored state: no token in the change journal" "${S_JOURNAL:-x}" "0"
+check "stored state: no 40-hex value in the change journal" "${S_JOURNAL_HEX:-x}" "0"
+check "stored state: no token anywhere in the options table (the journal and the link table included)" "${S_OPTS:-x}" "0"
+check "stored state: no token in post meta" "${S_META:-x}" "0"
+check "stored state: the link table holds hashes only (no token, no 40-hex value)" "${S_LINKS:-x}/${S_LINKS_HEX:-x}" "0/0"
+if [ "${S_DBG_CALLS:-0}" -ge 1 ]; then
+  check "stored state: no token in the debug log, which printed these calls" "${S_DBG}/${S_DBG_HEX}" "0/0"
+else
+  echo "  ....  debug-log half not checked: the debug log holds none of these calls (no writable error_log file on this stack)"
+fi
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_debug_mode"]='"$([ "$PV_DBG_WAS" = on ] && echo true || echo false)"';update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_preview_links >/dev/null 2>&1
+
 # Fetch policy. The refusals are deterministic and need no network.
 fetch_verdict() { # fetch_verdict <url> -> "refused" when the POLICY refused, "admitted" otherwise
   call pv_f "{\"jsonrpc\":\"2.0\",\"id\":420,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_fetch_page\",\"arguments\":{\"url\":\"$1\"}}}"

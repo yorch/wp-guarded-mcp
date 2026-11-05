@@ -418,8 +418,28 @@ something that looks harmless and is not, so each says what it cannot promise.
   for the same reason: it would be recorded as an argument, and a preview
   credential has no business being fetched by a tool that cannot show a draft
   anyway.
+- Nobody can read a token back: no tool returns one after the call that made it,
+  there is no tool that lists links, and the stored row holds only the SHA-256 of
+  each token, which `wp_get_option` and every other option tool refuse to read at
+  any level. Measured with three keys (write, drafts-only, admin) that each made and
+  opened a link: the exact tokens were searched for in every column of every audit
+  row, the change journal, the whole options table, post meta, the link table and the
+  debug log, and in the replies of `wp_list_changes`, `wp_get_audit_log` and
+  `wp_get_option`, and were in none of them; the reply that made each one was the
+  control and held it. `wp_get_audit_log` is admin-level, so a write-level or
+  drafts-only key cannot read the log at all. What is readable: `wp_revoke_preview_links`
+  for one post reports how many links it ended and how many remain, to any key that can
+  edit that post (every key acts as an administrator, so that is every post). That is a
+  count, never a token or an id, and asking destroys what it counts, but it does tell a
+  key whether a link existed for a post and ends it, including one made by another key
+  or another person. Ending every link needs an admin-level key.
 - Not closed, and said so: viewing a link is not logged (only issuing and
-  revoking are); anyone who is given the link can forward it; a link pasted into a
+  revoking are); the token is in the URL, so the web server's access log, a
+  proxy's, the browser's history and any Referer to a third party carry it,
+  outside anything this plugin writes or can scrub (the preview response sends
+  `Referrer-Policy: no-referrer`, which covers links followed from that page and not
+  the logs; the access log of the sandbox server used for the measurement above does
+  not record request URIs, so that part was not measured); anyone who is given the link can forward it; a link pasted into a
   post body or a message is outside what the preview scrub can see (the audit log's
   text test now blanks an argument that carries a credential-shaped string, but a
   preview link is not one of the shapes it knows); the
