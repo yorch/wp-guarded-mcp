@@ -19,8 +19,8 @@ if ( !defined( 'ABSPATH' ) ) {
 *    gmcp_redirect_allowed_hosts filter (default: empty). No wildcard, no userinfo, no port.
 *  - The source is a literal path. A regular expression is refused unless the site opts in with
 *    gmcp_redirect_allow_regex, and even then it is refused when it matches a protected path.
-*  - A source on wp-login, wp-admin, the REST API, this plugin's own route or the OAuth
-*    discovery documents is refused, however it is spelled.
+*  - A source on wp-login, wp-admin, wp-cron.php, xmlrpc.php, the REST API, this plugin's own route
+*    or the OAuth discovery documents is refused, however it is spelled.
 *  - Only the plain "URL" match with the plain "redirect" action is managed here. The other
 *    match types (agent, referrer, cookie, IP, login status...) make a redirect conditional on
 *    who is asking, which is how a redirect is shown to a crawler and hidden from the owner.
@@ -37,10 +37,13 @@ if ( !defined( 'ABSPATH' ) ) {
 * The plugin's own PHP classes are used for every read and write (Red_Item). Nothing here writes
 * SQL against its tables; the only query is SHOW TABLES, to tell "no redirects" from "no tables".
 *
-* Facts about Redirection's API that this file relies on were written from memory of its source
-* and could not be run against an install. Each is listed in the report that accompanied the
-* change, marked UNVERIFIED, and each call into the plugin is guarded so a wrong one produces a
-* sentence rather than a fatal or a silent success.
+* Facts about Redirection's API that this file relies on were first written from memory and
+* have since been checked by running smoke-redirection.sh against Redirection 5.10.1: Red_Item
+* get_by_id, create, update, get_filtered and to_json behave as used here, with the corrections
+* noted where they apply (get_filtered clamps per_page to at least 5, to_json reports a redirect
+* nobody has followed with last_access "-", and the regular-expression wrapper is '@..@s[i]').
+* Each call into the plugin is still guarded, so a version that differs produces a sentence
+* rather than a fatal or a silent success.
 */
 class GMCP_Tools_Redirection {
 
@@ -77,7 +80,7 @@ class GMCP_Tools_Redirection {
   }
 
   private function tools(): array {
-    $policy = 'The target must be a path on this site (starting with a single /) or an http(s) URL on this site\'s own host; an https URL on any other host is refused unless the site has listed that host through the gmcp_redirect_allowed_hosts filter, which is empty by default. A source on wp-login.php, wp-admin, the REST API, this plugin\'s endpoint or the OAuth discovery documents is refused, and so is a regular-expression source unless the site opts in through gmcp_redirect_allow_regex.';
+    $policy = 'The target must be a path on this site (starting with a single /) or an http(s) URL on this site\'s own host; an https URL on any other host is refused unless the site has listed that host through the gmcp_redirect_allowed_hosts filter, which is empty by default. The target must also come through WordPress\'s redirect sanitiser unchanged (it deletes characters such as ^ \' { | and $, so /^/evil.com would be sent as //evil.com). A source on wp-login.php, wp-admin, wp-cron.php, xmlrpc.php, the REST API, this plugin\'s endpoint or the OAuth discovery documents is refused, and so is a regular-expression source unless the site opts in through gmcp_redirect_allow_regex (a % is refused in a pattern).';
     return [
       'redirection_list' => [
         'name' => 'redirection_list',

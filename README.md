@@ -287,10 +287,13 @@ installed. Five tools: list and get at `write`, and create, update and switch on
 and lock you out of your own, so the tools keep a policy of their own. The **target** must be
 a path on this site or a URL on this site's own host; an `https` URL on any other host is
 refused unless the site lists that host through the `gmcp_redirect_allowed_hosts` filter,
-which is empty by default (exact host names, default port, no userinfo, no wildcard). The
+which is empty by default (exact host names, default port, no userinfo, no wildcard). The target
+must also survive `wp_sanitize_redirect()` unchanged: that function deletes characters, so
+`/^/evil.com` would be sent as `//evil.com`, and any target it would alter is refused. The
 **source** must be a literal path; regular-expression sources are refused unless the site opts
 in through `gmcp_redirect_allow_regex`, and are then still refused if the pattern matches a
-protected path. A source on `wp-login.php`, `wp-admin`, the REST API, this plugin's endpoint or
+protected path (a `%` is refused in a pattern, because Redirection decodes it twice). A source on
+`wp-login.php`, `wp-admin`, `wp-cron.php`, `xmlrpc.php`, the REST API, this plugin's endpoint or
 the OAuth discovery documents is refused however it is spelled (case, percent-encoding,
 `..` segments, `index.php/`, a `rest_route` query, a site in a subdirectory). Only the plain
 URL match with the plain redirect action is managed: the conditional match types (agent,

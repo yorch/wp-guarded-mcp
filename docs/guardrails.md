@@ -780,14 +780,40 @@ regular-expression redirect a `$1` that starts the target is the classic open re
 request `//evil.com` is copied in), so a capture is accepted only after a fixed first path
 segment.
 
+**The target is what `wp_redirect()` will send, not what was typed.** Redirection hands the
+stored target to `wp_redirect()`, whose `wp_sanitize_redirect()` DELETES every character outside
+`a-z 0-9 - ~ + _ . ? # = & ; , / : % ! * [ ] ( ) @`. Deleting is an open redirect: `/^/evil.com`
+begins with a single `/`, passes a check of its first two characters, is stored unchanged
+(Redirection's `sanitize_url` only strips newlines and control characters), and leaves
+`wp_redirect()` as `//evil.com`; the same for `'` `"` `{` `}` `|` `$` `` ` `` `<` `>` and `%0a`/`%0d`
+(`/%0a/evil.com`). A target is therefore accepted only if `wp_sanitize_redirect()` leaves it
+unchanged, and the `//`, host and scheme checks then run on exactly that text. The rule is in
+`problems_for()`, so create, update, enable and the read-back of a stored row all ask it. A
+non-ASCII path must be percent-encoded for the same reason (the sanitiser would encode it).
+In a regular-expression redirect `$1` is replaced before `wp_redirect()` sees the target, so
+it is stood in for with a digit when the rule is applied.
+
 **Sources.** A literal path, compared after percent-decoding to a fixed point, lower-casing,
 and rejecting `.`, `..` and empty segments; the site's subdirectory and a leading `index.php`
 are peeled off before the protected list is applied, and the protected paths are taken from
 WordPress (`wp_login_url()`, `admin_url()`, `rest_url()`, this plugin's endpoint) rather than
-hard-coded, so a moved login page is covered. A `rest_route` query is refused on any path.
+hard-coded, so a moved login page is covered. `/wp-cron.php` and `/xmlrpc.php` are protected
+too: neither is a page, and a redirect on either stops scheduled posts, updates and
+WooCommerce jobs, or remote publishing, with nothing on screen. A `rest_route` query is refused
+on any path.
 Regular-expression sources are off by default because a pattern cannot be proven not to cover
 the login page; when a site allows them, the pattern is tested against the protected paths
 and refused if it matches one. That test is best effort and is the reason the default is off.
+What it knows about Redirection's own handling of a pattern (read in 5.10.1): the source is
+`rawurldecode`d once when it is saved (`Red_Item_Sanitize::sanitize_url`) and the stored form is
+`rawurldecode`d again every time a request is matched (`Red_Regex::__construct`), then wrapped as
+`'@' . pattern . '@s'` with an `i` appended only when the redirect ignores case (not `'@..@i'`).
+So `^/wp-login%255c.php` is stored as `^/wp-login%5c.php` and matches `/wp-login.php`, and a probe of
+the text as typed, or of the stored text, never sees it. A `%` in a regular-expression source is
+therefore refused, the decoded forms are probed as well (for rows made in the admin screen), both
+wrapper flavours are used, and the probes include query-string variants
+(`/wp-login.php?a=1`) and the cron and XML-RPC paths. A backslash is refused in any source, so a
+literal dot is written `[.]`, not `\.`.
 
 **The policy belongs to the redirect, not to the call.** It is evaluated on the stored row
 after every write, and a row that fails is switched off, because Redirection sanitises what it
@@ -797,6 +823,16 @@ tool. Disabling asks nothing. Only the plain URL match and redirect action are m
 because match types that depend on the visitor (agent, referrer, cookie, IP, login status)
 are how a redirect is shown to a crawler and hidden from the owner, and an update that
 rebuilt one would drop its conditions without saying.
+
+**Facts about Redirection's API that these tools were corrected against (5.10.1).**
+`Red_Item::get_filtered` clamps `per_page` to at least 5 and offsets by `page * clamped size`, so
+asking for 3 returned 5 and page 2 started at row 10; the list now asks only for sizes it
+honours and cuts the requested page out locally. `to_json()` reports a redirect nobody has
+followed with `last_access` of `-`, which is reported as `null`. `Red_Item::create` honours
+`enabled => false`, so a redirect meant to be off is inserted off and not disabled afterwards
+(that left it live in between). `Red_Item_Sanitize::get_position()` answers 0 when no position
+is given, so an update carries the stored position over instead of moving the redirect to the
+front of its group.
 
 **No delete.** Disabling is the reversible removal and loses nothing. A deletion also loses
 the hit count and cannot be undone, and no task needs it. Adding one later means giving it
@@ -819,9 +855,11 @@ functions, its "not configured" state has several shapes, and it could not be in
 measure. A reader written from memory is how a confident "no translations" is produced.
 ## Rank Math and All in One SEO
 
-Every statement here about how those plugins store their data was written from memory of
-their source, on a machine where neither could be installed, and is marked UNVERIFIED in
-`includes/tools-seo.php`. It needs checking against a running copy before it is believed.
+How those plugins store their data was written from memory of their source, and has since been
+checked by running `smoke-seo.sh` against Rank Math 1.0.281 and All in One SEO 5.0.5: the post
+meta keys, the robots array and AIOSEO's table and robots columns are as described. Anything
+still marked UNVERIFIED in `includes/tools-seo.php` was not re-read. (Two checks of the suite
+simulate a missing table with `RENAME TABLE` and cannot pass on a SQLite stack.)
 
 - **The two plugins keep the data in different places, and that decides how each is
   written.** Rank Math keeps per-post SEO in ordinary post meta (`rank_math_title`,
