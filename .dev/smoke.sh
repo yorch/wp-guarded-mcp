@@ -1875,7 +1875,7 @@ ini_set( "error_log", "/tmp/gmcp-errlog-probe.log" );
 PHPEOF'
 # 1. A tool argument: a query with the secret in its key=value form, a message with a
 #    bearer credential in it, and the tool name carrying the marker.
-call dl_arg '{"jsonrpc":"2.0","id":90,"method":"tools/call","params":{"name":"gmcp_probe_'"$DL_MARK"'","arguments":{"query":"'"$DL_MARK"' smtp_pwd='"$DL_ARG"'","message":"'"$DL_MARK"' Bearer '"$DL_BEARER"'"}}}'
+call dl_arg '{"jsonrpc":"2.0","id":90,"method":"tools/call","params":{"name":"dlprobe_'"$DL_MARK"'","arguments":{"query":"'"$DL_MARK"' smtp_pwd='"$DL_ARG"'","message":"'"$DL_MARK"' Bearer '"$DL_BEARER"'"}}}'
 # 2. The client's self-reported name, from initialize.
 call dl_client '{"jsonrpc":"2.0","id":91,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"'"$DL_MARK"' smtp_pwd='"$DL_CLIENT"'","version":"1"}}}'
 # 3. A query string: the authorize endpoint logs redirect_uri, and this one carries the
@@ -1884,6 +1884,14 @@ call dl_client '{"jsonrpc":"2.0","id":91,"method":"initialize","params":{"protoc
 curl -sS -o /dev/null "$BASE/wp-json/mcp/v1/oauth/authorize?response_type=code&client_id=probe&redirect_uri=https%3A%2F%2Fexample.test%2Fcb%3F$DL_MARK%26smtp_pwd%3D$DL_QUERY&scope=mcp&code_challenge=x&code_challenge_method=S256&state=s"
 # 4. A form field: the token endpoint logs grant_type, here a bearer credential in it.
 curl -sS -o /dev/null -X POST "$BASE/wp-json/mcp/v1/oauth/token" --data-urlencode "grant_type=Bearer $DL_GRANT" --data-urlencode "client_id=$DL_MARK"
+# 5. The authorize endpoint answers before anyone is logged in and builds its refusal line from the
+#    request: a response_type that carries a line break and a forged log line, and a client_id
+#    that carries a key=value credential. Both reach log_authorize_refusal(), which printed them
+#    raw: the first as a SECOND log line, the second in the clear.
+DL_FORGE="forgedline$DL_RUN"
+DL_CLIENT2=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
+curl -sS -o /dev/null "$BASE/wp-json/mcp/v1/oauth/authorize?response_type=tok%0A%5BGuarded%20MCP%5D%20$DL_FORGE%20pretends%20to%20be%20a%20log%20line&client_id=probe&redirect_uri=https%3A%2F%2Fexample.test%2Fcb&scope=mcp&code_challenge=x&code_challenge_method=S256&state=s"
+curl -sS -o /dev/null "$BASE/wp-json/mcp/v1/oauth/authorize?response_type=code&client_id=unknown_smtp_pwd%3D$DL_CLIENT2&redirect_uri=https%3A%2F%2Fexample.test%2Fcb&scope=mcp&code_challenge=x&code_challenge_method=S256&state=s"
 # The probes are done. Read the log, then put the site back, then compare: a guard test
 # must not leave the debug option, the mu-plugin or the log file behind.
 docker compose exec -T wp cat /tmp/gmcp-errlog-probe.log > "$OUT/errlog.txt" 2>/dev/null
@@ -1892,7 +1900,7 @@ wpe 'global $gmcp_core; $o = $gmcp_core->get_all_options(true); $o["mcp_debug_mo
 # CONTROLS first: the marker reached the log from each path, so the absence checks below
 # are reading a log that was written.
 check "CONTROL: the marker reaches the log from a tool argument and the tool name" \
-  "$([ "$(grep -c -- "gmcp_probe_$DL_MARK" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+  "$([ "$(grep -c -- "dlprobe_$DL_MARK" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
 check "CONTROL: the marker reaches the log from the client name" \
   "$([ "$(grep -c -- "Client: $DL_MARK" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
 check "CONTROL: the marker reaches the log from the authorize query string" \
@@ -1907,6 +1915,12 @@ check "a bearer credential in an argument is absent from the log" "$(grep -c -- 
 check "a secret in the client's self-reported name is absent from the log" "$(grep -c -- "$DL_CLIENT" "$OUT/errlog.txt" 2>/dev/null)" "0"
 check "a secret in an authorize query string is absent from the log" "$(grep -c -- "$DL_QUERY" "$OUT/errlog.txt" 2>/dev/null)" "0"
 check "a bearer credential in a token form field is absent from the log" "$(grep -c -- "$DL_GRANT" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "CONTROL: the forged text reached the log (on the refusal line, as an escape)" \
+  "$([ "$(grep -c -- "Authorize refused: unsupported response_type: tok.*$DL_FORGE" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+check "a line break in a request value does not start a second log line" "$(grep -c -- "^\[Guarded MCP\] $DL_FORGE" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "CONTROL: the unknown-client refusal line was written, with the client_id name in it" \
+  "$([ "$(grep -c -- "unknown client_id unknown_smtp_pwd" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+check "a credential in a refused authorize request's client_id is absent from the log" "$(grep -c -- "$DL_CLIENT2" "$OUT/errlog.txt" 2>/dev/null)" "0"
 check "the debug option is back as it was" \
   "$(wpe 'global $gmcp_core; echo $gmcp_core->get_option("mcp_debug_mode") ? "on" : "off";')" "$DL_WAS"
 

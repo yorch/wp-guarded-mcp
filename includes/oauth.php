@@ -542,7 +542,11 @@ class GMCP_OAuth {
 
   private function log_authorize_refusal( $reason ) {
     if ( $this->logging ) {
-      error_log( '[Guarded MCP OAuth] ❌ Authorize refused: ' . $reason );
+      // $reason is built from the request's own response_type, client_id, code_challenge_method
+      // and redirect_uri, and this endpoint answers before anyone has logged in. It is client
+      // text like every other value printed here, so it takes the same scrub and the same
+      // control-character escape.
+      error_log( '[Guarded MCP OAuth] ❌ Authorize refused: ' . GMCP_Core::log_text( $reason ) );
     }
   }
 

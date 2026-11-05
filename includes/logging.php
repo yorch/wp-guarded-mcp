@@ -47,10 +47,11 @@ class GMCP_Logging {
   }
 
   /**
-  * The one writer for this class. Every message is scrubbed here as well as at the call
-  * sites that print client text, so a caller that forgets is still covered.
+  * The one writer for this class. Every message goes through the full log scrub here as well as
+  * at the call sites that print client text, so a caller that forgets is still covered, and a
+  * newline in a message cannot start a second log line. @see GMCP_Core::log_line()
   */
   private static function write( $line ) {
-    error_log( GMCP_Core::scrub_written_text( (string) $line ) );
+    error_log( GMCP_Core::log_line( (string) $line ) );
   }
 }

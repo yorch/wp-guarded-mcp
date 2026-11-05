@@ -442,8 +442,18 @@ something that looks harmless and is not, so each says what it cannot promise.
   the audit log gives, so a value under a credential-named option or meta key is not
   printed there either. Every other value the trace writes that a client sent (the
   tool name, the client's own name and version, a requested redirect URI, a grant
-  type, an exception message) goes through `GMCP_Core::log_text()`, and a session
-  id is written as its first eight characters. Without it the tool that hands the link out would
+  type, an exception message, the reason an authorize request was refused) goes through
+  `GMCP_Core::log_text()`, and a session id is written as its first eight characters.
+  `log_text()` is the widest scrub in the plugin because a log is the channel nobody is
+  told about before reading it: it turns control characters into visible escapes (a
+  newline in a request value used to be written as a second line, so a client could forge
+  `[Guarded MCP]` lines), runs the line through the same scrubber the error-log reader
+  uses (vendor key prefixes, PEM blocks, URL user information, JWTs, escaped JSON,
+  `define()` lines, `pw=`), and takes the whole value after a secret-named key: an
+  unquoted one up to `&` or the end of the line, a quoted one up to its closing quote,
+  so `smtp_pwd=correct horse battery` no longer leaves `horse battery`. It reads at most
+  2,500 bytes of a value, and when PCRE gives up the line says it was withheld rather than
+  coming out empty. `GMCP_Logging` writes every line through the same function. Without it the tool that hands the link out would
   have written it into the audit log in the clear in the same call, which the
   first test of it showed. The fetch tool refuses a URL carrying the parameter
   for the same reason: it would be recorded as an argument, and a preview

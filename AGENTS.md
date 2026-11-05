@@ -125,11 +125,17 @@ error_log.** `user_pass` is dropped unconditionally, and
 two cannot drift apart. The debug `error_log` is a third channel the same credential
 can reach, and a channel with no redaction is a leak waiting for the first caller
 that passes a secret. So every debug line that prints something a client sent goes
-through `GMCP_Core::log_text()`, which redacts arrays through `redact()` and then
-blanks a credential written as an assignment inside a string (`smtp_pwd=...`, a
-`Bearer` token). `GMCP_Logging` scrubs every message it writes as well, so a line
-added later without the helper is still covered. A bare token with no key in front
-of it is not recognised by any of this, and nothing in the docs claims it is.
+through `GMCP_Core::log_text()` (`log_line()` for a string), and so does every line
+`GMCP_Logging` writes, so a line added later without the helper is still covered. In a log
+over-redacting is fine and under-redacting is not, so it is the widest of the channels: control
+characters become visible escapes (a newline in a request value was a forged second log line),
+`GMCP_Diag_Util::scrub_log_line()` removes the vendor key shapes, PEM blocks, URL user
+information, JWTs, escaped JSON, `define()` lines and `pw=`, and the whole value after a
+secret-named key goes, an unquoted one to `&` or the end of the line and a quoted one to its
+closing quote. Every `error_log()` in `includes/` is checked by a tripwire in
+`.dev/test-credential-channels.php`: one that prints `$reason`, an exception message or a request
+parameter without `log_text()` fails it. A bare token with no key in front of it and no known
+prefix is not recognised by any of this, and nothing in the docs claims it is.
 
 **Free text is judged as text, in one place.** `holds_credential()` reads field names and opens
 only values that begin as JSON or serialized data, so a post body with `{"api_key":"..."}` or a

@@ -409,7 +409,7 @@ class GMCP_Server {
         } );
         GMCP_Tokens::touch( $key['id'] );
         if ( $this->logging ) {
-          error_log( '[Guarded MCP] 🔐 Key auth OK: ' . $key['label'] );
+          error_log( '[Guarded MCP] 🔐 Key auth OK: ' . GMCP_Core::log_text( $key['label'] ) );
         }
         return true;
       }
@@ -590,7 +590,7 @@ class GMCP_Server {
       if ( $this->logging ) {
         // A session id is a handle a client presents again, so it is logged by its first
         // eight characters, as the SSE and termination lines already do.
-        error_log( '[Guarded MCP] 🆔 Direct session initialized: ' . substr( $session_id, 0, 8 ) . '...' );
+        error_log( '[Guarded MCP] 🆔 Direct session initialized: ' . GMCP_Core::log_text( substr( $session_id, 0, 8 ) ) . '...' );
       }
     }
 
@@ -683,7 +683,7 @@ class GMCP_Server {
 
           if ( $this->logging ) {
             error_log( '[Guarded MCP Direct] 🔧 tools/call - Tool: ' . GMCP_Core::log_text( $tool ) );
-            error_log( '[Guarded MCP Direct] 🔧 tools/call - Arguments: ' . wp_json_encode( GMCP_Core::redact_call_args( is_array( $arguments ) ? $arguments : [] ) ) );
+            error_log( '[Guarded MCP Direct] 🔧 tools/call - Arguments: ' . GMCP_Core::log_text( GMCP_Core::redact_call_args( is_array( $arguments ) ? $arguments : [] ) ) );
           }
 
           try {
@@ -833,7 +833,7 @@ class GMCP_Server {
     $response->header( 'Mcp-Session-Id', $session_id );
 
     if ( $this->logging ) {
-      error_log( '[Guarded MCP] 🪪 Response session header: ' . substr( $session_id, 0, 8 ) . '...' );
+      error_log( '[Guarded MCP] 🪪 Response session header: ' . GMCP_Core::log_text( substr( $session_id, 0, 8 ) ) . '...' );
     }
 
     return $response;
@@ -925,7 +925,7 @@ class GMCP_Server {
     $session_id = !empty( $session_header ) ? sanitize_text_field( $session_header ) : wp_generate_uuid4();
 
     if ( $this->logging ) {
-      error_log( '[Guarded MCP HTTP] 📡 SSE stream opened for session: ' . substr( $session_id, 0, 8 ) . '...' );
+      error_log( '[Guarded MCP HTTP] 📡 SSE stream opened for session: ' . GMCP_Core::log_text( substr( $session_id, 0, 8 ) ) . '...' );
     }
 
     // Set up SSE output
@@ -1083,7 +1083,7 @@ class GMCP_Server {
     $session_id = sanitize_text_field( $session_header );
 
     if ( $this->logging ) {
-      error_log( '[Guarded MCP HTTP] 🗑️ Session terminated: ' . substr( $session_id, 0, 8 ) . '...' );
+      error_log( '[Guarded MCP HTTP] 🗑️ Session terminated: ' . GMCP_Core::log_text( substr( $session_id, 0, 8 ) ) . '...' );
     }
 
     // Queue kill signal for any active SSE streams

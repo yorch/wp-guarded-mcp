@@ -1995,7 +1995,7 @@ class GMCP_Core {
 
   /**
   * One request-derived value, as a debug line may carry it: a scalar as text, an array or
-  * object as its redacted JSON, with the text scrub applied either way.
+  * object as its redacted JSON, with the full log scrub applied either way. @see log_line()
   *
   * Every log line that prints something a client sent goes through this. The value is
   * scrubbed before anything truncates it, so a cut cannot leave a secret's head visible.
@@ -2003,9 +2003,109 @@ class GMCP_Core {
   public static function log_text( $value ): string {
     if ( is_array( $value ) || is_object( $value ) ) {
       $json = wp_json_encode( self::redact( $value ) );
-      return self::scrub_written_text( is_string( $json ) ? $json : '' );
+      return self::log_line( is_string( $json ) ? $json : '' );
     }
-    return self::scrub_written_text( (string) $value );
+    return self::log_line( (string) $value );
+  }
+
+  /** The longest stretch of one value that is read for a debug line; the line itself is shorter. */
+  const LOG_READ_BYTES = 2500;
+
+  /**
+  * Stands in for a redacted value while a log line is being scrubbed in two passes. Letters only,
+  * so the second pass reads it as one ordinary token and ends its own replacement exactly there.
+  */
+  const LOG_SENTINEL = 'GMCPREDACTEDVALUE';
+
+  /**
+  * Text as the debug log may keep it. Over-redacting is acceptable here and under-redacting is
+  * not: a log is read by whoever runs the server, and nobody is expected to be told what is
+  * in it before they open it. Steps, in this order.
+  *
+  *  1. Cut to what a line can hold (read no more than that), so a megabyte argument is not
+  *     processed to print two thousand characters.
+  *  2. Control characters become visible escapes. A request value with a newline in it was
+  *     written as a second line, so any client could forge "[Guarded MCP] ..." lines in the log
+  *     an operator reads; one line in, one line out.
+  *  3. A value after a secret-named key is taken whole: an unquoted one up to "&" or the end of
+  *     the line, a quoted one up to its closing quote. "smtp_pwd=correct horse battery" was left
+  *     as "smtp_pwd=[redacted] horse battery" by a scrub that ended a value at the first space.
+  *  4. GMCP_Diag_Util::scrub_log_line(), the scrubber the error-log reader already uses, which
+  *     knows the vendor key prefixes, PEM blocks, URL user information, JWTs, escaped JSON,
+  *     define() lines and pw=.
+  *
+  * The two scrubs cannot read each other's marker: given "key=[redacted]" the second ends the
+  * value at the "]" and leaves "[redacted]]" behind. So a marker is a letters-only sentinel
+  * between steps 3 and 4 and becomes "[redacted]" at the end, which also makes the whole thing
+  * stable when a line that was already scrubbed is scrubbed again (GMCP_Logging does that to
+  * every line a call site has already passed through log_text()).
+  *
+  * Never returns "" for text: a scrub that gives up yields UNSCRUBBABLE.
+  */
+  public static function log_line( string $text ): string {
+    $text = self::escape_control_characters( self::cut_bytes( $text, self::LOG_READ_BYTES ) );
+    if ( $text === '' ) {
+      return '';
+    }
+    $text = str_replace( [ self::REDACTION_MARKER, self::LOG_SENTINEL ], self::LOG_SENTINEL, $text );
+    $text = self::scrub_log_assignments( $text );
+    if ( $text !== self::UNSCRUBBABLE ) {
+      $scrubbed = GMCP_Diag_Util::scrub_log_line( $text, [ 'patterns' => array_values( array_filter( array_map( 'strval', (array) self::credential_field_patterns() ), 'strlen' ) ) ] );
+      // scrub_log_line() casts each rule's result to a string, so a rule that PCRE gives up on
+      // blanks the line and the rules after it run over nothing: what comes back is "" or just
+      // its own truncation note. That is a line that lost its content, not a clean one.
+      $left = trim( str_replace( ' …[line truncated]', '', $scrubbed ) );
+      $text = ( $left === '' && trim( $text ) !== '' && trim( $text ) !== self::LOG_SENTINEL ) ? self::UNSCRUBBABLE : $scrubbed;
+    }
+    return self::escape_control_characters( str_replace( self::LOG_SENTINEL, self::REDACTION_MARKER, $text ) );
+  }
+
+  /**
+  * Control characters (and the three Unicode line separators) as visible escapes, so that what
+  * is written is one line. Not a regular expression: a table, which cannot give up.
+  */
+  public static function escape_control_characters( string $text ): string {
+    static $table = null;
+    if ( $table === null ) {
+      $table = [ "\n" => '\\n', "\r" => '\\r', "\t" => '\\t', "\x7F" => '\\x7f',
+        "\xC2\x85" => '\\u0085', "\xE2\x80\xA8" => '\\u2028', "\xE2\x80\xA9" => '\\u2029' ];
+      for ( $i = 0; $i < 32; $i++ ) {
+        if ( !isset( $table[ chr( $i ) ] ) ) {
+          $table[ chr( $i ) ] = sprintf( '\\x%02x', $i );
+        }
+      }
+    }
+    return strtr( $text, $table );
+  }
+
+  /**
+  * The whole value after a secret-named key replaced by the sentinel, for the debug log. See
+  * log_line() step 3. Linear for the same reasons scrub_written_text() is: the name run starts
+  * at its beginning only, the pieces are possessive, and the credential word is asked of the
+  * run by a lookahead and only for words that occur in the text. A value that is already the
+  * sentinel is left as it is, and a quoted value keeps its quotes.
+  */
+  private static function scrub_log_assignments( string $text ): string {
+    $names = [];
+    foreach ( (array) self::credential_field_patterns() as $pattern ) {
+      if ( is_string( $pattern ) && $pattern !== '' && stripos( $text, $pattern ) !== false ) {
+        $names[] = preg_quote( $pattern, '/' );
+      }
+    }
+    if ( !$names ) {
+      return $text;
+    }
+    $re = '/(?<![A-Za-z0-9_.\-\[\]])(?=[A-Za-z0-9_.\-\[\]]*?(?:' . implode( '|', $names ) . '))'
+      . '([A-Za-z0-9_.\-\[\]]++)((?:\\\\*+["\'])?+\s*+(?:=>|=|:|%3[Dd]|%3[Aa])\s*+)'
+      . '(["\']?+' . self::LOG_SENTINEL . '["\']?+|"[^"\r\n]*+"?+|\'[^\'\r\n]*+\'?+|[^&\r\n]++)/i';
+    $out = preg_replace_callback( $re, static function ( $m ) {
+      if ( strpos( $m[3], self::LOG_SENTINEL ) !== false && strlen( $m[3] ) <= strlen( self::LOG_SENTINEL ) + 2 ) {
+        return $m[0];
+      }
+      $quote = $m[3][0] === '"' || $m[3][0] === "'" ? $m[3][0] : '';
+      return $m[1] . $m[2] . $quote . self::LOG_SENTINEL . $quote;
+    }, $text );
+    return self::scrubbed_or_withheld( $out, $text );
   }
 
   /**
