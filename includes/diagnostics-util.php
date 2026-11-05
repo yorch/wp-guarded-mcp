@@ -612,9 +612,13 @@ final class GMCP_Diag_Util {
   * reader. Not for what a tool returns to its caller about the site's own data.
   */
   public static function scrub_preview_tokens( string $text ): string {
-    if ( stripos( $text, 'preview' ) === false && stripos( $text, '%' ) === false ) {
+    if ( stripos( $text, 'preview' ) === false && stripos( $text, 'download' ) === false && stripos( $text, '%' ) === false ) {
       return $text;
     }
+    // A one-time download URL is a bearer credential too, and the tool reply that hands it out
+    // is copied into this log. The token is alphanumeric, so it needs none of the
+    // percent-encoding handling below: cut the path segment and keep the route.
+    $text = (string) preg_replace( '#(/download/)[A-Za-z0-9]{8,}#i', '$1[redacted]', $text );
     static $re = null;
     if ( $re === null ) {
       $lit = static function ( string $word ): string {

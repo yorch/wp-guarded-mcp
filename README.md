@@ -121,7 +121,10 @@ terms, comments, media (including upload by URL or by a one-time upload link), u
 post meta, site options, post types, block patterns, and theme mods. `wp_copy_post_meta`
 and `wp_duplicate_post` copy inside PHP so a large design never leaves the server;
 `wp_write_post_meta_chunk` and `wp_read_post_meta_chunk` stage a value across several
-calls. `wp_create_posts` creates up to twenty in one call. `wp_site_briefing` answers
+calls. `wp_download_request` returns a one-time URL that streams an attachment's file, so a
+file's bytes never pass through a tool reply or the audit log; a file attached to a post that is
+not published can only be requested with an admin-level key, and the endpoint refuses anything
+that does not resolve inside the site's uploads directory. `wp_create_posts` creates up to twenty in one call. `wp_site_briefing` answers
 "what am I looking at" in one call. `wp_write_blocks` takes either a list of block specs or
 a Markdown string (headings, paragraphs, lists, blockquotes, fenced code, emphasis, links
 and images); Markdown HTML is shown as text, not run.
@@ -634,7 +637,8 @@ tools; `smoke-woo-subscriptions.sh` for the Subscriptions tools; `smoke-wsal.sh`
 WP Activity Log tools; `smoke-redirection.sh` for the Redirection tools; `smoke-polylang.sh`
 for the Polylang tools; `smoke-seo.sh` for the Rank Math and All in One SEO tools;
 `smoke-forms.sh` for the form-submission tools; `smoke-wordfence.sh` for the Wordfence tools;
-`smoke-stream.sh` for the Stream tools; and `smoke-beaver.sh` for the Beaver Builder tools. `smoke-seo.sh`, `smoke-forms.sh`,
+`smoke-stream.sh` for the Stream tools; `smoke-beaver.sh` for the Beaver Builder tools; and `smoke-download.sh` for the one-time
+download endpoint. `smoke-seo.sh`, `smoke-forms.sh`,
 `smoke-polylang.sh` and `smoke-redirection.sh` were written without a running stack and have
 not been run. All but the first two need their plugin installed.
 
