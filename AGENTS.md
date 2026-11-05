@@ -58,6 +58,18 @@ every sentence that describes it (refusal text, key label, README, readme.txt, g
 say so rather than "anything that is live". Media attached to no post is refused for edits as
 well as deletes, because a live page may be showing it and nothing can find which.
 
+**A read policy about a post belongs to the post, and follows what hangs from it.**
+`GMCP_Core::post_read_guard()` (the form-submission policy at every level, the commerce read
+policy below admin) judges a post as the nearest guarded post above it through `post_parent`,
+because a revision of a submission, a file attached to one and a comment on one are ordinary
+rows of another type that pass any check made on their own type. Every tool that returns a
+post, its meta, its comments, its terms, its media or its title asks it, and so do the REST
+tools, the briefing and the resources. The change records go through `GMCP_Changes::record()`
+and carry a submission as an id with `[withheld]` values, because `wp_list_changes` is a
+read-level tool and names a post by its title. A new reader of any of these asks the guard;
+`smoke-forms.sh` block 0c seeds a submission with a revision, an upload, a comment and a term
+and calls every reader with a read-only key.
+
 **A deletion is not always a delete tool.** WordPress deletes on markers it reads from
 ordinary rows: `wp_scheduled_delete()` removes every post with an old `_wp_trash_meta_time`
 and `wp_delete_auto_drafts()` every old auto-draft. So `GMCP_Core::status_write_refusal()`

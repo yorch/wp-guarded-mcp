@@ -1073,19 +1073,67 @@ re-read.
   form, status and date only. This is the reason Gravity Forms' own search was rebuilt
   rather than passed through.
 - **The generic post readers refuse the post types Flamingo and Ninja Forms store
-  submissions under.** This is the part that is not in the new file, and it is there because
+  submissions under, and what hangs off them.** This is the part that is not in the new file, and it is there because
   without it the rest is a sentence about the tool and not about the data: Flamingo and Ninja
   Forms keep a submission as a post, `wp_get_post_meta` is a `read`-level tool that returns
   any key on any post (its own source says post meta reads are ungated), and a read-only key
   could therefore read every answer, and for Flamingo the visitor's IP address, through the
   tool beside the admin-only ones. `GMCP_Core::personal_data_post_guard()` is asked, ahead of
   the dispatch switch, by `wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`,
-  `wp_read_post_meta_chunk`, `wp_alter_post` (a match count over a body is an oracle) and the
+  `wp_read_post_meta_chunk`, `wp_get_post_terms`, `wp_add_post_terms` (its reply lists the terms
+  the post now holds), `wp_alter_post` (a match count over a body is an oracle) and the
   previews of `wp_update_post` and `wp_delete_post` (which print a title and the start of the
   body), for the post type `wp_get_posts` names, and per row in a `wp_get_posts` listing (type
-  `any` names none). The `gmcp://post/{id}` resource and `wp_create_preview_link` ask it too.
-  It is on whether or not the forms group is. The type list is filterable through
-  `gmcp_personal_data_post_types`.
+  `any` names none), a `wp_get_comments` listing and a `wp_get_media` listing. The
+  `gmcp://post/{id}` resource, the resource listing and `wp_create_preview_link` ask it too, as
+  does `wp_site_briefing` (it quotes the title of the most recently modified post, which for a
+  submission is the visitor's subject line; it now reports the newest post the caller may read)
+  and `wp_add_menu_item` (a submission is `publish`, and a menu item would copy its title into
+  the public navigation). It is on whether or not the forms group is. The type list is
+  filterable through `gmcp_personal_data_post_types`.
+- **The policy follows the post's parents.** A revision of a submission holds its body, a file
+  attached to one is what the visitor uploaded, and a child post is part of it, yet each is an
+  ordinary row of another type (`revision`, `attachment`, `page`) that passes every check made
+  on its own type. `personal_data_post_guard()` and `commerce_post_read_guard()` therefore walk
+  `post_parent` (`GMCP_Core::post_chain_types()`, bounded at eight and loop-safe) and judge a
+  post as the nearest guarded post above it. A comment is judged as the post it is on. This was
+  measured, not inferred: before it, a read-only key read a seeded submission's revision and
+  upload through `wp_get_post`, `wp_get_post_snapshot`, `wp_get_posts` (type `revision` or
+  `attachment`), `wp_get_media`, and the comments on it through `wp_get_comments`.
+  `wp_duplicate_post` of such a row was allowed and copied it into a draft that
+  `wp_get_post` then returned.
+- **Terms: decided on evidence.** The terms ON a post are asked about through the post
+  (`wp_get_post_terms`, the snapshot and the resource header all refuse a guarded post).
+  Whether a term is itself personal data was read from the plugins: Flamingo assigns a channel
+  to a message only when the term already exists (`term_exists()` guards the call) and takes a
+  contact's tags from existing terms, so neither holds text a visitor typed, and Ninja Forms
+  registers no taxonomy for its submission type. The term LISTING names no post, so it cannot
+  ask the post guard; `wp_get_terms` refuses (at every level) a taxonomy whose every object type
+  is a guarded type, because a vocabulary that exists only to classify submissions is the one
+  place a plugin that minted terms from submitted values would put them, and refusing costs a
+  caller nothing the form tools do not give. A taxonomy shared with an ordinary type is listed:
+  its terms are ordinary content.
+- **The generated REST tools.** Their routes are fixed to `posts`, `pages` and `media`, and the
+  REST controller answers a post of the wrong type with a 404, so a submission cannot be
+  reached by its own id (checked live: `get_posts` of a submission id is `rest_post_invalid_id`).
+  What did reach it was a media row attached to one: `get_media`, `list_media` and `update_media`
+  returned and, for `update_media`, retitled a file attached to a seeded submission. Now every
+  tool that takes an `id` asks `post_read_guard()` first; a list call runs with a
+  `posts_where` filter that leaves out the guarded types and posts hanging from them (two
+  levels), so rows are removed where the query is built and not afterwards, because `_fields`
+  can leave the id out of the rows; and a route whose post type is a guarded type (a plugin
+  registering one with `show_in_rest` and a `rest_base` of `posts`, `pages` or `media`) is not
+  turned into tools at all. The tool cache key moved to `v6` so a cached list is rebuilt.
+- **The change records do not quote a submission.** A read-level key can call `wp_list_changes`,
+  and each entry names the post by the first 60 characters of its title. A `readwrite` key can
+  write to a submission (this guard is about reading it, and a write is not refused), which
+  recorded its title and the previous values in the journal, its snapshot table and the audit
+  summary. `GMCP_Changes::record()`, the one place every record passes, now replaces the label
+  with the id and every before/after value with `[withheld]`, and drops the previous values;
+  `undoable_post()` refuses such a post, so the journal records nothing to put back and an old
+  entry is not put back either. An entry written before this change is rewritten on the way out
+  of `wp_list_changes`. Nothing in these paths ever returned a previous value to the caller
+  (`wp_list_changes` lists no values and `wp_undo_change`'s reply names none).
 - **A tool that copies from a post is a reader.** `wp_copy_post_meta` used to ask the write
   guards about the post it wrote TO and nothing about the post it read FROM, so a `readwrite`
   key copied every meta key of a Flamingo message (its `_meta` holds the IP address and user
@@ -1101,15 +1149,31 @@ re-read.
   write to one.
 - **What the guards do not cover.** They are a list of readers, not a property of the data,
   and the same weakness the commerce guard has: a reader added later has to be added to it.
-  Not covered today: `wp_get_post_terms` and the terms of a post in the resource header
-  (channel terms only), the REST-route tools when that group is on and a plugin exposes the
-  type through REST, the change journal (it records a changed meta key and withholds values
-  that look credential-shaped, and only for posts a tool changed), and every route to the
-  database that is not a post reader. WooCommerce orders stored as posts ARE covered by
-  `commerce_post_read_guard()` in `wp_get_posts`, `wp_get_post`, `wp_get_post_snapshot`,
-  `wp_get_post_meta`, `wp_read_post_meta_chunk`, `wp_get_comments` and, now, the copy tools
-  and the resource; that guard applies below admin level only, whereas the form-submission
-  guard applies at every level (an admin key uses the form tools).
+  Exactly, today:
+  - Counts. `wp_count_posts`, `wp_count_media`, `wp_count_terms`, the per-type counts and the
+    per-term `count` in `wp_site_briefing` and `wp_get_terms`, and the type names in
+    `wp_get_post_types` and `wp_get_taxonomies` say how many rows exist and never return one.
+    An existence oracle for the number of submissions, which the read-level form briefings
+    return on purpose. Kept, not an oversight.
+  - The audit log keeps the arguments an agent sent, including a value it wrote to a
+    submission, because that is the record of what it did. It never holds what the post held
+    before, and it is an admin-level read.
+  - A journal entry about a submission that was **deleted** before this change still carries
+    the title it was written with: once the post is gone its type cannot be looked up.
+  - Posts hanging from a guarded post are found through `post_parent`: eight levels in the
+    guards, two in the REST list filter. A row related to a submission by anything else (a meta
+    value holding its id, a plugin's own table) is not.
+  - A taxonomy shared between a submission type and an ordinary type is listed by
+    `wp_get_terms`, and the same applies to its terms on an ordinary post.
+  - Every route to the database that is not a post reader, and the optional groups' own stores
+    (Gravity Forms entries, WooCommerce Subscriptions, LearnDash, the audit tables of an activity
+    log), which are gated by their own tools and levels and not by this guard.
+
+  WooCommerce orders stored as posts ARE covered by `commerce_post_read_guard()` in
+  `wp_get_posts`, `wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`,
+  `wp_read_post_meta_chunk`, `wp_get_comments`, `wp_get_media`, the copy tools, the resource,
+  the REST tools and the template-reference scans. That guard applies below admin level only,
+  whereas the form-submission guard applies at every level (an admin key uses the form tools).
 - **Fluent Forms has a setting that keeps no entries, and `fluentform_briefing` reports it.**
   `formSettings.delete_entry_on_submission` (a form's settings JSON in `fluentform_form_meta`,
   default `no`) deletes each entry as it is stored, and `delete_after_x_days` with

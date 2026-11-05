@@ -209,8 +209,11 @@ plugin that stores them is not installed", "its table is missing" and, for Ninja
 form records nothing" — Contact Form 7 alone stores nothing, so it is Flamingo that is read.
 Because Flamingo and Ninja Forms keep a submission as a post, the generic post readers
 (`wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`, `wp_read_post_meta_chunk`,
-`wp_get_posts`) now refuse those post types, whether or not this group is on. That guard is a
-list of readers, and the guardrails page says what it does not cover.
+`wp_get_posts`, `wp_get_post_terms`, `wp_get_comments`, `wp_get_media`, the briefing, the
+resources and the REST-generated tools) refuse those post types and what hangs off them (a
+revision, an upload, a comment, a child post), and the change records never quote one,
+whether or not this group is on. That guard is a list of readers, and the guardrails page
+says exactly what it does not cover (counts, for one).
 
 **WPForms** is in that group and is deliberately the smallest part of it: two tools, a form's
 schema and a submission briefing, and **no entry tool at all**. Measured on WPForms Lite
@@ -409,7 +412,9 @@ and a reader written without it installed is how a confident "no translations" i
 
 **REST API tools**, off by default: tools generated from the site's own REST API routes.
 Generated once and cached for a day; the cache is thrown away on the first request after
-the plugin's version changes.
+the plugin's version changes. A route that belongs to a form-submission or commerce post
+type is not generated at all, and every call is judged by the same read policies as the
+generic post tools (including media attached to a submission or an order).
 
 **Preview.** Six tools whose effect is not visible from the call accept `preview`, which
 describes what would happen and changes nothing: `wp_delete_post`, `wp_update_post`,
