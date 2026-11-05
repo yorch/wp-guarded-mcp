@@ -357,6 +357,7 @@ class GMCP_Settings {
       'mcp_tools_wordfence' => 'bool',
       'mcp_tools_stream' => 'bool',
       'mcp_tools_beaver' => 'bool',
+      'mcp_tools_export' => 'bool',
       'mcp_approval_mode' => 'approval_mode',
       'mcp_debug_mode' => 'bool',
       'mcp_activity_log' => 'bool',
@@ -1307,6 +1308,9 @@ class GMCP_Settings {
     // never on screen must keep its stored value rather than read as unticked, which is
     // what happens to the WooCommerce group on a site where Woo is switched off.
     $keys = [ 'mcp_tools_core', 'mcp_tools_admin', 'mcp_tools_rest' ];
+    // Site-file export has no plugin dependency: the four roots exist on every WordPress
+    // site, so its checkbox is always on screen and its stored value is always declared.
+    $keys[] = 'mcp_tools_export';
     if ( $woo ) {
       $keys[] = 'mcp_tools_woo';
     }
@@ -1487,6 +1491,10 @@ class GMCP_Settings {
                 </label>
               <?php endif; ?>
               <label>
+                <input type="checkbox" name="mcp_tools_export" value="1" <?php checked( !empty( $options['mcp_tools_export'] ) ); ?>>
+                <?php esc_html_e( 'Site files (a manifest of plugins, themes, mu-plugins or uploads, and an archive that only a person can approve)', 'guarded-mcp' ); ?>
+              </label>
+              <label>
                 <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>
                 <?php esc_html_e( 'Generate create, read, update and delete tools for posts, pages and media from the REST API', 'guarded-mcp' ); ?>
               </label>
@@ -1569,6 +1577,9 @@ class GMCP_Settings {
                 <?php esc_html_e( 'The Beaver Builder tools read a page\'s layout STRUCTURE and never its settings, because a node\'s settings is the content and the html module makes it executable. They report whether the builder is enabled on a post, how many nodes the published and draft copies hold, and whether the layout carries custom CSS or JS. There is no tool that writes layout data: the layout lives in post meta rather than post content, so a generic body edit appears to work and changes nothing, and writing the meta would be persistent script injection with no restore tool behind it. The one write is clearing the builder\'s generated CSS/JS, which it regenerates.', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
+            <p class="description">
+              <?php esc_html_e( 'The site-file export tools are a manifest and an archive, and both read files rather than posts. A manifest reports what is in one of four named roots (plugins, themes, mu-plugins, uploads), including every upload, with counts, a digest and the entries it would exclude (symbolic links, hard links and non-regular files are refused rather than followed); it never returns file contents. An archive is only built after a signed-in administrator approves that exact call on the Approvals screen, whatever the approval mode says, because uploads can hold customer exports and plugin directories can hold licence keys. The zip is built outside the web root, streamed once through a five-minute token, and never returned in a tool reply.', 'guarded-mcp' ); ?>
+            </p>
             <?php if ( $stream ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The Stream tools only read, for the same reason the WP Activity Log tools do: an audit log an agent can shorten or switch off is not an audit log. Individual records are admin level because a record names a person, IP addresses are never returned at any level, and the metadata is filtered by an allowlist because Stream stores a person\'s data under names that give nothing away. Stream\'s own settings are refused to every writer here, and switching the plugin off is refused too.', 'guarded-mcp' ); ?>

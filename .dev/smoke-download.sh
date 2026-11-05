@@ -114,6 +114,26 @@ check "CONTROL: the tool call is in the audit log" \
 check "and the file's content is not" \
   "$(dbq "SELECT COUNT(*) FROM wp_gmcp_audit WHERE CONCAT(COALESCE(args,''),COALESCE(detail,''),COALESCE(changes,'')) LIKE '%PAYLOAD-MARKER-$MARK%'")" "0"
 
+echo "-- an upload token is a credential too, and the reply that hands it out is logged --"
+# wp_upload_request returns a one-time URL, exactly as wp_download_request does. The URL is in
+# the tool reply, and the reply is copied into the audit log, so the token has to be scrubbed
+# there. The positive control is the tool row itself: an empty table is not the explanation.
+call "$TOK" upreq "$(tc wp_upload_request '{"filename":"export-probe.txt"}')"
+check "the upload request answers" "$(verdict upreq)" "ok"
+UPLOAD_URL=$(py 'import json,sys
+t=json.load(sys.stdin).get("result",{}).get("content",[{}])[0].get("text","{}")
+print(json.loads(t).get("upload_url",""))' "" upreq)
+UTOK=${UPLOAD_URL##*/}
+# The shape, printed without the token. A token that is empty or missing makes the absence
+# check below pass for the wrong reason.
+case "$UPLOAD_URL" in http*/upload/*) echo "  upload url: ${UPLOAD_URL%%/upload/*}/upload/<token>" ;; *) echo "  FAIL  no upload_url in the reply"; fail=$((fail+1)) ;; esac
+check "CONTROL: the reply carries a token-shaped upload token" \
+  "$(printf '%s' "$UTOK" | grep -cE '^[A-Za-z0-9]{8,}$')" "1"
+check "CONTROL: the upload tool call is in the audit log" \
+  "$(dbq "SELECT IF(COUNT(*) > 0, 'yes', 'no') FROM wp_gmcp_audit WHERE tool='wp_upload_request'")" "yes"
+check "and the upload token is not" \
+  "$(dbq "SELECT COUNT(*) FROM wp_gmcp_audit WHERE CONCAT(COALESCE(args,''),COALESCE(detail,''),COALESCE(changes,'')) LIKE '%$UTOK%'")" "0"
+
 echo "-- a file attached to an unpublished post is admin-only --"
 DRAFT=$(wpc post create --post_title="Download draft $MARK" --post_status=draft --porcelain | tail -1)
 wpc eval 'wp_update_post([ "ID" => '"$ATT"', "post_parent" => '"$DRAFT"' ]);' >/dev/null 2>&1

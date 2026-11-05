@@ -103,6 +103,11 @@ class GMCP_Core {
     // from clearing the generated CSS/JS, and no tool writes layout data: the html module
     // makes that persistent script injection with no restore behind it.
     'mcp_tools_beaver' => false,
+    // Site files: a directory manifest, and an archive export that always waits for a person
+    // on the Approvals screen. Off by default because a listing is reconnaissance and an
+    // archive of uploads can be a customer export; the switch is the site owner's decision,
+    // and no approval mode can turn the pull leg on without a person.
+    'mcp_tools_export' => false,
     // Out-of-band human approval. 'never' | 'deletes' | 'site': which tool calls are held
     // until a logged-in administrator approves them on the Approvals screen. Global rather
     // than per key, so that a key, an OAuth grant and a key minted next week are all
@@ -1936,6 +1941,9 @@ class GMCP_Core {
     // in the audit log: the mode can be switched to 'never' while requests are still open,
     // and the screen has to be able to answer them and the daily event to lapse them.
     GMCP_Approvals::boot();
+    // The export group's expiry sweep is registered whether the group is on or off, so an
+    // archive minted before somebody switched it off is still removed when it lapses.
+    GMCP_Tools_Export::boot();
     GMCP_Core::install_trash_meta_net();
 
     // How to put back what changed.
@@ -2109,6 +2117,12 @@ class GMCP_Core {
     // can answer "the builder is not loaded" rather than the tool being absent.
     if ( $this->get_option( 'mcp_tools_beaver' ) ) {
       new GMCP_Tools_Beaver();
+    }
+
+    // Site files. Its own switch, off by default, and the pull leg additionally declares
+    // that it always needs a person (see GMCP_Tools_Export and GMCP_Approvals).
+    if ( $this->get_option( 'mcp_tools_export' ) ) {
+      new GMCP_Tools_Export();
     }
   }
 

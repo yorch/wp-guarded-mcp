@@ -223,6 +223,14 @@ class GMCP_Server {
       'permission_callback' => '__return_true',
       'show_in_index' => false,
     ] );
+    // One-time export archive. Same shape again, and the group switch is checked inside the
+    // handler: turning the group off ends every URL it ever issued, not only future ones.
+    register_rest_route( $this->namespace, '/export/(?P<token>[a-zA-Z0-9]+)', [
+      'methods' => 'GET',
+      'callback' => [ $this, 'handle_export' ],
+      'permission_callback' => '__return_true',
+      'show_in_index' => false,
+    ] );
   }
 
   /**
@@ -1232,6 +1240,10 @@ class GMCP_Server {
           'accessLevel' => $tool['accessLevel'] ?? null,
           'annotations' => $tool['annotations'] ?? [],
           'inputSchema' => $tool['inputSchema'] ?? [],
+          // A tool can declare that some calls always wait for a person. It travels with
+          // the definition so GMCP_Approvals reads the registration rather than a list of
+          // tool names kept beside the queue. @see GMCP_Approvals::requires_human_approval().
+          'requiresApproval' => $tool['requiresApproval'] ?? null,
         ];
         $required = $tool['inputSchema']['required'] ?? [];
         $this->tool_required_args[ $tool['name'] ] = is_array( $required ) ? $required : [];
@@ -1962,6 +1974,79 @@ class GMCP_Server {
     $type = wp_check_filetype( $real );
     $mime = is_array( $type ) && !empty( $type['type'] ) ? (string) $type['type'] : 'application/octet-stream';
     return [ $real, $mime ];
+  }
+  #endregion
+
+  #region Handle /export (one-time archive via token)
+  /**
+  * Serve one export archive to a one-time token.
+  *
+  * The archive is built by wp_export_request only after a person approved the exact call,
+  * and it sits outside the web root with 0600 permissions. It is streamed here and deleted
+  * afterwards; the bytes never pass through a tool reply, which would copy them into the
+  * audit log. The token is consumed with a conditional DELETE, so two requests cannot both
+  * receive the same archive, and the group switch is checked first so turning it off ends
+  * every URL it issued rather than only future ones.
+  */
+  public function handle_export( WP_REST_Request $request ) {
+    $token = (string) $request->get_param( 'token' );
+    if ( class_exists( 'GMCP_Tools_Export' ) ) {
+      GMCP_Tools_Export::cleanup_expired();
+    }
+    if ( !class_exists( 'GMCP_Tools_Export' ) || !GMCP_Tools_Export::enabled() ) {
+      if ( class_exists( 'GMCP_Tools_Export' ) ) {
+        GMCP_Tools_Export::discard_token( $token );
+      }
+      return new WP_REST_Response( [ 'success' => false, 'message' => 'The site-file export group is switched off.' ], 403 );
+    }
+
+    $taken = GMCP_Tools_Export::take_token( $token );
+    if ( isset( $taken['error'] ) ) {
+      return new WP_REST_Response( [ 'success' => false, 'message' => $taken['error'] ], (int) ( $taken['status'] ?? 403 ) );
+    }
+
+    $path = (string) $taken['path'];
+    $filename = (string) $taken['filename'];
+    // Re-checked at serve time, not trusted from the token row: the row says what was true
+    // when it was minted and the filesystem is not immutable. take_token() already does
+    // this, and this is the second lock in the place that actually opens the file.
+    if ( is_link( $path ) || !is_file( $path ) || !is_readable( $path ) ) {
+      GMCP_Tools_Export::unlink_archive( $path );
+      return new WP_REST_Response( [ 'success' => false, 'message' => 'That archive is no longer available.' ], 403 );
+    }
+    $size = filesize( $path );
+
+    // THE ARCHIVE IS ALREADY SOMEBODY ELSE'S PROBLEM BY THE TIME ANY BYTE IS SENT. The token
+    // above is spent, so this file has no other owner: if the connection dies while readfile()
+    // is writing, PHP ends the request there and the unlink below never runs, which left the
+    // archive in the temporary directory until a later sweep found it. A shutdown callback
+    // registered before the first byte goes out is the one thing that runs on that path, so it
+    // is registered here rather than after the stream. It is idempotent: on a complete send the
+    // unlink below has already removed the file and this finds nothing to do.
+    register_shutdown_function( static function () use ( $path ) {
+      GMCP_Tools_Export::unlink_archive( $path );
+    } );
+    // A host whose php.ini sets ignore_user_abort=1 would otherwise keep a worker reading a
+    // 512 MiB archive into a socket nobody is holding. Ended here so the abort ends the request
+    // at the failed write, which is the path the shutdown callback above covers.
+    @ignore_user_abort( false );
+
+    nocache_headers();
+    header( 'X-Content-Type-Options: nosniff' );
+    header( 'Content-Type: application/zip' );
+    if ( $size !== false ) {
+      header( 'Content-Length: ' . (string) $size );
+    }
+    header( 'Content-Disposition: attachment; filename="' . sanitize_file_name( $filename ) . '"' );
+    readfile( $path );
+    // Reached on a complete send, and also when the connection dropped but PHP did not end the
+    // request on the write itself. The abort is named in the debug log so a truncated download
+    // has a line of its own rather than looking like a token that was spent on nothing.
+    if ( connection_aborted() || connection_status() !== CONNECTION_NORMAL ) {
+      GMCP_Logging::log( 'Export download of ' . $filename . ' was interrupted by the client; the archive was removed.' );
+    }
+    GMCP_Tools_Export::unlink_archive( $path );
+    exit;
   }
   #endregion
 

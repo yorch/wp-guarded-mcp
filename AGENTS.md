@@ -201,15 +201,17 @@ Elementor Pro tools, `smoke-woo-subscriptions.sh` covers the Subscriptions tools
 Redirection tools, `smoke-polylang.sh` covers the Polylang tools, `smoke-seo.sh` covers the Rank Math and
 All in One SEO tools, and `smoke-forms.sh` covers the form-submission tools (Contact Form 7 with
 Flamingo, Fluent Forms, Ninja Forms, WPForms; its first block needs no form plugin).
-`smoke-wordfence.sh` covers the Wordfence tools, `smoke-stream.sh` covers the Stream tools and
-`smoke-beaver.sh` covers the Beaver Builder tools and `smoke-download.sh` covers the one-time
-download endpoint.
+`smoke-wordfence.sh` covers the Wordfence tools, `smoke-stream.sh` covers the Stream tools,
+`smoke-beaver.sh` covers the Beaver Builder tools, `smoke-download.sh` covers the one-time
+download endpoint and `smoke-export.sh` covers the site-file manifest, the approval-gated
+archive and its one-time endpoint.
 Run all
-twenty before committing. All but the first two need
+twenty-one before committing. The plugin-specific suites need
 their plugin installed and say so and exit rather than reporting failures against a site that
-simply does not have it. (This sentence said fourteen while twelve suites existed and sixteen
+simply does not have it; `smoke-download.sh` and `smoke-export.sh` need only this plugin.
+(This sentence said fourteen while twelve suites existed and sixteen
 while seventeen did, which is the same drift the access-level table had: a count nothing checks
-moves on its own. It is twenty now, counted from `ls .dev/smoke*.sh`.)
+moves on its own. It is twenty-one now, counted from `ls .dev/smoke*.sh`.)
 
 **A test for a guard must not depend on that guard.** Read the value, make the hostile
 call, read it back, **put it back**, and only then compare. The first version of the
