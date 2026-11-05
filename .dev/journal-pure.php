@@ -568,6 +568,92 @@ check( 'scanner: a half-megabyte ordinary body is not flagged', $big_held, false
 check( 'scanner: and is read in well under a second (a bound, not a benchmark; measured 10 to 60 ms)', $big_ms < 1000, true );
 check( 'CONTROL: the same body with one wp-config line appended IS flagged', GMCP_Credential_Scan::text_holds( $big . "\ndefine('DB_PASSWORD','x9Zq77abc');" ), true );
 
+echo "-- the text scanner, second review: escapes, long names, array indexes, prose --\n";
+// Each flagged row names the secret, and the check is that blanking the spans gives back the text with
+// exactly that secret replaced: which proves the OFFSETS are right through every escape, not only that
+// something was found. Vendor-shaped keys are built at runtime so no literal in the tree looks like one.
+$S = 'Zx9Qw3Lp7Rt2';
+$flag_rows = [
+  'a PHP array-index assignment'              => [ "\$cfg['db_password'] = '$S';", $S ],
+  'an array index in double quotes'           => [ "\$cfg[\"smtp_pass\"] = \"$S\";", $S ],
+  'define() with a value that starts with $'  => [ "define('DB_PASSWORD', '\$uperS3cret99')", '$uperS3cret99' ],
+  'a Gutenberg attribute with \\u0026 in it'  => [ '<!-- wp:x {"smtpPassword":"p\\u0026ssw0rd99"} /-->', 'p\\u0026ssw0rd99' ],
+  'a backslash path inside a quoted value'    => [ '"db_password": "C:\\\\vault\\\\' . $S . '"', 'C:\\\\vault\\\\' . $S ],
+  'an escaped quote inside a define() value'  => [ "define('DB_PASSWORD', 'ab\\'cdef12345')", "ab\\'cdef12345" ],
+  'an escaped quote inside an assignment'     => [ "\$smtp_password = 'ab\\'cdef12345';", "ab\\'cdef12345" ],
+  'an HTML-escaped arrow in a code block'     => [ "'secret' =&gt; '$S'", $S ],
+  'a JSON string escaped twice'               => [ '\\\\"api_key\\\\":\\\\"' . $S . '\\\\"', $S ],
+  'a name of a hundred characters'            => [ '"' . str_repeat( 'a', 100 ) . '_password": "' . $S . '"', $S ],
+  'a name of ten thousand characters'         => [ '"' . str_repeat( 'a', 10000 ) . '_password": "' . $S . '"', $S ],
+  'a hyphenated name'                         => [ 'DB-PASSWORD=' . $S, $S ],
+  'a bare Basic credential'                   => [ 'try Basic dXNlcjpwYXNzd29yZDEyMw== here', 'dXNlcjpwYXNzd29yZDEyMw==' ],
+  'a Basic credential without padding'        => [ 'try Basic dXNlcjpwYXNzMQ here', 'dXNlcjpwYXNzMQ' ],
+  'a Bearer token'                            => [ 'send Bearer abc12345 now', 'abc12345' ],
+  'a qualified pass name, unquoted'           => [ 'DB_PASS: ' . $S . ' ok', $S ],
+  'smtp_pass, unquoted'                       => [ 'smtp_pass=' . $S . ' ok', $S ],
+  'a hyphenated passphrase under password'    => [ 'password=correct-horse-battery-staple', 'correct-horse-battery-staple' ],
+  'a Maps-style key in a URL (still flagged: an AIza key can be a server secret)' => [ 'https://maps.example/api?key=' . 'AIza' . 'SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q', 'AIza' . 'SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q' ],
+  'a secret key after a decoy that is prose'  => [ '<script src="https://evil.example/x.js"></script><!-- see Basic HTML/CSS 101 --> sk_' . 'live_abcdefgh12345678', 'sk_' . 'live_abcdefgh12345678' ],
+];
+foreach ( $flag_rows as $label => [ $text, $secret ] ) {
+  check( "scanner: $label is flagged", GMCP_Credential_Scan::text_holds( $text ), true );
+  check( "CONTROL: scanner: the probe for $label really contains the secret exactly once", substr_count( $text, $secret ), 1 );
+  check( "scanner: $label: blanking the spans replaces exactly the secret and nothing else",
+    GMCP_Credential_Scan::redact_spans( $text, '[x]' ), str_replace( $secret, '[x]', $text ) );
+}
+// Prose and public-by-design values, each beside a control that looks the same under a name that IS secret.
+$prose_rows = [
+  [ 'Course 1: Basic HTML/CSS for beginners', 'Course 1: Basic dXNlcjpwYXNzd29yZDEyMw== for beginners' ],
+  [ 'Basic 2024/2025 membership', 'Basic YWRtaW46YWRtaW4xMjM0 membership' ],
+  [ 'Season Pass: 2024-2025', 'DB_PASS: 2024-2025x9' ],
+  [ 'Day pass: 10am-6pm daily', 'smtp_pass: 10am6pm9x' ],
+  [ 'Token: 1st-come-first-served', 'Token: 9f8e7d6c5b4a3210ff' ],
+  [ 'The ring Bearer 4-year-old nephew', 'The ring Bearer 4yearold1 nephew' ],
+  [ 'Hall pass=2nd-floor', 'hall_pass=2ndfloor9z' ],
+  [ '<div class="g-recaptcha" data-sitekey="6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI"></div>', '<div data-secret="6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI"></div>' ],
+  [ 'publishable pk_' . 'live_abcdefghijklmnop12345 here', 'secret sk_' . 'live_abcdefghijklmnop12345 here' ],
+  [ 'a test publishable key: pk_' . 'test_abcdefghijklmnop12345', 'a test secret key: sk_' . 'test_abcdefghijklmnop12345' ],
+  [ "define('DB_PASSWORD', '\$DB_PASS')", "define('DB_PASSWORD', '\$Db_pass9')" ],
+  [ "define('DB_PASSWORD', '\${DB_PASS}')", "define('DB_PASSWORD', '\${db_pass9}')" ],
+  [ 'strlen_pass::count_nonzero_bytes_addr (x)', 'strlen_pass: count_nonzero_bytes_addr9' ],
+  [ 'Token: v2.1.0', 'Token: v2.1.0x9f8e7d' ],
+];
+foreach ( $prose_rows as $i => [ $harmless, $control ] ) {
+  check( "scanner: prose row $i is not flagged: " . substr( $harmless, 0, 50 ), GMCP_Credential_Scan::text_holds( $harmless ), false );
+  check( "CONTROL: scanner: prose row $i has a counterpart that is flagged: " . substr( $control, 0, 50 ), GMCP_Credential_Scan::text_holds( $control ), true );
+}
+// A 64-character name no longer matches only up to a bound, and a run of backslashes is one escape.
+check( 'scanner: a name past the old 63-character bound is judged by its last word, not skipped',
+  GMCP_Credential_Scan::name_strength( str_repeat( 'a', 70 ) . '_password' ), 2 );
+check( 'scanner: data-sitekey is public, site_key is not exempt (the same words name a private key elsewhere)',
+  [ GMCP_Credential_Scan::name_strength( 'data-sitekey' ), GMCP_Credential_Scan::name_strength( 'site_key' ) ], [ 0, 2 ] );
+// Several credentials in one escaped text: every span lands on its own secret.
+$multi = '{\\"password\\":\\"Abc12345\\"} and \\u0027x\\u0027 define(\'DB_PASSWORD\', \'q\\\'Z9y8x7w6\') then ' . 'sk_' . 'live_abcdefgh12345678';
+check( 'scanner: three credentials in one mixed-escape text are each blanked and the text between is kept',
+  GMCP_Credential_Scan::redact_spans( $multi, '[x]' ),
+  '{\\"password\\":\\"[x]\\"} and \\u0027x\\u0027 define(\'DB_PASSWORD\', \'[x]\') then [x]' );
+// A private key block is one span, and an unterminated run of them is one span to the end, not one search each.
+$keys17 = str_repeat( "-----BEGIN RSA PRIVATE KEY-----\n", 17500 );
+$t0 = microtime( true );
+$key_spans = GMCP_Credential_Scan::spans( 'before ' . $keys17 );
+$key_ms = ( microtime( true ) - $t0 ) * 1000;
+check( 'scanner: 17,500 unterminated BEGIN lines are one span from the first to the end of the text', $key_spans, [ [ 7, strlen( $keys17 ) ] ] );
+check( 'scanner: and they are read in well under a second (3.4 s before; a bound, not a benchmark)', $key_ms < 1000, true );
+check( 'scanner: two closed blocks are two spans and the text between them is kept',
+  GMCP_Credential_Scan::redact_spans( "a -----BEGIN RSA PRIVATE KEY-----\nAAA\n-----END RSA PRIVATE KEY----- b -----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY----- c", '[x]' ),
+  'a [x] b [x] c' );
+// Idempotence: a text that was already scrubbed is not changed by scrubbing it again.
+$idem = true;
+foreach ( $flag_rows as $label => [ $text ] ) {
+  $once = GMCP_Credential_Scan::redact_spans( $text, '[redacted]' );
+  $idem = $idem && GMCP_Credential_Scan::redact_spans( $once, '[redacted]' ) === $once;
+}
+check( 'scanner: scrubbing an already scrubbed text changes nothing, for every flagged row above', $idem, true );
+// The budget: a value with more nodes than can be read is not "clean".
+check( 'CONTROL: a value of a thousand short leaves is read and is clean', GMCP_Credential_Scan::holds( array_fill( 0, 1000, 'a' ) ), false );
+check( 'a value of 150,000 one-character leaves is over the budget and is treated as unsafe to keep', GMCP_Credential_Scan::holds( array_fill( 0, 150000, 'a' ) ), true );
+check( 'within_budget agrees', [ GMCP_Credential_Scan::within_budget( array_fill( 0, 1000, 'a' ) ), GMCP_Credential_Scan::within_budget( array_fill( 0, 150000, 'a' ) ) ], [ true, false ] );
+
 echo "-- post fields never enter the journal carrying a credential --\n";
 // The gap: holds_credential() judges field names and opens only a value that BEGINS as JSON or
 // serialized data, so a post body with a settings snippet in the middle of it was copied whole.
