@@ -237,14 +237,22 @@ something that looks harmless and is not, so each says what it cannot promise.
   path. A configured file is still refused if its name is not log-shaped, if it
   is a script or a configuration file, or if it is a symbolic link, so a
   misconfigured or swapped value cannot turn it into a general file reader.
-  It reads from the end of the file, at most 256KB of it, through a handle whose
-  type is checked after it is opened, so a multi-gigabyte log costs what a small
-  one does. It has no search and no pattern argument; the model asks for the last
+  The path is looked at without following a link (`lstat`) before it is opened, so a
+  link, a pipe or a device is refused untouched (a FIFO would otherwise block the
+  worker on open), and the handle that was opened is compared with what was looked
+  at by device and inode and must be a regular file, which catches a file swapped in
+  between. PHP cannot open with `O_NOFOLLOW`, so the window between the two calls is
+  narrowed and not removed, and a site where an attacker can write to the log
+  directory is outside what this protects.
+  It reads from the end of the file, at most 256KB of it, so a multi-gigabyte log
+  costs what a small one does. It has no search and no pattern argument; the model asks for the last
   N lines and filters them itself.
 - Every line is scrubbed before it leaves: values under credential-shaped names
   (the same `gmcp_credential_field_patterns` list the audit log and journal
   use), bearer and basic credentials, user information in URLs, JWTs, password
-  hashes, this plugin's own keys, long opaque tokens, e-mail addresses, public IP
+  hashes, this plugin's own keys, long opaque tokens, the value in a
+  `define( 'DB_PASSWORD', '...' )` of a credential-named constant, `pw=...`, AWS
+  access key ids and 40-character AWS-style secret keys, e-mail addresses, public IP
   addresses (loopback and private ones stay, because `connect to 127.0.0.1` is
   the diagnosis), the argument values in stack frames, and the values in a failed
   SQL query past its first 120 characters. Paths are shown as `[content]/` and
@@ -310,6 +318,11 @@ something that looks harmless and is not, so each says what it cannot promise.
   because a signature cannot be revoked, carries whatever lifetime it was signed
   with, and would bring every old link back when a published post is reverted to
   a draft.
+  Ending every link on the site (`all: true`) needs an admin-level key, because it
+  also ends links other keys and other people made; every key acts as an
+  administrator user, so the user recorded with a link cannot tell keys apart and the
+  access level is the cut that exists. A key below admin can still end the links for
+  one post it can edit.
 - Verification happens on the front end, on the MAIN query only. `pre_get_posts`
   accepts the token only when the request is already a single-post request for
   exactly the post the token was issued for, and only then lets that query
@@ -330,7 +343,12 @@ something that looks harmless and is not, so each says what it cannot promise.
   `gmcp[preview]`, percent-encoded characters in the name or the `=`) out of every
   string it is handed on the logging paths, which is what the audit log's
   arguments and the debug trace both use, and the audit log applies the same
-  scrub to the reply it keeps. Without it the tool that hands the link out would
+  scrub to the reply it keeps. It does not scrub what a tool returns to its caller:
+  a stored theme mod or field that happens to contain the text is the site's own
+  data, and the readers pass `scrub_preview = false` so it comes back as stored. The
+  debug trace prints a call's arguments through `redact_call_args()`, the same answer
+  the audit log gives, so a value under a credential-named option or meta key is not
+  printed there either. Without it the tool that hands the link out would
   have written it into the audit log in the clear in the same call, which the
   first test of it showed. The fetch tool refuses a URL carrying the parameter
   for the same reason: it would be recorded as an argument, and a preview

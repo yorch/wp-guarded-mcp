@@ -216,6 +216,32 @@ $t = GMCP_Diag_Util::read_tail( $big, 2, 65536 );
 check( 'a 3 GiB file: last lines found', $t['lines'], [ 'tail one', 'tail two' ] );
 check( 'a 3 GiB file: memory stayed small', memory_get_peak_usage() - $mem < 4 * 1024 * 1024, true );
 unlink( $big );
+// The file that is read is the one that was looked at.
+file_put_contents( "$dir/real.log", "secret line\n" );
+check( 'control: the target of the link reads fine on its own', GMCP_Diag_Util::read_tail( "$dir/real.log", 5, 100 )['lines'], [ 'secret line' ] );
+check( 'control: lstat sees a regular file there', ( lstat( "$dir/real.log" )['mode'] & 0170000 ) === 0100000, true );
+symlink( "$dir/real.log", "$dir/link.log" );
+check( 'control: the link resolves to a readable file (a plain fopen would read it)', @file_get_contents( "$dir/link.log" ), "secret line\n" );
+$t = GMCP_Diag_Util::read_tail( "$dir/link.log", 5, 100 );
+check( 'a symbolic link is refused', $t['ok'], false );
+check( '  ...and nothing was read through it', $t['lines'], [] );
+if ( function_exists( 'posix_mkfifo' ) && @posix_mkfifo( "$dir/pipe.log", 0600 ) ) {
+  $t0 = microtime( true );
+  $t = GMCP_Diag_Util::read_tail( "$dir/pipe.log", 5, 100 );
+  check( 'a FIFO is refused', $t['ok'], false );
+  check( '  ...without blocking on it', microtime( true ) - $t0 < 2, true );
+  unlink( "$dir/pipe.log" );
+}
+else {
+  echo "  ....  FIFO case not run: posix_mkfifo is unavailable here\n";
+}
+$ls = lstat( "$dir/real.log" );
+check( 'same_regular_file: control, the same file', GMCP_Diag_Util::same_regular_file( $ls, $ls ), true );
+check( 'same_regular_file: another inode', GMCP_Diag_Util::same_regular_file( $ls, [ 'ino' => $ls['ino'] + 1 ] + $ls ), false );
+check( 'same_regular_file: another device', GMCP_Diag_Util::same_regular_file( $ls, [ 'dev' => $ls['dev'] + 1 ] + $ls ), false );
+check( 'same_regular_file: a link where a file was', GMCP_Diag_Util::same_regular_file( [ 'mode' => 0120777 ] + $ls, $ls ), false );
+check( 'same_regular_file: a pipe was opened', GMCP_Diag_Util::same_regular_file( $ls, [ 'mode' => 0010600 ] + $ls ), false );
+unlink( "$dir/link.log" );
 
 echo "-- scrub_log_line --\n";
 $ctx = [ 'content_dir' => '/srv/www/site/wp-content', 'abspath' => '/srv/www/site/', 'patterns' => [ 'pass', 'pwd', 'secret', 'token', 'key', 'auth', 'salt', 'nonce', 'credential', 'bearer', 'signature', 'licence', 'license', 'private' ] ];
@@ -244,6 +270,13 @@ $cases = [
   [ 'public IPv6', 'Client 2606:2800:220:1:248:1893:25c8:1946 requested /x', '2606:2800:220:1:248:1893:25c8:1946', 'requested /x' ],
   [ 'opaque token', 'Stripe said ABCDEF0123456789abcdef0123456789ABCD was invalid', 'ABCDEF0123456789abcdef0123456789ABCD', 'was invalid' ],
   [ 'stack frame arguments', "#2 /srv/www/site/wp-includes/user.php(120): wp_authenticate('admin', 'MyPassw0rd!', Object(WP_User))", 'MyPassw0rd', 'wp_authenticate(' ],
+  [ 'define() of a password constant', "PHP Notice: in wp-config.php: define( 'DB_PASSWORD', 'Sup3rS3cretDbPw' );", 'Sup3rS3cretDbPw', "define( 'DB_PASSWORD'," ],
+  [ 'define() with double quotes and no spaces', 'define("AUTH_KEY","pU7vXyZ0ab9Qq1RrTt");', 'pU7vXyZ0ab9Qq1RrTt', 'define(' ],
+  [ 'pw= in a URL', 'GET /connect?user=bob&pw=correcthorse&x=1', 'correcthorse', 'user=bob' ],
+  [ 'pw: in a dump', 'login attempt pw: "my pw value" for bob', 'my pw value', 'login attempt' ],
+  [ 'AWS access key id', 'S3 client built with AKIAIOSFODNN7EXAMPLE for bucket x', 'AKIAIOSFODNN7EXAMPLE', 'for bucket x' ],
+  [ 'AWS secret access key, bare', 'signing with wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY failed', 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', 'failed' ],
+  [ 'AWS secret by name', 'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', 'bPxRfiCYEXAMPLEKEY', 'aws_secret_access_key' ],
   [ 'SQL values', 'WordPress database error Duplicate entry for query INSERT INTO wp_users (user_login) VALUES (\'bob\') ' . str_repeat( 'x', 140 ) . ' SECRET_TAIL_VALUE', 'SECRET_TAIL_VALUE', 'INSERT INTO wp_users' ],
 ];
 foreach ( $cases as [ $label, $in, $gone, $kept ] ) {
@@ -262,6 +295,9 @@ $keep = [
   'Fatal error: Allowed memory size of 134217728 bytes exhausted (tried to allocate 20480 bytes)',
   '[04-Nov-2026 22:36:32 UTC] PHP Deprecated:  Creation of dynamic property is deprecated',
   'Call to undefined function some_very_long_but_ordinary_function_name_without_digits()',
+  // The new shapes must not eat ordinary text: "pw" is a whole word only, and a define() of something that is not a credential is just a notice.
+  'power=5 and pwa=1 and showpw=2 were set',
+  "define( 'WP_DEBUG', true ); define( 'WP_CONTENT_URL', 'https://x.test/c' );",
 ];
 foreach ( $keep as $line ) {
   check( 'unchanged: ' . substr( $line, 0, 50 ), GMCP_Diag_Util::scrub_log_line( $line, [] ), $line );

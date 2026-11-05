@@ -664,7 +664,7 @@ class GMCP_Server {
 
           if ( $this->logging ) {
             error_log( '[Guarded MCP Direct] 🔧 tools/call - Tool: ' . $tool );
-            error_log( '[Guarded MCP Direct] 🔧 tools/call - Arguments: ' . wp_json_encode( GMCP_Core::redact( $arguments ) ) );
+            error_log( '[Guarded MCP Direct] 🔧 tools/call - Arguments: ' . wp_json_encode( GMCP_Core::redact_call_args( is_array( $arguments ) ? $arguments : [] ) ) );
           }
 
           try {

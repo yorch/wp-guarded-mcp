@@ -1395,8 +1395,15 @@ class GMCP_Core {
   * Walks arrays and objects. Does not try to parse strings: a JSON blob under an
   * innocuous field name is left whole, and callers that care should test it with
   * field_looks_secret() on the field it arrived under.
+  *
+  * $scrub_preview is for what is WRITTEN DOWN (the audit log, the debug log), where a
+  * preview link's token must never land, and defaults to on so a new logging caller is
+  * safe without knowing about it. A caller that is answering a tool call with a value the
+  * site stores (a theme mod, an ACF field, a Kirki setting) passes false: the reply is the
+  * data, and a stored string that happens to contain "gmcp_preview=" is the site's own
+  * text, which was being returned as "gmcp_preview=[redacted]".
   */
-  public static function redact( $value, int $depth = 0 ) {
+  public static function redact( $value, int $depth = 0, bool $scrub_preview = true ) {
     if ( $depth > 8 ) {
       return '[too deeply nested to record]';
     }
@@ -1404,7 +1411,7 @@ class GMCP_Core {
       $value = get_object_vars( $value );
     }
     if ( is_string( $value ) ) {
-      return self::scrub_preview_tokens( $value );
+      return $scrub_preview ? self::scrub_preview_tokens( $value ) : $value;
     }
     if ( !is_array( $value ) ) {
       return $value;
@@ -1415,7 +1422,7 @@ class GMCP_Core {
         $out[ $key ] = '[redacted]';
         continue;
       }
-      $out[ $key ] = self::redact( $inner, $depth + 1 );
+      $out[ $key ] = self::redact( $inner, $depth + 1, $scrub_preview );
     }
     return $out;
   }

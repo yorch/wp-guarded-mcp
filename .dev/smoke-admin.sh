@@ -3275,6 +3275,21 @@ check "a write-level key cannot read the PHP error log" "$(py 'import json,sys;d
 kcall pv_ro_fetch "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":412,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_fetch_page\",\"arguments\":{\"url\":\"$BASE/\"}}}"
 check "a write-level key cannot fetch a page" "$(py 'import json,sys;d=json.load(sys.stdin);print("denied" if "error" in d and "Access denied" in d["error"]["message"] else "reached")' pv_ro_fetch)" "denied"
 
+# Ending EVERY link on the site is an admin-level act: a write-level key could end links other
+# keys and people made. One link exists here (PV_A, from pv_make3).
+check "control: a link exists before the all:true attempts" "$(pv_posts)" "$PV_A"
+kcall pv_all_rw "$K_PV_RW" '{"jsonrpc":"2.0","id":413,"method":"tools/call","params":{"name":"wp_revoke_preview_links","arguments":{"all":true}}}'
+check "a write-level key cannot revoke every link on the site" "$(verdict pv_all_rw)" "error"
+check "...and says it needs an admin-level key" "$(refusal pv_all_rw | grep -c 'admin-level key')" "1"
+check "stored state: the link is still there" "$(pv_posts)" "$PV_A"
+kcall pv_one_rw "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":414,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_revoke_preview_links\",\"arguments\":{\"post_id\":$PV_B}}}"
+check "control: the same key can still end the links of one post" "$(verdict pv_one_rw)" "ok"
+call pv_all_admin '{"jsonrpc":"2.0","id":415,"method":"tools/call","params":{"name":"wp_revoke_preview_links","arguments":{"all":true}}}'
+check "control: an admin-level key can revoke every link" "$(verdict pv_all_admin)" "ok"
+check "stored state: and the store is empty" "$(pv_posts)" ""
+kcall pv_make4 "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":416,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+PV_LAST=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_make4)
+
 # Fetch policy. The refusals are deterministic and need no network.
 fetch_verdict() { # fetch_verdict <url> -> "refused" when the POLICY refused, "admitted" otherwise
   call pv_f "{\"jsonrpc\":\"2.0\",\"id\":420,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_fetch_page\",\"arguments\":{\"url\":\"$1\"}}}"
@@ -3367,6 +3382,42 @@ if [ -n "$PV_LOGFILE" ] && docker compose exec -T cli test -w "$PV_LOGFILE" >/de
   check "the public IP address is not" "$(grep -c '203.0.114.9' "$OUT/pv_log2")" "0"
 else
   echo "  ....  log scrubbing end-to-end not checked: no writable error_log file is configured on this stack"
+fi
+
+# A read returns what the site stores. redact() scrubs a preview token out of every string it
+# is handed, which is right for what gets written down and wrong for a tool's reply: a theme
+# mod whose text happens to contain "gmcp_preview=" came back as "gmcp_preview=[redacted]".
+docker compose exec -T cli wp eval 'set_theme_mod( "fixc_note", "see gmcp_preview=abc123def456 for the draft" );' >/dev/null 2>&1
+call pv_tm '{"jsonrpc":"2.0","id":440,"method":"tools/call","params":{"name":"wp_get_theme_mod","arguments":{"key":"fixc_note"}}}'
+check "control: the stored theme mod holds the text" "$(docker compose exec -T cli wp eval 'echo strpos( (string) get_theme_mod( "fixc_note" ), "gmcp_preview=abc123def456" ) !== false ? "yes" : "no";' 2>/dev/null | tr -d '\r\n')" "yes"
+check "the reply carries the stored text, not a redaction mark" "$(grep -c 'gmcp_preview=abc123def456' "$OUT/pv_tm")" "1"
+# ...while the audit log, which writes arguments down, still scrubs the same shape.
+PV_TV="tokenvalue${RANDOM}${RANDOM}"
+call pv_tm2 "{\"jsonrpc\":\"2.0\",\"id\":441,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_theme_mod\",\"arguments\":{\"key\":\"fixc_none\",\"default\":\"see gmcp_preview=$PV_TV here\"}}}"
+check "the audit log still scrubs a token in an argument" "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE tool='wp_get_theme_mod' AND args LIKE '%$PV_TV%'")" "0"
+check "control: and that call is in the audit log, with the mark" "$([ "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE tool='wp_get_theme_mod' AND args LIKE '%gmcp_preview=[redacted]%'")" -ge 1 ] && echo yes || echo no)" "yes"
+docker compose exec -T cli wp eval 'remove_theme_mod( "fixc_note" );' >/dev/null 2>&1
+
+# The debug log (MCP debug mode) prints each call's arguments. It used to print them through
+# redact(), which judges field NAMES, so wp_update_option {key: "x_pwd", value: "..."} logged
+# the value: "value" is not a secret-looking field name, and the option name that makes it
+# one is in a sibling field. Needs a log file the stack writes to: GMCP_TEST_ERROR_LOG names
+# one for a stack that is not configured with its own.
+DBG_LOG="${GMCP_TEST_ERROR_LOG:-$PV_LOGFILE}"
+if [ -n "$DBG_LOG" ] && docker compose exec -T cli test -w "$DBG_LOG" >/dev/null 2>&1; then
+  DBG_WAS=$(docker compose exec -T cli wp eval 'echo empty( get_option( "gmcp_options", [] )["mcp_debug_mode"] ) ? "off" : "on";' 2>/dev/null | tr -d '\r\n')
+  docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_debug_mode"]=true;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+  call dbg_1 '{"jsonrpc":"2.0","id":450,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"fixc_vendor_pwd","value":"HUNTER2-LOGLEAK"}}}'
+  call dbg_2 '{"jsonrpc":"2.0","id":451,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"fixc_plain_opt","value":"PLAINVALUE-LOGGED"}}}'
+  check "control: the secret-named option really was written" "$(docker compose exec -T cli wp option get fixc_vendor_pwd 2>/dev/null | tr -d '\r\n')" "HUNTER2-LOGLEAK"
+  check "control: the debug log has this call's lines" "$([ "$(docker compose exec -T cli sh -c "grep -c 'tools/call - Tool: wp_update_option' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" -ge 2 ] && echo yes || echo no)" "yes"
+  check "control: an ordinary value IS printed in the arguments, so the probe can see one" "$([ "$(docker compose exec -T cli sh -c "grep -c 'PLAINVALUE-LOGGED' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "the value stored under a secret-named option is not in the debug log" "$(docker compose exec -T cli sh -c "grep -c 'HUNTER2-LOGLEAK' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" "0"
+  check "...but the option's name is, so the line still says what changed" "$([ "$(docker compose exec -T cli sh -c "grep -c 'fixc_vendor_pwd' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" -ge 1 ] && echo yes || echo no)" "yes"
+  docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_debug_mode"]='"$([ "$DBG_WAS" = on ] && echo true || echo false)"';update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+  docker compose exec -T cli wp option delete fixc_vendor_pwd fixc_plain_opt >/dev/null 2>&1
+else
+  echo "  ....  debug-log redaction not checked: no writable error_log file is configured on this stack (set GMCP_TEST_ERROR_LOG to one the web server writes to)"
 fi
 
 # Put the site back.

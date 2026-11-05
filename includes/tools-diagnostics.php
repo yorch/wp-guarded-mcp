@@ -89,7 +89,7 @@ class GMCP_Tools_Diagnostics {
       ],
       'wp_revoke_preview_links' => [
         'name' => 'wp_revoke_preview_links',
-        'description' => 'End preview links before they expire: every live link for one post (post_id), or every live link on the site (all: true). Reports how many were ended. Links also end by themselves on expiry and when their post is published, trashed or deleted.',
+        'description' => 'End preview links before they expire: every live link for one post (post_id), or every live link on the site (all: true, which needs an admin-level key because it also ends links other keys made). Reports how many were ended. Links also end by themselves on expiry and when their post is published, trashed or deleted.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -545,6 +545,13 @@ class GMCP_Tools_Diagnostics {
     }
     if ( $all && $id > 0 ) {
       return $this->error( $r, 'Give post_id or all, not both.' );
+    }
+    // Ending every link on the site ends links other keys and other people made, for posts this
+    // key may have no business with. Links are stored with the user that made them, but every
+    // key acts as an administrator user, so "only my own" cannot be told apart by key: the
+    // honest cut is the level. A key below admin can still end the links for one post it can edit.
+    if ( $all && GMCP_Core::caller_access_level() !== 'admin' ) {
+      return $this->error( $r, 'Ending every preview link on the site needs an admin-level key, because it also ends links made by other keys and other people. This key is ' . GMCP_Core::caller_access_level() . '. Pass post_id to end the links for one post you can edit.' );
     }
     if ( !$all && ( $post = get_post( $id ) ) && !current_user_can( 'edit_post', $post->ID ) ) {
       return $this->error( $r, 'Not permitted: ending the links for a post requires the capability to edit it.' );

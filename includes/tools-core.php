@@ -3121,7 +3121,7 @@ class GMCP_Tools_Core {
           $value = '[redacted]';
         }
         else {
-          $value = GMCP_Core::redact( $value );
+          $value = GMCP_Core::redact( $value, 0, false );
         }
         $this->add_result_text( $r, wp_json_encode( $value, JSON_PRETTY_PRINT ) );
         break;
@@ -3177,7 +3177,7 @@ class GMCP_Tools_Core {
         // text. redact() walks the value and blanks the leaves the same way it does for
         // an audit-log argument, keeping the shape so the caller can still see what is
         // there without seeing what was in it.
-        $mods = GMCP_Core::redact( $mods );
+        $mods = GMCP_Core::redact( $mods, 0, false );
         $this->add_result_text( $r, wp_json_encode( $mods, JSON_PRETTY_PRINT ) );
         break;
 

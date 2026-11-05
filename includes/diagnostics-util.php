@@ -515,6 +515,21 @@ final class GMCP_Diag_Util {
   /* ----------------------------------------------------------------- the error log */
 
   /**
+  * Whether what was opened is the regular file that was looked at: a regular file, on the same
+  * device, with the same inode. Pure, so the swap it exists to catch can be tested without
+  * racing one.
+  *
+  * @param array $lstat stat() of the path before opening, taken without following a link.
+  * @param array $fstat fstat() of the handle that was then opened.
+  */
+  public static function same_regular_file( array $lstat, array $fstat ): bool {
+    return ( ( $fstat['mode'] ?? 0 ) & 0170000 ) === 0100000
+      && ( ( $lstat['mode'] ?? 0 ) & 0170000 ) === 0100000
+      && ( $lstat['dev'] ?? null ) === ( $fstat['dev'] ?? false )
+      && ( $lstat['ino'] ?? null ) === ( $fstat['ino'] ?? false );
+  }
+
+  /**
   * The end of a file, read from the end.
   *
   * Never reads more than $max_bytes (+1, to learn whether the first line it has is whole),
@@ -526,15 +541,25 @@ final class GMCP_Diag_Util {
   */
   public static function read_tail( string $path, int $max_lines, int $max_bytes ): array {
     $r = [ 'ok' => false, 'error' => '', 'size' => 0, 'mtime' => 0, 'lines' => [], 'lines_available' => 0, 'starts_mid_file' => false ];
+    // lstat() does not follow a link and does not open anything, so a symbolic link, a FIFO
+    // (an open for reading would block this worker until something wrote to it) or a device is
+    // refused before it is touched. The caller checked the same things a moment earlier; a file
+    // can be swapped in the gap, which is why this asks again and then compares what it opened
+    // with what it looked at.
+    $before = @lstat( $path );
+    if ( !$before || ( $before['mode'] & 0170000 ) !== 0100000 ) {
+      $r['error'] = 'The path is not a regular file (a symbolic link, pipe or device is not read).';
+      return $r;
+    }
     $fh = @fopen( $path, 'rb' );
     if ( !$fh ) {
       $r['error'] = 'The file could not be opened for reading.';
       return $r;
     }
     $st = fstat( $fh );
-    if ( !$st || ( $st['mode'] & 0170000 ) !== 0100000 ) {
+    if ( !$st || !self::same_regular_file( $before, $st ) ) {
       fclose( $fh );
-      $r['error'] = 'The path is not a regular file.';
+      $r['error'] = 'The path is not the regular file it was a moment ago (it was replaced while being opened), so it was not read.';
       return $r;
     }
     $size = (int) $st['size'];
@@ -682,6 +707,30 @@ final class GMCP_Diag_Util {
         $line
       );
     }
+
+    // Shapes the name-based rule above cannot see.
+    //  - define( 'DB_PASSWORD', 'value' ): the name and the value are separated by a comma, not
+    //    by "=" or ":", and a PHP notice quoting a line of wp-config.php prints exactly this.
+    //  - pw=value: "pw" is too short to be one of the substring patterns without matching
+    //    "power" and "pwa", so it is matched as a whole word.
+    $line = (string) preg_replace(
+      '/(\bdefine\s*\(\s*([\'"])[A-Za-z0-9_]*(?:PASS|PWD|PW|SECRET|KEY|SALT|TOKEN|AUTH|CREDENTIAL)[A-Za-z0-9_]*\2\s*,\s*)(?:"[^"]*"|\'[^\']*\'|[^\s,)]+)/i',
+      '$1[redacted]',
+      $line
+    );
+    $line = (string) preg_replace(
+      '/(?<![A-Za-z0-9_])(pw)(\s*(?:=>|[:=])\s*)("[^"]*"|\'[^\']*\'|[^\s&,;)\]}]+)/i',
+      '$1$2[redacted]',
+      $line
+    );
+    // AWS: an access key id has a fixed prefix; a secret access key is 40 characters of base64
+    // that may contain "/" and "+", which the long-token rule below treats as path delimiters,
+    // so one is matched here when it mixes upper case, lower case and digits (a 40-character
+    // lower-case hex string is a commit hash and is left alone).
+    $line = (string) preg_replace( '/\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[A-Z0-9]{16}\b/', '[aws key id]', $line );
+    $line = (string) preg_replace_callback( '#(?<![A-Za-z0-9/+=_.-])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=_-])#', static function ( $m ) {
+      return ( preg_match( '/[A-Z]/', $m[0] ) && preg_match( '/[a-z]/', $m[0] ) && preg_match( '/\d/', $m[0] ) ) ? '[aws secret]' : $m[0];
+    }, $line );
 
     $line = (string) preg_replace( '/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/', '[jwt]', $line );
     $line = (string) preg_replace( '#\$(?:P|H)\$[A-Za-z0-9./]{20,}|\$wp\$2y\$\d+\$[A-Za-z0-9./]{20,}|\$2[aby]\$\d{2}\$[A-Za-z0-9./]{40,}#', '[hash]', $line );

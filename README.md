@@ -137,7 +137,7 @@ path, scrubs every line, and says whether logging is off, the file is absent, or
 empty); `wp_fetch_page` requests one page of this site the way an anonymous visitor does
 and reports status, redirects, robots signals and a bounded excerpt of the text (this
 site's own host only, `admin` level); and `wp_create_preview_link` /
-`wp_revoke_preview_links` make and end an expiring, non-indexed link to one unpublished
+`wp_revoke_preview_links` (ending every link on the site needs an admin-level key) make and end an expiring, non-indexed link to one unpublished
 post, 24 hours by default and 7 days at most. Viewing a preview link is not logged.
 
 **WooCommerce**, off by default, and the switch only appears when the shop is installed:
