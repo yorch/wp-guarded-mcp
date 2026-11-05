@@ -618,19 +618,20 @@ class GMCP_Tools_Diagnostics {
     $hours = isset( $a['hours'] ) && is_numeric( $a['hours'] ) ? (int) $a['hours'] : GMCP_Preview::DEFAULT_HOURS;
     $post = $id > 0 ? get_post( $id ) : null;
     if ( !$post ) {
-      return $this->error( $r, 'No post with id ' . $id . '.' );
+      return $this->error( $r, GMCP_Core::post_not_found_text( $id ) );
     }
     if ( !current_user_can( 'edit_post', $post->ID ) ) {
       return $this->error( $r, 'Not permitted: sharing a draft requires the capability to edit it, which the authenticated account does not have for post ' . $post->ID . '.' );
     }
-    $guard = GMCP_Core::commerce_post_guard( (int) $post->ID, 'Sharing' );
-    if ( $guard !== true ) {
-      return $this->error( $r, $guard );
-    }
-    // A link is a read handed to whoever holds it, so the read policy of the post applies.
+    // A link is a read handed to whoever holds it, so the read policy of the post applies, and
+    // it is asked first: it answers a post this key may not read as one that is not there.
     $readable = GMCP_Core::post_read_guard( (int) $post->ID );
     if ( $readable !== true ) {
       return $this->error( $r, $readable );
+    }
+    $guard = GMCP_Core::commerce_post_guard( (int) $post->ID, 'Sharing' );
+    if ( $guard !== true ) {
+      return $this->error( $r, $guard );
     }
     $made = GMCP_Preview::create( $post, $hours, get_current_user_id() );
     if ( !$made['ok'] ) {

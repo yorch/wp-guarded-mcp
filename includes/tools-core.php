@@ -2612,9 +2612,16 @@ class GMCP_Tools_Core {
     $reads_one = in_array( $tool, [ 'wp_get_post', 'wp_get_post_snapshot', 'wp_get_post_meta', 'wp_read_post_meta_chunk', 'wp_alter_post', 'wp_get_post_terms', 'wp_add_post_terms' ], true )
       || ( !empty( $a['preview'] ) && in_array( $tool, [ 'wp_update_post', 'wp_delete_post' ], true ) );
     if ( $reads_one ) {
-      $held = GMCP_Core::post_read_guard( (int) ( $a['ID'] ?? 0 ) );
+      $read_id = (int) ( $a['ID'] ?? 0 );
+      // A post that is not there and a post this caller may not read get the same sentence and
+      // the same code, answered here for every tool in the list so no tool's own "not found"
+      // wording can tell them apart. @see GMCP_Core::post_read_guard().
+      if ( $read_id > 0 && !get_post( $read_id ) ) {
+        return $this->error( $r, GMCP_Core::post_not_found_text( $read_id ), -32602 );
+      }
+      $held = GMCP_Core::post_read_guard( $read_id );
       if ( $held !== true ) {
-        return $this->error( $r, $held, -32600 );
+        return $this->error( $r, $held, GMCP_Core::read_refusal_code( $read_id, $held ) );
       }
     }
     elseif ( $tool === 'wp_get_posts' ) {
@@ -3657,7 +3664,7 @@ class GMCP_Tools_Core {
         }
         $p = get_post( intval( $a['ID'] ) );
         if ( !$p ) {
-          $r = $this->error( $r, 'Post not found', -32602 );
+          $r = $this->error( $r, GMCP_Core::post_not_found_text( intval( $a['ID'] ) ), -32602 );
           break;
         }
         $one_read = GMCP_Core::commerce_post_read_guard( $p );
@@ -3691,7 +3698,7 @@ class GMCP_Tools_Core {
         $p = get_post( $post_id );
 
         if ( !$p ) {
-          $r = $this->error( $r, 'Post not found', -32602 );
+          $r = $this->error( $r, GMCP_Core::post_not_found_text( $post_id ), -32602 );
           break;
         }
         $snap_read = GMCP_Core::commerce_post_read_guard( $p );
@@ -3960,9 +3967,15 @@ class GMCP_Tools_Core {
         }
         // The source is read and its content and meta carried across, so the read policies
         // apply to it as they would to wp_get_post: a form submission, or an order below admin.
+        // Asked first, so that below admin a submission is answered as a post that is not there.
         $dup_read = GMCP_Core::post_read_guard( (int) $src->ID );
         if ( $dup_read !== true ) {
-          $r = $this->error( $r, $dup_read, -32600 );
+          $r = $this->error( $r, $dup_read, GMCP_Core::read_refusal_code( (int) $src->ID, $dup_read ) );
+          break;
+        }
+        $commerce = GMCP_Core::commerce_post_guard( $src->ID, 'Duplicating' );
+        if ( $commerce !== true ) {
+          $r = $this->error( $r, $commerce, -32600 );
           break;
         }
         // The source is only read, so a live page may be copied by a drafts-only key; what
@@ -4798,7 +4811,11 @@ class GMCP_Tools_Core {
         // copyable onto a draft of the caller's own. The read policies apply to the source.
         $source_read = GMCP_Core::post_read_guard( $from_id );
         if ( $source_read !== true ) {
-          $r = $this->error( $r, $source_read, -32600 );
+          // Below admin a source this key may not read is answered as one that is not there,
+          // in this tool's own words for that.
+          $r = $source_read === GMCP_Core::post_not_found_text( $from_id )
+            ? $this->error( $r, 'No source post with ID ' . $from_id . '.', -32602 )
+            : $this->error( $r, $source_read, -32600 );
           break;
         }
         // The target is the write.

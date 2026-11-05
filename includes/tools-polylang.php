@@ -160,7 +160,7 @@ class GMCP_Tools_Polylang {
     $post_id = (int) ( $args['post_id'] ?? 0 );
     $post = $post_id > 0 ? get_post( $post_id ) : null;
     if ( !$post ) {
-      return $this->error( $r, 'No post with ID ' . $post_id . ' exists.' );
+      return $this->error( $r, GMCP_Core::post_not_found_text( $post_id ) );
     }
     // A submission's id, type and translation group are not for a key that cannot read it.
     $read_policy = GMCP_Core::post_read_guard( $post_id );

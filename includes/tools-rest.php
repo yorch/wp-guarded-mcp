@@ -362,11 +362,19 @@ class GMCP_Tools_Rest {
       // hangs from. The controller refuses an id of the wrong type with a 404 and so answers
       // for a submission's own id, but a media row attached to one is a perfectly good
       // attachment to the media controller, and an update or a delete replies with the row.
-      $held = GMCP_Core::post_read_guard( intval( $args['id'] ) );
+      $row_id = intval( $args['id'] );
+      $held = GMCP_Core::post_read_guard( $row_id );
       if ( $held !== true ) {
-        return $this->error( $id, $held, -32600 );
+        if ( $held !== GMCP_Core::post_not_found_text( $row_id ) ) {
+          return $this->error( $id, $held, -32600 );
+        }
+        // Below admin, a post this key may not read is asked of the controller as an id that
+        // names nothing, so its answer is the controller's own answer for one that does not
+        // exist and cannot differ from it.
+        $row_id = 0;
+        $args['id'] = 0;
       }
-      $path .= '/' . intval( $args['id'] );
+      $path .= '/' . $row_id;
     }
 
     switch ( $action ) {

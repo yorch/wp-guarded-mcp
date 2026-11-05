@@ -110,7 +110,10 @@ for tool_json in \
   callas "$RO" g0 "$(tc "$t" "$a")"
   check "a read-only key is refused $t on a submission post ($a)" "$(verdict g0)" "error"
   check "and the reply does not contain the stored value" "$(has g0 "$MARK")" "no"
-  check "and the refusal is the personal-data guard's, not some other error" "$(has g0 "form submission")" "yes"
+  pid=$(printf '%s' "$a" | grep -o '"ID":[0-9]*' | cut -d: -f2)
+  check "and the answer is the one a post that does not exist gets" "$(has g0 "No post with ID $pid.")" "yes"
+  callas "$TOK" g0a "$(tc "$t" "$a")"
+  check "CONTROL: an admin key is refused too, and told why (the personal-data guard is what answered)" "$(has g0a "form submission")" "yes"
 done
 callas "$RO" g0 "$(tc wp_get_post_snapshot "{\"ID\":$NORMAL}")"
 check "CONTROL: wp_get_post_snapshot on an ordinary post succeeds, so its refusal above was the guard" "$(verdict g0)" "ok"
@@ -152,7 +155,7 @@ callas "$RW" w1 "$(tc wp_copy_post_meta "{\"from_id\":$SUBID,\"to_id\":$DRAFT}")
 check "wp_copy_post_meta FROM a submission is refused" "$(verdict w1)" "error"
 check "STORED: the draft holds none of the submission's keys" \
   "$(wpe 'echo count(array_intersect(array_keys(get_post_meta('"$DRAFT"')), ["_meta","_field_message"]));')" "0"
-check "and the refusal is the personal-data guard's" "$(has w1 "form submission")" "yes"
+check "and the answer is the one a missing source gets" "$(has w1 "No source post with ID $SUBID.")" "yes"
 callas "$RW" w1b "$(tc wp_copy_post_meta "{\"from_id\":$SUBID,\"to_id\":$DRAFT,\"keys\":[\"_meta\"]}")"
 check "naming the key does not help" "$(verdict w1b)" "error"
 check "STORED: still no _meta on the draft" "$(wpe 'echo metadata_exists("post",'"$DRAFT"',"_meta")?"yes":"no";')" "no"
@@ -216,7 +219,7 @@ callas "$RW" w8 "$(tc wp_create_preview_link "{\"post_id\":$DRAFT}")"
 check "CONTROL: a preview link for an ordinary draft is minted" "$(verdict w8)" "ok"
 callas "$RW" w8b "$(tc wp_create_preview_link "{\"post_id\":$SUBID2}")"
 check "a preview link to an unpublished submission is not minted" "$(verdict w8b)" "error"
-check "and the refusal is the personal-data guard's" "$(has w8b "form submission")" "yes"
+check "and the answer is the one a post that does not exist gets" "$(has w8b "No post with ID $SUBID2.")" "yes"
 docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-forms-type.php >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------------------------
@@ -830,6 +833,45 @@ callas "$TOK" x7 "$(tc wp_delete_post "{\"ID\":$DEL,\"force\":true}")"
 check "CONTROL: an admin key's wp_delete_post of an ordinary post succeeds" "$(verdict x7)" "ok"
 check "CONTROL: and STORED: it is gone" "$(wpe 'echo get_post('"$DEL"')?"there":"gone";')" "gone"
 
+echo "-- below admin a guarded post is answered exactly as one that does not exist --"
+MISSING=987654321
+norm() { python3 -c 'import json,sys
+d=json.load(sys.stdin)
+c=d.get("result",{}).get("content",[])
+t=(c[0]["text"] if c else "")+json.dumps(d.get("error",""))
+e=d.get("result",{}).get("isError",False)
+print(("E:" if e else "O:")+t.replace(sys.argv[1],"N"))' "$2" < "$OUT/$1"; }
+same() { # same <label> <key> <tool> <args containing @ID@> <guarded id>
+  callas "$2" u1 "$(tc "$3" "${4//@ID@/$5}")"; callas "$2" u2 "$(tc "$3" "${4//@ID@/$MISSING}")"
+  check "$1: a guarded id and a missing id get the same answer" "$(norm u1 "$5")" "$(norm u2 "$MISSING")"
+  check "$1: and it is a refusal" "$(verdict u1)" "error"
+}
+for g in "$SUB" "$SUBREV" "$SUBATT"; do
+  same "wp_get_post ($g)" "$RO" wp_get_post '{"ID":@ID@}' "$g"
+  same "wp_get_post_snapshot ($g)" "$RO" wp_get_post_snapshot '{"ID":@ID@}' "$g"
+  same "wp_get_post_meta ($g)" "$RO" wp_get_post_meta '{"ID":@ID@}' "$g"
+  same "wp_read_post_meta_chunk ($g)" "$RO" wp_read_post_meta_chunk '{"ID":@ID@,"key":"_field_message"}' "$g"
+  same "wp_get_post_terms ($g)" "$RO" wp_get_post_terms '{"ID":@ID@,"taxonomy":"category"}' "$g"
+  same "wp_alter_post preview ($g)" "$RW" wp_alter_post '{"ID":@ID@,"field":"post_content","search":"a","replace":"b","preview":true}' "$g"
+  same "wp_update_post preview ($g)" "$RW" wp_update_post '{"ID":@ID@,"fields":{"post_title":"x"},"preview":true}' "$g"
+  same "wp_create_preview_link ($g)" "$RW" wp_create_preview_link '{"post_id":@ID@}' "$g"
+  same "wp_duplicate_post ($g)" "$RW" wp_duplicate_post '{"ID":@ID@}' "$g"
+  same "wp_copy_post_meta source ($g)" "$RW" wp_copy_post_meta "{\"from_id\":@ID@,\"to_id\":$PG2}" "$g"
+  same "wp_add_post_terms ($g)" "$RW" wp_add_post_terms '{"ID":@ID@,"taxonomy":"category","terms":[1]}' "$g"
+done
+callas "$TOK" u0 "$(tc wp_delete_post "{\"ID\":$SUB,\"preview\":true}")"
+check "an admin key's preview of deleting a submission is refused, with the reason" "$(has u0 "form submission")" "yes"
+setrest true
+same "get_media (REST)" "$RO" get_media '{"id":@ID@}' "$SUBATT"
+setrest false
+callas "$RO" u3 "$(tc wp_get_post "{\"ID\":$CTL}")"
+callas "$RO" u4 "$(tc wp_get_post "{\"ID\":$MISSING}")"
+check "CONTROL: an ordinary post is answered differently from a missing one (the comparison can tell)" \
+  "$([ "$(norm u3 "$CTL")" != "$(norm u4 "$MISSING")" ] && echo differs || echo same)" "differs"
+callas "$TOK" u5 "$(tc wp_get_post "{\"ID\":$SUB}")"
+check "an ADMIN key is still told why" "$(has u5 "form submission")" "yes"
+callas "$RO" u6 "$(tc wp_get_posts '{"post_type":"flamingo_inbound"}')"
+check "a listing that names the submission type is refused with the reason (it names a type, not a post)" "$(has u6 "form submission")" "yes"
 if [ "$REST_WAS" = unset ]; then
   wpe '$o=get_option("gmcp_options",[]);unset($o["mcp_tools_rest"]);update_option("gmcp_options",$o,false);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null
 else

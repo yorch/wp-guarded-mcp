@@ -270,7 +270,7 @@ class GMCP_Tools_Seo {
     }
     $post = get_post( $post_id );
     if ( !$post ) {
-      return 'Post ' . $post_id . ' does not exist.';
+      return GMCP_Core::post_not_found_text( $post_id );
     }
     // The read policies about the post's type, ahead of everything that would return a value
     // from it: a form submission is never read through these tools, and an order only by an

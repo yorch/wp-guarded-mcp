@@ -1673,9 +1673,30 @@ class GMCP_Core {
   public static function post_read_guard( int $post_id ) {
     $held = self::personal_data_post_guard( $post_id );
     if ( $held !== true ) {
-      return $held;
+      // Below admin the answer is the one a post that does not exist gets, word for word, so
+      // a key that can only read cannot walk ids and learn which are submissions, which are
+      // their revisions or uploads, and which are nothing. The explanation stays for admin,
+      // who can list submissions through the form tools anyway, and in the audit log, which
+      // records the call and the reply it got. @see post_not_found_text().
+      return self::caller_access_level() === 'admin' ? $held : self::post_not_found_text( $post_id );
     }
     return self::commerce_post_read_guard( $post_id );
+  }
+
+  /**
+  * What every generic reader says about a post id it cannot return, and what it says about
+  * one that does not exist. One function, so the two cannot drift apart.
+  */
+  public static function post_not_found_text( int $post_id ): string {
+    return 'No post with ID ' . $post_id . '.';
+  }
+
+  /**
+  * The error code that goes with a refusal from post_read_guard(): the one "not found" carries
+  * when the answer is the not-found sentence, so the code does not give the difference away.
+  */
+  public static function read_refusal_code( int $post_id, string $held ): int {
+    return $held === self::post_not_found_text( $post_id ) ? -32602 : -32600;
   }
 
   /**
