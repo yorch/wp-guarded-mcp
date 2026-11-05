@@ -94,7 +94,7 @@ An access level belongs to a named key, or to an OAuth grant. A key carries the 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
 nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO,
 ACF, Gravity Forms, LearnDash, Elementor Pro, WP Activity Log, Redirection, Polylang, Rank Math and All in One SEO,
-and the form-submission tools are not counted: their tools
+Wordfence, Stream and the form-submission tools are not counted: their tools
 are optional groups that come and go with a plugin, so folding them in would make the table
 depend on what
 happens to be installed.
@@ -176,7 +176,7 @@ is readable and not writable. How each plugin stores its data was written withou
 copy to check and is flagged in the source.
 
 **Form submissions**, off by default, on one switch that appears when Contact Form 7 or
-Flamingo, Fluent Forms or Ninja Forms is installed. **Read only: nothing can be edited,
+Flamingo, Fluent Forms, Ninja Forms or WPForms is installed. **Read only: nothing can be edited,
 trashed or deleted.** A counts-only briefing per plugin at `read`; listing and reading
 individual submissions at `admin`, because a submission is personal data a member of the
 public wrote. Only fields present in the form's current definition and of a plain-input type
@@ -193,6 +193,20 @@ Because Flamingo and Ninja Forms keep a submission as a post, the generic post r
 (`wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`, `wp_read_post_meta_chunk`,
 `wp_get_posts`) now refuse those post types, whether or not this group is on. That guard is a
 list of readers, and the guardrails page says what it does not cover.
+
+**WPForms** is in that group and is deliberately the smallest part of it: two tools, a form's
+schema and a submission briefing, and **no entry tool at all**. Measured on WPForms Lite
+2.0.3.1: `wpforms()->obj('entry')` is null, the plugin ships no entries component, and none of
+`wpforms_entries`, `wpforms_entry_fields` or `wpforms_entry_meta` exist — Lite counts
+submissions in form meta (`wpforms_entries_count`, the key its own reports class reads) and
+emails them. So on the free plugin there is nothing to read, and on Pro the tables have never
+been measured from here, which is not a good enough footing for personal-data handling no test
+can exercise. The briefing names its source for every count, because "no submissions" and
+"nothing is storing submissions" look identical as a number. A form is a `wpforms` post whose
+post content is one JSON document holding the fields, the notification recipients and the
+confirmation redirects, so `wpforms_get_form` counts those settings and never returns them —
+and the generic post tools are refused on that post type, below admin for reads and for every
+write, because otherwise the withholding would be decoration.
 
 **Advanced Custom Fields**, off by default, and the switch only appears when ACF is
 installed: custom field discovery, value get/set through `update_field`/`get_field` with
@@ -280,6 +294,44 @@ an IP list is a behavioural record of an identifiable person and this group take
 list could feed; a per-user activity ranking is profiling, and also wrong, because REST
 actions are recorded against whichever user the bearer key borrows. Each is a deliberate
 absence, not an omission to be helpfully filled in.
+
+**Stream**, off by default, and the switch only appears when Stream is installed: a counts-only
+briefing by connector, context and action over at most 90 days at `read`, and the individual
+records at `admin`. It is a separate group from WP Activity Log rather than an adapter behind
+the same names, because the two store different shapes — Stream has one row with a connector,
+a context and a rendered summary, WP Activity Log has an alert id, a severity and a metadata
+table — and a shared tool name would have to lie about one of them. What is shared is the
+policy, deliberately: read only, counts at read, rows at admin, no IP address at any level, an
+allowlisted metadata reader, no free-text search, no per-user ranking. The metadata allowlist
+exists because of a measured value: on a record for a created user, the new account's email
+address is the first of several values under a repeated key called `user_meta`, with nothing
+in the name to give it away. Stream's retention is a real hole rather than a hypothetical one
+— measured on this stack, one `wp_update_option` setting `general_records_ttl` to 1 was
+accepted and stored — so `wp_stream` is refused by the same rule that refuses `wsal_`, and it
+is a prefix rule because it covers `wp_stream`, `wp_stream_db` and `wp_stream_network`.
+
+**Wordfence**, off by default, and the switch only appears when Wordfence is installed. Three
+read tools answering "is this site being watched, and is the watching working": `wf_status`
+at `read` (firewall mode, login-security thresholds, whether a scan is running, whether one
+has ever completed, issue counts by status and severity, blocks by type, and a list of the
+states that mean protection is weaker than the settings suggest), `wf_scan_issues` and
+`wf_lockouts` at `admin`. The status tool is the one that matters: on a fresh install every
+count is zero and the honest answer is "nothing has looked yet", so the scan block reports
+`never` alongside the counts, read from the same key Wordfence's own status widget reads. The
+firewall's `learning-mode` is reported with what it means, because "enabled" and "blocking"
+are different claims. `wf_lockouts` lists only the block types that name one address — a
+country or pattern block stores an all-zero IP, which renders as `::` — and the counts in
+`wf_status` break down by type so those are not lost. There is **no write tool, and there will
+not be one**: dismissing an issue, whitelisting an address, changing a firewall mode or
+starting a scan are each a way to make the watcher quieter, and an agent that can quiet it and
+then read it back can confirm its own silence. No configuration value that is a credential or
+a person is returned — Wordfence keeps `apiKey`, `encKey` and `alertEmails` in the same table
+as the values reported here, and none of those names appears in the code. Issue long messages
+and data blobs are withheld at every level, and the message a failed scan recorded is withheld
+from a read key because it is an exception message and those carry paths. Measured while
+building this: the option writer cannot reach any of it, because Wordfence 9.0.2 keeps its
+configuration in its own `wp_wfconfig` table and rewrites its version option on load, so the
+protection here is that the group has no writers rather than a prefix rule.
 
 **Redirection**, off by default, and the switch only appears when the Redirection plugin is
 installed. Five tools: list and get at `write`, and create, update and switch on/off at
@@ -561,10 +613,16 @@ one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor t
 `smoke-learndash.sh` for the LearnDash tools; `smoke-elementor-pro.sh` for the Elementor Pro
 tools; `smoke-woo-subscriptions.sh` for the Subscriptions tools; `smoke-wsal.sh` for the
 WP Activity Log tools; `smoke-redirection.sh` for the Redirection tools; `smoke-polylang.sh`
-for the Polylang tools; `smoke-seo.sh` for the Rank Math and All in One SEO tools; and
-`smoke-forms.sh` for the form-submission tools. `smoke-seo.sh` and `smoke-forms.sh` were
-written without a running stack and have not been run. All but the first two need their
-plugin installed.
+for the Polylang tools; `smoke-seo.sh` for the Rank Math and All in One SEO tools;
+`smoke-forms.sh` for the form-submission tools; `smoke-wordfence.sh` for the Wordfence tools;
+and `smoke-stream.sh` for the Stream tools. `smoke-seo.sh`, `smoke-forms.sh`,
+`smoke-polylang.sh` and `smoke-redirection.sh` were written without a running stack and have
+not been run. All but the first two need their plugin installed.
+
+Wordfence makes every call on a stack slow: it checks in with its own servers when it loads,
+and with no outbound route each request waits for that to time out — measured at 0.3s per
+`wp` call without it and 10.6s with it. `smoke-wordfence.sh` therefore takes minutes rather
+than seconds, and the other suites are usually run with Wordfence deactivated.
 
 Never run `wp plugin install --force` against that stack. Its plugin directory is a bind
 mount of this repository, and WordPress deletes the old plugin directory before unpacking

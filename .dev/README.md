@@ -92,7 +92,22 @@ docker compose exec -T cli wp plugin install redirection --activate   # a fresh 
 
 docker compose exec -T cli wp plugin install polylang --activate
 ./smoke-polylang.sh  # the Polylang tools (read only); needs Polylang
+
+docker compose exec -T cli wp plugin install stream --activate
+./smoke-stream.sh     # the Stream tools; needs Stream
+
+docker compose exec -T cli wp plugin install wordfence --activate
+./smoke-wordfence.sh  # the Wordfence tools; needs Wordfence
 ```
+
+Wordfence makes every CLI invocation on this stack slow: it checks in with its own servers
+when it loads, and in a sandbox with no outbound internet each call waits for that to time
+out. Measured here at 0.3s per `wp` call without it and 10.6s with it, which turns
+`smoke-wordfence.sh` into a several-minute run and slows every other suite while it is active.
+That is the environment, not the suite; on a machine with working outbound requests the same
+run takes seconds. If a suite seems to hang, time a bare
+`docker compose exec -T cli wp eval 'echo 1;'` before suspecting the suite, and consider
+deactivating Wordfence for the runs that do not test it.
 
 `smoke-admin.sh` also expects a theme named `futuretheme` that declares a PHP version this
 site cannot meet, to prove activation is refused for a reason other than the theme being

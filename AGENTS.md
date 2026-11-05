@@ -33,6 +33,18 @@ ordering storage off, and their billing period, next payment date and status liv
 same rows. One write tool enforcing it and the next not is the same defect as the settings
 tool that once enforced an option policy no other writer did.
 
+`GMCP_Core::plugin_config_post_types()` is the same rule for post types another plugin owns,
+and it exists because a group that withholds something is decoration if a generic tool returns
+it. A WPForms form is a `wpforms` post whose `post_content` is one JSON document holding the
+fields, the notification recipients and the confirmation redirects, so `wpforms_get_form`
+counting those settings and never returning them would mean nothing while `wp_get_post`
+returned the blob and `wp_update_post` could rewrite the recipient — a readwrite key could
+point every future submission at an address it chose, on a plugin that stores no submissions
+at all. The guard is wired into the two existing ones (`commerce_post_guard` for writes,
+`commerce_post_read_guard` for non-admin reads) rather than a third pair of call sites, and it
+covers creating or retyping into the type. Stream's alert rules (`wp_stream_alerts`) are listed
+for the same reason: a rule set to a disabled status stops that alert firing.
+
 **A drafts-only key is held by the post, not by the tool.** `GMCP_Core::drafts_only_guard()`
 (through `post_write_guard()` for the generic writers) is asked by every tool that writes a
 post, its meta, its terms or its thumbnail, and `restrict_caller_to_drafts()` installs hooks
@@ -70,12 +82,30 @@ reachable by naming the same row through a different tool.
 
 **An audit log this plugin does not own is still not writable through it.**
 `option_write_policy()` refuses options whose name begins with a prefix in
-`audit_log_option_prefixes()` — `wsal_` for WP Activity Log, extendable through
-`gmcp_audit_log_prefixes` for any other logger. Those rows are ordinary options, so every
-generic writer can reach them: one admin-level `wp_update_option` on `wsal_disabled-alerts`
-stops chosen events being recorded, and `wsal_delete-data` arms dropping the log on
-uninstall. A log an agent can switch off is not a log, and an agent that can switch it off
-and then read it back can confirm its own silence.
+`audit_log_option_prefixes()` — `wsal_` for WP Activity Log and `wp_stream` for Stream,
+extendable through `gmcp_audit_log_prefixes` for any other logger. Those rows are ordinary
+options, so every generic writer can reach them: one admin-level `wp_update_option` on
+`wsal_disabled-alerts` stops chosen events being recorded, `wsal_delete-data` arms dropping the
+log on uninstall, and on Stream one write to `wp_stream` with `general_records_ttl` set to 1
+shortens retention to a day — measured on this stack before the rule existed, with the `wsal_`
+refusal running as the control. A log an agent can switch off is not a log, and an agent that
+can switch it off and then read it back can confirm its own silence.
+
+**The same promise covers switching the plugin off, and the option rule alone did not.**
+`GMCP_Core::watcher_plugin_files()` refuses deactivation, deletion and update of Wordfence,
+Stream and WP Activity Log, because one `wp_deactivate_plugin` call stops the recording just as
+effectively as rewriting its settings and is not an option write at all. Measured on this
+stack: all three were deactivatable through the admin group while the README said a log an
+agent can switch off is not a log. An update is refused too, because it can replace a working
+watcher with one whose tables or settings the site has not migrated to.
+
+Wordfence is deliberately not covered by the option rule, and that is measured rather than
+assumed: 9.0.2 keeps its entire configuration in its own `wp_wfconfig` table, and its only
+`wp_options` rows are `wordfence_version`, `wordfence_ls_version`, `wordfence_installed`,
+`wordfenceActivated`, `wordfence_case` and `wf_plugin_act_error`. Writing `wordfence_version`
+is accepted and then rewritten by the plugin on load, so there is no durable setting to
+protect. A prefix rule there would guard nothing and would read as protection that is not
+there, which is the failure this whole file is about.
 
 **Credential-shaped data never reaches the journal, the audit log, or the debug
 error_log.** `user_pass` is dropped unconditionally, and
@@ -170,10 +200,14 @@ Elementor Pro tools, `smoke-woo-subscriptions.sh` covers the Subscriptions tools
 `smoke-wsal.sh` covers the WP Activity Log tools, `smoke-redirection.sh` covers the
 Redirection tools, `smoke-polylang.sh` covers the Polylang tools, `smoke-seo.sh` covers the Rank Math and
 All in One SEO tools, and `smoke-forms.sh` covers the form-submission tools (Contact Form 7 with
-Flamingo, Fluent Forms, Ninja Forms; its first block needs no form plugin). Run all
-sixteen before committing. All but the first two need
+Flamingo, Fluent Forms, Ninja Forms, WPForms; its first block needs no form plugin).
+`smoke-wordfence.sh` covers the Wordfence tools and `smoke-stream.sh` covers the Stream tools.
+Run all
+eighteen before committing. All but the first two need
 their plugin installed and say so and exit rather than reporting failures against a site that
-simply does not have it.
+simply does not have it. (This sentence said fourteen while twelve suites existed and sixteen
+while seventeen did, which is the same drift the access-level table had: a count nothing checks
+moves on its own. It is eighteen now, counted from `ls .dev/smoke*.sh`.)
 
 **A test for a guard must not depend on that guard.** Read the value, make the hostile
 call, read it back, **put it back**, and only then compare. The first version of the
