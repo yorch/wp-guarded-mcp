@@ -1892,6 +1892,16 @@ class GMCP_Server {
     if ( $stored === null ) {
       return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired download token.' ], 403 );
     }
+    // EXPIRY IS CHECKED HERE, not by get_transient(). Reading the row directly is what makes
+    // consumption atomic, and it also bypasses the expiry check that get_transient() performs:
+    // a token whose row has not been garbage-collected yet would otherwise stay redeemable past
+    // its five minutes. Measured on this stack: the row outlives the timeout by hours.
+    $expires = (int) get_option( '_transient_timeout_' . $key, 0 );
+    if ( $expires > 0 && $expires < time() ) {
+      $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", $row ) );
+      delete_option( '_transient_timeout_' . $key );
+      return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired download token.' ], 403 );
+    }
     $won = (int) $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", $row, $stored ) );
     delete_option( '_transient_timeout_' . $key );
     if ( $won !== 1 ) {
