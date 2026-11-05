@@ -1329,6 +1329,106 @@ check "refusals are in the audit log, attributed to the key by its label" \
 check "CONTROL: the key's allowed writes are in the log as ok, so the filter can tell them apart" \
   "$(wpe '$n=0;foreach(GMCP_Audit::query(["outcome"=>"ok","limit"=>300]) as $r){if($r["client"]==="drafts only writer"){$n++;}}echo $n>0?"logged":"none";')" "logged"
 
+echo "-- deletion by another name: trash, auto-draft and the schedule WordPress deletes by --"
+# A write-level key must not be able to destroy a post. wp_scheduled_delete() permanently
+# deletes whatever carries an old _wp_trash_meta_time, and wp_delete_auto_drafts() whatever is
+# an old auto-draft, so "set the status, stamp the meta" was a permanent delete with no
+# approval and no second call. Every refusal is asserted against the STORED state, and each
+# has a control that makes the legitimate version of the same write succeed.
+DX_P=$(wpe 'echo wp_insert_post(["post_title"=>"DX victim","post_status"=>"publish","post_content"=>"body"]);')
+# Hosted on a post of its own: trashing DX victim below turns its comments "post-trashed".
+DX_C=$(wpe '$h=wp_insert_post(["post_title"=>"DX comment host","post_status"=>"publish"]);echo wp_insert_comment(["comment_post_ID"=>$h,"comment_content"=>"DX comment","comment_approved"=>"1"]);')
+check "CONTROL: the fixtures exist" "$(pstatus $DX_P)/$(wpe "echo get_comment($DX_C)->comment_approved;")" "publish/1"
+K_DXA=$(wpe '$a=GMCP_Tokens::create("dx admin","admin",0,[]);echo $a["secret"];')
+case "$K_DXA" in gmcp_*) ;; *) echo "could not mint the dx key" >&2; exit 1 ;; esac
+dxstate() { wpe "wp_cache_flush(); \$p=get_post($1); echo \$p ? \$p->post_status : 'gone', '/', metadata_exists('post',$1,'_wp_trash_meta_time') ? 'stamped' : 'unstamped';"; }
+
+callk dx "$K_PW" "$(tool_json 1 wp_update_post "{\"ID\":$DX_P,\"fields\":{\"post_status\":\"trash\"}}")"
+check "a write key cannot trash a post through wp_update_post" "$(verdict dx)/$(dxstate $DX_P)" "error/publish/unstamped"
+callk dx "$K_PW" "$(tool_json 2 wp_update_post "{\"ID\":$DX_P,\"post_status\":\" TRASH\"}")"
+check "  nor with the status at the top level, in capitals" "$(verdict dx)/$(dxstate $DX_P)" "error/publish/unstamped"
+callk dx "$K_PW" "$(tool_json 3 wp_update_post "{\"ID\":$DX_P,\"fields\":{\"post_status\":\"Auto-Draft \",\"post_date\":\"2020-01-01 00:00:00\"}}")"
+check "a write key cannot turn a post into an old auto-draft (wp_delete_auto_drafts deletes those)" "$(verdict dx)/$(dxstate $DX_P)" "error/publish/unstamped"
+check "  and its date was not rewritten either" "$(wpe "wp_cache_flush(); echo substr(get_post($DX_P)->post_date,0,4) > 2020 ? 'kept' : 'rewritten';")" "kept"
+
+callk dx "$K_PW" "$(tool_json 4 wp_update_post_meta "{\"ID\":$DX_P,\"key\":\"_wp_trash_meta_time\",\"value\":\"1\"}")"
+check "the trash timestamp cannot be written through wp_update_post_meta" "$(verdict dx)/$(pmeta $DX_P _wp_trash_meta_time)" "error/absent"
+callk dx "$K_PW" "$(tool_json 5 wp_update_post_meta "{\"ID\":$DX_P,\"key\":\"_WP_Trash_Meta_Time \",\"value\":\"1\"}")"
+check "  in another case with a trailing space (the column compares that way)" "$(verdict dx)/$(pmeta $DX_P _wp_trash_meta_time)" "error/absent"
+callk dx "$K_PW" "$(tool_json 6 wp_update_post_meta "{\"ID\":$DX_P,\"key\":\"_wp_trash_meta_status\",\"value\":\"publish\"}")"
+check "  the status half of the pair is refused as well" "$(verdict dx)/$(pmeta $DX_P _wp_trash_meta_status)" "error/absent"
+callk dx "$K_PW" "$(tool_json 7 wp_update_post "{\"ID\":$DX_P,\"meta_input\":{\"dx_ok\":\"1\",\"_wp_trash_meta_time\":\"1\"}}")"
+check "  and through meta_input on wp_update_post, which writes nothing at all (the allowed key too)" "$(verdict dx)/$(pmeta $DX_P _wp_trash_meta_time)/$(pmeta $DX_P dx_ok)" "error/absent/absent"
+callk dx "$K_PW" "$(tool_json 8 wp_create_post '{"post_title":"DX born stamped","meta_input":{"_wp_trash_meta_time":"1"}}')"
+check "  and through meta_input on wp_create_post, which creates nothing" "$(verdict dx)/$(pcount 'DX born stamped')" "error/0"
+callk dx "$K_PW" "$(tool_json 9 wp_write_post_meta_chunk "{\"session\":\"dx1\",\"ID\":$DX_P,\"key\":\"_wp_trash_meta_time\",\"data\":\"MQ\",\"final\":true}")"
+check "  and through the chunked writer" "$(verdict dx)/$(pmeta $DX_P _wp_trash_meta_time)" "error/absent"
+callk dx "$K_PW" "$(tool_json 10 wp_update_post_meta "{\"ID\":$DX_P,\"key\":\"dx_plain\",\"value\":\"1\"}")"
+check "CONTROL: an ordinary key is written by the same tool, so the probe can see a write" "$(verdict dx)/$(pmeta $DX_P dx_plain)" "ok/set:1"
+callk dx "$K_PW" "$(tool_json 11 wp_get_post_meta "{\"ID\":$DX_P,\"key\":\"_wp_trash_meta_time\"}")"
+check "CONTROL: reading that key is not refused" "$(verdict dx)" "ok"
+
+echo "  -- the net under the tools, for a writer that is not one of them --"
+DX_NET=$(wpe '
+  $try = function ( $label, $fn ) { try { $fn(); echo $label, "=wrote;"; } catch ( GMCP_Policy_Refusal $e ) { echo $label, "=refused;"; } catch ( Throwable $e ) { echo $label, "=error:", get_class( $e ), ";"; } };
+  $P = '"$DX_P"';
+  $try( "CONTROL_outside_a_tool_call", function () use ( $P ) { update_post_meta( $P, "_wp_trash_meta_time", "1" ); delete_post_meta( $P, "_wp_trash_meta_time" ); } );
+  do_action( "gmcp_tool_start", "wp_update_post", [] );
+  $try( "update_in_a_tool_call", function () use ( $P ) { update_post_meta( $P, "_wp_trash_meta_time", "1" ); } );
+  $try( "add_in_a_tool_call", function () use ( $P ) { add_post_meta( $P, "_wp_trash_meta_status", "publish" ); } );
+  $try( "CONTROL_other_key_in_a_tool_call", function () use ( $P ) { update_post_meta( $P, "dx_net", "1" ); } );
+  $try( "CONTROL_core_trash_in_a_tool_call", function () use ( $P ) { wp_trash_post( $P ); } );
+')
+for want in update_in_a_tool_call=refused add_in_a_tool_call=refused CONTROL_outside_a_tool_call=wrote CONTROL_other_key_in_a_tool_call=wrote CONTROL_core_trash_in_a_tool_call=wrote; do
+  check "net: ${want%%=*}" "$(printf '%s' "$DX_NET" | tr ';' '\n' | grep "^${want%%=*}=" | head -1)" "$want"
+done
+check "net, stored: core's own trash wrote its bookkeeping, and nothing else did" "$(dxstate $DX_P)/$(pmeta $DX_P dx_net)" "trash/stamped/set:1"
+callk dx "$K_PW" "$(tool_json 12 wp_update_post "{\"ID\":$DX_P,\"fields\":{\"post_status\":\"draft\"}}")"
+check "CONTROL: restoring from the trash by status still works, and clears the stamp" "$(verdict dx)/$(dxstate $DX_P)" "ok/draft/unstamped"
+callk dx "$K_DXA" "$(tool_json 13 wp_delete_post "{\"ID\":$DX_P}")"
+check "CONTROL: wp_delete_post is the way to trash, and stamps it" "$(verdict dx)/$(dxstate $DX_P)" "ok/trash/stamped"
+
+check "CONTROL: and a permanent delete inside a tool call, which clears that stamp itself, is not refused" \
+  "$(wpe 'do_action("gmcp_tool_start","wp_delete_post",[]); try { wp_delete_post('"$DX_P"',true); echo "wrote"; } catch ( Throwable $e ) { echo "refused"; }')/$(pstatus $DX_P)" "wrote/none"
+
+echo "  -- a comment is a deletion too --"
+callk dx "$K_PW" "$(tool_json 14 wp_update_comment "{\"comment_ID\":$DX_C,\"fields\":{\"comment_approved\":\"trash\"}}")"
+check "wp_update_comment cannot trash a comment" "$(verdict dx)/$(wpe "wp_cache_flush(); echo get_comment($DX_C)->comment_approved;")" "error/1"
+callk dx "$K_PW" "$(tool_json 15 wp_update_comment "{\"comment_ID\":$DX_C,\"fields\":{\"comment_approved\":\"0\"}}")"
+check "CONTROL: it still changes a comment's approval" "$(verdict dx)/$(wpe "wp_cache_flush(); echo get_comment($DX_C)->comment_approved;")" "ok/0"
+
+echo "  -- the approval gate sees the same thing --"
+# Pure: what the classifier answers for definitions and arguments, with controls for each
+# direction so a classifier that says "destructive" to everything cannot pass.
+check "classify_call: a status of trash on a write widens it to destructive" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_update_thing","accessLevel"=>"write"],["fields"=>["post_status"=>"Trash "]]);')" "destructive"
+check "  and so does one at the top level, whatever the tool is called" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_edit_thing","accessLevel"=>"admin"],["status"=>"trash"]);')" "destructive"
+check "  and an auto-draft status" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_update_thing","accessLevel"=>"write"],["post_status"=>"auto-draft"]);')" "destructive"
+check "  and a fields value it cannot read, which it cannot vouch for" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_update_thing","accessLevel"=>"write"],["fields"=>"{broken"]);')" "destructive"
+check "CONTROL: the same write with an ordinary status stays content" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_update_thing","accessLevel"=>"write"],["fields"=>["post_status"=>"draft"]]);')" "content"
+check "CONTROL: a read tool that LISTS trashed things stays read" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_list_things","accessLevel"=>"read"],["status"=>"trash"]);')" "read"
+check "running a scheduled event is destructive by name (a cron callback can delete anything)" \
+  "$(wpe 'echo GMCP_Approvals::classify(["name"=>"wp_run_cron_event","accessLevel"=>"admin"]);')" "destructive"
+check "CONTROL: an unrelated admin write is still only site" \
+  "$(wpe 'echo GMCP_Approvals::classify(["name"=>"wp_flush_cache","accessLevel"=>"admin"]);')" "site"
+
+DX_MODE_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "never";')
+wpe '$o=get_option("gmcp_options",[]);$o["mcp_approval_mode"]="deletes";update_option("gmcp_options",$o,false);' >/dev/null
+DX_P2=$(wpe 'echo wp_insert_post(["post_title"=>"DX victim two","post_status"=>"publish"]);')
+callk dx "$K_PW" "$(tool_json 16 wp_update_post "{\"ID\":$DX_P2,\"fields\":{\"post_status\":\"trash\"}}")"
+check "in mode deletes, a write key asking for trash is HELD, not run and not merely refused by the tool" \
+  "$(py 'import json,sys;print(json.load(sys.stdin)["result"].get("data",{}).get("status","-"))' dx)/$(pstatus $DX_P2)" "awaiting_human_approval/publish"
+callk dx "$K_PW" "$(tool_json 17 wp_update_post "{\"ID\":$DX_P2,\"fields\":{\"post_title\":\"DX victim two edited\"}}")"
+check "CONTROL: an ordinary edit under the same mode is not held" "$(ptitle $DX_P2)" "DX victim two edited"
+wpe "\$o=get_option('gmcp_options',[]);\$o['mcp_approval_mode']='$DX_MODE_WAS';update_option('gmcp_options',\$o,false);global \$wpdb;\$wpdb->query(\"DELETE FROM {\$wpdb->prefix}gmcp_approvals WHERE tool='wp_update_post'\");" >/dev/null
+check "the mode is back where it was" "$(wpe 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "never";')" "$DX_MODE_WAS"
+wpe 'foreach(get_posts(["post_status"=>"any","post_type"=>"post","numberposts"=>-1,"s"=>"DX "]) as $p){ if(strpos($p->post_title,"DX ")===0){wp_delete_post($p->ID,true);} } foreach(GMCP_Tokens::all() as $t){ if($t["label"]==="dx admin"){GMCP_Tokens::revoke($t["id"]);} }' >/dev/null
+
 echo "-- OAuth: the consent screen offers full or read-only, and the grant carries it --"
 JAR="$OUT/oauth.jar"
 curl -sS -c "$JAR" -b "$JAR" -d 'log=admin&pwd=admin&rememberme=forever&testcookie=1' "$BASE/wp-login.php" -o /dev/null 2>/dev/null

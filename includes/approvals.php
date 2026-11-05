@@ -66,7 +66,7 @@ class GMCP_Approvals {
   * widens the gate: a tool that annotation or level already calls destructive stays so.
   */
   const DESTRUCTIVE_VERBS = [ 'delete', 'remove', 'unenroll', 'unschedule', 'trash', 'purge',
-    'uninstall', 'cancel', 'drop', 'erase', 'wipe', 'destroy', 'revoke', 'reset' ];
+    'uninstall', 'cancel', 'drop', 'erase', 'wipe', 'destroy', 'revoke', 'reset', 'run' ];
 
   /** The verbs of tools that only look. Used for admin-level tools, which carry no annotation in the optional groups. */
   const READ_VERBS = [ 'get', 'list', 'count' ];
@@ -175,6 +175,65 @@ class GMCP_Approvals {
       return 'read';
     }
     return 'site';
+  }
+
+  /** Strictest last. A call is held under the strictest class any part of it earns. */
+  const CLASS_RANK = [ 'read' => 0, 'content' => 1, 'site' => 2, 'destructive' => 3, 'unknown' => 4 ];
+
+  /**
+  * What kind of CALL this is: the tool's class, widened by what the arguments ask for.
+  *
+  * classify() judges the registration, and a registration cannot see that a harmless-looking
+  * update is being asked to delete. A status of "trash" (or "auto-draft") on any write is a
+  * deletion that WordPress finishes on its own schedule, so it is held as the deletion it is
+  * whatever the tool is called. This only ever widens: a read tool that is merely LISTING
+  * trashed things keeps its class, because naming a status to look at is not a write.
+  *
+  * The tools in this plugin that take a status refuse trash themselves (GMCP_Core::
+  * status_write_refusal()), so for those this is the second lock. It exists for the
+  * tool nobody has written yet, and for a plugin's tool the first lock cannot reach.
+  *
+  * @param array|null $tool The registered definition.
+  * @param array      $args The call's arguments.
+  */
+  public static function classify_call( ?array $tool, array $args ): string {
+    $class = self::classify( $tool );
+    if ( $class !== 'read' && self::asks_for_deletion_status( $args ) ) {
+      $class = self::stricter( $class, 'destructive' );
+    }
+    return $class;
+  }
+
+  private static function stricter( string $a, string $b ): string {
+    $rank = self::CLASS_RANK;
+    return ( $rank[ $b ] ?? 99 ) > ( $rank[ $a ] ?? 99 ) ? $b : $a;
+  }
+
+  /** Whether a top-level or `fields` status argument is one GMCP_Core refuses to write. */
+  private static function asks_for_deletion_status( array $args ): bool {
+    $scopes = [ $args ];
+    if ( isset( $args['fields'] ) ) {
+      $fields = $args['fields'];
+      if ( is_string( $fields ) ) {
+        $fields = json_decode( $fields, true );
+      }
+      if ( is_object( $fields ) ) {
+        $fields = get_object_vars( $fields );
+      }
+      // A `fields` that is not an object we can read is not one we can vouch for.
+      if ( !is_array( $fields ) ) {
+        return true;
+      }
+      $scopes[] = $fields;
+    }
+    foreach ( $scopes as $scope ) {
+      foreach ( [ 'post_status', 'status', 'comment_approved' ] as $key ) {
+        if ( array_key_exists( $key, $scope ) && GMCP_Core::status_write_refusal( $scope[ $key ] ) !== null ) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   /** Whether a class of tool waits for a person under a mode. */
@@ -289,7 +348,7 @@ class GMCP_Approvals {
     if ( $mode === 'never' ) {
       return [ 'run' => true, 'claim' => 0 ];
     }
-    $class = self::classify( $definition );
+    $class = self::classify_call( $definition, $args );
     if ( !self::needs_approval( $mode, $class ) ) {
       return [ 'run' => true, 'claim' => 0 ];
     }

@@ -1140,6 +1140,147 @@ class GMCP_Core {
 
   #endregion
 
+  #region Deletion by another name
+
+  /**
+  * Post statuses a tool may not write. Both are DELETIONS that wait for a daily job.
+  *
+  * 'trash': wp_scheduled_delete() permanently deletes every post that carries a
+  * _wp_trash_meta_time older than EMPTY_TRASH_DAYS, and a generic meta writer could stamp
+  * that key with a date in 1970. So "set post_status to trash" plus one meta write was a
+  * permanent delete with no approval and no two steps, reached from the write level, which
+  * the README defines as "no destructive tools".
+  *
+  * 'auto-draft': wp_delete_auto_drafts() force-deletes every auto-draft whose post_date is
+  * more than seven days old, and post_date is an ordinary field. Same outcome, no meta
+  * needed.
+  *
+  * Refused rather than routed to the delete tool or held by argument. The tool that does
+  * this honestly is wp_delete_post, which the approval gate holds by its name, and a second
+  * door that merely behaves like it would have to be found and held again by every future
+  * tool that takes a status. A refusal is closed by construction.
+  *
+  * @return string|null The refusal, or null when the status is fine to write.
+  */
+  public static function status_write_refusal( $status, string $noun = 'post' ): ?string {
+    if ( !is_scalar( $status ) ) {
+      return null;
+    }
+    $status = strtolower( trim( (string) $status ) );
+    if ( $status === 'trash' ) {
+      return 'Setting a status of "trash" is refused here: a trashed ' . $noun . ' is deleted for good by WordPress\'s daily clean-up, so this is a deletion by another name and the write level does not delete. Use wp_delete_' . $noun . ', which says whether the result can be restored and is held for approval where that is switched on.';
+    }
+    if ( $status === 'auto-draft' ) {
+      return 'Setting a status of "auto-draft" is refused here: WordPress deletes old auto-drafts for good in its daily clean-up, so this is a deletion by another name. Use wp_delete_' . $noun . '.';
+    }
+    return null;
+  }
+
+  /**
+  * Meta keys core uses to decide what to delete, which no tool may write.
+  *
+  * The _wp_trash_meta_ family is the schedule wp_scheduled_delete() reads (see
+  * status_write_refusal()). Only core's own wp_trash_post() and wp_untrash_post() may touch
+  * it, and trash_meta_net() lets exactly those through. Matched case-insensitively and
+  * ignoring trailing spaces, because the meta_key column compares that way: "_WP_TRASH_META_TIME "
+  * is the same row to every query WordPress runs.
+  *
+  * Not on the list, and why: _edit_lock only says who is editing, _wp_desired_post_slug only
+  * names the slug an untrash restores and _wp_old_slug only adds a redirect from a slug the
+  * writer could already have set directly. Each is reachable by an ordinary content edit and
+  * none of them removes anything.
+  *
+  * @return string|null The refusal, or null when the key is fine.
+  */
+  public static function protected_meta_refusal( $key ): ?string {
+    if ( !is_string( $key ) ) {
+      return null;
+    }
+    $needle = strtolower( rtrim( $key ) );
+    if ( strncmp( $needle, '_wp_trash_meta_', 15 ) === 0 ) {
+      return 'The meta key "' . $key . '" is refused: WordPress deletes posts and comments for good on the schedule these keys hold, so writing one is a deletion by another name. Use wp_delete_post.';
+    }
+    return null;
+  }
+
+  /**
+  * The posts core is trashing, untrashing or deleting right now, whose own bookkeeping may be
+  * written. A set, not one id: deleting a post deletes its revisions from inside the call, so
+  * two deletions are open at once and the outer one still has meta to clear after the inner
+  * one has finished.
+  *
+  * @var array<int,true>
+  */
+  private static $trash_meta_posts = [];
+
+  /**
+  * The same refusal for every writer, not only the tools that remember to ask.
+  *
+  * An ACF field, an Elementor save or another plugin's tool writes meta through the same
+  * three functions, so the tool-level refusal alone would be a policy about one tool. Active
+  * only while a tool call is in flight, so wp-admin, cron and wp-cli are untouched.
+  */
+  public static function install_trash_meta_net(): void {
+    foreach ( [ 'add', 'update', 'delete' ] as $op ) {
+      add_filter( $op . '_post_metadata', [ __CLASS__, 'trash_meta_net' ], PHP_INT_MIN, 3 );
+    }
+    add_filter( 'update_post_metadata_by_mid', [ __CLASS__, 'trash_meta_net_by_mid' ], PHP_INT_MIN, 4 );
+    add_filter( 'delete_post_metadata_by_mid', [ __CLASS__, 'trash_meta_net_by_mid' ], PHP_INT_MIN, 2 );
+    // Core's own trash, untrash and permanent delete write or clear the key in between these
+    // pairs (wp_delete_post() removes it before it removes the row). Scoped to the one post, so
+    // it is not a window for anything else.
+    foreach ( [ 'wp_trash_post', 'untrash_post', 'before_delete_post' ] as $hook ) {
+      add_action( $hook, function ( $post_id ) {
+        self::$trash_meta_posts[ (int) $post_id ] = true;
+      }, PHP_INT_MIN );
+    }
+    // wp_delete_attachment() clears the key before it fires any action, so the only door in
+    // front of it is its pre-filter. Last, and only when nobody short-circuited the delete.
+    add_filter( 'pre_delete_attachment', function ( $check, $post = null ) {
+      if ( $check === null && $post instanceof WP_Post ) {
+        self::$trash_meta_posts[ (int) $post->ID ] = true;
+      }
+      return $check;
+    }, PHP_INT_MAX, 2 );
+    foreach ( [ 'trashed_post', 'untrashed_post', 'deleted_post' ] as $hook ) {
+      add_action( $hook, function ( $post_id ) {
+        unset( self::$trash_meta_posts[ (int) $post_id ] );
+      }, PHP_INT_MAX );
+    }
+  }
+
+  private static function tool_in_flight(): bool {
+    return did_action( 'gmcp_tool_start' ) > did_action( 'gmcp_tool_called' );
+  }
+
+  public static function trash_meta_net( $check, $object_id = 0, $meta_key = '' ) {
+    if ( self::tool_in_flight() && !isset( self::$trash_meta_posts[ (int) $object_id ] ) ) {
+      $why = self::protected_meta_refusal( $meta_key );
+      if ( $why !== null ) {
+        throw new GMCP_Policy_Refusal( $why );
+      }
+    }
+    return $check;
+  }
+
+  public static function trash_meta_net_by_mid( $check, $meta_id = 0, $meta_value = null, $meta_key = false ) {
+    if ( self::tool_in_flight() ) {
+      $row = function_exists( 'get_metadata_by_mid' ) ? get_metadata_by_mid( 'post', (int) $meta_id ) : null;
+      $on = $row ? (int) $row->post_id : 0;
+      if ( !isset( self::$trash_meta_posts[ $on ] ) ) {
+        foreach ( [ $meta_key, $row->meta_key ?? null ] as $candidate ) {
+          $why = self::protected_meta_refusal( $candidate );
+          if ( $why !== null ) {
+            throw new GMCP_Policy_Refusal( $why );
+          }
+        }
+      }
+    }
+    return $check;
+  }
+
+  #endregion
+
   /**
   * Post types that are form submissions, which the generic post READERS must not return.
   *
@@ -1560,6 +1701,7 @@ class GMCP_Core {
     // in the audit log: the mode can be switched to 'never' while requests are still open,
     // and the screen has to be able to answer them and the daily event to lapse them.
     GMCP_Approvals::boot();
+    GMCP_Core::install_trash_meta_net();
 
     // How to put back what changed.
     if ( $this->get_option( 'mcp_change_journal' ) ) {
@@ -1871,4 +2013,11 @@ class GMCP_Core {
 * journal's undo can answer with the sentence instead of a stack of "failed".
 */
 class GMCP_Drafts_Only_Refusal extends RuntimeException {
+}
+
+/**
+* Thrown by a net under the tools when a write is refused by a policy that is not the
+* drafts-only one (the deletion-by-another-name meta keys).
+*/
+class GMCP_Policy_Refusal extends RuntimeException {
 }

@@ -3584,6 +3584,15 @@ check "CONTROL: the registered tools were enumerated and every class that gates 
   "$(ap_eval "$AP_CONTRACT"' echo $n>20 && isset($seen["destructive"],$seen["site"],$seen["read"],$seen["content"]) ? "enumerated" : "NOT ($n)";')" "enumerated"
 check "no read- or write-level tool is destructive, and none lacks a level" \
   "$(ap_eval "$AP_CONTRACT"' echo $bad ? implode(",",$bad) : "none";')" "none"
+# A cron callback can do anything a plugin can, delete files included, and a scheduled
+# event can be a deletion's second half (wp_scheduled_delete). So running or unscheduling one
+# is held with the deletes. Read from the REGISTERED tools, not from a synthetic definition.
+check "the registered wp_run_cron_event is destructive" \
+  "$(ap_eval 'do_action("rest_api_init"); $c="NOT REGISTERED"; foreach ( apply_filters("gmcp_tools",[]) as $t ) { if ( ($t["name"]??"")==="wp_run_cron_event" ) { $c=GMCP_Approvals::classify($t); } } echo $c;')" "destructive"
+check "and so is wp_unschedule_cron_event" \
+  "$(ap_eval 'do_action("rest_api_init"); $c="NOT REGISTERED"; foreach ( apply_filters("gmcp_tools",[]) as $t ) { if ( ($t["name"]??"")==="wp_unschedule_cron_event" ) { $c=GMCP_Approvals::classify($t); } } echo $c;')" "destructive"
+check "CONTROL: the read-only listing next to them is not" \
+  "$(ap_eval 'do_action("rest_api_init"); $c="NOT REGISTERED"; foreach ( apply_filters("gmcp_tools",[]) as $t ) { if ( ($t["name"]??"")==="wp_list_cron_events" ) { $c=GMCP_Approvals::classify($t); } } echo $c;')" "read"
 check "a nonsense stored mode is read as the strictest" \
   "$(ap_mode bogus; ap_eval 'echo GMCP_Approvals::mode();')" "site"
 AP_F=$(ap_post "AP victim F")

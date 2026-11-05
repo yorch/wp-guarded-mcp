@@ -41,6 +41,15 @@ the guard; the net is the backstop, not the plan. Attachments are filtered throu
 `wp_insert_attachment_data`, not `wp_insert_post_data`, and the net needs both. The flag caps the
 key at `readwrite`; that cap is part of the guard.
 
+**A deletion is not always a delete tool.** WordPress deletes on markers it reads from
+ordinary rows: `wp_scheduled_delete()` removes every post with an old `_wp_trash_meta_time`
+and `wp_delete_auto_drafts()` every old auto-draft. So `GMCP_Core::status_write_refusal()`
+refuses a status of `trash` or `auto-draft` in the write tools, `protected_meta_refusal()`
+refuses the `_wp_trash_meta_` keys in every meta writer (with a net under the WordPress
+meta functions for writers that are not ours), and `GMCP_Approvals::classify_call()` reads
+the arguments as well as the tool's name. A write-level key that can reach any of them has a
+delete tool, whatever the README calls the level.
+
 **Never run `wp plugin install --force`, `wp plugin update` or `wp plugin delete` against
 the `.dev` stack.** Its plugin directory is a bind mount of this repository, and WordPress
 deletes the old directory before unpacking the new one. The delete goes through the mount

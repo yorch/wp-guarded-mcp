@@ -1305,6 +1305,47 @@ made here and the previous one is still there to switch back to. A site that
 genuinely wants an import has the Elementor screen for it, where a person sees
 what is about to happen.
 
+## Deletion by another name
+
+The `readwrite` level is defined as "create and update, no destructive tools", and the
+approval queue holds a call by what its tool is. Both promises were true of the tool names
+and false of the data. WordPress deletes on a schedule it reads from ordinary rows: every
+day `wp_scheduled_delete()` permanently deletes each post that carries a
+`_wp_trash_meta_time` older than `EMPTY_TRASH_DAYS`, and `wp_delete_auto_drafts()`
+force-deletes each auto-draft whose `post_date` is more than seven days old. So a
+`readwrite` key could set `post_status` to `trash` through `wp_update_post`, stamp the post
+with a timestamp from 1970 through any meta writer, and wait for the daily job (or call
+`wp_run_cron_event`, which was not held) to destroy it: a permanent delete with no
+approval and no second call, from the level that has no delete tool. Confirmed by running
+it, not by reading it.
+
+- **A status that is a deletion is refused.** `wp_update_post` and `wp_update_comment`
+  refuse a status of `trash`, and `wp_update_post` refuses `auto-draft`, with a sentence
+  pointing at `wp_delete_post` / `wp_delete_comment`. Refused rather than rerouted or held
+  by argument, because the honest tool already exists, is held by its name, and a second
+  door that merely behaves like it would have to be found and held again by every tool
+  that ever takes a status. `wp_alter_post` and `wp_update_media` write no status, and the
+  generated REST tools reject both values in the route's own enum (checked). Setting a
+  trashed post back to `draft` still works.
+- **The schedule itself is not writable.** Every meta key beginning `_wp_trash_meta_` is
+  refused by every tool that writes post meta (update, delete, copy, chunk, `meta_input`
+  on create and update). Matching ignores case and trailing spaces because the column
+  compares that way. Reading one is allowed. Because other plugins write meta through the
+  same three WordPress functions, the same refusal also sits under them while a tool call
+  is in flight (`GMCP_Core::trash_meta_net()`), letting through only core's own
+  `wp_trash_post`, `wp_untrash_post` and `wp_delete_post`, which write and clear the key
+  themselves. Not protected, and why: `_edit_lock`, `_wp_desired_post_slug` and
+  `_wp_old_slug` only name an editor, a slug to restore and a redirect from a slug the
+  writer could have set directly; none removes anything.
+- **The approval gate asks the arguments too.** `GMCP_Approvals::classify_call()` widens a
+  call whose arguments carry a deletion status (`post_status`, `status` or
+  `comment_approved`, top level or inside `fields`) to `destructive`, whatever the tool is
+  called. It only widens, and a read tool that is merely listing trashed things keeps its
+  class.
+- **Running a scheduled event is destructive.** `wp_run_cron_event` fires every callback
+  on a hook, and its own description says they can delete files. `run` is now one of the
+  destructive verbs. `wp_unschedule_cron_event` already was.
+
 ## Human approval
 
 The two-step confirmation on irreversible tools is minted by the server and handed to

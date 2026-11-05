@@ -474,15 +474,17 @@ class GMCP_Tools_Core {
   * not. So a write passes wp_slash( $key ) and a read passes $key, and only then do the
   * writer and the reader mean the same row.
   *
-  * There is nothing to smuggle past by keeping the case. No guard stands in front of a
-  * meta key at any access level, and the one case-sensitive comparison in this file,
+  * There is nothing to smuggle past by keeping the case. The one guard in front of a meta key
+  * is GMCP_Core::protected_meta_refusal(), which is itself case-insensitive, and the one
+  * case-sensitive comparison in this file,
   * META_KEYS_NEVER_COPIED, is made against keys already present on the source post rather
   * than against anything a caller typed. GMCP_Core::field_looks_secret() lowercases what
   * it is handed before matching, so redaction is unaffected either way.
   *
+  * @param bool $writing False for a read, which is not refused the keys a write may not touch.
   * @return true|string True if the key is usable, otherwise the refusal message.
   */
-  private function meta_key_allowed( string $key ) {
+  private function meta_key_allowed( string $key, bool $writing = true ) {
     // Both strings WordPress itself calls "no key". add_metadata(), update_metadata(),
     // delete_metadata() and get_metadata_raw() all gate on ! $meta_key, which is false for
     // "" and for "0" alike. Measured: update_post_meta( $id, "0", ... ) returns false and
@@ -504,6 +506,15 @@ class GMCP_Tools_Core {
     $length = mb_strlen( $key );
     if ( $length > 255 ) {
       return 'The meta key is ' . $length . ' characters. wp_postmeta.meta_key holds 255, and a longer one is refused by the database rather than shortened, so no row can exist under it and no write to it would store anything. Use a key of 255 characters or fewer.';
+    }
+    // Writers only. Reading a trash timestamp is harmless; writing one schedules a permanent
+    // deletion. A policy about the key, asked by every meta writer through this function and
+    // by GMCP_Core::trash_meta_net() for the writers that do not come through here.
+    if ( $writing ) {
+      $protected = GMCP_Core::protected_meta_refusal( $key );
+      if ( $protected !== null ) {
+        return $protected;
+      }
     }
     return true;
   }
@@ -909,6 +920,10 @@ class GMCP_Tools_Core {
         $skipped[ $key ] = 'names whoever is editing post #' . $from . ', so it belongs to that post and not to its content';
         continue;
       }
+      if ( GMCP_Core::protected_meta_refusal( (string) $key ) !== null ) {
+        $skipped[ $key ] = 'is the schedule WordPress deletes posts by, so it is never copied onto another post';
+        continue;
+      }
       if ( !$overwrite && metadata_exists( 'post', $to, $key ) ) {
         $skipped[ $key ] = 'already set on post #' . $to . '; pass overwrite to replace it';
         continue;
@@ -1086,6 +1101,14 @@ class GMCP_Tools_Core {
       $meta_input = json_decode( $meta_input, true ) ?? [];
     }
     if ( !empty( $meta_input ) && is_array( $meta_input ) ) {
+      // Before the post exists, so a refused key leaves nothing half made. The net under
+      // update_post_metadata would stop it too, but only after wp_insert_post() had stored the row.
+      foreach ( array_keys( $meta_input ) as $meta_k ) {
+        $protected = GMCP_Core::protected_meta_refusal( (string) $meta_k );
+        if ( $protected !== null ) {
+          return new WP_Error( 'gmcp_protected_meta', $protected . ' Nothing was created.' );
+        }
+      }
       // JSON for an array is decoded here as every other meta writer decodes it, so the
       // same payload is not an array through wp_update_post_meta and a string through this
       // tool. Not slashed here: wp_slash( $ins ) below does that once for the whole row.
@@ -2873,6 +2896,16 @@ class GMCP_Tools_Core {
           break;
         }
         $c = [ 'comment_ID' => intval( $a['comment_ID'] ) ];
+        // wp_update_comment() hands a comment_approved of "trash" to wp_trash_comment(), which
+        // is a deletion that WordPress completes on its own schedule. wp_delete_comment is the
+        // tool that says so, and the one an approval can hold.
+        if ( !empty( $a['fields'] ) && is_array( $a['fields'] ) && array_key_exists( 'comment_approved', $a['fields'] ) ) {
+          $comment_status_why = GMCP_Core::status_write_refusal( $a['fields']['comment_approved'], 'comment' );
+          if ( $comment_status_why !== null ) {
+            $r = $this->error( $r, $comment_status_why, -32600 );
+            break;
+          }
+        }
         if ( !empty( $a['fields'] ) && is_array( $a['fields'] ) ) {
           foreach ( $a['fields'] as $k => $v ) {
             if ( !is_scalar( $v ) ) {
@@ -4147,6 +4180,14 @@ class GMCP_Tools_Core {
           }
         }
 
+        // A status that is a deletion in waiting. Judged on what the call asks for, before
+        // anything is written. @see GMCP_Core::status_write_refusal().
+        $status_why = array_key_exists( 'post_status', $fields ) ? GMCP_Core::status_write_refusal( $fields['post_status'] ) : null;
+        if ( $status_why !== null ) {
+          $r = $this->error( $r, $status_why, -32600 );
+          break;
+        }
+
         // Track what we're trying to update for verification
         $content_to_verify = null;
         if ( !empty( $fields ) && is_array( $fields ) ) {
@@ -4497,7 +4538,7 @@ class GMCP_Tools_Core {
           }
         }
         else {
-          $get_why = $this->meta_key_allowed( $get_key );
+          $get_why = $this->meta_key_allowed( $get_key, false );
           if ( $get_why !== true ) {
             $r = $this->error( $r, $get_why, -32602 );
             break;
@@ -4796,7 +4837,7 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $chunk_read, -32600 );
           break;
         }
-        $read_why = $this->meta_key_allowed( $read_key );
+        $read_why = $this->meta_key_allowed( $read_key, false );
         if ( $read_why !== true ) {
           $r = $this->error( $r, $read_why, -32602 );
           break;
