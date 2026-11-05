@@ -124,7 +124,7 @@ final class GMCP_Credential_Scan {
       . '|\bAIza[0-9A-Za-z_-]{30,}'
       . '|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*'
       . '|\bgmcp_[A-Za-z0-9]{4,}_[A-Za-z0-9]{16,}'
-      . '|(?i:\b[a-z][a-z0-9+.-]*:\/\/)[^\/\s:@<>"\']+:[^\/\s@<>"\']+@/';
+      . '|(?i:(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*+:\/\/)[^\/\s:@<>"\']++:[^\/\s@<>"\']++@/';
     $hit = preg_match( $fixed, $text );
     if ( $hit === false || $hit === 1 ) {
       return true;

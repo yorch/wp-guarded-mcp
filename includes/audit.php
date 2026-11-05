@@ -274,6 +274,13 @@ class GMCP_Audit {
 
   /** Arguments as they will be stored: redacted, size-capped, and honest about both. */
   public static function storable_args( array $args, bool $failed = false ): string {
+    // No leaf can be stored in full: the encoded call is capped at MAX_ARGS, and past that only
+    // a short preview is kept. So no leaf is read past that cap plus a margin for the JSON around
+    // it. This runs from gmcp_tool_called, after the tool has run, so time spent here on text that
+    // cannot be stored is time the row can fail to be written in. $cut_off keeps the recorded
+    // size honest: it is the size of the call the agent sent, not of the copy examined here.
+    $cut_off = 0;
+    $args = GMCP_Core::cut_leaves( $args, self::MAX_ARGS + 1024, $cut_off );
     foreach ( self::NEVER_RECORD as $field ) {
       if ( array_key_exists( $field, $args ) ) {
         $args[ $field ] = '[redacted]';
@@ -320,7 +327,7 @@ class GMCP_Audit {
       // Truncated rather than dropped, and the original size recorded, so a reader can
       // tell a large call from a missing one.
       return wp_json_encode( [
-        '__gmcp_truncated' => strlen( $json ),
+        '__gmcp_truncated' => strlen( $json ) + $cut_off,
         'preview' => mb_substr( $json, 0, $failed ? 1000 : 2000 ),
       ], JSON_UNESCAPED_SLASHES );
     }
@@ -533,7 +540,7 @@ class GMCP_Audit {
       'ms' => 0,
       'args' => $json === false ? '{}' : mb_substr( $json, 0, self::MAX_ARGS ),
       'changes' => null,
-      'detail' => mb_substr( GMCP_Core::scrub_preview_tokens( wp_strip_all_tags( (string) ( $fields['detail'] ?? '' ) ) ), 0, 1000 ),
+      'detail' => mb_substr( GMCP_Core::scrub_preview_tokens( self::plain_text( mb_substr( (string) ( $fields['detail'] ?? '' ), 0, 8000 ) ) ), 0, 1000 ),
     ] );
   }
 
@@ -558,11 +565,29 @@ class GMCP_Audit {
     // margin is wide enough that the second cut, not the first, decides the result for
     // anything but text that is almost entirely markup, where a shorter line is the
     // right answer anyway.
-    $text = wp_strip_all_tags( mb_substr( $text, 0, 8000 ) );
+    $text = self::plain_text( mb_substr( $text, 0, 8000 ) );
     // A preview link is a bearer credential and its tool's reply is where it is handed out.
     // The reply is recorded here, so the token is cut out of it: an audit log that holds a
     // working link to an unpublished post is a second place that link can be read from.
     return self::scrub_text( mb_substr( GMCP_Core::scrub_preview_tokens( $text ), 0, 1000 ), '[redacted: the reply held something credential-shaped]' );
+  }
+
+  /**
+  * Text with its tags removed, for the columns that keep a reply or a message.
+  *
+  * wp_strip_all_tags() runs two PCRE passes and does not check them: when PCRE gives up,
+  * preg_replace() returns null and the function hands back "", so a reply it could not read was
+  * recorded as an empty detail, the one column that says why a call was refused. A result that
+  * is empty for text that was not is retried with strip_tags(), which uses no regular
+  * expression. Script and style CONTENT then stays in the text, which is harmless in a column
+  * that is only ever shown as text.
+  */
+  private static function plain_text( string $text ): string {
+    $plain = wp_strip_all_tags( $text );
+    if ( $plain === '' && trim( $text ) !== '' ) {
+      $plain = trim( strip_tags( $text ) );
+    }
+    return $plain;
   }
 
   /**

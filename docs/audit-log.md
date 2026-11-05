@@ -70,6 +70,16 @@ handed, and the reply text the entry keeps is
 scrubbed the same way, so the tool that hands a link out does not also write it
 into the log.
 
+The scrubs run after the tool has run, over every string of the call, so they have to
+be fast on text an agent controls and honest when they cannot finish. No string is
+read past 64,000 bytes plus a margin, because no more than that can be stored, and a
+call cut that way records the size it really had (`__gmcp_truncated`). The expressions
+are linear in the length of the text, measured with the regular-expression JIT on and
+off (`.dev/test-redact-timing.php`): an earlier form was quadratic, and a 560 KB
+argument made the tool's effect land with no row written at all. When the engine does
+give up on a string, the record says `[unscrubbable text withheld]`; it never records
+an empty string in place of text it could not read.
+
 ### What was called is not what changed
 
 An entry saying `wp_update_post` ran on post 12 with certain arguments does not

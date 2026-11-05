@@ -1905,32 +1905,77 @@ class GMCP_Core {
   * and by the audit log for the reply text it keeps.
   */
   public static function scrub_preview_tokens( string $text ): string {
-    return GMCP_Diag_Util::scrub_preview_tokens( $text );
+    $out = GMCP_Diag_Util::scrub_preview_tokens( $text );
+    return self::scrubbed_or_withheld( $out, $text );
+  }
+
+  /** What stands in for text a scrub could not process. Never an empty string. @see scrubbed_or_withheld() */
+  const UNSCRUBBABLE = '[unscrubbable text withheld]';
+
+  /**
+  * The result of a preg_replace over $original, or a marker when PCRE gave up.
+  *
+  * preg_replace() returns null when it hits a backtrack, recursion or JIT limit, and a cast to
+  * string makes that "". A scrub that wrote "" for text it could not read recorded the argument
+  * as an empty string: a false record, in a log whose whole value is that its records are true.
+  * Failing closed means the marker says "something was here and was withheld", never nothing.
+  *
+  * @param string|null $result what preg_replace() returned
+  */
+  public static function scrubbed_or_withheld( $result, string $original ): string {
+    if ( !is_string( $result ) || ( $result === '' && $original !== '' ) ) {
+      return self::UNSCRUBBABLE;
+    }
+    return $result;
   }
 
   /**
-  * Text that is about to be written down: a preview link's token, and any credential
-  * written as an assignment inside the text.
+  * Text that is about to be written down, with a preview link's token and any credential written
+  * as an assignment inside it blanked.
   *
-  * redact() judges a string only by the preview-link rule, so a string value is written
-  * whole, and "smtp_pwd=hunter2" inside a search query went into the debug log as the
-  * query's first thirty characters, and into the argument dump as the whole string. A
-  * credential in a URL or a free-text field is named by the key in front of it, the same
-  * way a field is, so the key decides here too: a key that field_looks_secret() flags has
-  * its value blanked, and a Bearer or Basic credential is blanked whatever it is named.
+  * redact() used to judge a string only by the preview-link rule, so a string value was written
+  * whole, and "smtp_pwd=hunter2" inside a search query went into the debug log as the query's
+  * first thirty characters. A credential in a URL or a free-text field is named by the key in
+  * front of it, the same way a field is, so the key decides here too: a key that
+  * field_looks_secret() flags has its value blanked, and a Bearer or Basic credential is blanked
+  * whatever it is named. The value ends at the first delimiter (a space, & , ; a quote or a
+  * closing bracket), which is what makes the output read as the text it came from.
   *
-  * Still structural. A bare token with no key in front of it is not recognised, and this
-  * says so rather than pretending otherwise.
+  * Aggressive on purpose: any value after a secret-named key is blanked, whatever it looks like,
+  * so "To reset your password: click the link" becomes "...password: [redacted] the link". That
+  * is right for a log nobody should find a secret in, and wrong for a record of what a post said,
+  * which is why the audit log's arguments and the journal use GMCP_Credential_Scan (the shapes
+  * and assignments whose VALUE looks like a credential) and this is the debug log's. The audit
+  * log also asks it as a test, for the short free-text columns where over-redacting a label is
+  * cheaper than leaking one. @see log_text(), @see GMCP_Audit::scrub_text()
+  *
+  * Still structural. A bare token with no key in front of it is not recognised, and this says so
+  * rather than pretending otherwise.
+  *
+  * Linear in the length of the text, with the JIT on or off, and never returns "" for text:
+  *  - a name run is only started at its beginning (the lookbehind), and the name, the separator and
+  *    the value are possessive, so no run is ever re-scanned from a later position. The earlier
+  *    form had neither and was quadratic: measured at 31 s for 512 KB of "pass" with the JIT on and
+  *    over three minutes for 16 KB with it off, run by redact() over every argument of every call;
+  *  - whether the name holds a credential word is asked inside the match, by a lookahead over the
+  *    run alone, and only for the words that occur in the text at all;
+  *  - when PCRE gives up the result is UNSCRUBBABLE, not "".
   */
   public static function scrub_written_text( string $text ): string {
     $text = self::scrub_preview_tokens( $text );
-    if ( $text === '' ) {
+    if ( $text === '' || $text === self::UNSCRUBBABLE ) {
       return $text;
     }
-    $text = (string) preg_replace( '/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/=-]{8,}/i', '$1 ' . self::REDACTION_MARKER, $text );
+    $text = self::scrubbed_or_withheld(
+      preg_replace( '/\b(Bearer|Basic)\s++[A-Za-z0-9._~+\/=-]{8,}+/i', '$1 ' . self::REDACTION_MARKER, $text ),
+      $text
+    );
+    if ( $text === self::UNSCRUBBABLE ) {
+      return $text;
+    }
     $names = [];
     foreach ( (array) self::credential_field_patterns() as $pattern ) {
-      if ( is_string( $pattern ) && $pattern !== '' ) {
+      if ( is_string( $pattern ) && $pattern !== '' && stripos( $text, $pattern ) !== false ) {
         $names[] = preg_quote( $pattern, '/' );
       }
     }
@@ -1940,12 +1985,12 @@ class GMCP_Core {
     // A name that contains a credential word, followed by a separator (= : => or their
     // URL-encoded forms, with an optional closing quote), then the value up to the next
     // delimiter. The name class admits the brackets and dots of form and query names.
-    // The lookahead keeps this idempotent: a value already replaced by the marker is left
+    // The (?!\[redacted\]) keeps this idempotent: a value already replaced by the marker is left
     // as it is, because the marker's own brackets would otherwise end the value early and
-    // leave a stray "]" behind on a second pass (log_text() scrubs what redact() has done).
-    $re = '/([A-Za-z0-9_.\-\[\]]*(?:' . implode( '|', $names ) . ')[A-Za-z0-9_.\-\[\]]*)'
-      . '(["\']?\s*(?:=>|=|:|%3D|%3A|%3d|%3a)\s*["\']?)(?!\[redacted\])[^\s&,;"\'}\])<>]+/i';
-    return (string) preg_replace( $re, '$1$2' . self::REDACTION_MARKER, $text );
+    // leave a stray "]" behind on a second pass.
+    $re = '/(?<![A-Za-z0-9_.\-\[\]])(?=[A-Za-z0-9_.\-\[\]]*?(?:' . implode( '|', $names ) . '))'
+      . '([A-Za-z0-9_.\-\[\]]++)(["\']?+\s*+(?:=>|=|:|%3D|%3A|%3d|%3a)\s*+["\']?+)(?!\[redacted\])[^\s&,;"\'}\])<>]++/i';
+    return self::scrubbed_or_withheld( preg_replace( $re, '$1$2' . self::REDACTION_MARKER, $text ), $text );
   }
 
   /**
@@ -2029,6 +2074,9 @@ class GMCP_Core {
   * blanked whole.
   */
   public static function redact_call_args( array $args ): array {
+    // The debug line prints a few hundred characters of this; nothing is gained by reading more.
+    $unused = 0;
+    $args = self::cut_leaves( $args, 4096, $unused );
     foreach ( self::NEVER_RECORD_ARGS as $field ) {
       if ( array_key_exists( $field, $args ) ) {
         $args[ $field ] = self::REDACTION_MARKER;
@@ -2051,6 +2099,62 @@ class GMCP_Core {
       }
     }
     return self::blank_credential_strings( $redacted );
+  }
+
+  /**
+  * A string cut to at most $max bytes without ending in half a character.
+  *
+  * Pure PHP: mb_strcut() is not guaranteed to exist and WordPress does not polyfill it.
+  */
+  public static function cut_bytes( string $text, int $max ): string {
+    if ( strlen( $text ) <= $max ) {
+      return $text;
+    }
+    $cut = substr( $text, 0, max( 0, $max ) );
+    $i = strlen( $cut ) - 1;
+    $back = 0;
+    while ( $i >= 0 && $back < 3 && ( ord( $cut[ $i ] ) & 0xC0 ) === 0x80 ) {
+      $i--;
+      $back++;
+    }
+    if ( $i >= 0 && ord( $cut[ $i ] ) >= 0xC0 ) {
+      $need = ord( $cut[ $i ] ) >= 0xF0 ? 4 : ( ord( $cut[ $i ] ) >= 0xE0 ? 3 : 2 );
+      if ( strlen( $cut ) - $i < $need ) {
+        $cut = substr( $cut, 0, $i );
+      }
+    }
+    return $cut;
+  }
+
+  /**
+  * Every string leaf of a value cut to at most $max bytes, and how many bytes that removed.
+  *
+  * For a caller that can write down no more than $max bytes of any one leaf and wants the scrubs
+  * to read no more than it can use: the scrubs are linear, but linear in 512 KB is still work
+  * done after the tool has run, for text that cannot be stored. The count lets the caller say how
+  * large the original was instead of reporting the size of the copy.
+  *
+  * @param int $removed running total, by reference
+  */
+  public static function cut_leaves( $value, int $max, int &$removed, int $depth = 0 ) {
+    if ( is_string( $value ) ) {
+      if ( strlen( $value ) <= $max ) {
+        return $value;
+      }
+      $cut = self::cut_bytes( $value, $max );
+      $removed += strlen( $value ) - strlen( $cut );
+      return $cut;
+    }
+    if ( is_object( $value ) ) {
+      $value = get_object_vars( $value );
+    }
+    if ( !is_array( $value ) || $depth > 8 ) {
+      return $value;
+    }
+    foreach ( $value as $k => $inner ) {
+      $value[ $k ] = self::cut_leaves( $inner, $max, $removed, $depth + 1 );
+    }
+    return $value;
   }
 
   /**

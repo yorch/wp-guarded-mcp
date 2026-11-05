@@ -1910,6 +1910,69 @@ check "a bearer credential in a token form field is absent from the log" "$(grep
 check "the debug option is back as it was" \
   "$(wpe 'global $gmcp_core; echo $gmcp_core->get_option("mcp_debug_mode") ? "on" : "off";')" "$DL_WAS"
 
+
+echo "-- the audit log's two scrubs agree: key=value text and shaped text in one argument --"
+# Two passes read the same string leaves: the debug-log scrub (a secret-named key followed by a
+# separator, and Bearer/Basic) and the credential scan (shapes that identify themselves, and a
+# secret-named assignment with a quoted value). They run one after the other in storable_args(),
+# and neither may leave a value behind, nor stack the marker into "[redacted: [redacted]]".
+AS_ROW=$(wpe '$j = GMCP_Audit::storable_args( [ "message" => "smtp_pwd=hunter2zz and Bearer abcdefghijklmnop12345678 ok", "query" => "x_api_key=k3yk3yk3y9 here", "note" => "nothing to hide here" ] ); echo $j;')
+check "audit args: the key=value secret is gone" "$(printf %s "$AS_ROW" | grep -c 'hunter2zz\|k3yk3yk3y9')" "0"
+check "audit args: the bearer value is gone" "$(printf %s "$AS_ROW" | grep -c 'abcdefghijklmnop12345678')" "0"
+check "audit args: no stacked marker" "$(printf %s "$AS_ROW" | grep -c 'redacted: \[redacted\|\[redacted\]\]')" "0"
+check "audit args: control, an argument with nothing in it is kept whole" "$(printf %s "$AS_ROW" | grep -c 'nothing to hide here')" "1"
+
+echo "-- a padded call is still recorded: the scrub runs after the tool, over every argument --"
+# storable_args() runs from gmcp_tool_called, after the tool has changed the site. A scrub that is
+# quadratic in the length of an argument made a call with a large one slow enough to hit
+# max_execution_time (and to take half a minute even where there is no limit), so the option was
+# written and the audit row never was. The padding is an argument the tool ignores, 560 KB of a
+# word that is itself one of the credential patterns: the worst case for the old expression.
+#
+# Asserted on stored state: the option holds the new value (the tool ran, so the probe is live) AND
+# the table gained exactly one row for the call, within a time bound the old code exceeded.
+PAD_WAS=$(wpe 'echo get_option("blogdescription");')
+PAD_A_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_activity_log"] ?? 0 ? 1 : 0;')
+wpe '$o=get_option("gmcp_options",[]);$o["mcp_activity_log"]=true;update_option("gmcp_options",$o,false);' >/dev/null
+PAD_MARK="padprobe$(python3 -c 'import secrets;print(secrets.token_hex(5))')"
+PAD_FIRST=$(wpe 'global $wpdb; echo (int) $wpdb->get_var("SELECT COALESCE(MAX(id),0) FROM " . GMCP_Audit::table());')
+python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"blogdescription","value":sys.argv[1],"zz":"pass"*140000}}}))' "$PAD_MARK" > "$OUT/pad.json"
+PAD_T0=$(date +%s)
+curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' -d @"$OUT/pad.json" -o "$OUT/pad_resp"
+PAD_SECS=$(( $(date +%s) - PAD_T0 ))
+check "CONTROL: the padded call's request really was large" "$([ "$(wc -c < "$OUT/pad.json")" -gt 500000 ] && echo yes || echo no)" "yes"
+check "CONTROL: the tool ran (the option holds the new value)" "$(wpe 'wp_cache_flush(); echo get_option("blogdescription");')" "$PAD_MARK"
+check "the padded call left exactly one audit row" "$(wpe 'global $wpdb; echo (int) $wpdb->get_var( "SELECT COUNT(*) FROM " . GMCP_Audit::table() . " WHERE id > '"$PAD_FIRST"' AND tool = \"wp_update_option\"" );')" "1"
+check "the whole call, row included, took under 20 seconds (took ${PAD_SECS}s)" "$([ "$PAD_SECS" -lt 20 ] && echo yes || echo no)" "yes"
+check "the row names the option, and says the arguments were cut and how large they were" \
+  "$(wpe 'global $wpdb; $a = (string) $wpdb->get_var( "SELECT args FROM " . GMCP_Audit::table() . " WHERE id > '"$PAD_FIRST"' AND tool = \"wp_update_option\" ORDER BY id DESC LIMIT 1" ); $j = json_decode( $a, true ); echo ( $j["__gmcp_truncated"] ?? 0 ) > 560000 && strpos( $j["preview"] ?? "", "blogdescription" ) !== false ? "yes" : "no:" . substr( $a, 0, 80 );')" "yes"
+wpe 'update_option("blogdescription", '"$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$PAD_WAS")"');$o=get_option("gmcp_options",[]);$o["mcp_activity_log"]=('"$PAD_A_WAS"'===1);update_option("gmcp_options",$o,false);' >/dev/null
+check "put back: the description is as it was" "$(wpe 'wp_cache_flush(); echo get_option("blogdescription");')" "$PAD_WAS"
+
+echo "-- a form submission and a credential in one call: the withholding comes first --"
+# The change record for a personal-data post is withheld whole before anything else judges it, and
+# an ordinary post edited in the same call still gets the credential scan. Asserted on what the
+# journal option and the audit summary hold, with the ordinary post as the control that the
+# probe can find a value that SHOULD be kept.
+GS_OUT=$(wpe 'register_post_type( "flamingo_inbound", [ "public" => false ] ); wp_set_current_user( 1 ); add_filter( "gmcp_can_call_tool", "__return_true" ); update_option( "gmcp_journal", [], false );
+do_action( "gmcp_tool_start", "wp_update_post" );
+$g = wp_insert_post( [ "post_type" => "flamingo_inbound", "post_status" => "publish", "post_title" => "GSSUBJ one", "post_content" => "gsbody" ] );
+$o = wp_insert_post( [ "post_type" => "post", "post_status" => "draft", "post_title" => "gs plain probe", "post_content" => "gs ord body" ] );
+do_action( "gmcp_tool_called" ); do_action( "gmcp_tool_start", "wp_update_post" );
+wp_update_post( [ "ID" => $g, "post_title" => "smtp_pwd=gshunter7A GSSUBJ two", "post_content" => "define(\"DB_PASSWORD\",\"gssecretB99\") GSBODY2" ] );
+wp_update_post( [ "ID" => $o, "post_title" => "gs ord smtp_pwd=gshunter7C", "post_content" => "gs ord body 2" ] );
+$sum = (string) GMCP_Changes::summarise( GMCP_Changes::captured(), 16000 ); do_action( "gmcp_tool_called" );
+$all = json_encode( get_option( "gmcp_journal" ) ) . $sum;
+foreach ( [ "GSSUBJ", "GSBODY2", "gshunter7A", "gssecretB99", "gshunter7C" ] as $n ) { echo $n, "=", substr_count( $all, $n ), ";"; }
+echo "ctl=", substr_count( $all, "gs plain probe" ), ";";
+$log = get_option( "gmcp_journal" ); $log[] = [ "id" => "gslegx", "t" => time(), "kind" => "post", "ID" => $g, "what" => "x", "fields" => [ "post_title" ], "previous" => [ "post_title" => "x" ], "tool" => "wp_update_post", "call" => "z" ]; update_option( "gmcp_journal", $log, false );
+$r = GMCP_Journal::revert( "gslegx" ); echo "legacy=", var_export( $r["ok"], true ), ";";
+wp_delete_post( $g, true ); wp_delete_post( $o, true ); update_option( "gmcp_journal", [], false );')
+check "submission title and body, and both credentials, are in neither the journal nor the summary" "$(printf %s "$GS_OUT" | grep -o 'GSSUBJ=[0-9]*;GSBODY2=[0-9]*;gshunter7A=[0-9]*;gssecretB99=[0-9]*;gshunter7C=[0-9]*')" "GSSUBJ=0;GSBODY2=0;gshunter7A=0;gssecretB99=0;gshunter7C=0"
+check "control: the ordinary post's harmless title is kept (journal previous + summary from)" "$(printf %s "$GS_OUT" | grep -o 'ctl=[0-9]*')" "ctl=2"
+check "a stored entry for a submission is refused on revert" "$(printf %s "$GS_OUT" | grep -o 'legacy=[a-z]*')" "legacy=false"
+
 echo "-- a credential in a post body never reaches the journal or the audit log --"
 # holds_credential() judges field NAMES and opens only a value that BEGINS as JSON or serialized
 # data. A post body is prose, so a settings snippet, a pasted wp-config line or an Authorization
