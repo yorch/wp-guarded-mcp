@@ -3503,6 +3503,52 @@ else
   check "...before the HTTP API was handed a request at all" "$PV_T_HANDED" "0"
 fi
 
+# The pin must not depend on the URL string. The HTTP library upper-cases percent escapes before
+# the request hooks run, so a guard that compared the URL it was handed with the one that was
+# checked was skipped for any lowercase escape, and a transport forced to something other than
+# cURL then SENT the request; only the reply was discarded afterwards. The recording transport
+# below really sends (through fsockopen), so a count of 1 is a request that reached the site. The
+# plain path is the control: it has always been refused, and the forced-transport control shows
+# the probe counts a sent request. The cURL leg proves the fix did not stop the ordinary
+# lowercase-escape fetch.
+PV_ESC=$(docker compose exec -T cli wp eval '
+  if ( ! class_exists( "WpOrg\\Requests\\Requests" ) ) { echo "skip"; return; }
+  class F3Rec implements \WpOrg\Requests\Transport {
+    public static $n = 0;
+    public function request( $url, $headers = [], $data = [], $options = [] ) { self::$n++; return ( new \WpOrg\Requests\Transport\Fsockopen() )->request( $url, $headers, $data, $options ); }
+    public function request_multiple( $requests, $options ) { self::$n++; return []; }
+    public static function test( $capabilities = [] ) { return true; }
+  }
+  global $gmcp_core;
+  $t = new GMCP_Tools_Diagnostics( $gmcp_core );
+  $fetch = static function ( $path ) use ( $t ) {
+    $r = $t->handle_call( null, "wp_fetch_page", [ "url" => home_url( $path ) ], 1 );
+    return (string) ( $r["result"]["content"][0]["text"] ?? "" );
+  };
+  $out = [];
+  $j = json_decode( $fetch( "/caf%c3%a9-probe/" ), true );
+  $out[] = is_array( $j ) ? ( $j["connection"] ?? "-" ) : "error";
+  $force = static function ( &$url, &$headers, &$data, &$type, &$options ) { $options["transport"] = "F3Rec"; };
+  add_action( "requests-requests.before_request", $force, 10, 5 );
+  wp_remote_get( home_url( "/f3-control-probe/" ), [ "timeout" => 3 ] );
+  $out[] = F3Rec::$n;
+  foreach ( [ "/f3-plain-probe/", "/caf%c3%a9-f3-probe/", "/caf%c3%a9-%e2%82%ac-f3/?q=%c3%a9&r=%C3%A9" ] as $path ) {
+    F3Rec::$n = 0;
+    $txt = $fetch( $path );
+    $out[] = F3Rec::$n . ":" . ( strpos( $txt, "Nothing was sent" ) !== false ? "refused" : "other" );
+  }
+  echo implode( "|", $out );' 2>/dev/null | tr -d '\r\n')
+if [ "$PV_ESC" = "skip" ]; then
+  echo "  ....  escape-spelling pin check not run: this WordPress has no WpOrg\\Requests"
+else
+  IFS='|' read -r PV_E_CURL PV_E_CONTROL PV_E_PLAIN PV_E_LOWER PV_E_MIXED <<< "$PV_ESC"
+  check "control: the probe transport counts a request that is really sent" "$([ "${PV_E_CONTROL:-0}" -ge 1 ] && echo yes || echo no)" "yes"
+  check "with the cURL transport a lowercase escape is still fetched, pinned" "$PV_E_CURL" "direct (no proxy), pinned to the address that was checked"
+  check "a plain path on a non-cURL transport: refused, nothing sent" "$PV_E_PLAIN" "0:refused"
+  check "a lowercase percent escape on a non-cURL transport: refused, nothing sent" "$PV_E_LOWER" "0:refused"
+  check "mixed-case escapes in path and query on a non-cURL transport: refused, nothing sent" "$PV_E_MIXED" "0:refused"
+fi
+
 # The error log tool.
 call pv_log '{"jsonrpc":"2.0","id":430,"method":"tools/call","params":{"name":"wp_get_php_error_log","arguments":{"lines":5}}}'
 check "the log tool answers with a state, not a bare list" \

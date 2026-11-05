@@ -330,9 +330,18 @@ something that looks harmless and is not, so each says what it cannot promise.
   host name again when they connect). A plugin that swaps the transport for one request
   is caught again in the last hook before the transport is chosen, which aborts the
   request; a response that still arrives with no pin applied (another plugin
-  short-circuits the HTTP API) is discarded. Measured against a transport swapped by
-  the transport cache and by an action: the earlier code sent the request and then
-  discarded the answer, so the site saw an unpinned request; now it sees none.
+  short-circuits the HTTP API) is discarded. Both hooks are live for exactly the one
+  request this tool makes and act on every request made in that window; neither
+  compares the URL it is handed with the one that was checked, because the HTTP
+  library rewrites the address (it upper-cases percent escapes) before the hooks run,
+  and a comparison made the guard skip any lowercase escape: a transport swapped to
+  something other than cURL then sent `/caf%c3%a9/` and only the answer was discarded.
+  The URL that is checked is also spelled the way it will be sent (escapes in upper
+  case). A pin that cURL refuses to apply aborts the request before it is sent. Measured
+  with a recording transport that really sends: a lowercase-escape URL reached the site
+  once before this and zero times now, and the plain-path control was refused before
+  and after. The branch where `curl_setopt` itself fails was not exercised (cURL accepts
+  the options on any valid handle), so that abort is read, not measured.
   Link-local, reserved
   and multicast addresses are refused for every site, which is where the cloud
   metadata service lives. Private and loopback addresses are accepted only when
@@ -447,8 +456,10 @@ something that looks harmless and is not, so each says what it cannot promise.
   where the HTTP transport is cURL. What that rests on, exactly: the transport check
   calls a method of WordPress's HTTP library that is not public (through reflection,
   with the answer "not cURL" if it cannot), another plugin that can still alter the
-  cURL handle after this tool has (an `http_api_curl` callback later than priority
-  9999) can undo the pin, and a host name's pin is one address, the first checked.
+  cURL handle after this tool has (the pin is applied at priority `PHP_INT_MAX`, so only
+  an `http_api_curl` callback registered later at that same priority, or one that
+  removes this one, can undo it: code running as the site, which is outside what this
+  plugin defends against) can undo the pin, and a host name's pin is one address, the first checked.
   IPv6: the entry for a host name that resolves to an IPv6 address is bracketed
   (`name:80:[::1]`); libcurl 8.5 accepts it and connects to that address, which was
   verified only as far as the connect attempt, because the sandbox it was tested in has

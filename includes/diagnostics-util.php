@@ -379,6 +379,12 @@ final class GMCP_Diag_Util {
     $rebuilt = $scheme . '://' . ( strpos( $host, ':' ) !== false ? '[' . $host . ']' : $host )
       . ( $port !== ( $scheme === 'https' ? 443 : 80 ) ? ':' . $port : '' )
       . $path . ( $query !== '' ? '?' . $query : '' );
+    // The HTTP library upper-cases every percent escape (it normalises the address before it
+    // sends it), so the string checked here has to be spelled the way it will be sent: a URL
+    // that differs from the one on the wire is a URL nothing downstream can recognise as ours.
+    $rebuilt = preg_replace_callback( '/%[0-9a-fA-F]{2}/', static function ( array $m ): string {
+      return strtoupper( $m[0] );
+    }, $rebuilt );
 
     return [ 'ok' => true, 'reason' => '', 'url' => $rebuilt, 'scheme' => $scheme, 'host' => $host, 'port' => $port, 'ips' => $ips, 'pin' => $ips[0] ];
   }

@@ -75,6 +75,11 @@ check( 'control: explicit default port', $fetch( 'https://example.com:443/a' )['
 check( 'control: index.php is a page', $fetch( 'https://example.com/index.php?p=3' )['ok'], true );
 check( 'control: a site in a subdirectory', $fetch( 'https://example.com/blog/post/', 'https://example.com/blog' )['ok'], true );
 check( 'control: IPv6 answer', $fetch( 'https://v6.example.com/', 'https://v6.example.com' )['ok'], true );
+// The HTTP library upper-cases percent escapes before its hooks run, so the string checked
+// here has to be the string that is sent.
+check( 'rebuilt URL: lowercase escapes in the path are upper-cased', $fetch( 'https://example.com/caf%c3%a9/' )['url'], 'https://example.com/caf%C3%A9/' );
+check( 'rebuilt URL: ...and in the query', $fetch( 'https://example.com/?q=%c3%a9&r=%C3%A9&s=%e2%82%ac' )['url'], 'https://example.com/?q=%C3%A9&r=%C3%A9&s=%E2%82%AC' );
+check( 'control: a URL with no escapes is unchanged by that', $fetch( 'https://example.com/a-b/?q=1' )['url'], 'https://example.com/a-b/?q=1' );
 
 echo "-- check_fetch_url: what is refused --\n";
 $refused = [

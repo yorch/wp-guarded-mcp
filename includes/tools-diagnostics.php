@@ -391,10 +391,18 @@ class GMCP_Tools_Diagnostics {
       }
     }
     $pinned = false;
-    $callback = static function ( $handle, $args, $url ) use ( $check, &$pinned ) {
-      if ( $url !== $check['url'] ) {
-        return;
-      }
+    $unpinned = null;
+    // Both hooks are live for exactly the one wp_remote_get() below and apply to EVERY request
+    // made while it runs; neither compares the URL it is handed with the one that was checked.
+    // The HTTP library rewrites the address (it upper-cases percent escapes, for one) before
+    // these hooks fire, so a comparison skipped the guard on any spelling that differed and the
+    // request went out unpinned, to be discarded only after the fact. A request that is not ours
+    // but is made inside this window is refused too, which is the safe direction.
+    $exception = static function ( string $message ) {
+      $ex = class_exists( 'WpOrg\\Requests\\Exception' ) ? 'WpOrg\\Requests\\Exception' : ( class_exists( 'Requests_Exception' ) ? 'Requests_Exception' : '' );
+      return $ex !== '' ? new $ex( $message, 'gmcp_pin' ) : new \RuntimeException( $message );
+    };
+    $callback = static function ( $handle, $args, $url ) use ( $check, &$pinned, &$unpinned, $exception ) {
       // null for a host that is itself an IP address: there is no name to resolve, so nothing
       // to pin, and libcurl rejects "::1:80:[::1]" as an unparseable entry (and fails the whole
       // request), so an IPv6 literal site could not be fetched at all with an entry here.
@@ -406,45 +414,56 @@ class GMCP_Tools_Diagnostics {
       // off. Both must be accepted for the connection to count as pinned.
       $direct = curl_setopt( $handle, CURLOPT_PROXY, '' ) && curl_setopt( $handle, CURLOPT_NOPROXY, '*' );
       // Pin first: whatever else this does, the connection must go where the check looked.
-      if ( $direct && ( $entry === null || curl_setopt( $handle, CURLOPT_RESOLVE, [ $entry ] ) ) ) {
-        $pinned = true;
+      // A pin that cannot be applied aborts the request here, before any connection exists: a
+      // callback cannot return a verdict, so it throws and the HTTP API turns that into an error.
+      if ( !$direct || ( $entry !== null && !curl_setopt( $handle, CURLOPT_RESOLVE, [ $entry ] ) ) ) {
+        $unpinned = true;
+        throw $exception( 'the connection could not be pinned' );
       }
+      $pinned = true;
       if ( defined( 'CURLOPT_PROTOCOLS' ) ) {
         curl_setopt( $handle, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS );
       }
       curl_setopt( $handle, CURLOPT_FOLLOWLOCATION, false );
     };
-    add_action( 'http_api_curl', $callback, 9999, 3 );
+    // The last word before a connection exists: PHP_INT_MAX, so nothing registered through the
+    // hook API earlier can come after it. Code that registers later at the same priority, or
+    // removes this callback, still can; that is code running as the site, which this plugin
+    // does not defend against.
+    add_action( 'http_api_curl', $callback, PHP_INT_MAX, 3 );
     // The last word before the transport is chosen. An earlier hook can set the transport for
     // this request; if it is not cURL the request is aborted here, before a connection is made,
     // and the HTTP API turns the exception into an error.
     $not_curl = null;
-    $guard = static function ( &$url, &$headers, &$data, &$type, &$options ) use ( $check, &$not_curl ) {
-      if ( $url !== $check['url'] ) {
-        return;
-      }
+    $guard = static function ( &$url, &$headers, &$data, &$type, &$options ) use ( &$not_curl, $exception ) {
       $t = self::effective_transport( stripos( (string) $url, 'https://' ) === 0, $options['transport'] ?? null );
       if ( !$t['curl'] ) {
         $not_curl = $t['name'];
-        $ex = class_exists( 'WpOrg\\Requests\\Exception' ) ? 'WpOrg\\Requests\\Exception' : ( class_exists( 'Requests_Exception' ) ? 'Requests_Exception' : '' );
-        throw $ex !== '' ? new $ex( 'transport is not cURL', 'gmcp_transport' ) : new \RuntimeException( 'transport is not cURL' );
+        throw $exception( 'transport is not cURL' );
       }
     };
     add_action( 'requests-requests.before_request', $guard, PHP_INT_MAX, 5 );
-    $response = wp_remote_get( $check['url'], [
-      'timeout' => 8,
-      'redirection' => 0,
-      'reject_unsafe_urls' => false, // our own check is stricter, and this one refuses local development sites
-      'limit_response_size' => self::FETCH_MAX_BYTES,
-      'user-agent' => 'Mozilla/5.0 (compatible; GuardedMCP-PageCheck)',
-      'headers' => [ 'Accept' => 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1' ],
-      'cookies' => [],
-      'sslverify' => true,
-      'decompress' => true,
-    ] );
-    remove_action( 'http_api_curl', $callback, 9999 );
-    remove_action( 'requests-requests.before_request', $guard, PHP_INT_MAX );
+    try {
+      $response = wp_remote_get( $check['url'], [
+        'timeout' => 8,
+        'redirection' => 0,
+        'reject_unsafe_urls' => false, // our own check is stricter, and this one refuses local development sites
+        'limit_response_size' => self::FETCH_MAX_BYTES,
+        'user-agent' => 'Mozilla/5.0 (compatible; GuardedMCP-PageCheck)',
+        'headers' => [ 'Accept' => 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1' ],
+        'cookies' => [],
+        'sslverify' => true,
+        'decompress' => true,
+      ] );
+    }
+    finally {
+      remove_action( 'http_api_curl', $callback, PHP_INT_MAX );
+      remove_action( 'requests-requests.before_request', $guard, PHP_INT_MAX );
+    }
 
+    if ( $unpinned ) {
+      return [ 'ok' => false, 'error' => 'The connection could not be pinned to the address that was checked (the proxy or resolve option was refused by cURL). Nothing was sent.' ];
+    }
     if ( $not_curl !== null ) {
       return [ 'ok' => false, 'error' => 'The HTTP transport for this request is ' . $not_curl . ', not cURL, so the connection cannot be pinned to the address that was checked. Nothing was sent.' ];
     }
