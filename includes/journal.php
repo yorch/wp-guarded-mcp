@@ -1557,6 +1557,15 @@ class GMCP_Journal {
         if ( !array_key_exists( $field, (array) $entry['previous'] ) ) {
           continue;
         }
+        // Only the fields the recorder watches. The commerce guard is asked about the post
+        // as it is NOW (reversible_kind), and it is never asked about a value an entry would
+        // write, so a field outside this list could be restored unchecked: post_type is the
+        // one that matters, since putting 'shop_order' on a page makes a hand-made order.
+        // Nothing records post_type today, and an entry that names it was not made by this
+        // plugin's recorder, so it is skipped rather than trusted.
+        if ( !in_array( $field, GMCP_Changes::POST_FIELDS, true ) ) {
+          continue;
+        }
         $value = $entry['previous'][ $field ];
         if ( self::too_large( $value ) ) {
           continue;

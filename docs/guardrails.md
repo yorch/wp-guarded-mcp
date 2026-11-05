@@ -1089,7 +1089,12 @@ Reverting a post, a custom field or a set of terms also asks
 `commerce_post_guard()`, because an order and a subscription are `wp_posts` rows
 and the policy about them belongs to the post type rather than to the tool that
 is writing it. Revert now enforces that for itself instead of relying on the
-original write having been refused.
+original write having been refused. The guard judges the post as it is now, not a
+value the revert would write, so a post revert also restores only the fields the
+recorder watches (title, content, excerpt, status, slug, parent, menu order) and
+never `post_type`. No route to a post_type restore was found: the recorder does not
+record that field, and the journal's own row cannot be edited through any tool. The
+filter is a backstop for an entry this plugin did not write.
 
 An undo is recorded as a change of its own. The entry keeps what the undo
 overwrote, names the entry it reversed, and carries the tool of the original, so
