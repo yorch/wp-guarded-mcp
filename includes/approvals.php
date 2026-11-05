@@ -586,6 +586,33 @@ class GMCP_Approvals {
     return is_array( $props ) && ( $props['type'] ?? '' ) === 'string';
   }
 
+  /**
+  * Whether this call always waits for a person, whatever mcp_approval_mode says.
+  *
+  * The declaration is part of the tool's registration:
+  *
+  *   'requiresApproval' => [ 'argument' => 'mode', 'values' => [ 'pull' ] ]
+  *
+  * A bare `true` makes every call to the tool wait. The rule only ever adds a wait; it
+  * cannot open a gate or widen an approval, and a definition without one behaves exactly
+  * as before.
+  */
+  private static function requires_human_approval( ?array $definition, array $args ): bool {
+    $rule = $definition['requiresApproval'] ?? null;
+    if ( $rule === true ) {
+      return true;
+    }
+    if ( !is_array( $rule ) ) {
+      return false;
+    }
+    $argument = (string) ( $rule['argument'] ?? '' );
+    $values = array_map( 'strval', (array) ( $rule['values'] ?? [] ) );
+    if ( $argument === '' || $values === [] ) {
+      return false;
+    }
+    return in_array( (string) ( $args[ $argument ] ?? '' ), $values, true );
+  }
+
   #endregion
 
   #region The dispatcher's side
@@ -615,11 +642,18 @@ class GMCP_Approvals {
 
   private static function gate_inner( string $tool, array $args, ?array $definition, array $caller, array $definitions ): array {
     $mode = self::mode();
-    if ( $mode === 'never' ) {
+    // A tool can declare that some of its own calls always need a person, in every mode
+    // including 'never'. This is how the export tool's pull leg works: the site has a
+    // switch for the capability, but no setting may make a file leave the server without
+    // somebody answering the queue. The declaration lives on the tool's registration and
+    // names the argument and values it covers, so the queue is still derived from what the
+    // tool says it is rather than from a list of tool names here.
+    $forced = self::requires_human_approval( $definition, $args );
+    if ( $mode === 'never' && !$forced ) {
       return [ 'run' => true, 'claim' => 0 ];
     }
     $class = self::classify_call( $definition, $args, $definitions );
-    if ( !self::needs_approval( $mode, $class ) ) {
+    if ( !$forced && !self::needs_approval( $mode, $class ) ) {
       return [ 'run' => true, 'claim' => 0 ];
     }
 

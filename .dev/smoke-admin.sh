@@ -2662,6 +2662,10 @@ tc_groups() { # tc_groups <admin 0|1> <woo 0|1>
     $o["mcp_tools_core"] = true;
     $o["mcp_tools_admin"] = '"$1"' ? true : false;
     $o["mcp_tools_woo"]   = '"$2"' ? true : false;
+    // The export group is always available once its switch is on, so it is not one of the
+    // groups the table counts and must be off for this count: leaving it on would move every
+    // number for a reason that has nothing to do with the content/admin/woo surface.
+    $o["mcp_tools_export"] = false;
     update_option( "gmcp_options", $o, false );' >/dev/null 2>&1
 }
 # Optional groups are excluded by tool-name prefix, because the table counts only the groups

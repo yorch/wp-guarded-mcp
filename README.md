@@ -94,10 +94,10 @@ An access level belongs to a named key, or to an OAuth grant. A key carries the 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
 nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO,
 ACF, Gravity Forms, LearnDash, Elementor Pro, WP Activity Log, Redirection, Polylang, Rank Math and All in One SEO,
-Wordfence, Stream, Beaver Builder and the form-submission tools are not counted: their tools
-are optional groups that come and go with a plugin, so folding them in would make the table
-depend on what
-happens to be installed.
+Wordfence, Stream, Beaver Builder, the form-submission tools and the site-file export group
+are not counted: their tools are optional groups that come and go with a plugin (or, for the
+export group, with its switch), so folding them in would make the table depend on what
+happens to be installed or enabled.
 
 A **named key** narrows this further. It carries its own level, an optional expiry date,
 and an optional list of the only tools it may call, so a key handed to a deploy script
@@ -128,6 +128,21 @@ that does not resolve inside the site's uploads directory. `wp_create_posts` cre
 "what am I looking at" in one call. `wp_write_blocks` takes either a list of block specs or
 a Markdown string (headings, paragraphs, lists, blockquotes, fenced code, emphasis, links
 and images); Markdown HTML is shown as text, not run.
+
+**Site files**, off by default: `wp_export_request` reads one of four named roots —
+`plugins`, `themes`, `mu-plugins` or `uploads` — with an optional relative path under it. In
+its default `manifest` mode it walks the tree and reports the file count, total bytes, depth,
+a digest and the entries that WOULD be excluded with the reason (symbolic links, hard links,
+non-regular files, unreadable entries, anything resolving outside the root). The digest covers
+each file's name, size and contents, so a file rewritten in place is a change. It never returns
+file contents, and it refuses over 20,000 entries or 512 MiB rather than truncating the count.
+Its `pull` mode takes the digest from a manifest, refuses if the tree has changed, and always
+waits for a signed-in administrator on the Approvals screen, whatever `mcp_approval_mode` is
+set to. Only after that approval does it build a zip outside the web root, with 0600
+permissions, and return a one-time URL that streams it for five minutes; the archive is never
+returned in a tool reply, and the token is scrubbed from the audit log. `uploads` means all of
+uploads, which on a real site can contain customer exports — that is why the group is off
+until somebody switches it on.
 
 **Site administration**, off by default: installing, activating, updating and deleting
 plugins and themes; navigation menus and their items; widgets and widget areas; the
@@ -610,6 +625,7 @@ Other hooks:
 - Keys are stored as a SHA-256 hash and shown once, so the database holds nothing that can be replayed. A key also records the administrator who created it and acts as that account, which is what lets the log name a person; it stops working the moment that account stops holding `manage_options`, so revoking somebody's access revokes their agent with it.
 - No row belonging to this plugin, and no option whose name looks like a credential, can be read or written through the option tools. The change journal additionally inspects the value it is about to record, so a `secret_key` or `pass` field inside a settings array is blanked before the rest of that array is kept, and an undo leaves the live value in place rather than writing the placeholder over it. Strings that parse as JSON or as a serialized array are unpacked and judged too, and blanked whole when they hold one. The check reads field names, not content, so it will not catch a secret held as a bare string under an innocuous option name.
 - Optional human approval holds deletes, and optionally site changes, until an administrator signed in to wp-admin approves that exact call. There is no approval token for an agent to learn or mint, and no tool that reads or answers the queue. See Approvals above.
+- Site-file export is off by default, and its manifest returns counts and exclusions rather than file contents. A pull is always held for a person, whatever the approval mode says; the approval is bound to the manifest digest — which covers each file's name, size and contents — so a tree that changed after it was read needs a new one, and one whose file was rewritten in place is refused when the pull runs. The archive is built outside the web root with 0600 permissions, streamed once through a five-minute token, and deleted after it is sent, including when the client disconnects mid-download. The token is scrubbed from the audit log, like the download and upload tokens.
 - The `readwrite` level cannot delete by another name. WordPress permanently deletes whatever carries an old `_wp_trash_meta_time`, every auto-draft older than a week, and, where Akismet or a similar plugin is active, every comment marked spam for fifteen days, so setting a post status of `trash` or `auto-draft` through `wp_update_post`, a comment status of `trash` or `spam` through `wp_update_comment`, and writing any `_wp_trash_meta_` meta key through any tool, are refused; `wp_delete_post` and `wp_delete_comment` are the way to delete and are held by the approval queue. An agent therefore cannot mark a comment as spam at any level; a person does that in wp-admin. `wp_run_cron_event` is held with the deletes.
 - Tools do not execute arbitrary PHP or SQL. Every tool is a fixed WordPress operation with a schema.
 - A preview link is a bearer credential for one unpublished post. Only a hash of it is stored, in a row the option tools refuse, and the audit log and debug trace scrub it from arguments and replies. It is shown once. Anyone who is given the link can use it until it expires or the post is published, and viewing it is not logged.
@@ -626,7 +642,7 @@ docker run --rm -v "$PWD":/app -w /app php:8.1-cli sh -c 'for f in includes/*.ph
 ```
 
 A throwaway WordPress for testing lives in `.dev/` (see that directory's README). It carries
-fourteen suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
+twenty-one suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
 previews; `smoke-admin.sh` for the administration tools, the change journal, named keys and
 every guard around them, which rebuilds `.htaccess` partway through and is the destructive
 one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor tools;
@@ -637,10 +653,12 @@ tools; `smoke-woo-subscriptions.sh` for the Subscriptions tools; `smoke-wsal.sh`
 WP Activity Log tools; `smoke-redirection.sh` for the Redirection tools; `smoke-polylang.sh`
 for the Polylang tools; `smoke-seo.sh` for the Rank Math and All in One SEO tools;
 `smoke-forms.sh` for the form-submission tools; `smoke-wordfence.sh` for the Wordfence tools;
-`smoke-stream.sh` for the Stream tools; `smoke-beaver.sh` for the Beaver Builder tools; and `smoke-download.sh` for the one-time
-download endpoint. `smoke-seo.sh`, `smoke-forms.sh`,
-`smoke-polylang.sh` and `smoke-redirection.sh` were written without a running stack and have
-not been run. All but the first two need their plugin installed.
+`smoke-stream.sh` for the Stream tools; `smoke-beaver.sh` for the Beaver Builder tools;
+`smoke-download.sh` for the one-time download endpoint; and `smoke-export.sh` for the site
+files manifest, the approval-gated archive and its one-time endpoint. `smoke-seo.sh`,
+`smoke-forms.sh`, `smoke-polylang.sh` and `smoke-redirection.sh` were written without a
+running stack and have not been run. The plugin-specific suites need their plugin installed;
+`smoke-download.sh` and `smoke-export.sh` need only this plugin.
 
 Wordfence makes every call on a stack slow: it checks in with its own servers when it loads,
 and with no outbound route each request waits for that to time out — measured at 0.3s per

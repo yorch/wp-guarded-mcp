@@ -1605,6 +1605,17 @@ the second half.
   tool with no hint and a verb outside the list is a site change, so it waits only in the
   wider mode; the `wp_upload_request` endpoint is not a tool call; a preview waits like the call it
   previews, because the setting cannot tell the two apart.
+- **A tool can require a person in every mode.** `requiresApproval` on a tool's registration
+  — `[ 'argument' => 'mode', 'values' => [ 'pull' ] ]`, or `true` for every call — makes
+  `gate_inner()` queue the call whatever `mcp_approval_mode` says, `never` included. It sits
+  on the registration rather than in a list of names kept beside the queue, and it can only
+  add a wait: a definition without one behaves exactly as before, and a rule naming no
+  argument or no value holds nothing. `wp_export_request` uses it for its `pull` leg, because
+  an archive of `uploads` leaves the server and the site's approval mode is a setting somebody
+  may have left at `never` for reasons that had nothing to do with files. The declaration
+  covers the value it names and no other: the same tool's `manifest` leg is judged like any
+  other admin tool — held in `deletes` and `site`, not held in `never` — which is why the
+  registration is read, not the tool's name.
 - **An undo is the write it repeats.** `wp_undo_change` is a write-level tool, so on its name
   alone it never waits, but it replays earlier values: in the wider mode a key held for
   `wp_update_option` could put an option back, unheld. `classify_call()` looks the recorded
