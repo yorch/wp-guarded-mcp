@@ -1393,9 +1393,17 @@ the second half.
   the README's definition of the `write` level as having no destructive tools, which
   `smoke-admin.sh` checks against the registered tools. Honest limits: a destructive admin
   tool with no hint and a verb outside the list is a site change, so it waits only in the
-  wider mode; `wp_undo_change` (write level) replays earlier values and is not gated; the
-  `wp_upload_request` endpoint is not a tool call; a preview waits like the call it
+  wider mode; the `wp_upload_request` endpoint is not a tool call; a preview waits like the call it
   previews, because the setting cannot tell the two apart.
+- **An undo is the write it repeats.** `wp_undo_change` is a write-level tool, so on its name
+  alone it never waits, but it replays earlier values: in the wider mode a key held for
+  `wp_update_option` could put an option back, unheld (reproduced). `classify_call()` looks the
+  recorded entry up (by `id`, or every entry of a `call`) and holds the undo as the strictest
+  tool that made the change, using the same list the undo itself asks "can this caller call it"
+  about (`GMCP_Journal::undo_tools()`). An entry it cannot find, a call naming both `id` and
+  `call`, or a recorded tool with no registration here is `unknown`, held in every mode. So an
+  undo of a post or meta edit waits where writing it would (never), and an undo of an option
+  waits where writing the option does (the wider mode).
 - **An account the agent made cannot answer for the agent.** In mode `deletes` an admin key
   could create an administrator with a password it chose (`wp_create_user` and
   `wp_update_user` were `site` changes, which wait only in the wider mode), sign in at

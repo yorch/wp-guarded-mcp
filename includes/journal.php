@@ -1007,6 +1007,36 @@ class GMCP_Journal {
   }
 
   /**
+  * The tools whose writes an undo would repeat, for the approval gate. Null when the log holds
+  * no such entry, which the gate reads as "cannot tell", and holds.
+  *
+  * Exactly what revert() and revert_call() would act on: one entry by id, or every entry of a
+  * call that has not been undone. The union of gates(), so an option entry yields
+  * wp_update_option as well as the tool that was in flight when it was recorded.
+  *
+  * @return string[]|null
+  */
+  public static function undo_tools( string $id, string $call ): ?array {
+    $log = get_option( self::OPTION, [] );
+    $log = is_array( $log ) ? $log : [];
+    $tools = [];
+    $found = false;
+    foreach ( $log as $entry ) {
+      if ( !is_array( $entry ) ) {
+        continue;
+      }
+      $match = $call !== ''
+        ? ( (string) ( $entry['call'] ?? '' ) === $call && empty( $entry['undone'] ) )
+        : ( (string) ( $entry['id'] ?? '' ) === $id );
+      if ( $match ) {
+        $found = true;
+        $tools = array_merge( $tools, self::gates( $entry ) );
+      }
+    }
+    return $found ? array_values( array_unique( $tools ) ) : null;
+  }
+
+  /**
   * Put one change back.
   *
   * Deliberately narrow: it restores exactly the fields the entry recorded and touches

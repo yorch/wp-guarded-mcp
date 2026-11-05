@@ -214,8 +214,11 @@ class GMCP_Approvals {
   * @param array|null $tool The registered definition.
   * @param array      $args The call's arguments.
   */
-  public static function classify_call( ?array $tool, array $args ): string {
+  public static function classify_call( ?array $tool, array $args, array $definitions = [] ): string {
     $class = self::classify( $tool );
+    if ( is_array( $tool ) && strtolower( (string) ( $tool['name'] ?? '' ) ) === 'wp_undo_change' ) {
+      return self::stricter( $class, self::classify_undo( $args, $definitions ) );
+    }
     if ( $class !== 'read' && self::asks_for_deletion_status( $args ) ) {
       $class = self::stricter( $class, 'destructive' );
     }
@@ -288,6 +291,39 @@ class GMCP_Approvals {
       }
     }
     return false;
+  }
+
+  /**
+  * An undo is the write it repeats.
+  *
+  * wp_undo_change sits at the write level, which never waits, but it replays an earlier value:
+  * an option put back is the option written, so in the wider mode a key that was held for
+  * wp_update_option could undo-write it unheld. The class is the strictest of the tools that
+  * made the recorded change (GMCP_Journal::undo_tools(), the same list the undo itself asks
+  * "can this caller call it" about). Anything that cannot be resolved is 'unknown', which is
+  * held in every mode: no journal, no such entry, both id and call named, or a recorded tool
+  * with no registration here. Neither named is left to the tool, which refuses it.
+  *
+  * @param array $definitions Every registered tool by name.
+  */
+  private static function classify_undo( array $args, array $definitions ): string {
+    $id = isset( $args['id'] ) && is_scalar( $args['id'] ) ? (string) $args['id'] : '';
+    $call = isset( $args['call'] ) && is_scalar( $args['call'] ) ? (string) $args['call'] : '';
+    if ( $id === '' && $call === '' ) {
+      return 'content';
+    }
+    if ( ( $id !== '' && $call !== '' ) || !class_exists( 'GMCP_Journal' ) ) {
+      return 'unknown';
+    }
+    $tools = GMCP_Journal::undo_tools( $id, $call );
+    if ( !$tools ) {
+      return 'unknown';
+    }
+    $class = 'content';
+    foreach ( $tools as $name ) {
+      $class = self::stricter( $class, self::classify( is_array( $definitions[ $name ] ?? null ) ? $definitions[ $name ] : null ) );
+    }
+    return $class;
   }
 
   private static function stricter( string $a, string $b ): string {
@@ -554,26 +590,26 @@ class GMCP_Approvals {
   *
   * @param array $caller identity (who this is), label, auth_method, user_id
   */
-  public static function gate( string $tool, array $args, ?array $definition, array $caller ): array {
+  public static function gate( string $tool, array $args, ?array $definition, array $caller, array $definitions = [] ): array {
     // wpdb prints a failed query straight into the response when WP_DEBUG_DISPLAY is on,
     // which would put text in front of the JSON-RPC body. Errors are read from last_error
     // below and turned into a refusal, so nothing is lost by not printing them.
     global $wpdb;
     $noisy = $wpdb->suppress_errors( true );
     try {
-      return self::gate_inner( $tool, $args, $definition, $caller );
+      return self::gate_inner( $tool, $args, $definition, $caller, $definitions );
     }
     finally {
       $wpdb->suppress_errors( $noisy );
     }
   }
 
-  private static function gate_inner( string $tool, array $args, ?array $definition, array $caller ): array {
+  private static function gate_inner( string $tool, array $args, ?array $definition, array $caller, array $definitions ): array {
     $mode = self::mode();
     if ( $mode === 'never' ) {
       return [ 'run' => true, 'claim' => 0 ];
     }
-    $class = self::classify_call( $definition, $args );
+    $class = self::classify_call( $definition, $args, $definitions );
     if ( !self::needs_approval( $mode, $class ) ) {
       return [ 'run' => true, 'claim' => 0 ];
     }

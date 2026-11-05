@@ -396,6 +396,7 @@ repeats the identical call and it runs once.
   (plugins, themes, users, options, settings, menus, and the writes of the optional
   groups). Content edits at the `read` and `write` level never wait.
 - Creating an account, and changing a password, email address or role on one (or anything on an account that can run the site), waits in both modes, because an agent that can make an administrator could sign in as it and approve its own calls. For the same reason an account that a tool call created or re-credentialed in the last 24 hours cannot answer requests: use another administrator account, or wait. Nothing on any screen clears that; `wp user meta delete <id> gmcp_changed_by_mcp` does.
+- An undo waits exactly where the write it would repeat waits: `wp_undo_change` is looked up in the change journal and held as the strictest tool that made the recorded change (an option put back waits in the wider mode; a post edit put back does not), and an entry it cannot find is held.
 - A pending request lapses after an hour. An approval lasts 15 minutes and works once, for
   that key, that tool and exactly those arguments (a hash of the canonical JSON, keyed so
   a stored row cannot be used to guess a password offline). A different argument, key or

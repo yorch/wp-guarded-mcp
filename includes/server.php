@@ -1648,7 +1648,7 @@ class GMCP_Server {
       //
       // It is before the dispatch, so a held call has done nothing at all.
       GMCP_Core::$gate_withheld = false;
-      $held = GMCP_Approvals::gate( (string) $tool, (array) $args, $this->tool_definitions[ $tool ] ?? null, $this->approval_caller() );
+      $held = GMCP_Approvals::gate( (string) $tool, (array) $args, $this->tool_definitions[ $tool ] ?? null, $this->approval_caller(), (array) $this->tool_definitions );
       $claim = (int) ( $held['claim'] ?? 0 );
       if ( empty( $held['run'] ) ) {
         // Not an isError reply when it is a wait: the call did not fail, it is pending, and

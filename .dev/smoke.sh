@@ -1528,6 +1528,58 @@ check "a string that holds a credential inside it is hidden whole" \
 check "a text-reordering character is shown as an escape, not applied" \
   "$(bv '{}' '$v=GMCP_Approvals::build_view(["note"=>"safe\u{202E}evil"],$d); echo strpos($v["text"],"\u{202E}")===false && strpos($v["text"],"\\u202e")!==false ? "escaped":"RAW";')" "escaped"
 
+echo "-- undo is the same write backwards, so the approval gate asks about the write it repeats --"
+# wp_undo_change is a write-level tool, so on its own name it is never held. It replays an
+# earlier value, though, and an option written back is the option written: in the wider mode
+# an admin key could not write the option (held) but could undo-write it (not held). The gate
+# now classifies an undo as the strictest tool that made the recorded change, and an entry it
+# cannot find as unknown, which is held. Controls: the same undo runs where the direct write
+# would, and the same direct write is held where the undo is.
+UN_DESC_WAS=$(wpe 'echo get_option("blogdescription");')
+UN_MODE_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "never";')
+unmode() { wpe '$o=get_option("gmcp_options",[]);$o["mcp_approval_mode"]="'"$1"'";update_option("gmcp_options",$o,false);' >/dev/null; }
+unstate() { py 'import json,sys;print(json.load(sys.stdin)["result"].get("data",{}).get("status","-"))' "$1"; }
+unmode never
+wpe 'update_option("blogdescription","UN first");' >/dev/null
+callk un "$K_ADMIN" "$(tool_json 1 wp_update_option '{"key":"blogdescription","value":"UN second"}')"
+UN_ENTRY=$(wpe 'foreach ( GMCP_Journal::recent( 30 ) as $e ) { if ( strpos( wp_json_encode( $e ), "blogdescription" ) !== false ) { echo $e["id"], " ", $e["call"]; break; } }')
+read -r UN_ID UN_CALL <<< "$UN_ENTRY"
+check "CONTROL: the journal holds the option change, and the option has the new value" \
+  "$([ -n "$UN_ID" ] && [ -n "$UN_CALL" ] && echo yes || echo no)/$(wpe 'echo get_option("blogdescription");')" "yes/UN second"
+
+unmode site
+callk un "$K_ADMIN" "$(tool_json 2 wp_update_option '{"key":"blogdescription","value":"UN direct"}')"
+check "CONTROL: in the wider mode the direct option write is held" "$(unstate un)/$(wpe 'echo get_option("blogdescription");')" "awaiting_human_approval/UN second"
+callk un "$K_ADMIN" "$(tool_json 3 wp_undo_change "{\"id\":\"$UN_ID\"}")"
+check "in the wider mode, undoing that option write by id is held too, and the option is unchanged" \
+  "$(unstate un)/$(wpe 'echo get_option("blogdescription");')" "awaiting_human_approval/UN second"
+callk un "$K_ADMIN" "$(tool_json 4 wp_undo_change "{\"call\":\"$UN_CALL\"}")"
+check "  and so is undoing the whole call" "$(unstate un)/$(wpe 'echo get_option("blogdescription");')" "awaiting_human_approval/UN second"
+
+unmode deletes
+callk un "$K_ADMIN" "$(tool_json 5 wp_undo_change '{"id":"no-such-entry"}')"
+check "an entry the gate cannot find is held, not passed" "$(unstate un)" "awaiting_human_approval"
+callk un "$K_ADMIN" "$(tool_json 6 wp_undo_change '{"id":"x","call":"y"}')"
+check "an undo naming both is held as unknown, not guessed at" "$(unstate un)" "awaiting_human_approval"
+callk un "$K_ADMIN" "$(tool_json 7 wp_undo_change "{\"id\":\"$UN_ID\"}")"
+check "CONTROL: in the narrower mode, where the direct write is not held either, the undo runs" \
+  "$(unstate un)/$(wpe 'echo get_option("blogdescription");')" "-/UN first"
+
+# A post edit is a write-level change: undoing one is not held in the wider mode.
+UN_POST=$(wpe 'echo wp_insert_post(["post_title"=>"UN draft","post_status"=>"draft"]);')
+unmode never
+callk un "$K_ADMIN" "$(tool_json 8 wp_update_post_meta "{\"ID\":$UN_POST,\"key\":\"un_meta\",\"value\":\"one\"}")"
+callk un "$K_ADMIN" "$(tool_json 9 wp_update_post_meta "{\"ID\":$UN_POST,\"key\":\"un_meta\",\"value\":\"two\"}")"
+UN_MID=$(wpe 'foreach ( GMCP_Journal::recent( 30 ) as $e ) { if ( strpos( wp_json_encode( $e ), "un_meta" ) !== false ) { echo $e["id"]; break; } }')
+check "CONTROL: a meta change is on record" "$([ -n "$UN_MID" ] && echo yes || echo no)/$(pmeta $UN_POST un_meta)" "yes/set:two"
+unmode site
+callk un "$K_ADMIN" "$(tool_json 10 wp_undo_change "{\"id\":\"$UN_MID\"}")"
+check "CONTROL: in the wider mode undoing a content edit is not held, because writing it is not" "$(unstate un)/$(pmeta $UN_POST un_meta)" "-/set:one"
+
+unmode "$UN_MODE_WAS"
+wpe 'update_option("blogdescription", base64_decode("'"$(printf '%s' "$UN_DESC_WAS" | base64 | tr -d '\n')"'")); wp_delete_post('"$UN_POST"', true); global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_approvals WHERE tool IN (\"wp_undo_change\",\"wp_update_option\")");' >/dev/null
+check "put back: the description and the mode" "$(wpe 'echo get_option("blogdescription");')/$(wpe 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "never";')" "$UN_DESC_WAS/$UN_MODE_WAS"
+
 echo "-- OAuth: the consent screen offers full or read-only, and the grant carries it --"
 JAR="$OUT/oauth.jar"
 curl -sS -c "$JAR" -b "$JAR" -d 'log=admin&pwd=admin&rememberme=forever&testcookie=1' "$BASE/wp-login.php" -o /dev/null 2>/dev/null
