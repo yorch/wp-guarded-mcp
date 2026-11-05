@@ -137,13 +137,13 @@ class GMCP_OAuth {
     }
     if ( strpos( $path, '/.well-known/oauth-protected-resource' ) === 0 ) {
       if ( $this->logging ) {
-        error_log( '[Guarded MCP OAuth] Host-root PRM hit: ' . $path );
+        error_log( '[Guarded MCP OAuth] Host-root PRM hit: ' . GMCP_Core::log_text( $path ) );
       }
       $this->emit_json( $this->protected_resource_metadata() );
     }
     if ( strpos( $path, '/.well-known/oauth-authorization-server' ) === 0 ) {
       if ( $this->logging ) {
-        error_log( '[Guarded MCP OAuth] Host-root ASM hit: ' . $path );
+        error_log( '[Guarded MCP OAuth] Host-root ASM hit: ' . GMCP_Core::log_text( $path ) );
       }
       $this->emit_json( $this->authorization_server_metadata() );
     }
@@ -426,7 +426,7 @@ class GMCP_OAuth {
     }
 
     if ( $this->logging ) {
-      error_log( '[Guarded MCP OAuth] Registered client: ' . $client_name . ' (' . $client_id . ')' );
+      error_log( '[Guarded MCP OAuth] Registered client: ' . GMCP_Core::log_text( $client_name ) . ' (' . GMCP_Core::log_text( $client_id ) . ')' );
     }
 
     $this->prune_orphan_clients();
@@ -478,9 +478,11 @@ class GMCP_OAuth {
     // because every branch below only renders a page in the user's browser. That
     // ambiguity has cost several support rounds.
     if ( $this->logging ) {
+      // redirect_uri is the one that carries a query string, which a client may use to pass
+      // anything it likes, so it is scrubbed like every other value taken from the request.
       error_log( '[Guarded MCP OAuth] → GET /oauth/authorize client_id='
-        . ( $params['client_id'] ?: '(none)' ) . ' redirect_uri=' . ( $params['redirect_uri'] ?: '(none)' )
-        . ' scope=' . $params['scope'] );
+        . GMCP_Core::log_text( $params['client_id'] ?: '(none)' ) . ' redirect_uri=' . GMCP_Core::log_text( $params['redirect_uri'] ?: '(none)' )
+        . ' scope=' . GMCP_Core::log_text( $params['scope'] ) );
     }
 
     if ( $params['response_type'] !== 'code' ) {
@@ -528,7 +530,7 @@ class GMCP_OAuth {
     // privileges they do not hold in WordPress itself.
     if ( !$this->user_can_authorize( $user->ID ) ) {
       if ( $this->logging ) {
-        error_log( '[Guarded MCP OAuth] ❌ Non-admin user ' . $user->ID . ' tried to authorize client ' . $params['client_id'] );
+        error_log( '[Guarded MCP OAuth] ❌ Non-admin user ' . $user->ID . ' tried to authorize client ' . GMCP_Core::log_text( $params['client_id'] ) );
       }
       $this->render_error_page( 'Only administrators can authorize MCP applications on this site.' );
       exit;
@@ -607,7 +609,7 @@ class GMCP_OAuth {
     ];
     if ( $this->logging && $code_data['resource'] !== ''
       && $code_data['resource'] !== rest_url( $this->namespace . '/http' ) ) {
-      error_log( '[Guarded MCP OAuth] Client asked for resource ' . $code_data['resource']
+      error_log( '[Guarded MCP OAuth] Client asked for resource ' . GMCP_Core::log_text( $code_data['resource'] )
         . ', we serve ' . rest_url( $this->namespace . '/http' ) . '. Accepted anyway.' );
     }
     set_transient( $this->auth_code_key( $code ), $code_data, self::AUTH_CODE_TTL );
@@ -618,7 +620,7 @@ class GMCP_OAuth {
     }
 
     if ( $this->logging ) {
-      error_log( '[Guarded MCP OAuth] Authorized user ' . get_current_user_id() . ' for client ' . $client_id
+      error_log( '[Guarded MCP OAuth] Authorized user ' . get_current_user_id() . ' for client ' . GMCP_Core::log_text( $client_id )
         . ' with ' . ( $readonly ? 'read-only' : 'full' ) . ' access' );
     }
 
@@ -641,7 +643,7 @@ class GMCP_OAuth {
     // permission problem. Tokens are never logged, only a short hash prefix so two lines
     // can be tied to the same grant.
     if ( $this->logging ) {
-      error_log( '[Guarded MCP OAuth] → /oauth/token grant_type=' . ( $grant_type ?: '(none)' ) );
+      error_log( '[Guarded MCP OAuth] → /oauth/token grant_type=' . GMCP_Core::log_text( $grant_type ?: '(none)' ) );
     }
 
     if ( $grant_type === 'authorization_code' ) {
@@ -651,7 +653,7 @@ class GMCP_OAuth {
       return $this->handle_token_refresh( $request );
     }
     if ( $this->logging ) {
-      error_log( '[Guarded MCP OAuth] ❌ Unsupported grant_type: ' . ( $grant_type ?: '(none)' ) );
+      error_log( '[Guarded MCP OAuth] ❌ Unsupported grant_type: ' . GMCP_Core::log_text( $grant_type ?: '(none)' ) );
     }
     return $this->oauth_error( 'unsupported_grant_type', 'Supported: authorization_code, refresh_token.', 400 );
   }

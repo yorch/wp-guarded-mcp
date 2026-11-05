@@ -1845,6 +1845,71 @@ check "a refresh that names the read-only scope does not lower a full grant eith
 callk o_c "$(cat "$OUT/oq_ro.tok")" "$(tool_json 57 wp_update_post "{\"ID\":$DO_LIVE,\"fields\":{\"post_title\":\"DO oauth write 3\"}}")"
 check "and after all those refreshes the read-only grant still cannot write" "$(verdict o_c)/$(ptitle $DO_LIVE)" "error/DO oauth write"
 
+echo "-- the debug log: no request value reaches error_log in the clear --"
+# The debug log is the channel an operator reads without thinking about credentials. It
+# printed the first thirty characters of a query or message, the whole of a string
+# argument, the client's self-reported name, and the redirect_uri of an authorize request,
+# each as it arrived. Measured before the fix: "smtp_pwd=<secret>" in a tool argument went
+# into the log intact, because redact() judged a string only by the preview-link rule.
+#
+# Five secrets, each sent through a different request path, each unique to this run. The
+# marker travels in the same values and must come back out of the log, so a log that was
+# never written, or a mu-plugin that did not take, cannot pass the absence checks.
+DL_RUN=$(python3 -c 'import secrets;print(secrets.token_hex(6))')
+DL_MARK="errlogprobe$DL_RUN"
+DL_ARG=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
+DL_BEARER=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
+DL_QUERY=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
+DL_GRANT=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
+DL_CLIENT=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
+DL_WAS=$(wpe 'global $gmcp_core; echo $gmcp_core->get_option("mcp_debug_mode") ? "on" : "off";')
+wpe 'global $gmcp_core; $o = $gmcp_core->get_all_options(true); $o["mcp_debug_mode"] = true; $gmcp_core->update_options($o);' >/dev/null
+# php -S and the web container both take error_log from the ini at request time, so an
+# mu-plugin that sets it is enough. The file lives in /tmp inside the container, not under
+# wp-content, so nothing web-reachable is left behind even if the cleanup below fails.
+docker compose exec -T wp sh -c 'rm -f /tmp/gmcp-errlog-probe.log' >/dev/null 2>&1
+docker exec -u 0 "${COMPOSE_PROJECT_NAME:-wptest}-wp-1" mkdir -p /var/www/html/wp-content/mu-plugins
+docker compose exec -T wp sh -c 'cat > /var/www/html/wp-content/mu-plugins/errlog-probe.php <<"PHPEOF"
+<?php
+ini_set( "error_log", "/tmp/gmcp-errlog-probe.log" );
+PHPEOF'
+# 1. A tool argument: a query with the secret in its key=value form, a message with a
+#    bearer credential in it, and the tool name carrying the marker.
+call dl_arg '{"jsonrpc":"2.0","id":90,"method":"tools/call","params":{"name":"gmcp_probe_'"$DL_MARK"'","arguments":{"query":"'"$DL_MARK"' smtp_pwd='"$DL_ARG"'","message":"'"$DL_MARK"' Bearer '"$DL_BEARER"'"}}}'
+# 2. The client's self-reported name, from initialize.
+call dl_client '{"jsonrpc":"2.0","id":91,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"'"$DL_MARK"' smtp_pwd='"$DL_CLIENT"'","version":"1"}}}'
+# 3. A query string: the authorize endpoint logs redirect_uri, and this one carries the
+#    marker and a key=value credential in its own query. The request is refused further on,
+#    which does not matter: the line is written before any check.
+curl -sS -o /dev/null "$BASE/wp-json/mcp/v1/oauth/authorize?response_type=code&client_id=probe&redirect_uri=https%3A%2F%2Fexample.test%2Fcb%3F$DL_MARK%26smtp_pwd%3D$DL_QUERY&scope=mcp&code_challenge=x&code_challenge_method=S256&state=s"
+# 4. A form field: the token endpoint logs grant_type, here a bearer credential in it.
+curl -sS -o /dev/null -X POST "$BASE/wp-json/mcp/v1/oauth/token" --data-urlencode "grant_type=Bearer $DL_GRANT" --data-urlencode "client_id=$DL_MARK"
+# The probes are done. Read the log, then put the site back, then compare: a guard test
+# must not leave the debug option, the mu-plugin or the log file behind.
+docker compose exec -T wp cat /tmp/gmcp-errlog-probe.log > "$OUT/errlog.txt" 2>/dev/null
+docker compose exec -T wp sh -c 'rm -f /tmp/gmcp-errlog-probe.log /var/www/html/wp-content/mu-plugins/errlog-probe.php' >/dev/null 2>&1
+wpe 'global $gmcp_core; $o = $gmcp_core->get_all_options(true); $o["mcp_debug_mode"] = '"$([ "$DL_WAS" = on ] && echo true || echo false)"'; $gmcp_core->update_options($o);' >/dev/null
+# CONTROLS first: the marker reached the log from each path, so the absence checks below
+# are reading a log that was written.
+check "CONTROL: the marker reaches the log from a tool argument and the tool name" \
+  "$([ "$(grep -c -- "gmcp_probe_$DL_MARK" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+check "CONTROL: the marker reaches the log from the client name" \
+  "$([ "$(grep -c -- "Client: $DL_MARK" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+check "CONTROL: the marker reaches the log from the authorize query string" \
+  "$([ "$(grep -c -- "example.test/cb?$DL_MARK" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+check "CONTROL: the marker reaches the log from the token form" \
+  "$([ "$(grep -c -- "client_id=$DL_MARK\|grant_type=Bearer" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+# The redacted form is the proof that a value was scrubbed rather than the line dropped.
+check "CONTROL: a secret was replaced by the marker, not the line dropped" \
+  "$([ "$(grep -c -- 'smtp_pwd=\[redacted\]' "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+check "a tool argument's secret is absent from the log" "$(grep -c -- "$DL_ARG" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "a bearer credential in an argument is absent from the log" "$(grep -c -- "$DL_BEARER" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "a secret in the client's self-reported name is absent from the log" "$(grep -c -- "$DL_CLIENT" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "a secret in an authorize query string is absent from the log" "$(grep -c -- "$DL_QUERY" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "a bearer credential in a token form field is absent from the log" "$(grep -c -- "$DL_GRANT" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "the debug option is back as it was" \
+  "$(wpe 'global $gmcp_core; echo $gmcp_core->get_option("mcp_debug_mode") ? "on" : "off";')" "$DL_WAS"
+
 # Put the site back: the fixtures, the keys, the grants. A guard test must not leave them.
 wpe 'foreach(get_posts(["post_status"=>"any","post_type"=>["post","page","attachment"],"numberposts"=>-1,"s"=>"DO "]) as $p){ if(strpos($p->post_title,"DO ")===0){wp_delete_post($p->ID,true);} } foreach(wp_get_nav_menus() as $m){ if($m->name==="DO net menu"){wp_delete_nav_menu($m->term_id);} } foreach(GMCP_Tokens::all() as $t){ if(in_array($t["label"],["drafts only writer","plain writer","drafts only admin","pre-flag writer","do admin"],true)){GMCP_Tokens::revoke($t["id"]);} } global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_tokens WHERE client_id IN (SELECT client_id FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\")"); $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\"");' >/dev/null
 

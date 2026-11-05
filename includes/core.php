@@ -1807,6 +1807,61 @@ class GMCP_Core {
   }
 
   /**
+  * Text that is about to be written down: a preview link's token, and any credential
+  * written as an assignment inside the text.
+  *
+  * redact() judges a string only by the preview-link rule, so a string value is written
+  * whole, and "smtp_pwd=hunter2" inside a search query went into the debug log as the
+  * query's first thirty characters, and into the argument dump as the whole string. A
+  * credential in a URL or a free-text field is named by the key in front of it, the same
+  * way a field is, so the key decides here too: a key that field_looks_secret() flags has
+  * its value blanked, and a Bearer or Basic credential is blanked whatever it is named.
+  *
+  * Still structural. A bare token with no key in front of it is not recognised, and this
+  * says so rather than pretending otherwise.
+  */
+  public static function scrub_written_text( string $text ): string {
+    $text = self::scrub_preview_tokens( $text );
+    if ( $text === '' ) {
+      return $text;
+    }
+    $text = (string) preg_replace( '/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/=-]{8,}/i', '$1 ' . self::REDACTION_MARKER, $text );
+    $names = [];
+    foreach ( (array) self::credential_field_patterns() as $pattern ) {
+      if ( is_string( $pattern ) && $pattern !== '' ) {
+        $names[] = preg_quote( $pattern, '/' );
+      }
+    }
+    if ( !$names ) {
+      return $text;
+    }
+    // A name that contains a credential word, followed by a separator (= : => or their
+    // URL-encoded forms, with an optional closing quote), then the value up to the next
+    // delimiter. The name class admits the brackets and dots of form and query names.
+    // The lookahead keeps this idempotent: a value already replaced by the marker is left
+    // as it is, because the marker's own brackets would otherwise end the value early and
+    // leave a stray "]" behind on a second pass (log_text() scrubs what redact() has done).
+    $re = '/([A-Za-z0-9_.\-\[\]]*(?:' . implode( '|', $names ) . ')[A-Za-z0-9_.\-\[\]]*)'
+      . '(["\']?\s*(?:=>|=|:|%3D|%3A|%3d|%3a)\s*["\']?)(?!\[redacted\])[^\s&,;"\'}\])<>]+/i';
+    return (string) preg_replace( $re, '$1$2' . self::REDACTION_MARKER, $text );
+  }
+
+  /**
+  * One request-derived value, as a debug line may carry it: a scalar as text, an array or
+  * object as its redacted JSON, with the text scrub applied either way.
+  *
+  * Every log line that prints something a client sent goes through this. The value is
+  * scrubbed before anything truncates it, so a cut cannot leave a secret's head visible.
+  */
+  public static function log_text( $value ): string {
+    if ( is_array( $value ) || is_object( $value ) ) {
+      $json = wp_json_encode( self::redact( $value ) );
+      return self::scrub_written_text( is_string( $json ) ? $json : '' );
+    }
+    return self::scrub_written_text( (string) $value );
+  }
+
+  /**
   * A copy of a value with anything credential-shaped replaced.
   *
   * Unlike holds_credential() above, which refuses the whole value if any part of it
@@ -1833,7 +1888,7 @@ class GMCP_Core {
       $value = get_object_vars( $value );
     }
     if ( is_string( $value ) ) {
-      return $scrub_preview ? self::scrub_preview_tokens( $value ) : $value;
+      return $scrub_preview ? self::scrub_written_text( $value ) : $value;
     }
     if ( !is_array( $value ) ) {
       return $value;

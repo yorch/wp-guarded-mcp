@@ -403,7 +403,7 @@ class GMCP_Audit {
     $wpdb->suppress_errors( $noisy );
     $locked = ( (string) $got === '1' );
     if ( (string) $got === '0' ) {
-      error_log( '[Guarded MCP] audit chain lock not obtained within 5 seconds for ' . $row['tool']
+      error_log( '[Guarded MCP] audit chain lock not obtained within 5 seconds for ' . GMCP_Core::log_text( $row['tool'] )
         . '; writing the entry unserialised, so the chain may fork here.' );
     }
 
@@ -454,8 +454,10 @@ class GMCP_Audit {
       // older than the code, which the constructor tries to rule out. Say so loudly
       // rather than returning quietly, because the alternative is a log that is wrong
       // and looks intact.
-      error_log( '[Guarded MCP] audit entry NOT recorded for ' . $row['tool'] . ': '
-        . ( $wpdb->last_error ?: 'the database reported no error' ) );
+      // last_error is the database's own text, which on a duplicate key or a rejected value
+      // can quote the row it was writing: the arguments are in that row.
+      error_log( '[Guarded MCP] audit entry NOT recorded for ' . GMCP_Core::log_text( $row['tool'] ) . ': '
+        . GMCP_Core::log_text( $wpdb->last_error ?: 'the database reported no error' ) );
     }
   }
 

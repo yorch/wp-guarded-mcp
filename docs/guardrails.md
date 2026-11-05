@@ -343,12 +343,21 @@ something that looks harmless and is not, so each says what it cannot promise.
   `gmcp[preview]`, percent-encoded characters in the name or the `=`) out of every
   string it is handed on the logging paths, which is what the audit log's
   arguments and the debug trace both use, and the audit log applies the same
-  scrub to the reply it keeps. It does not scrub what a tool returns to its caller:
-  a stored theme mod or field that happens to contain the text is the site's own
+  scrub to the reply it keeps. On those same paths a credential written as an
+  assignment inside a string is blanked as well: a name that field_looks_secret()
+  flags, followed by `=`, `:` or `=>` (plain or percent-encoded), so `smtp_pwd=...`
+  in a query or a message, and a `Bearer` or `Basic` credential whatever it is
+  named. It is structural, not a guess about content: a bare token with no key in
+  front of it is not recognised, and nothing says it is. It does not scrub what a
+  tool returns to its caller: a stored theme mod or field that happens to contain
+  the text is the site's own
   data, and the readers pass `scrub_preview = false` so it comes back as stored. The
   debug trace prints a call's arguments through `redact_call_args()`, the same answer
   the audit log gives, so a value under a credential-named option or meta key is not
-  printed there either. Without it the tool that hands the link out would
+  printed there either. Every other value the trace writes that a client sent (the
+  tool name, the client's own name and version, a requested redirect URI, a grant
+  type, an exception message) goes through `GMCP_Core::log_text()`, and a session
+  id is written as its first eight characters. Without it the tool that hands the link out would
   have written it into the audit log in the clear in the same call, which the
   first test of it showed. The fetch tool refuses a URL carrying the parameter
   for the same reason: it would be recorded as an argument, and a preview

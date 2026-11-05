@@ -110,10 +110,14 @@ there, which is the failure this whole file is about.
 **Credential-shaped data never reaches the journal, the audit log, or the debug
 error_log.** `user_pass` is dropped unconditionally, and
 `GMCP_Core::field_looks_secret()` is the single answer both subsystems ask, so the
-two cannot drift apart. The debug `error_log` at `server.php:604` routes tool
-arguments through `GMCP_Core::redact()` for the same reason: it is a third channel
-the same credential can reach, and a channel with no redaction is a leak waiting
-for the first caller that passes a secret.
+two cannot drift apart. The debug `error_log` is a third channel the same credential
+can reach, and a channel with no redaction is a leak waiting for the first caller
+that passes a secret. So every debug line that prints something a client sent goes
+through `GMCP_Core::log_text()`, which redacts arrays through `redact()` and then
+blanks a credential written as an assignment inside a string (`smtp_pwd=...`, a
+`Bearer` token). `GMCP_Logging` scrubs every message it writes as well, so a line
+added later without the helper is still covered. A bare token with no key in front
+of it is not recognised by any of this, and nothing in the docs claims it is.
 
 **There is no restore tool, at any access level.** Backups can be started and read. That is
 deliberate and not an omission to be helpfully filled in.
