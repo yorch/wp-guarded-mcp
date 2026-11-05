@@ -889,6 +889,26 @@ final class GMCP_Diag_Util {
   /* ----------------------------------------------------------------- preview tokens */
 
   /**
+  * The token in a one-time download or upload URL, cut out of a string. "" when PCRE gave up,
+  * which the caller reads as "withheld" (@see GMCP_Core::scrubbed_or_withheld()).
+  *
+  * Linear: the token is a possessive run of alphanumerics, the separators have no nested
+  * quantifier over the same characters, and nothing here is re-scanned from a later position.
+  */
+  private static function scrub_transfer_tokens( string $text ): string {
+    $sep = '(?:\\\\*+/|%2[Ff])';
+    $out = preg_replace(
+      [
+        '#(' . $sep . 'download' . $sep . ')[A-Za-z0-9]{8,}+#i',
+        '#(v1' . $sep . '(?:upload|export)' . $sep . ')[A-Za-z0-9]{8,}+#i',
+      ],
+      '$1[redacted]',
+      $text
+    );
+    return is_string( $out ) ? $out : '';
+  }
+
+  /**
   * A preview link's token cut out of a string, whichever way the parameter name was spelled.
   *
   * PHP turns "gmcp.preview", "gmcp preview" and "gmcp[preview" into $_GET['gmcp_preview'],
@@ -903,18 +923,22 @@ final class GMCP_Diag_Util {
   * reader. Not for what a tool returns to its caller about the site's own data.
   */
   public static function scrub_preview_tokens( string $text ): string {
-    if ( stripos( $text, 'preview' ) === false && stripos( $text, 'download' ) === false
-      && stripos( $text, 'upload' ) === false && stripos( $text, 'export' ) === false
-      && stripos( $text, '%' ) === false ) {
+    if ( stripos( $text, 'preview' ) === false && stripos( $text, 'download' ) === false && stripos( $text, 'upload' ) === false && stripos( $text, 'export' ) === false && stripos( $text, '%' ) === false ) {
       return $text;
     }
-    // The one-time URLs are bearer credentials too, and the tool reply that hands one out is
-    // copied into this log. Their tokens are alphanumeric, so they need none of the
-    // percent-encoding handling below: cut the path segment and keep the route. Upload,
-    // download and export differ only in the route they sit under. The reply is JSON, so its
-    // slashes may arrive escaped as \/ and the pattern has to accept either spelling; the
-    // first version did not, and a token in an escaped URL sat in the log unredacted.
-    $text = (string) preg_replace( '#(\\\\?/(?:download|upload|export)\\\\?/)[A-Za-z0-9]{8,}#i', '$1[redacted]', $text );
+    // A one-time download or upload URL is a bearer credential too, and the tool reply that
+    // hands it out is copied into the audit log. The token is alphanumeric, so the value needs
+    // none of the handling below, but the SEPARATORS do: the reply is JSON, and wp_json_encode
+    // writes "/" as "\/", so a pattern that looked for a bare "/download/" matched the URL in the
+    // tool's own reply nowhere and the token was stored in the audit log's detail column in the
+    // clear (measured). Each separator is therefore a slash with any number of backslashes in
+    // front of it (the reply quoted inside another JSON string doubles them), or its %2F form (a
+    // site on plain permalinks puts the route in a query string and percent-encodes it).
+    // The upload and export routes are matched only under mcp/v1, because both are ordinary words in a path.
+    $text = self::scrub_transfer_tokens( $text );
+    if ( $text === '' ) {
+      return '';
+    }
     static $re = null;
     if ( $re === null ) {
       $lit = static function ( string $word ): string {

@@ -703,6 +703,35 @@ check( 'control: text with no preview key is untouched', $sp( "see https://x/?p=
 check( 'control: the word preview alone is untouched', $sp( 'a preview of the page' ), 'a preview of the page' );
 check( 'scrub_log_line applies it too', strpos( GMCP_Diag_Util::scrub_log_line( "404 /?gmcp.preview=$tok", [] ), $tok ) === false, true );
 
+echo "-- scrub_preview_tokens: one-time download and upload URLs --\n";
+// The reply that hands the URL out is JSON, and wp_json_encode writes "/" as "\/", so the form that
+// is actually recorded in the audit log is the escaped one. The first scrub looked for "/download/"
+// only and passed that form through (measured on a live site: the token sat in the detail column).
+$dl = 'Zk3Qm9Lp2Rt7Xw4Vb8Nc5Hd1Jf6Gs0A';
+$route = 'wp-json/mcp/v1/download/';
+$reply = (string) json_encode( [ 'download_url' => "https://x/{$route}{$dl}", 'usage' => "curl -L \"https://x/{$route}{$dl}\"" ], JSON_PRETTY_PRINT );
+foreach ( [
+  'a plain URL' => "https://x/{$route}{$dl}",
+  'the JSON-escaped URL a tool reply holds' => str_replace( '/', '\\/', "https://x/{$route}{$dl}" ),
+  'a reply quoted inside a second JSON string' => str_replace( '/', '\\\\/', "https://x/{$route}{$dl}" ),
+  'the whole reply as the audit log stores it' => $reply,
+  'a plain-permalink URL, percent-encoded' => "https://x/?rest_route=%2Fmcp%2Fv1%2Fdownload%2F{$dl}",
+  'a plain-permalink URL, lower-case percent-encoding' => "https://x/?rest_route=%2fmcp%2fv1%2fdownload%2f{$dl}",
+  'an upload URL' => "https://x/wp-json/mcp/v1/upload/{$dl}",
+  'the JSON-escaped upload URL' => str_replace( '/', '\\/', "https://x/wp-json/mcp/v1/upload/{$dl}" ),
+  'a plain-permalink upload URL' => "https://x/?rest_route=%2Fmcp%2Fv1%2Fupload%2F{$dl}",
+] as $label => $text ) {
+  check( "control: the $label probe holds the token", strpos( $text, $dl ) !== false, true );
+  $out = $sp( $text );
+  check( "scrubbed: $label (token gone)", strpos( $out, $dl ) === false, true );
+  check( "  ...and marked ($label)", strpos( $out, '[redacted]' ) !== false, true );
+  check( "  ...and the route is kept ($label)", (bool) preg_match( '#(download|upload)#', $out ), true );
+  check( "stable: $label is unchanged by a second pass", $sp( $out ), $out );
+}
+check( 'control: an ordinary uploads path is untouched', $sp( 'see wp-content/uploads/2026/11/holiday-photo.jpg' ), 'see wp-content/uploads/2026/11/holiday-photo.jpg' );
+check( 'control: a short path segment after /download/ is untouched', $sp( 'https://x/download/readme' ), 'https://x/download/readme' );
+check( 'control: the word download alone is untouched', $sp( 'a download of the report' ), 'a download of the report' );
+check( 'control: a bare /upload/ path outside the plugin route is untouched', $sp( "https://x/upload/{$dl}" ), "https://x/upload/{$dl}" );
 // The upload and export endpoints hand out a token in the path for the same reason the
 // download one does, and their replies are copied into the same audit log. Each check has
 // a control on a nearby ordinary URL, so "the token is gone" cannot be the scrubber
