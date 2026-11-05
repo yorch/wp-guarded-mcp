@@ -3227,6 +3227,23 @@ d=json.loads(raw) if raw else {}
 d=d if isinstance(d,dict) else {}
 print(",".join(str(g["post"]) for g in sorted(d.values(), key=lambda g:g["post"])))'; }
 pv_status() { curl -sS -o "$OUT/pv_body" -w '%{http_code}' "$BASE$1"; }
+# Counts a marker where the post body is rendered, not across the whole page: an SEO plugin
+# emits the body as og:description, twitter:description and in its JSON-LD graph, so a plain
+# `grep -c` on the page returns 2 or more on a site with one active while the body it is
+# asserting is present exactly once. Inside the content element when the theme has one; if it
+# has none, the page with its <meta>, <script> and <title> elements removed, which is where
+# those plugins put the copies.
+pv_body_count() { python3 - "$OUT/pv_body" "$1" <<'PYEOF'
+import re, sys
+html = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+m = re.search(r'<div[^>]*class="[^"]*entry-content[^"]*"[^>]*>(.*?)</div>', html, re.S)
+if m:
+    scope = m.group(1)
+else:
+    scope = re.sub(r'<(script|title)\b.*?</\1>|<meta\b[^>]*>', '', html, flags=re.S | re.I)
+print(scope.count(sys.argv[2]))
+PYEOF
+}
 docker compose exec -T cli wp option delete gmcp_preview_links >/dev/null 2>&1
 
 PV_A=$(docker compose exec -T cli wp post create --post_status=draft --post_title="PV alpha" --post_content="PVMARK-ALPHA" --porcelain 2>/dev/null | tr -d '\r\n')
@@ -3243,7 +3260,7 @@ check "stored state: the token itself is not in the row" "$(pv_stored | grep -c 
 check "control: that grep finds a token in text that holds it" "$(echo "x$PV_TOKEN" | grep -c "$PV_TOKEN")" "1"
 
 check "the draft shows with its token" "$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_TOKEN")" "200"
-check "...and the body is the draft" "$(grep -c PVMARK-ALPHA "$OUT/pv_body")" "1"
+check "...and the body is the draft" "$(pv_body_count PVMARK-ALPHA)" "1"
 check "without the token the same URL is a 404" "$(pv_status "/?p=$PV_A&post_type=post")" "404"
 check "...and shows nothing" "$(grep -c PVMARK-ALPHA "$OUT/pv_body")" "0"
 check "the token does not open another draft" "$(pv_status "/?p=$PV_B&post_type=post&gmcp_preview=$PV_TOKEN")" "404"
