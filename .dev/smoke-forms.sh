@@ -73,6 +73,16 @@ wpe() { docker compose exec -T cli wp eval "$1" 2>/dev/null | tr -d '\r\n'; }
 tc() { printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$1" "$2"; }
 setopt() { docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_forms"]='"$1"';$o["mcp_tools_core"]=true;update_option("gmcp_options",$o,false);' >/dev/null 2>&1; }
 setopt true
+# wp_create_preview_link lives in the administration group, which defaults to off. Block 0 calls
+# it as the control for the preview guard, so the group is switched on for the length of this run
+# and put back at the end. Without this the suite only passed on a stack where an earlier suite
+# had left the group on, and on a fresh one reported "requires 'admin' access" as two failures
+# that described the guard rather than the missing switch.
+ADMIN_WAS=$(wpe 'echo empty(get_option("gmcp_options",[])["mcp_tools_admin"])?"false":"true";')
+setadmin() { docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_admin"]='"$1"';update_option("gmcp_options",$o,false);' >/dev/null 2>&1; }
+setadmin true
+check "CONTROL: the administration group (preview links) is on for this run" \
+  "$(wpe 'global $gmcp_core;echo $gmcp_core->get_option("mcp_tools_admin")?"on":"off";')" "on"
 CLEAN=""
 
 # ---------------------------------------------------------------------------------------------
@@ -532,6 +542,7 @@ callas "$RO" sw_gen "$(tc wp_get_post_meta "{\"ID\":$NF}")"
 check "and the generic readers still refuse submission posts with the group off" "$(verdict sw_gen)" "error"
 
 echo "-- cleanup --"
+setadmin "$ADMIN_WAS"
 for p in $CLEAN; do wpe 'wp_delete_post('"$p"',true);' >/dev/null; done
 
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
