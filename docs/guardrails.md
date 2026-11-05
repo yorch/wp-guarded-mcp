@@ -1407,9 +1407,12 @@ private statuses count, and the comparison ignores case and trailing spaces, bec
 the posts table does and a stricter PHP check would call "Publish " a draft that every
 query finds. Unpublishing a live post is refused as well as publishing: taking a page
 down is a change to what the public sees. An attachment takes its parent's visibility,
-so media on a live page is protected and media on a draft, or on nothing, can be made
-and edited. Deleting unattached media is refused, because it can be a live page's
-featured image.
+so media attached to a live page is protected, and media attached to a draft can be made
+and edited. Media attached to NOTHING can be uploaded but neither edited (`wp_update_media`,
+or `wp_update_post` on an attachment) nor deleted: such a file can be a live page's featured
+image or an embed, and nothing here can find the pages that use it, so the guard refuses the
+case it cannot judge. An earlier version allowed the edit and said so in this paragraph;
+retitling or re-captioning a file changes what every live page showing it displays.
 
 **A net sits under the tools.** The tool-level checks give a clear sentence and stop
 before anything is half written, but a list of tools is not a proof that none was
@@ -1427,9 +1430,21 @@ because a pre-filter that returns false makes the caller believe it wrote.
 tools does either for content. That is why a drafts-only key is capped at read and
 write: the groups that reach third-party code (options, menus, the page builders, SEO
 and form plugins) are admin-level and are not offered to it. The
-cap is applied when the key is made and again whenever the key is presented. Comments,
-orders, taxonomy terms, users and options are not posts and are not covered. Pair the
-flag with a tool list when the key should do less than that.
+cap is applied when the key is made and again whenever the key is presented.
+
+**What it covers, and what it does not.** Covered: posts and what is stored as posts
+(pages, products, menu items), their custom fields, term assignments, featured image, and
+attachments attached to a post. Not covered, so a drafts-only key can still do these:
+create, approve and edit comments (`wp_create_comment`, `wp_update_comment`); create and
+rename taxonomy terms (`wp_create_term`, `wp_update_term`: renaming a category changes every
+live post in it, and deleting one needs `admin`); change users and options (`admin`, capped
+away); act on orders and subscriptions (the generic post tools refuse those for every
+key, the shop tools are `admin`); and share a draft by preview link, which shows it to
+whoever holds the URL. Edits to media attached to no post are refused (see above), and a
+draft can still embed media or shortcodes that render live data. An earlier version of the
+refusal text and the key's label said the key cannot touch "anything that is live", which
+was wider than any of this and has been narrowed to what is true. Pair the flag with a
+tool list when the key should do less than that.
 
 A refusal is an ordinary tool failure, so the audit log records it as a refusal under
 the key's label. Keys made before the flag exist have no `drafts_only` field, which
@@ -1464,6 +1479,47 @@ made here and the previous one is still there to switch back to. A site that
 genuinely wants an import has the Elementor screen for it, where a person sees
 what is about to happen.
 
+## Deletion by another name
+
+The `readwrite` level is defined as "create and update, no destructive tools", and the
+approval queue holds a call by what its tool is. Both promises were true of the tool names
+and false of the data. WordPress deletes on a schedule it reads from ordinary rows: every
+day `wp_scheduled_delete()` permanently deletes each post that carries a
+`_wp_trash_meta_time` older than `EMPTY_TRASH_DAYS`, and `wp_delete_auto_drafts()`
+force-deletes each auto-draft whose `post_date` is more than seven days old. So a
+`readwrite` key could set `post_status` to `trash` through `wp_update_post`, stamp the post
+with a timestamp from 1970 through any meta writer, and wait for the daily job (or call
+`wp_run_cron_event`, which was not held) to destroy it: a permanent delete with no
+approval and no second call, from the level that has no delete tool. Confirmed by running
+it, not by reading it.
+
+- **A status that is a deletion is refused.** `wp_update_post` and `wp_update_comment`
+  refuse a status of `trash`, and `wp_update_post` refuses `auto-draft`, with a sentence
+  pointing at `wp_delete_post` / `wp_delete_comment`. Refused rather than rerouted or held
+  by argument, because the honest tool already exists, is held by its name, and a second
+  door that merely behaves like it would have to be found and held again by every tool
+  that ever takes a status. `wp_alter_post` and `wp_update_media` write no status, and the
+  generated REST tools reject both values in the route's own enum (checked). Setting a
+  trashed post back to `draft` still works.
+- **The schedule itself is not writable.** Every meta key beginning `_wp_trash_meta_` is
+  refused by every tool that writes post meta (update, delete, copy, chunk, `meta_input`
+  on create and update). Matching ignores case and trailing spaces because the column
+  compares that way. Reading one is allowed. Because other plugins write meta through the
+  same three WordPress functions, the same refusal also sits under them while a tool call
+  is in flight (`GMCP_Core::trash_meta_net()`), letting through only core's own
+  `wp_trash_post`, `wp_untrash_post` and `wp_delete_post`, which write and clear the key
+  themselves. Not protected, and why: `_edit_lock`, `_wp_desired_post_slug` and
+  `_wp_old_slug` only name an editor, a slug to restore and a redirect from a slug the
+  writer could have set directly; none removes anything.
+- **The approval gate asks the arguments too.** `GMCP_Approvals::classify_call()` widens a
+  call whose arguments carry a deletion status (`post_status`, `status` or
+  `comment_approved`, top level or inside `fields`) to `destructive`, whatever the tool is
+  called. It only widens, and a read tool that is merely listing trashed things keeps its
+  class.
+- **Running a scheduled event is destructive.** `wp_run_cron_event` fires every callback
+  on a hook, and its own description says they can delete files. `run` is now one of the
+  destructive verbs. `wp_unschedule_cron_event` already was.
+
 ## Human approval
 
 The two-step confirmation on irreversible tools is minted by the server and handed to
@@ -1484,7 +1540,10 @@ the second half.
   to approved, and `decide()` refuses unless the request is a wp-admin page load with a
   logged-in cookie belonging to the current user (a bearer key or OAuth grant sets the
   current user without a cookie), `manage_options`, a nonce bound to the request and the
-  verdict, and no tool call or REST request in flight. There is no tool that reads,
+  verdict, no tool call or REST request in flight, and an account that no tool call has
+  created or re-credentialed in the last 24 hours (see "An account the agent made" below).
+  A cookie proves a session, not a person: an agent that can make an administrator can
+  sign in as one. There is no tool that reads,
   lists, approves, declines or edits the queue, and the setting and the table are not
   reachable through the option tools (`gmcp_` rows are refused by name; the queue is not an
   option at all).
@@ -1503,16 +1562,56 @@ the second half.
 - **What counts.** Derived from each tool's own registration, not from a list of names.
   `unknown` (no definition, or no recognised level) and `destructive` (a destructive hint
   or verb, which outranks the level) are held in both modes. In the wider mode so is
-  `site`: any other admin-level write. `read` and `write` levels never wait. That relies on
+  `site`: any other admin-level write. A fourth class, `account`, waits in both modes (see
+  below). `read` and `write` levels never wait. That relies on
   the README's definition of the `write` level as having no destructive tools, which
   `smoke-admin.sh` checks against the registered tools. Honest limits: a destructive admin
   tool with no hint and a verb outside the list is a site change, so it waits only in the
-  wider mode; `wp_undo_change` (write level) replays earlier values and is not gated; the
-  `wp_upload_request` endpoint is not a tool call; a preview waits like the call it
+  wider mode; the `wp_upload_request` endpoint is not a tool call; a preview waits like the call it
   previews, because the setting cannot tell the two apart.
-- **What a person sees.** The tool, the key, and the arguments as the audit log would
-  record them. A credential-shaped value is hidden, so it is approved unseen and covered
-  by the hash. Long arguments are shortened on screen only.
+- **An undo is the write it repeats.** `wp_undo_change` is a write-level tool, so on its name
+  alone it never waits, but it replays earlier values: in the wider mode a key held for
+  `wp_update_option` could put an option back, unheld. `classify_call()` looks the recorded
+  entry up (by `id`, or every entry of a `call`) and holds the undo as the strictest tool that
+  made the change, using the same list the undo itself asks "can this caller call it" about
+  (`GMCP_Journal::undo_tools()`). An entry it cannot find, a call naming both `id` and `call`,
+  or a recorded tool with no registration here is `unknown`, held in every mode. So an undo of
+  a post or meta edit waits where writing it would (never), and an undo of an option waits
+  where writing the option does (the wider mode).
+- **An account the agent made cannot answer for the agent.** In mode `deletes` an admin key
+  could create an administrator with a password it chose (`wp_create_user` and
+  `wp_update_user` were `site` changes, which wait only in the wider mode), sign in at
+  `wp-login.php`, and approve its own held calls. Reproduced end to end. Two locks. First,
+  `classify_call()` gives a user tool the `account` class, held in every mode but `never`:
+  every creation, any update that touches a password, an address, a role (a demotion too:
+  "the lowest role" is the site's own `default_role`) or a field outside the display fields,
+  any update to an account holding a privileged capability, and any argument outside the
+  tool's schema. Only a display-name-style edit of an ordinary account is left to the mode.
+  Second, `watch_accounts()` records, in user meta, any account that a tool call created or
+  whose password, address or role it changed, and `session_problem()` refuses that account
+  the approval screen for 24 hours, with its own message on the screen and in `decide()`.
+  This covers the call that got through the first lock (mode `never` at the time, a plugin's
+  own tool). The cost is real: an administrator whose own password an agent changed, or
+  who asked an agent to make them an account, approves from another administrator's account
+  or waits a day. There is no button to clear it, because a button is the way round;
+  `wp user meta delete <id> gmcp_changed_by_mcp` does. Mode `never` still holds nothing, and
+  the plugin cannot make an agent that was told to create an administrator in that mode
+  stop; it can only keep that administrator from approving anything. Not covered: a tool
+  that changes an account in some way the user tools' names do not say.
+- **What a person sees.** Exactly what the hash covers, or the call is not queued. The
+  screen once printed the arguments in the order the client sent them, cut at 4000
+  characters, with credential-shaped values hidden: three ways to show a different call
+  from the one approved. `GMCP_Approvals::build_view()` now makes the one view, at queue
+  time, and the screen prints it unchanged. Arguments are sorted (the tool's declared ones
+  first, objects sorted all the way down). A call is refused, with a normal error the agent
+  can read, if it carries an argument the tool's schema does not declare, if it is a list of
+  unnamed values, if it nests more than 12 levels, or if its arguments written out exceed
+  16000 bytes: an approval covers every byte, so it is not asked for what cannot be read.
+  A credential-shaped field, a string that holds one, and a preview-link token show as
+  `[redacted]`, and the screen says how many values are hidden and names their paths, so a
+  person knows a value they cannot see is part of what they approve. Bidirectional and
+  zero-width characters are shown as escapes. Rows stored before this existed are labelled
+  as possibly incomplete.
 - **A held call is not a success.** The reply is a normal result, not `isError`, so a
   client does not send the agent looking for a workaround; the audit log records the call
   as refused, because nothing ran. Requests, approvals, declines, lapses, uses and refused

@@ -313,7 +313,7 @@ class GMCP_Settings {
       .gmcp-verdict-broken { border-left-color: #d63638; }
       /* A refusal is worth spotting from across the table, not by reading it. */
       tr.gmcp-row-refused td { box-shadow: inset 3px 0 0 #d63638; }
-      .gmcp-args { white-space: pre-wrap; font-size: 11px; margin: 4px 0 0; }
+      .gmcp-args { white-space: pre-wrap; font-size: 11px; margin: 4px 0 0; max-height: 28em; overflow: auto; }
       .gmcp-summary { cursor: pointer; color: #2271b1; font-size: 12px; }
       .gmcp-limits { font-size: 11px; }
       .gmcp-intro { max-width: 800px; }
@@ -1159,10 +1159,10 @@ class GMCP_Settings {
           <td>
             <label for="key_drafts_only">
               <input type="checkbox" id="key_drafts_only" name="key_drafts_only" value="1">
-              <?php esc_html_e( 'Never publish, schedule or change anything that is live', 'guarded-mcp' ); ?>
+              <?php esc_html_e( 'Never publish, schedule or change a post that is live', 'guarded-mcp' ); ?>
             </label>
             <p class="description">
-              <?php esc_html_e( 'The key can create and edit drafts and pending posts, and upload media for them. It is refused any write that would publish, schedule or make a post private, and any edit, deletion or unpublishing of a post that is already live, whichever tool is used. Comments, orders, terms and users are not posts and are not covered by this setting. Because full administration reaches tools this cannot police, a drafts-only key is held to read and write.', 'guarded-mcp' ); ?>
+              <?php esc_html_e( 'The key can create and edit drafts and pending posts, and upload media for them. It is refused any write that would publish, schedule or make a post private, and any edit, deletion or unpublishing of a post that is already live, whichever tool is used. That covers posts and what is stored as posts, their custom fields, categories and tags, featured image and attached media. Media attached to no post cannot be edited or deleted by this key, because a live page may be showing it. It does NOT cover comments, taxonomy terms (renaming a category changes every live post in it), users or options, and it does not stop a preview link being made for a draft. Because full administration reaches tools this cannot police, a drafts-only key is held to read and write.', 'guarded-mcp' ); ?>
             </p>
           </td>
         </tr>
@@ -1632,6 +1632,10 @@ class GMCP_Settings {
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'When this is switched on, a tool call that would delete something or change the site does not run. It waits here for you. The agent is told it is waiting and cannot approve it: there is no tool that does, and an approval only counts when it comes from you, signed in to wp-admin. After you approve, the agent repeats the same call and it runs once. An approval is for one key, one tool and exactly those arguments; it lapses after 15 minutes unused, and an unanswered request lapses after an hour. The two-step confirmation on irreversible tools still applies inside an approved call.', 'guarded-mcp' ); ?></p>
 
+    <?php if ( GMCP_Approvals::session_problem() === 'recent_change' ) : ?>
+      <div class="notice notice-warning inline"><p><?php esc_html_e( 'An AI tool call created this account, or changed its password, email address or role, in the last 24 hours, so this account cannot approve or decline requests yet. Use another administrator account that no tool has changed, or wait until the day is up.', 'guarded-mcp' ); ?></p></div>
+    <?php endif; ?>
+
     <h2 class="title"><?php esc_html_e( 'Ask before', 'guarded-mcp' ); ?></h2>
     <form method="post">
       <?php
@@ -1683,7 +1687,7 @@ class GMCP_Settings {
               <span class="gmcp-detail"><?php echo esc_html( $row['identity'] ); ?></span></td>
             <td><code><?php echo esc_html( $row['tool'] ); ?></code>
               <span class="gmcp-detail">(<?php echo esc_html( $row['tool_class'] ); ?>)</span>
-              <?php echo self::approval_args_html( (string) $row['args_view'] ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- every piece is escaped inside. ?></td>
+              <?php echo self::approval_args_html( (string) $row['args_view'], $row['args_redacted'] ?? null ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- every piece is escaped inside. ?></td>
             <td class="gmcp-nowrap"><?php echo esc_html( human_time_diff( time(), (int) $row['expires'] ) ); ?></td>
             <td class="gmcp-nowrap">
               <?php foreach ( [ 'approve' => __( 'Approve', 'guarded-mcp' ), 'decline' => __( 'Decline', 'guarded-mcp' ) ] as $verdict => $label ) : ?>
@@ -1734,28 +1738,33 @@ class GMCP_Settings {
   }
 
   /**
-  * The stored, redacted arguments as a collapsible block, shortened for display only.
+  * The arguments exactly as stored, in the one canonical order, with what is hidden named.
   *
-  * Shortened rather than refused: a person who cannot see the end of a long argument is
-  * told so, and that the approval covers all of it by hash.
+  * Not shortened and not reordered here: GMCP_Approvals::build_view() refuses to queue a call
+  * that does not fit, so the text this prints is every byte the approval covers, except the
+  * values it says it hides. A row from before that (no redaction list, or a stored preview)
+  * is labelled as possibly incomplete instead of being passed off as whole.
+  *
+  * @param string|null $redacted JSON list of the paths hidden, or null for an older row.
   */
-  private static function approval_args_html( string $json ): string {
-    $decoded = json_decode( $json, true );
-    $text = json_last_error() === JSON_ERROR_NONE
-      ? wp_json_encode( $decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE )
-      : $json;
-    $text = (string) $text;
+  private static function approval_args_html( string $text, $redacted ): string {
+    $names = is_string( $redacted ) ? json_decode( $redacted, true ) : null;
     $note = '';
-    if ( strlen( $text ) > 4000 ) {
-      $note = '<p class="gmcp-detail">' . esc_html( sprintf(
-        /* translators: %d: total size in bytes. */
-        __( 'Shortened here; the full arguments (%d bytes) are what an approval covers. Credential-shaped values are hidden and covered too.', 'guarded-mcp' ),
-        strlen( $text )
-      ) ) . '</p>';
-      $text = mb_substr( $text, 0, 4000 );
+    if ( is_array( $names ) && $names ) {
+      $shown = array_map( function ( $n ) {
+        return '"' . mb_substr( (string) $n, 0, 60 ) . '"';
+      }, array_slice( $names, 0, 20 ) );
+      $note = '<p class="gmcp-detail gmcp-warn"><strong>' . esc_html( sprintf(
+        /* translators: %d: number of hidden values. */
+        _n( '%d value is hidden from this screen and is still part of what you approve:', '%d values are hidden from this screen and are still part of what you approve:', count( $names ), 'guarded-mcp' ),
+        count( $names )
+      ) ) . '</strong> ' . esc_html( implode( ', ', $shown ) . ( count( $names ) > 20 ? sprintf( /* translators: %d: how many more. */ __( ' and %d more', 'guarded-mcp' ), count( $names ) - 20 ) : '' ) ) . '</p>';
     }
-    return '<details><summary class="gmcp-summary">' . esc_html__( 'Arguments', 'guarded-mcp' ) . '</summary><pre class="gmcp-args">'
-      . esc_html( $text ) . '</pre>' . $note . '</details>';
+    elseif ( !is_array( $names ) || strpos( $text, '__gmcp_truncated' ) !== false ) {
+      $note = '<p class="gmcp-detail gmcp-warn">' . esc_html__( 'This request was stored by an earlier version. What is shown may be shortened and may hide values you cannot see here; decline it unless you are sure.', 'guarded-mcp' ) . '</p>';
+    }
+    return $note . '<details open><summary class="gmcp-summary">' . esc_html__( 'Arguments', 'guarded-mcp' ) . '</summary><pre class="gmcp-args">'
+      . esc_html( $text ) . '</pre></details>';
   }
 
   #endregion

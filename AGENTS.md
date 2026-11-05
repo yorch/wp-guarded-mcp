@@ -40,6 +40,20 @@ under WordPress that ask it again for writers that do not. A new tool that write
 the guard; the net is the backstop, not the plan. Attachments are filtered through
 `wp_insert_attachment_data`, not `wp_insert_post_data`, and the net needs both. The flag caps the
 key at `readwrite`; that cap is part of the guard.
+What it covers is posts, their meta, term assignments, featured image and attached media, and
+nothing else: comments, taxonomy terms, users, options and preview links are outside it, and
+every sentence that describes it (refusal text, key label, README, readme.txt, guardrails) must
+say so rather than "anything that is live". Media attached to no post is refused for edits as
+well as deletes, because a live page may be showing it and nothing can find which.
+
+**A deletion is not always a delete tool.** WordPress deletes on markers it reads from
+ordinary rows: `wp_scheduled_delete()` removes every post with an old `_wp_trash_meta_time`
+and `wp_delete_auto_drafts()` every old auto-draft. So `GMCP_Core::status_write_refusal()`
+refuses a status of `trash` or `auto-draft` in the write tools, `protected_meta_refusal()`
+refuses the `_wp_trash_meta_` keys in every meta writer (with a net under the WordPress
+meta functions for writers that are not ours), and `GMCP_Approvals::classify_call()` reads
+the arguments as well as the tool's name. A write-level key that can reach any of them has a
+delete tool, whatever the README calls the level.
 
 **Never run `wp plugin install --force`, `wp plugin update` or `wp plugin delete` against
 the `.dev` stack.** Its plugin directory is a bind mount of this repository, and WordPress

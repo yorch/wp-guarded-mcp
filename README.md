@@ -109,7 +109,7 @@ nothing stops working.
 
 A key can also be **drafts only**. It may create and edit drafts and pending posts, and upload media for them, and it is refused every write that would publish, schedule or make a post private, and every edit, trash, deletion or unpublishing of a post that is already live (publish, future or private, or any status a plugin registers as public). That covers post fields, custom fields, categories and tags, the featured image, block content, and revert through the change journal, whichever tool is asked, including the generated REST tools. Copying a live page into a draft is allowed, because the live page is only read.
 
-The flag caps the key at read and write: a drafts-only key cannot have full administration, because those tools reach code that writes posts in ways this cannot see. It protects posts and the things stored as posts (pages, products, menu items, media on a live page). It does not cover comments, orders, taxonomy terms themselves, users or options, so pair it with a tool list when the key should do less than that. A refused call is recorded in the audit log like any other refusal. Keys made before this existed carry no flag and behave as they always did.
+The flag caps the key at read and write: a drafts-only key cannot have full administration, because those tools reach code that writes posts in ways this cannot see. What it covers is posts and the things stored as posts (pages, products, menu items), their custom fields, category and tag assignments, featured image, and media attached to a post. Media attached to no post can be neither edited nor deleted by it, because a live page may be showing that file and nothing here can tell which. What it does **not** cover: comments (it can create, approve and edit them), taxonomy terms themselves (renaming or deleting a category changes every live post in it), users, options, and anything else that is not a post. Orders and subscriptions are refused to the generic post tools for every key, and the shop tools need `admin`, which this flag caps away. A preview link on a draft is not out of its reach either: it shows that draft to whoever holds the URL. Pair the key with a tool list when it should do less than that. A refused call is recorded in the audit log like any other refusal. Keys made before this existed carry no flag and behave as they always did.
 
 ## Tools
 
@@ -404,6 +404,8 @@ repeats the identical call and it runs once.
   unrecognised tool fails closed), and, in the wider mode, every other `admin`-level write
   (plugins, themes, users, options, settings, menus, and the writes of the optional
   groups). Content edits at the `read` and `write` level never wait.
+- Creating an account, and changing a password, email address or role on one (or anything on an account that can run the site), waits in both modes, because an agent that can make an administrator could sign in as it and approve its own calls. For the same reason an account that a tool call created or re-credentialed in the last 24 hours cannot answer requests: use another administrator account, or wait. Nothing on any screen clears that; `wp user meta delete <id> gmcp_changed_by_mcp` does.
+- An undo waits exactly where the write it would repeat waits: `wp_undo_change` is looked up in the change journal and held as the strictest tool that made the recorded change (an option put back waits in the wider mode; a post edit put back does not), and an entry it cannot find is held.
 - A pending request lapses after an hour. An approval lasts 15 minutes and works once, for
   that key, that tool and exactly those arguments (a hash of the canonical JSON, keyed so
   a stored row cannot be used to guess a password offline). A different argument, key or
@@ -416,8 +418,12 @@ repeats the identical call and it runs once.
   lists, approves, declines or edits the queue, at any access level.
 - The two-step confirmation still applies inside an approved call, and one approval covers
   both legs: a call that only issued a confirmation token has not spent it.
-- Arguments are redacted by the same test the audit log uses before they are stored or
-  shown, so a credential is approved unseen (the hash covers the real value). Requests,
+- The screen shows the call in one canonical order (sorted, the tool's declared arguments
+  first) and never shortens it: a call with an argument its tool does not declare, nested
+  more than 12 levels, or longer than 16000 bytes written out is refused with an error
+  instead of queued, because an approval covers every byte. A credential is hidden, and the
+  screen says how many values are hidden and which fields, so you know a value you cannot
+  see is part of what you approve (the hash covers the real value). Requests,
   approvals, declines, lapses, uses and refused replays are written to the audit log.
   There are no bulk actions and nothing to delete: a request leaves the list by being
   answered or by lapsing.
@@ -526,10 +532,11 @@ Other hooks:
 ## Security notes
 
 - Only administrators can authorize an OAuth client, checked both at authorize time and again on every request. A grant approved as read-only stays read-only through every refresh.
-- A drafts-only key cannot put anything in front of the public or change what is already there, through any tool, because the refusal sits under the post writes rather than in each tool. It does not cover writers that bypass WordPress and update the posts table directly, which is why the key is held below full administration. Orders, comments, users and options are outside it.
+- A drafts-only key cannot publish a post or change a post that is already live, through any tool, because the refusal sits under the post writes rather than in each tool. That is posts, their custom fields, term assignments, featured image and attached media: not comments, taxonomy terms, users, options, or media attached to no post (edits to which are refused because a live page may be showing it). It does not cover writers that bypass WordPress and update the posts table directly, which is why the key is held below full administration.
 - Keys are stored as a SHA-256 hash and shown once, so the database holds nothing that can be replayed. A key also records the administrator who created it and acts as that account, which is what lets the log name a person; it stops working the moment that account stops holding `manage_options`, so revoking somebody's access revokes their agent with it.
 - No row belonging to this plugin, and no option whose name looks like a credential, can be read or written through the option tools. The change journal additionally inspects the value it is about to record, so a `secret_key` or `pass` field inside a settings array is blanked before the rest of that array is kept, and an undo leaves the live value in place rather than writing the placeholder over it. Strings that parse as JSON or as a serialized array are unpacked and judged too, and blanked whole when they hold one. The check reads field names, not content, so it will not catch a secret held as a bare string under an innocuous option name.
 - Optional human approval holds deletes, and optionally site changes, until an administrator signed in to wp-admin approves that exact call. There is no approval token for an agent to learn or mint, and no tool that reads or answers the queue. See Approvals above.
+- The `readwrite` level cannot delete by another name. WordPress permanently deletes whatever carries an old `_wp_trash_meta_time` and every auto-draft older than a week, so setting a status of `trash` or `auto-draft` through `wp_update_post` or `wp_update_comment`, and writing any `_wp_trash_meta_` meta key through any tool, are refused; `wp_delete_post` is the way to trash and is held by the approval queue. `wp_run_cron_event` is held with the deletes.
 - Tools do not execute arbitrary PHP or SQL. Every tool is a fixed WordPress operation with a schema.
 - A preview link is a bearer credential for one unpublished post. Only a hash of it is stored, in a row the option tools refuse, and the audit log and debug trace scrub it from arguments and replies. It is shown once. Anyone who is given the link can use it until it expires or the post is published, and viewing it is not logged.
 - `wp_get_php_error_log` and `wp_fetch_page` return text written by other people (visitors, plugins, whoever controls a page). Both label it as data, and both are `admin` level for that reason as well as for what they can reach. The log is scrubbed for credential shapes, not for meaning, so a secret inside an ordinary sentence can survive it.

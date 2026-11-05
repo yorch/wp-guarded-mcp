@@ -3612,6 +3612,13 @@ ap_decide() { # ap_decide <verdict> <request id> [request-nonce override]
 if grep -q wordpress_logged_in "$AP_JAR"; then
   check "the Approvals page renders" \
     "$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null | grep -o '<h1>[^<]*</h1>' | head -n 1)" "<h1>Approvals</h1>"
+  AP_KEYS_PAGE=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-access" 2>/dev/null)
+  check "CONTROL: the keys page was fetched and has the drafts-only option" \
+    "$([ "$(printf '%s' "$AP_KEYS_PAGE" | grep -c 'name="key_drafts_only"')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "its label says a post that is live, not anything that is live" \
+    "$(printf '%s' "$AP_KEYS_PAGE" | grep -c 'Never publish, schedule or change a post that is live')/$(printf '%s' "$AP_KEYS_PAGE" | grep -c 'anything that is live')" "1/0"
+  check "and its help names what is NOT covered" \
+    "$(printf '%s' "$AP_KEYS_PAGE" | grep -c 'does NOT cover comments, taxonomy terms')" "1"
   check "CONTROL: the form parser finds the Approve form for a pending request" \
     "$([ -n "$(ap_form approve "$AP_R1")" ] && echo found || echo MISSING)" "found"
   AP_PAGE=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null)
@@ -3665,6 +3672,48 @@ if grep -q wordpress_logged_in "$AP_JAR"; then
   check "repeating it is held again, not run twice" "$(ap_state ap_replay)" "awaiting_human_approval"
   check "exactly one approval has been used" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals WHERE status=\"used\" AND tool=\"wp_delete_post\"')" "1"
   check "the refused replay is in the audit log" "$([ "$(ap_events replay_refused)" -ge 1 ] && echo yes || echo no)" "yes"
+
+  echo "   -- eight retries of one approved call at once: exactly one runs --"
+  # The claim is a single UPDATE ... WHERE status = 'approved', so two retries racing cannot
+  # both win. Asserted by counting what actually happened, not what was replied: the audit
+  # log's successful writes of this option, the approval row's state, and the option itself.
+  # The write is a scratch option under the wider mode, where wp_update_option is held.
+  ap_mode site
+  AP_RACE_KEY=smoke_probe_race
+  ap_eval 'delete_option("'"$AP_RACE_KEY"'");' >/dev/null
+  ap_race_ok() { ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_update_option\" AND outcome=\"ok\" AND args LIKE \"%'"$AP_RACE_KEY"'%\"'; }
+  AP_RACE_BEFORE=$(ap_race_ok)
+  ap_call ap_rc0 wp_update_option '{"key":"'"$AP_RACE_KEY"'","value":"raced"}'
+  AP_RR=$(ap_rid ap_rc0)
+  check "CONTROL: the scratch write is held first, and did nothing" \
+    "$(ap_state ap_rc0)/$(ap_eval 'echo get_option("'"$AP_RACE_KEY"'","unset");')" "awaiting_human_approval/unset"
+  ap_decide approve "$AP_RR"
+  check "CONTROL: a person approved it" "$(ap_status "$AP_RR")" "approved"
+  for i in 1 2 3 4 5 6 7 8; do
+    ap_call ap_rc$i wp_update_option '{"key":"'"$AP_RACE_KEY"'","value":"raced"}' &
+  done
+  wait
+  AP_RAN=0; AP_HELD=0
+  for i in 1 2 3 4 5 6 7 8; do
+    case "$(ap_state ap_rc$i)" in
+      -) AP_RAN=$((AP_RAN + 1)) ;;
+      awaiting_human_approval) AP_HELD=$((AP_HELD + 1)) ;;
+    esac
+  done
+  check "exactly one of the eight parallel retries ran, and the other seven were held" "$AP_RAN/$AP_HELD" "1/7"
+  check "the audit log holds exactly one successful write of it" "$(( $(ap_race_ok) - AP_RACE_BEFORE ))" "1"
+  check "the approval was spent exactly once" "$(ap_status "$AP_RR")" "used"
+  check "and the write happened" "$(ap_eval 'echo get_option("'"$AP_RACE_KEY"'","unset");')" "raced"
+  ap_eval 'delete_option("'"$AP_RACE_KEY"'");' >/dev/null
+  # Eight requests at once write eight audit rows at once. The chain is serialised with a named
+  # lock (GMCP_Audit, GET_LOCK), which a SQLite drop-in does not have: it answers null or a
+  # mangled "1=1" (measured), never "1", the rows fork the chain, and the verification further down reports a break that is the
+  # stack's and not the plugin's. Said out loud and cleared there; on MariaDB nothing is cleared.
+  if [ "$(ap_eval 'global $wpdb; $g=$wpdb->get_var("SELECT GET_LOCK(\"gmcp_probe\",1)"); if($g==="1"){$wpdb->get_var("SELECT RELEASE_LOCK(\"gmcp_probe\")");} echo $g===null?"none":$g;')" != "1" ]; then
+    echo "  ....  this stack has no GET_LOCK, so parallel audit writes fork the hash chain; clearing the log after the race"
+    ap_eval 'GMCP_Audit::clear();' >/dev/null
+  fi
+  ap_mode deletes
 
   echo "   -- declining, and the lapse of requests and approvals --"
   AP_C=$(ap_post "AP victim C")
@@ -3743,10 +3792,102 @@ if grep -q wordpress_logged_in "$AP_JAR"; then
   check "CONTROL: the page shows the request" \
     "$([ "$(printf '%s' "$AP_PAGE" | grep -c 'apuser')" -ge 1 ] && echo yes || echo no)" "yes"
   check "the page does not show the password" "$(printf '%s' "$AP_PAGE" | grep -c 'APPLAINTEXTMUSTNOTAPPEAR')" "0"
+  check "the page says a value is hidden yet part of the approval, and names it" \
+    "$(printf '%s' "$AP_PAGE" | grep -c 'is still part of what you approve:</strong> &quot;user_pass&quot;')" "1"
+  check "the stored view is in canonical order, not the order the client sent (role, email, login, password)" \
+    "$(ap_eval 'global $wpdb; $t=(string)$wpdb->get_var("SELECT args_view FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R7"'"); $p=array_map(function($k) use ($t){return strpos($t,"\"".$k."\"");},["role","user_email","user_login","user_pass"]); $s=$p; sort($s); echo $p===$s && !in_array(false,$p,true) ? "ordered" : "UNORDERED";')" "ordered"
+  echo "   -- a call that cannot be shown in full is not queued --"
+  AP_BEFORE=$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')
+  AP_BIG=$(python3 -c 'print("x"*20000)')
+  ap_call ap_big wp_update_option '{"key":"smoke_probe_big","value":"'"$AP_BIG"'"}'
+  check "an oversized call is refused, as an error" "$(verdict ap_big)" "error"
+  check "  that says why" "$(ap_text ap_big | grep -c 'not queued for approval')" "1"
+  check "  and queued nothing" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "$AP_BEFORE"
+  check "  and ran nothing" "$(ap_eval 'echo get_option("smoke_probe_big","unset") === "unset" ? "unset" : "WRITTEN";')" "unset"
+  ap_call ap_unk wp_update_option '{"key":"smoke_probe_unk","value":"v","sneaky":"hidden from the person"}'
+  check "an argument the tool does not declare is refused too, and nothing is queued" \
+    "$(verdict ap_unk)/$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "error/$AP_BEFORE"
+  ap_call ap_okq wp_update_option '{"key":"smoke_probe_unk","value":"v"}'
+  check "CONTROL: the same call without it is queued (so the refusals above were about the argument and the size)" \
+    "$(ap_state ap_okq)/$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "awaiting_human_approval/$((AP_BEFORE + 1))"
+  ap_decide decline "$(ap_rid ap_okq)"
   check "the audit log does not hold it" "$(leaked_audit APPLAINTEXTMUSTNOTAPPEAR)" "0"
   check "CONTROL: the audit scan does see a harmless argument of the same call" "$(leaked_audit ap@example.test)" "1"
   ap_decide decline "$AP_R7"
   check "(cleanup) the user request is declined" "$(ap_status "$AP_R7")" "declined"
+
+  echo "   -- an account the agent made cannot approve for the agent --"
+  # The attack: with the mode at "deletes" an admin key created an administrator with a
+  # password it chose, signed in at wp-login.php, and approved its own held calls. The two
+  # locks are tested separately, so a pass on one cannot hide a hole in the other: the
+  # account tools are held (first lock), and an account that slipped through anyway cannot
+  # answer (second lock, the marker). Every "cannot" has a control that makes the same
+  # account answer once the marker is gone, so a probe that cannot log in cannot read as a pass.
+  AP_EVIL_PASS='Evil-Pass-1234!'
+  ap_mode deletes
+  ap_eval 'foreach ( [ "apevil", "apsub" ] as $l ) { $u = get_user_by( "login", $l ); if ( $u ) { require_once ABSPATH . "wp-admin/includes/user.php"; wp_delete_user( $u->ID ); } }' >/dev/null
+  ap_call ap_ac1 wp_create_user '{"user_login":"apevil","user_email":"apevil@example.test","user_pass":"'"$AP_EVIL_PASS"'","role":"administrator"}'
+  check "mode deletes: creating an administrator with a chosen password is held, not run" "$(ap_state ap_ac1)" "awaiting_human_approval"
+  check "  and the account does not exist" "$(ap_eval 'echo username_exists("apevil") ? "exists" : "absent";')" "absent"
+  ap_call ap_ac2 wp_create_user '{"user_login":"apsub","user_email":"apsub@example.test","role":"subscriber"}'
+  check "mode deletes: creating a plain subscriber is held too" "$(ap_state ap_ac2)/$(ap_eval 'echo username_exists("apsub") ? "exists" : "absent";')" "awaiting_human_approval/absent"
+  ap_mode never
+  ap_call ap_ac3 wp_create_user '{"user_login":"apsub","user_email":"apsub@example.test","role":"subscriber"}'
+  check "CONTROL: with the mode at never the same call creates the account" "$(ap_eval 'echo username_exists("apsub") ? "exists" : "absent";')" "exists"
+  AP_SUB_ID=$(ap_eval 'echo username_exists("apsub");')
+  ap_mode deletes
+  AP_SUB_HASH=$(ap_eval 'echo get_userdata('"$AP_SUB_ID"')->user_pass;')
+  ap_call ap_ac4 wp_update_user '{"ID":'"$AP_SUB_ID"',"fields":{"user_pass":"'"$AP_EVIL_PASS"'"}}'
+  check "mode deletes: setting a password on an ordinary account is held, and the hash is unchanged" \
+    "$(ap_state ap_ac4)/$([ "$(ap_eval 'echo get_userdata('"$AP_SUB_ID"')->user_pass;')" = "$AP_SUB_HASH" ] && echo unchanged || echo CHANGED)" "awaiting_human_approval/unchanged"
+  ap_call ap_ac5 wp_update_user '{"ID":'"$AP_ADMIN_ID"',"fields":{"display_name":"Held display name"}}'
+  check "mode deletes: even a display name on an account that can run the site is held" "$(ap_state ap_ac5)" "awaiting_human_approval"
+  ap_call ap_ac6 wp_update_user '{"ID":'"$AP_SUB_ID"',"fields":{"display_name":"Agent set display name"}}'
+  check "CONTROL: a display name on an ordinary account is not held in mode deletes, and is stored" \
+    "$(ap_eval 'echo get_userdata('"$AP_SUB_ID"')->display_name;')" "Agent set display name"
+
+  # Second lock. Mode never, so the first lock is out of the way: this is the call that got
+  # through (an older key, a mode that was off at the time, another plugin's tool).
+  ap_mode never
+  ap_call ap_ac7 wp_create_user '{"user_login":"apevil","user_email":"apevil@example.test","user_pass":"'"$AP_EVIL_PASS"'","role":"administrator"}'
+  AP_EV_TOKEN=$(ap_text ap_ac7 | grep -o 'confirm set to "[0-9a-f]*"' | grep -o '[0-9a-f]\{16\}')
+  ap_call ap_ac8 wp_create_user '{"user_login":"apevil","user_email":"apevil@example.test","user_pass":"'"$AP_EVIL_PASS"'","role":"administrator","confirm":"'"$AP_EV_TOKEN"'"}'
+  AP_EVIL_ID=$(ap_eval 'echo username_exists("apevil");')
+  check "CONTROL: in mode never the agent did create a working administrator" \
+    "$(ap_eval '$u=get_userdata('"${AP_EVIL_ID:-0}"'); echo $u && in_array("administrator",$u->roles,true) && wp_check_password("'"$AP_EVIL_PASS"'",$u->user_pass,$u->ID) ? "created" : "NOT CREATED";')" "created"
+  check "the plugin remembered a tool call made it" "$(ap_eval 'echo GMCP_Approvals::account_changed_by_tool('"${AP_EVIL_ID:-0}"') ? "marked" : "clean";')" "marked"
+  check "CONTROL: and did not mark the real administrator, whom no tool touched" "$(ap_eval 'echo GMCP_Approvals::account_changed_by_tool('"$AP_ADMIN_ID"') ? "marked" : "clean";')" "clean"
+  ap_mode deletes
+  AP_VICTIM=$(ap_post "AP victim evil")
+  ap_call ap_ac9 wp_delete_post "{\"ID\":$AP_VICTIM,\"force\":true}"
+  AP_R_EVIL=$(ap_rid ap_ac9)
+  check "CONTROL: a held request exists for the evil account to try to answer" "$(ap_status "$AP_R_EVIL")" "pending"
+  AP_JAR_ADMIN="$AP_JAR"
+  AP_JAR=$(mktemp)
+  curl -sS -c "$AP_JAR" -b "$AP_JAR" --data-urlencode 'log=apevil' --data-urlencode "pwd=$AP_EVIL_PASS" -d 'rememberme=forever&testcookie=1' "$BASE/wp-login.php" -o /dev/null 2>/dev/null
+  check "CONTROL: the agent's account really signed in (a login that fails would pass everything below)" \
+    "$(grep -q wordpress_logged_in "$AP_JAR" && echo cookie || echo NO-COOKIE)" "cookie"
+  check "CONTROL: the page serves the approve form to that session, so a refusal is the plugin's" \
+    "$([ -n "$(ap_form approve "$AP_R_EVIL")" ] && echo found || echo MISSING)" "found"
+  check "  and says why on the page" \
+    "$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null | grep -c 'cannot approve or decline requests yet')" "1"
+  ap_decide approve "$AP_R_EVIL"
+  check "the agent's own administrator cannot approve its held call" "$(ap_status "$AP_R_EVIL")" "pending"
+  ap_call ap_ac10 wp_delete_post "{\"ID\":$AP_VICTIM,\"force\":true}"
+  check "  and retrying the call still does not run it" "$(ap_post_state "$AP_VICTIM")" "draft"
+  check "  nor can it decline (it cannot tidy the queue either)" \
+    "$(ap_decide decline "$AP_R_EVIL"; ap_status "$AP_R_EVIL")" "pending"
+  # The control that proves the marker was the only thing in the way: take it off (as wp-cli
+  # would; nothing on any screen can) and the same session answers.
+  ap_eval 'delete_user_meta('"${AP_EVIL_ID:-0}"', GMCP_Approvals::TOUCHED_META);' >/dev/null
+  ap_decide approve "$AP_R_EVIL"
+  check "CONTROL: with the marker removed the same session approves, so the marker was the only barrier" "$(ap_status "$AP_R_EVIL")" "approved"
+  check "  and the decision names that account" \
+    "$(ap_q 'SELECT decided_by FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R_EVIL")" "$AP_EVIL_ID"
+  rm -f "$AP_JAR"
+  AP_JAR="$AP_JAR_ADMIN"
+  ap_eval 'require_once ABSPATH . "wp-admin/includes/user.php"; foreach ( [ "apevil", "apsub" ] as $l ) { $u = get_user_by( "login", $l ); if ( $u ) { wp_delete_user( $u->ID ); } }' >/dev/null
+  ap_mode never
 
   echo "   -- the setting fails closed --"
   AP_PN=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null \
@@ -3793,6 +3934,15 @@ check "CONTROL: the registered tools were enumerated and every class that gates 
   "$(ap_eval "$AP_CONTRACT"' echo $n>20 && isset($seen["destructive"],$seen["site"],$seen["read"],$seen["content"]) ? "enumerated" : "NOT ($n)";')" "enumerated"
 check "no read- or write-level tool is destructive, and none lacks a level" \
   "$(ap_eval "$AP_CONTRACT"' echo $bad ? implode(",",$bad) : "none";')" "none"
+# A cron callback can do anything a plugin can, delete files included, and a scheduled
+# event can be a deletion's second half (wp_scheduled_delete). So running or unscheduling one
+# is held with the deletes. Read from the REGISTERED tools, not from a synthetic definition.
+check "the registered wp_run_cron_event is destructive" \
+  "$(ap_eval 'do_action("rest_api_init"); $c="NOT REGISTERED"; foreach ( apply_filters("gmcp_tools",[]) as $t ) { if ( ($t["name"]??"")==="wp_run_cron_event" ) { $c=GMCP_Approvals::classify($t); } } echo $c;')" "destructive"
+check "and so is wp_unschedule_cron_event" \
+  "$(ap_eval 'do_action("rest_api_init"); $c="NOT REGISTERED"; foreach ( apply_filters("gmcp_tools",[]) as $t ) { if ( ($t["name"]??"")==="wp_unschedule_cron_event" ) { $c=GMCP_Approvals::classify($t); } } echo $c;')" "destructive"
+check "CONTROL: the read-only listing next to them is not" \
+  "$(ap_eval 'do_action("rest_api_init"); $c="NOT REGISTERED"; foreach ( apply_filters("gmcp_tools",[]) as $t ) { if ( ($t["name"]??"")==="wp_list_cron_events" ) { $c=GMCP_Approvals::classify($t); } } echo $c;')" "read"
 check "a nonsense stored mode is read as the strictest" \
   "$(ap_mode bogus; ap_eval 'echo GMCP_Approvals::mode();')" "site"
 AP_F=$(ap_post "AP victim F")
