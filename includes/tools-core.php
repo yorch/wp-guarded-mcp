@@ -1144,7 +1144,7 @@ class GMCP_Tools_Core {
     if ( class_exists( 'GMCP_Changes' ) ) {
       foreach ( GMCP_Changes::captured() as $record ) {
         if ( ( $record['call'] ?? '' ) !== '' ) {
-          $group = GMCP_Journal::GROUP_PREFIX . $record['call'];
+          $group = (string) $record['call'];
           break;
         }
       }
@@ -1152,7 +1152,7 @@ class GMCP_Tools_Core {
     $note .= ' The custom fields this call wrote ARE journalled, grouped under this one call';
     return $group === ''
       ? $note . '; wp_list_changes shows the group.'
-      : $note . ' as "' . $group . '", and one wp_undo_change on that id removes all of them'
+      : $note . ', and wp_undo_change {"call":"' . $group . '"} removes all of them'
         . ' while leaving the posts standing.';
   }
 
