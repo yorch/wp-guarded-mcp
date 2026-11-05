@@ -1489,6 +1489,53 @@ re-read.
   has an active action that records submissions: a form without one cannot have any, so its
   zero is "not kept", and `null` is reported where that could not be determined.
 
+## WPForms, Wordfence and Stream
+
+All three are read only, and the absence of a write is the design: a form's recipients, a
+firewall mode, an issue list and a log's retention are each something an agent could change to
+make what is watching the site quieter, or to send what visitors submit somewhere it chose,
+and there is no restore tool behind any of them. WPForms is folded into the form group above
+(its switch, its levels, its `log_state` block); Wordfence and Stream have a switch each.
+
+- **WPForms has no entry tool.** Measured on Lite 2.0.4: `wpforms()->obj('entry')` is null and
+  none of the three entry tables exists, so the plugin keeps a counter in form meta and emails
+  the rest. The briefing names which of those two it is reading, because "none arrived" and
+  "nothing is storing them" are the same number. On Pro the tables have not been measured from
+  here, so nothing reads them. `wpforms_get_form` returns a form's fields and the labels of
+  its choices, and counts its notifications and confirmations without returning them.
+- **Another plugin's configuration is a post type the generic post tools refuse.**
+  `GMCP_Core::plugin_config_post_types()` lists `wpforms`, `wpforms-template` and
+  `wp_stream_alerts`. The first two hold one JSON document each (fields, notification
+  recipients, confirmation redirects; a template is read through the same decoder and new forms
+  are made from it); a Stream alert rule is a post whose status decides whether it fires. Writes
+  are refused at every level and include creating or retyping into the type
+  (`commerce_post_guard()`); reads are refused below admin, for the post and for what hangs from
+  it, a revision included (`commerce_post_read_guard()`); the SQL readers leave the types out
+  below admin (`read_excluded_post_types()`); and a REST route one of them takes over is not
+  turned into tools. What it does not cover: a menu item or a featured image that points at one
+  of these posts (it would print a title, not the document), a plugin's own tables, and any type
+  a site has not added through `gmcp_plugin_config_post_types`.
+- **The plugins that watch cannot be switched off through the plugin tools.**
+  `GMCP_Core::watcher_plugin_files()` (Wordfence, Stream, WP Activity Log; extendable through
+  `gmcp_watcher_plugin_files`) is refused for deactivation, deletion and update. The option rule
+  alone left the door open: measured, each was deactivatable in one call through the admin
+  group. It does not stop a site owner, a bulk action in wp-admin, or a plugin that deactivates
+  another.
+- **Stream's settings are refused to every option writer** (`wp_stream` is in
+  `audit_log_option_prefixes()`, and covers `wp_stream_db` and `wp_stream_network`).
+  Wordfence's are not, deliberately and measured: 9.0.2 keeps its configuration in its own
+  `wp_wfconfig` table and its handful of option rows are version and activation bookkeeping, so
+  a prefix there would guard nothing and read as protection that is not there.
+- **What the readers return was chosen against what a person typed.** Stream returns no IP
+  address at any level, filters a record's metadata through an allowlist (the new account's
+  email address of a created-user record sits under a repeated key called `user_meta`), and has
+  no free-text search, since a search over a rendered summary confirms a guessed value one
+  attempt at a time. Wordfence returns an address only for the block types that name one, at
+  admin; a login lockout's recorded reason ends in what the visitor typed (`... was:
+  'username'`, the password-reset form, an invalid username), and that text is replaced with
+  `[withheld: typed text]` for the three templates Wordfence writes. A reason of another shape is
+  returned as stored, because there is nothing to recognise it by.
+
 ## Theme mods
 
 Theme mods are the customizer's storage, and four generic tools cover them:
