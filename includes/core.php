@@ -1249,7 +1249,8 @@ class GMCP_Core {
     }
   }
 
-  private static function tool_in_flight(): bool {
+  /** Whether a tool call has started and not yet finished in this request. */
+  public static function tool_in_flight(): bool {
     return did_action( 'gmcp_tool_start' ) > did_action( 'gmcp_tool_called' );
   }
 

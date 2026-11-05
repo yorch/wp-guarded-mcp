@@ -1366,7 +1366,10 @@ the second half.
   to approved, and `decide()` refuses unless the request is a wp-admin page load with a
   logged-in cookie belonging to the current user (a bearer key or OAuth grant sets the
   current user without a cookie), `manage_options`, a nonce bound to the request and the
-  verdict, and no tool call or REST request in flight. There is no tool that reads,
+  verdict, no tool call or REST request in flight, and an account that no tool call has
+  created or re-credentialed in the last 24 hours (see "An account the agent made" below).
+  A cookie proves a session, not a person: an agent that can make an administrator can
+  sign in as one. There is no tool that reads,
   lists, approves, declines or edits the queue, and the setting and the table are not
   reachable through the option tools (`gmcp_` rows are refused by name; the queue is not an
   option at all).
@@ -1385,13 +1388,34 @@ the second half.
 - **What counts.** Derived from each tool's own registration, not from a list of names.
   `unknown` (no definition, or no recognised level) and `destructive` (a destructive hint
   or verb, which outranks the level) are held in both modes. In the wider mode so is
-  `site`: any other admin-level write. `read` and `write` levels never wait. That relies on
+  `site`: any other admin-level write. A fourth class, `account`, waits in both modes (see
+  below). `read` and `write` levels never wait. That relies on
   the README's definition of the `write` level as having no destructive tools, which
   `smoke-admin.sh` checks against the registered tools. Honest limits: a destructive admin
   tool with no hint and a verb outside the list is a site change, so it waits only in the
   wider mode; `wp_undo_change` (write level) replays earlier values and is not gated; the
   `wp_upload_request` endpoint is not a tool call; a preview waits like the call it
   previews, because the setting cannot tell the two apart.
+- **An account the agent made cannot answer for the agent.** In mode `deletes` an admin key
+  could create an administrator with a password it chose (`wp_create_user` and
+  `wp_update_user` were `site` changes, which wait only in the wider mode), sign in at
+  `wp-login.php`, and approve its own held calls. Reproduced end to end. Two locks. First,
+  `classify_call()` gives a user tool the `account` class, held in every mode but `never`:
+  every creation, any update that touches a password, an address, a role (a demotion too:
+  "the lowest role" is the site's own `default_role`) or a field outside the display fields,
+  any update to an account holding a privileged capability, and any argument outside the
+  tool's schema. Only a display-name-style edit of an ordinary account is left to the mode.
+  Second, `watch_accounts()` records, in user meta, any account that a tool call created or
+  whose password, address or role it changed, and `session_problem()` refuses that account
+  the approval screen for 24 hours, with its own message on the screen and in `decide()`.
+  This covers the call that got through the first lock (mode `never` at the time, a plugin's
+  own tool). The cost is real: an administrator whose own password an agent changed, or
+  who asked an agent to make them an account, approves from another administrator's account
+  or waits a day. There is no button to clear it, because a button is the way round;
+  `wp user meta delete <id> gmcp_changed_by_mcp` does. Mode `never` still holds nothing, and
+  the plugin cannot make an agent that was told to create an administrator in that mode
+  stop; it can only keep that administrator from approving anything. Not covered: a tool
+  that changes an account in some way the user tools' names do not say.
 - **What a person sees.** The tool, the key, and the arguments as the audit log would
   record them. A credential-shaped value is hidden, so it is approved unseen and covered
   by the hash. Long arguments are shortened on screen only.

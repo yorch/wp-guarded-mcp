@@ -1429,6 +1429,66 @@ wpe "\$o=get_option('gmcp_options',[]);\$o['mcp_approval_mode']='$DX_MODE_WAS';u
 check "the mode is back where it was" "$(wpe 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "never";')" "$DX_MODE_WAS"
 wpe 'foreach(get_posts(["post_status"=>"any","post_type"=>"post","numberposts"=>-1,"s"=>"DX "]) as $p){ if(strpos($p->post_title,"DX ")===0){wp_delete_post($p->ID,true);} } foreach(GMCP_Tokens::all() as $t){ if($t["label"]==="dx admin"){GMCP_Tokens::revoke($t["id"]);} }' >/dev/null
 
+echo "-- an agent cannot mint the account that approves its own calls --"
+# In mode "deletes" an admin key could create an administrator with a password it chose, sign
+# in at wp-login.php, and approve its own held calls, because the approval screen asks for a
+# valid cookie that belongs to the current user and nothing about who that user is. So the
+# account tools wait in every mode but "never" (what they ask for decides it, not their names
+# being on a list), and an account a tool call made or re-credentialed cannot answer the queue.
+# The pure part here; the sign-in itself is in smoke-admin.sh, which has a wp-admin session.
+AC_IDS=$(wpe '
+  $s = wp_insert_user( [ "user_login" => "ac_subscriber", "user_email" => "ac_sub@example.test", "user_pass" => wp_generate_password(), "role" => "subscriber" ] );
+  $a = get_users( [ "role" => "administrator", "number" => 1, "orderby" => "ID", "order" => "ASC" ] );
+  echo $s, " ", $a[0]->ID;')
+read -r AC_SUB AC_ADM <<< "$AC_IDS"
+check "CONTROL: the fixture users exist and differ" "$([ -n "$AC_SUB" ] && [ -n "$AC_ADM" ] && [ "$AC_SUB" != "$AC_ADM" ] && echo yes || echo no)" "yes"
+accls() { wpe 'echo GMCP_Approvals::classify_call(["name"=>"'"$1"'","accessLevel"=>"admin"],json_decode(base64_decode("'"$(printf '%s' "$2" | base64 | tr -d '\n')"'"),true));'; }
+check "creating any account is held in every mode but never: even a subscriber" "$(accls wp_create_user '{"user_login":"x","user_email":"x@example.test","role":"subscriber"}')" "account"
+check "  and one with no role named" "$(accls wp_create_user '{"user_login":"x","user_email":"x@example.test"}')" "account"
+check "  held under deletes and under site, not under never" \
+  "$(wpe 'echo implode(",",array_map(function($m){return GMCP_Approvals::needs_approval($m,"account")?"held":"runs";},["never","deletes","site"]));')" "runs,held,held"
+check "a password change on an ordinary user waits" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":{\"user_pass\":\"p\"}}")" "account"
+check "an address change waits" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":{\"user_email\":\"z@example.test\"}}")" "account"
+check "any role waits, a demotion included" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":{\"role\":\"subscriber\"}}")" "account"
+check "a field this list does not know waits" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":{\"wp_capabilities\":\"x\"}}")" "account"
+check "a nested ID waits" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":{\"ID\":$AC_ADM,\"display_name\":\"d\"}}")" "account"
+check "an argument outside the schema waits" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"user_pass\":\"p\",\"fields\":{\"display_name\":\"d\"}}")" "account"
+check "fields it cannot read wait (as the stricter class: the deletion scan cannot vouch for them either)" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":\"{broken\"}")" "destructive"
+check "ANY change to an account that can run the site waits, display name included" "$(accls wp_update_user "{\"ID\":$AC_ADM,\"fields\":{\"display_name\":\"d\"}}")" "account"
+check "CONTROL: a display name on an ordinary user is only a site change, so the mode decides" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":{\"display_name\":\"d\"}}")" "site"
+check "CONTROL: reading users is still read" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"wp_get_users","accessLevel"=>"read"],["role"=>"administrator"]);')" "read"
+check "CONTROL: a tool with no user in its name is untouched by the rule" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"wp_update_option","accessLevel"=>"admin"],["key"=>"blogname","value"=>"x"]);')" "site"
+
+echo "  -- the marker: set by a tool call, not by a person --"
+AC_MARK=$(wpe '
+  $u = '"$AC_SUB"';
+  $h = function () use ( $u ) { return GMCP_Approvals::account_changed_by_tool( $u ) ? "marked" : "clean"; };
+  wp_update_user( [ "ID" => $u, "user_pass" => "Outside-1!" ] );
+  echo "person_password=", $h(), ";";
+  do_action( "gmcp_tool_start", "wp_update_user", [] );
+  wp_update_user( [ "ID" => $u, "display_name" => "Only a name" ] );
+  echo "tool_display_name=", $h(), ";";
+  wp_update_user( [ "ID" => $u, "user_pass" => "Tool-Set-1!" ] );
+  echo "tool_password=", $h(), ";";
+  delete_user_meta( $u, GMCP_Approvals::TOUCHED_META );
+  wp_update_user( [ "ID" => $u, "user_email" => "ac_sub2@example.test" ] );
+  echo "tool_email=", $h(), ";";
+  delete_user_meta( $u, GMCP_Approvals::TOUCHED_META );
+  ( new WP_User( $u ) )->set_role( "editor" );
+  echo "tool_role=", $h(), ";";
+  delete_user_meta( $u, GMCP_Approvals::TOUCHED_META );
+  update_user_meta( $u, GMCP_Approvals::TOUCHED_META, time() - 2 * DAY_IN_SECONDS );
+  echo "old_marker=", $h(), ";";
+  $n = wp_insert_user( [ "user_login" => "ac_created", "user_email" => "ac_c@example.test", "user_pass" => wp_generate_password(), "role" => "subscriber" ] );
+  echo "tool_created=", GMCP_Approvals::account_changed_by_tool( $n ) ? "marked" : "clean", ";";
+  wp_delete_user( $n );')
+for want in person_password=clean tool_display_name=clean tool_password=marked tool_email=marked tool_role=marked old_marker=clean tool_created=marked; do
+  check "marker: ${want%%=*}" "$(printf '%s' "$AC_MARK" | tr ';' '\n' | grep "^${want%%=*}=" | head -1)" "$want"
+done
+wpe 'foreach ( [ "ac_subscriber" ] as $l ) { $u = get_user_by( "login", $l ); if ( $u ) { wp_delete_user( $u->ID ); } }' >/dev/null
+
 echo "-- OAuth: the consent screen offers full or read-only, and the grant carries it --"
 JAR="$OUT/oauth.jar"
 curl -sS -c "$JAR" -b "$JAR" -d 'log=admin&pwd=admin&rememberme=forever&testcookie=1' "$BASE/wp-login.php" -o /dev/null 2>/dev/null

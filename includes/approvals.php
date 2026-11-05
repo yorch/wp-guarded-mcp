@@ -60,6 +60,12 @@ class GMCP_Approvals {
   const MAX_OPEN_TOTAL = 200;
   /** Settled rows are kept this long for the screen; the audit log keeps the history. */
   const RETENTION_DAYS = 30;
+  /**
+  * How long an account that a tool call created, or whose password, address or role a tool
+  * call changed, cannot answer a request. @see watch_accounts().
+  */
+  const TOUCHED_WINDOW = DAY_IN_SECONDS;
+  const TOUCHED_META = 'gmcp_changed_by_mcp';
 
   /**
   * Verbs that destroy something. Matched against the name's segments, and only ever
@@ -89,6 +95,7 @@ class GMCP_Approvals {
       self::install();
     }
     add_action( GMCP_Audit::CRON_HOOK, [ __CLASS__, 'prune' ] );
+    self::watch_accounts();
   }
 
   public static function install(): void {
@@ -178,7 +185,7 @@ class GMCP_Approvals {
   }
 
   /** Strictest last. A call is held under the strictest class any part of it earns. */
-  const CLASS_RANK = [ 'read' => 0, 'content' => 1, 'site' => 2, 'destructive' => 3, 'unknown' => 4 ];
+  const CLASS_RANK = [ 'read' => 0, 'content' => 1, 'site' => 2, 'account' => 3, 'destructive' => 4, 'unknown' => 5 ];
 
   /**
   * What kind of CALL this is: the tool's class, widened by what the arguments ask for.
@@ -201,7 +208,75 @@ class GMCP_Approvals {
     if ( $class !== 'read' && self::asks_for_deletion_status( $args ) ) {
       $class = self::stricter( $class, 'destructive' );
     }
+    if ( $class !== 'read' && self::changes_who_can_sign_in( $tool, $args ) ) {
+      $class = self::stricter( $class, 'account' );
+    }
     return $class;
+  }
+
+  /**
+  * Whether a user tool's call creates an account or changes how one signs in or what it may do.
+  *
+  * Why this is not left to the 'site' class. 'site' waits only in the wider mode, so in mode
+  * 'deletes' an admin key could create an administrator with a password it chose, sign in to
+  * wp-login.php as that account, and approve its own held calls: a logged-in cookie that
+  * belongs to the current user is all human_session() asks. Account creation and account
+  * takeover are the one kind of site change that defeats the gate itself, so they wait in
+  * every mode that is not 'never'.
+  *
+  * Judged on the tool's NAME having a user segment (wp_create_user, wp_update_user, and any
+  * tool of that shape added later) and then on the arguments, failing closed:
+  *
+  *   - every creation waits (it always carries an address, a login and a role);
+  *   - an update waits unless it touches display fields only AND the target holds none of
+  *     GMCP_Core::privileged_capabilities(). Any password, address, role, or a field this
+  *     list does not know, waits. Any role waits, even a demotion: "the lowest role" is a
+  *     site's own decision (default_role can be anything), and a call that names a role is
+  *     not worth guessing about.
+  *
+  * Only ever widens. A user tool that is merely reading keeps its class.
+  */
+  private static function changes_who_can_sign_in( ?array $tool, array $args ): bool {
+    $name = is_array( $tool ) && isset( $tool['name'] ) && is_string( $tool['name'] ) ? strtolower( $tool['name'] ) : '';
+    $segments = explode( '_', $name );
+    if ( !array_intersect( $segments, [ 'user', 'users' ] ) ) {
+      return false;
+    }
+    if ( !in_array( 'update', $segments, true ) ) {
+      // create, set, reset, add, grant: anything that is not an update has no display-only
+      // exemption to speak of.
+      return true;
+    }
+    $id = $args['ID'] ?? null;
+    if ( !is_numeric( $id ) || (int) $id <= 0 || GMCP_Core::user_is_privileged( (int) $id ) ) {
+      return true;
+    }
+    foreach ( array_keys( $args ) as $key ) {
+      if ( !in_array( $key, [ 'ID', 'confirm', 'fields' ], true ) ) {
+        return true;
+      }
+    }
+    $fields = $args['fields'] ?? null;
+    if ( is_string( $fields ) ) {
+      $fields = json_decode( $fields, true );
+    }
+    if ( is_object( $fields ) ) {
+      $fields = get_object_vars( $fields );
+    }
+    if ( !is_array( $fields ) || !$fields ) {
+      return true;
+    }
+    $display_only = [ 'display_name', 'first_name', 'last_name', 'nickname', 'description', 'user_url', 'user_nicename' ];
+    foreach ( array_keys( $fields ) as $key ) {
+      if ( $key === 'ID' ) {
+        // Forced back to the top-level id by the tool, but a nested one is not display.
+        return true;
+      }
+      if ( !in_array( strtolower( (string) $key ), $display_only, true ) ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static function stricter( string $a, string $b ): string {
@@ -241,7 +316,7 @@ class GMCP_Approvals {
     if ( $mode === 'never' ) {
       return false;
     }
-    if ( $class === 'unknown' || $class === 'destructive' ) {
+    if ( $class === 'unknown' || $class === 'destructive' || $class === 'account' ) {
       return true;
     }
     // Any mode that is not 'never' or 'deletes' is read as the strictest.
@@ -516,14 +591,76 @@ class GMCP_Approvals {
   * because an approval must not be reachable from inside the thing being approved.
   */
   public static function human_session(): bool {
+    return self::session_problem() === null;
+  }
+
+  /**
+  * Why this request is not a person answering, or null when it is.
+  *
+  *   not_a_session  no wp-admin page load by a signed-in manage_options user's own cookie.
+  *   recent_change  that user's account was created, or had its password, address or role
+  *                  changed, by a tool call within TOUCHED_WINDOW.
+  *
+  * The second exists because the first is a statement about the COOKIE and not about the
+  * PERSON. An agent that can create an administrator, or reset an administrator's password,
+  * can then sign in at wp-login.php as that account and hold a perfectly valid cookie. The
+  * tools that do it are held in every mode but 'never' (classify_call()), and this is the
+  * second lock for the call that slipped through (mode 'never' when it was made, a key from
+  * before the setting, a plugin's own tool): what a tool call set up in the last day cannot
+  * vouch for a tool call.
+  *
+  * The cost is that an administrator whose own password an agent changed, or who asked an
+  * agent to make them an account, answers from another administrator's account or waits a
+  * day. Deliberately not clearable from any screen, since a button would be the way round.
+  */
+  public static function session_problem(): ?string {
     if ( !is_admin() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) || did_action( 'gmcp_tool_start' ) ) {
-      return false;
+      return 'not_a_session';
     }
     $user = get_current_user_id();
     if ( $user <= 0 || !current_user_can( 'manage_options' ) ) {
-      return false;
+      return 'not_a_session';
     }
-    return (int) wp_validate_auth_cookie( '', 'logged_in' ) === $user;
+    if ( (int) wp_validate_auth_cookie( '', 'logged_in' ) !== $user ) {
+      return 'not_a_session';
+    }
+    return self::account_changed_by_tool( $user ) ? 'recent_change' : null;
+  }
+
+  /** Whether a tool call touched this account's sign-in or role inside the window. */
+  public static function account_changed_by_tool( int $user_id ): bool {
+    $at = (int) get_user_meta( $user_id, self::TOUCHED_META, true );
+    return $at > 0 && ( time() - $at ) < self::TOUCHED_WINDOW;
+  }
+
+  /**
+  * Remember accounts that a tool call created or re-credentialed.
+  *
+  * Listens to WordPress, not to the two user tools, for the reason the change journal does:
+  * a tool of another group, or a plugin's callback during a tool call, changes a password
+  * through the same functions. Only while a tool call is in flight, so a person editing a
+  * profile in wp-admin marks nobody. A password and an address are compared against what the
+  * row held before, so saving a display name does not start a day's lockout.
+  */
+  private static function watch_accounts(): void {
+    add_action( 'user_register', [ __CLASS__, 'mark_account' ], 10, 1 );
+    add_action( 'profile_update', function ( $user_id, $old = null ) {
+      $now = get_userdata( (int) $user_id );
+      if ( $now && $old instanceof WP_User && ( $now->user_pass !== $old->user_pass || $now->user_email !== $old->user_email ) ) {
+        self::mark_account( $user_id );
+      }
+    }, 10, 2 );
+    add_action( 'set_user_role', [ __CLASS__, 'mark_account' ], 10, 1 );
+    add_action( 'add_user_role', [ __CLASS__, 'mark_account' ], 10, 1 );
+    add_action( 'wp_set_password', function ( $password, $user_id ) {
+      self::mark_account( $user_id );
+    }, 10, 2 );
+  }
+
+  public static function mark_account( $user_id ): void {
+    if ( (int) $user_id > 0 && GMCP_Core::tool_in_flight() ) {
+      update_user_meta( (int) $user_id, self::TOUCHED_META, time() );
+    }
   }
 
   public static function nonce_action( string $verdict, int $id ): string {
@@ -542,7 +679,11 @@ class GMCP_Approvals {
     if ( !in_array( $verdict, [ 'approve', 'decline' ], true ) || $id <= 0 ) {
       return [ false, __( 'That is not a request this screen can answer.', 'guarded-mcp' ) ];
     }
-    if ( !self::human_session() ) {
+    $problem = self::session_problem();
+    if ( $problem === 'recent_change' ) {
+      return [ false, __( 'This account was created, or had its password, email address or role changed, by an AI tool call in the last 24 hours, so it cannot approve requests yet. Approve from another administrator account that no tool has changed, or wait until the day is up.', 'guarded-mcp' ) ];
+    }
+    if ( $problem !== null ) {
       return [ false, __( 'Approvals can only be given from a signed-in wp-admin session.', 'guarded-mcp' ) ];
     }
     if ( !wp_verify_nonce( $nonce, self::nonce_action( $verdict, $id ) ) ) {

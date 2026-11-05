@@ -53,6 +53,10 @@ function gmcp_uninstall_site() {
   $gmcp_approvals = $wpdb->prefix . 'gmcp_approvals';
   $wpdb->query( "DROP TABLE IF EXISTS {$gmcp_tokens}, {$gmcp_clients}, {$gmcp_audit}, {$gmcp_snapshots}, {$gmcp_approvals}" );
 
+  // The marker that keeps an account a tool call changed from answering the approval queue.
+  // User meta is shared across a network's sites, so this is deleted by key and not by blog.
+  delete_metadata( 'user', 0, 'gmcp_changed_by_mcp', '', true );
+
   // The prune schedule outlives the plugin files otherwise, and WordPress will keep firing
   // an action nothing listens to until somebody notices.
   wp_clear_scheduled_hook( 'gmcp_audit_prune' );

@@ -3539,6 +3539,79 @@ if grep -q wordpress_logged_in "$AP_JAR"; then
   ap_decide decline "$AP_R7"
   check "(cleanup) the user request is declined" "$(ap_status "$AP_R7")" "declined"
 
+  echo "   -- an account the agent made cannot approve for the agent --"
+  # The attack: with the mode at "deletes" an admin key created an administrator with a
+  # password it chose, signed in at wp-login.php, and approved its own held calls. The two
+  # locks are tested separately, so a pass on one cannot hide a hole in the other: the
+  # account tools are held (first lock), and an account that slipped through anyway cannot
+  # answer (second lock, the marker). Every "cannot" has a control that makes the same
+  # account answer once the marker is gone, so a probe that cannot log in cannot read as a pass.
+  AP_EVIL_PASS='Evil-Pass-1234!'
+  ap_mode deletes
+  ap_eval 'foreach ( [ "apevil", "apsub" ] as $l ) { $u = get_user_by( "login", $l ); if ( $u ) { require_once ABSPATH . "wp-admin/includes/user.php"; wp_delete_user( $u->ID ); } }' >/dev/null
+  ap_call ap_ac1 wp_create_user '{"user_login":"apevil","user_email":"apevil@example.test","user_pass":"'"$AP_EVIL_PASS"'","role":"administrator"}'
+  check "mode deletes: creating an administrator with a chosen password is held, not run" "$(ap_state ap_ac1)" "awaiting_human_approval"
+  check "  and the account does not exist" "$(ap_eval 'echo username_exists("apevil") ? "exists" : "absent";')" "absent"
+  ap_call ap_ac2 wp_create_user '{"user_login":"apsub","user_email":"apsub@example.test","role":"subscriber"}'
+  check "mode deletes: creating a plain subscriber is held too" "$(ap_state ap_ac2)/$(ap_eval 'echo username_exists("apsub") ? "exists" : "absent";')" "awaiting_human_approval/absent"
+  ap_mode never
+  ap_call ap_ac3 wp_create_user '{"user_login":"apsub","user_email":"apsub@example.test","role":"subscriber"}'
+  check "CONTROL: with the mode at never the same call creates the account" "$(ap_eval 'echo username_exists("apsub") ? "exists" : "absent";')" "exists"
+  AP_SUB_ID=$(ap_eval 'echo username_exists("apsub");')
+  ap_mode deletes
+  AP_SUB_HASH=$(ap_eval 'echo get_userdata('"$AP_SUB_ID"')->user_pass;')
+  ap_call ap_ac4 wp_update_user '{"ID":'"$AP_SUB_ID"',"fields":{"user_pass":"'"$AP_EVIL_PASS"'"}}'
+  check "mode deletes: setting a password on an ordinary account is held, and the hash is unchanged" \
+    "$(ap_state ap_ac4)/$([ "$(ap_eval 'echo get_userdata('"$AP_SUB_ID"')->user_pass;')" = "$AP_SUB_HASH" ] && echo unchanged || echo CHANGED)" "awaiting_human_approval/unchanged"
+  ap_call ap_ac5 wp_update_user '{"ID":'"$AP_ADMIN_ID"',"fields":{"display_name":"Held display name"}}'
+  check "mode deletes: even a display name on an account that can run the site is held" "$(ap_state ap_ac5)" "awaiting_human_approval"
+  ap_call ap_ac6 wp_update_user '{"ID":'"$AP_SUB_ID"',"fields":{"display_name":"Agent set display name"}}'
+  check "CONTROL: a display name on an ordinary account is not held in mode deletes, and is stored" \
+    "$(ap_eval 'echo get_userdata('"$AP_SUB_ID"')->display_name;')" "Agent set display name"
+
+  # Second lock. Mode never, so the first lock is out of the way: this is the call that got
+  # through (an older key, a mode that was off at the time, another plugin's tool).
+  ap_mode never
+  ap_call ap_ac7 wp_create_user '{"user_login":"apevil","user_email":"apevil@example.test","user_pass":"'"$AP_EVIL_PASS"'","role":"administrator"}'
+  AP_EV_TOKEN=$(ap_text ap_ac7 | grep -o 'confirm set to "[0-9a-f]*"' | grep -o '[0-9a-f]\{16\}')
+  ap_call ap_ac8 wp_create_user '{"user_login":"apevil","user_email":"apevil@example.test","user_pass":"'"$AP_EVIL_PASS"'","role":"administrator","confirm":"'"$AP_EV_TOKEN"'"}'
+  AP_EVIL_ID=$(ap_eval 'echo username_exists("apevil");')
+  check "CONTROL: in mode never the agent did create a working administrator" \
+    "$(ap_eval '$u=get_userdata('"${AP_EVIL_ID:-0}"'); echo $u && in_array("administrator",$u->roles,true) && wp_check_password("'"$AP_EVIL_PASS"'",$u->user_pass,$u->ID) ? "created" : "NOT CREATED";')" "created"
+  check "the plugin remembered a tool call made it" "$(ap_eval 'echo GMCP_Approvals::account_changed_by_tool('"${AP_EVIL_ID:-0}"') ? "marked" : "clean";')" "marked"
+  check "CONTROL: and did not mark the real administrator, whom no tool touched" "$(ap_eval 'echo GMCP_Approvals::account_changed_by_tool('"$AP_ADMIN_ID"') ? "marked" : "clean";')" "clean"
+  ap_mode deletes
+  AP_VICTIM=$(ap_post "AP victim evil")
+  ap_call ap_ac9 wp_delete_post "{\"ID\":$AP_VICTIM,\"force\":true}"
+  AP_R_EVIL=$(ap_rid ap_ac9)
+  check "CONTROL: a held request exists for the evil account to try to answer" "$(ap_status "$AP_R_EVIL")" "pending"
+  AP_JAR_ADMIN="$AP_JAR"
+  AP_JAR=$(mktemp)
+  curl -sS -c "$AP_JAR" -b "$AP_JAR" --data-urlencode 'log=apevil' --data-urlencode "pwd=$AP_EVIL_PASS" -d 'rememberme=forever&testcookie=1' "$BASE/wp-login.php" -o /dev/null 2>/dev/null
+  check "CONTROL: the agent's account really signed in (a login that fails would pass everything below)" \
+    "$(grep -q wordpress_logged_in "$AP_JAR" && echo cookie || echo NO-COOKIE)" "cookie"
+  check "CONTROL: the page serves the approve form to that session, so a refusal is the plugin's" \
+    "$([ -n "$(ap_form approve "$AP_R_EVIL")" ] && echo found || echo MISSING)" "found"
+  check "  and says why on the page" \
+    "$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null | grep -c 'cannot approve or decline requests yet')" "1"
+  ap_decide approve "$AP_R_EVIL"
+  check "the agent's own administrator cannot approve its held call" "$(ap_status "$AP_R_EVIL")" "pending"
+  ap_call ap_ac10 wp_delete_post "{\"ID\":$AP_VICTIM,\"force\":true}"
+  check "  and retrying the call still does not run it" "$(ap_post_state "$AP_VICTIM")" "draft"
+  check "  nor can it decline (it cannot tidy the queue either)" \
+    "$(ap_decide decline "$AP_R_EVIL"; ap_status "$AP_R_EVIL")" "pending"
+  # The control that proves the marker was the only thing in the way: take it off (as wp-cli
+  # would; nothing on any screen can) and the same session answers.
+  ap_eval 'delete_user_meta('"${AP_EVIL_ID:-0}"', GMCP_Approvals::TOUCHED_META);' >/dev/null
+  ap_decide approve "$AP_R_EVIL"
+  check "CONTROL: with the marker removed the same session approves, so the marker was the only barrier" "$(ap_status "$AP_R_EVIL")" "approved"
+  check "  and the decision names that account" \
+    "$(ap_q 'SELECT decided_by FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R_EVIL")" "$AP_EVIL_ID"
+  rm -f "$AP_JAR"
+  AP_JAR="$AP_JAR_ADMIN"
+  ap_eval 'require_once ABSPATH . "wp-admin/includes/user.php"; foreach ( [ "apevil", "apsub" ] as $l ) { $u = get_user_by( "login", $l ); if ( $u ) { wp_delete_user( $u->ID ); } }' >/dev/null
+  ap_mode never
+
   echo "   -- the setting fails closed --"
   AP_PN=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null \
     | python3 -c '

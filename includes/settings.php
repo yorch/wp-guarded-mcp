@@ -1632,6 +1632,10 @@ class GMCP_Settings {
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'When this is switched on, a tool call that would delete something or change the site does not run. It waits here for you. The agent is told it is waiting and cannot approve it: there is no tool that does, and an approval only counts when it comes from you, signed in to wp-admin. After you approve, the agent repeats the same call and it runs once. An approval is for one key, one tool and exactly those arguments; it lapses after 15 minutes unused, and an unanswered request lapses after an hour. The two-step confirmation on irreversible tools still applies inside an approved call.', 'guarded-mcp' ); ?></p>
 
+    <?php if ( GMCP_Approvals::session_problem() === 'recent_change' ) : ?>
+      <div class="notice notice-warning inline"><p><?php esc_html_e( 'An AI tool call created this account, or changed its password, email address or role, in the last 24 hours, so this account cannot approve or decline requests yet. Use another administrator account that no tool has changed, or wait until the day is up.', 'guarded-mcp' ); ?></p></div>
+    <?php endif; ?>
+
     <h2 class="title"><?php esc_html_e( 'Ask before', 'guarded-mcp' ); ?></h2>
     <form method="post">
       <?php
