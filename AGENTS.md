@@ -266,3 +266,28 @@ Conventional Commits, atomic, and only your own changes. If a file holds edits y
 make, stage yours alone. Explain in the body why the change is right, not what the diff
 already shows; the commit log here is the reasoning record, and several entries exist
 purely to say why an obvious-looking alternative was wrong.
+
+**A pull request is written the same way.** Its title is a Conventional Commit, `type(scope):
+subject`, in the imperative and under about 72 characters, because the title becomes the commit
+subject when the PR is squash-merged and the log is the reasoning record. Use the types the
+history already uses: `feat`, `fix`, `docs`, `test`, `refactor`, `ci`, `build`. Mark a breaking
+change with `!` and a `BREAKING CHANGE:` line. Do not prefix the title with a model name,
+"WIP" or a ticket number; a draft is marked by being a draft.
+
+The description is the body of that commit, not a changelog of the diff. Put these in it, in
+this order:
+
+1. **Why**, in a sentence or two: the defect or the gap, and what was wrong with the obvious
+   alternative if there was one.
+2. **What changed**, grouped by behaviour a reader would notice (a new tool group, a guard whose
+   reach changed), each as its own Conventional-Commit-style bullet, not by file.
+3. **Guard and doc reach**, whenever a guard's reach changed: which sentences in `README.md`,
+   `readme.txt` and `docs/guardrails.md` were updated, and what the change deliberately does
+   *not* cover.
+4. **Verification**, stated as measured: which suites ran and their counts, which new tests were
+   shown to fail without the fix, and which suites **did not run and why**. A suite that could
+   not run is listed as not run, never as passing, and an assumption about a third-party plugin
+   that was not checked against its source is listed as unverified.
+
+A PR that carries several commits keeps one Conventional Commit per logical change, so a squash
+can be avoided when the history is worth keeping.
