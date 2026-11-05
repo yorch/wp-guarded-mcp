@@ -41,10 +41,10 @@ if ( !defined( 'ABSPATH' ) ) {
 *      modules and layout `js`/`css` that are ALREADY STORED. The caller never submits script;
 *      it picks a template that contains one. A module allowlist constrains new input and this
 *      route adds none.
-*   2. The change journal cannot undo a layout write. Its meta restore calls update_post_meta(),
-*      and GMCP_Core::layout_meta_refusal() refuses those keys during a tool call, so the
-*      plugin's own undo would be blocked by the plugin's own guard. A snapshot the tool writes
-*      is not a journal entry either, so wp_undo_change would not find it.
+*   2. The change journal has no record of a layout write to undo. The generic meta tools it
+*      records refuse these keys (GMCP_Core::generic_writer_meta_refusal(); not the net under
+*      WordPress, because the builder writes its own keys from its save hook), and a snapshot
+*      this group wrote would not be a journal entry, so wp_undo_change would not find it.
 *   3. A module allowlist does not prove non-executable content: `text`, `button` and `heading`
 *      all take values that can carry markup or a link, and nothing here has read Beaver's
 *      renderers to say otherwise.

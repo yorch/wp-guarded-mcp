@@ -512,10 +512,10 @@ class GMCP_Tools_Core {
       if ( $protected !== null ) {
         return $protected;
       }
-      // Writers only, and not through the net: @see GMCP_Core::attachment_file_meta_refusal().
-      $file_key = GMCP_Core::attachment_file_meta_refusal( $key );
-      if ( $file_key !== null ) {
-        return $file_key;
+      // Writers only, and not through the net: @see GMCP_Core::generic_writer_meta_refusal().
+      $generic = GMCP_Core::generic_writer_meta_refusal( $key );
+      if ( $generic !== null ) {
+        return $generic;
       }
     } else {
       // Reads too, for this one family: a builder layout is not a trash timestamp. Reading it
@@ -950,6 +950,10 @@ class GMCP_Tools_Core {
         $skipped[ $key ] = 'is the schedule WordPress deletes posts by, so it is never copied onto another post';
         continue;
       }
+      if ( GMCP_Core::layout_meta_refusal( (string) $key ) !== null ) {
+        $skipped[ $key ] = 'is a page builder layout, which the generic tools neither read nor write';
+        continue;
+      }
       if ( GMCP_Core::attachment_file_meta_refusal( (string) $key ) !== null ) {
         $skipped[ $key ] = 'names the file an attachment serves, so it is never copied onto another post';
         continue;
@@ -1138,7 +1142,7 @@ class GMCP_Tools_Core {
       // Before the post exists, so a refused key leaves nothing half made. The net under
       // update_post_metadata would stop it too, but only after wp_insert_post() had stored the row.
       foreach ( array_keys( $meta_input ) as $meta_k ) {
-        $protected = GMCP_Core::protected_meta_refusal( (string) $meta_k ) ?? GMCP_Core::attachment_file_meta_refusal( (string) $meta_k );
+        $protected = GMCP_Core::protected_meta_refusal( (string) $meta_k ) ?? GMCP_Core::generic_writer_meta_refusal( (string) $meta_k );
         if ( $protected !== null ) {
           return new WP_Error( 'gmcp_protected_meta', $protected . ' Nothing was created.' );
         }

@@ -1611,8 +1611,8 @@ class GMCP_Core {
   /**
   * The refusal for a layout meta key, or null when the key is fine.
   *
-  * Asked by the generic meta readers and writers, and by protected_meta_refusal() so the
-  * WordPress-level net covers writers that do not come through those tools.
+  * Asked by the generic meta readers and writers through generic_writer_meta_refusal(), and
+  * NOT by the WordPress-level net: the builder writes these keys from its own save hook.
   */
   /**
   * Depth counter for a sanctioned layout write.
@@ -1679,19 +1679,24 @@ class GMCP_Core {
     if ( GMCP_Meta_Key::starts_with( $key, '_wp_trash_meta_' ) ) {
       return 'The meta key "' . $key . '" is refused: WordPress deletes posts and comments for good on the schedule these keys hold, so writing one is a deletion by another name. Use wp_delete_post.';
     }
-    // A page builder's layout, for the same reason and through the same door: the WordPress
-    // filters installed by install_trash_meta_net() ask this function, so a writer that never
-    // calls the tools is covered too.
-    $layout = self::layout_meta_refusal( $key );
-    if ( $layout !== null ) {
-      // A sanctioned write (the Beaver create tool, and later the journal's restore) runs
-      // inside with_layout_write(). Reads do not come through this function at all.
-      if ( self::layout_write_in_progress() ) {
-        return null;
-      }
-      return $layout;
-    }
+    // NOT the page builder's layout keys, although they are refused to the generic meta tools
+    // too. This function is also what the net under the WordPress meta functions asks while a
+    // tool call is in flight, and the builder writes its own keys from inside an ordinary save:
+    // Beaver Builder copies a page's layout onto the revision from its save_post hook, so with
+    // the layout keys here wp_update_post on any Beaver page threw halfway through (measured:
+    // the title was written and the tool answered "failed"). @see generic_writer_meta_refusal().
     return null;
+  }
+
+  /**
+  * The key rules the generic meta WRITERS apply and the net under WordPress does not: a page
+  * builder's layout and the file an attachment serves. Asked beside protected_meta_refusal() by
+  * the meta tools, copy, meta_input and the REST meta argument. Not in the net, because the
+  * builder and core write these keys themselves from inside a save or an upload, and a refusal
+  * there fails a legitimate write after part of it is done.
+  */
+  public static function generic_writer_meta_refusal( $key ): ?string {
+    return self::layout_meta_refusal( $key ) ?? self::attachment_file_meta_refusal( $key );
   }
 
   /**
@@ -2202,7 +2207,7 @@ class GMCP_Core {
     }
     if ( isset( $args['meta'] ) && is_array( $args['meta'] ) ) {
       foreach ( $args['meta'] as $key => $value ) {
-        $why = self::protected_meta_refusal( (string) $key ) ?? self::attachment_file_meta_refusal( (string) $key ) ?? self::pointer_meta_refusal( (string) $key, $value, $post_id );
+        $why = self::protected_meta_refusal( (string) $key ) ?? self::generic_writer_meta_refusal( (string) $key ) ?? self::pointer_meta_refusal( (string) $key, $value, $post_id );
         if ( $why !== null ) {
           return $why;
         }

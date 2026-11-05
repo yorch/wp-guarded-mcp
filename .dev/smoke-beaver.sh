@@ -259,6 +259,27 @@ check "an admin key is told why, and still does not get the title" "$(has lay_su
 check "  ...the admin refusal carries no layout" "$(has lay_sub_admin "Sender $MARK")" "no"
 wpc eval 'wp_delete_post( '"$SUBID"', true );' >/dev/null 2>&1
 
+echo "-- an ordinary save of a builder page still works while the layout rules are armed --"
+# The builder copies a page's layout onto the revision from its own save_post hook. A refusal of the
+# layout keys in the net under WordPress's meta functions threw from inside that hook: the title was
+# written and the tool answered "failed". The rules belong to the generic meta TOOLS, not to that net.
+LAYOUT_BEFORE=$(dbq "SELECT MD5(meta_value) FROM wp_postmeta WHERE post_id=$PID AND meta_key='_fl_builder_data'")
+RW2=$(gmcp_make_key "smoke beaver readwrite save" readwrite)
+callas "$RW2" bb_save "$(tc wp_update_post '{"ID":'"$PID"',"fields":{"post_content":"saved through a tool '"$MARK"'"}}')"
+check "wp_update_post on a builder page succeeds" "$(verdict bb_save)" "ok"
+check "STORED: the new content is in the post" "$(dbq "SELECT IF(post_content LIKE '%saved through a tool $MARK%', 'yes', 'no') FROM wp_posts WHERE ID=$PID")" "yes"
+check "STORED: the layout is byte-for-byte what it was" \
+  "$(dbq "SELECT MD5(meta_value) FROM wp_postmeta WHERE post_id=$PID AND meta_key='_fl_builder_data'")" "$LAYOUT_BEFORE"
+check "CONTROL: the builder's own hook wrote the layout key onto a revision during that call (the write a net would refuse)" \
+  "$(dbq "SELECT IF(COUNT(*) > 0, 'yes', 'no') FROM wp_postmeta m JOIN wp_posts p ON p.ID = m.post_id WHERE p.post_parent=$PID AND p.post_type='revision' AND m.meta_key='_fl_builder_data'")" "yes"
+callas "$RW2" bb_dup "$(tc wp_duplicate_post '{"ID":'"$PID"'}')"
+check "wp_duplicate_post of a builder page answers" "$(verdict bb_dup)" "ok"
+DUPID=$(dbq "SELECT MAX(ID) FROM wp_posts WHERE post_type='page' AND post_title LIKE '%Beaver probe $MARK%' AND ID <> $PID")
+check "CONTROL: the copy exists" "$([ -n "$DUPID" ] && [ "$DUPID" != "NULL" ] && echo yes || echo no)" "yes"
+check "STORED: the layout was not copied onto it" "$(dbq "SELECT COUNT(*) FROM wp_postmeta WHERE post_id=$DUPID AND meta_key LIKE '\\_fl\\_builder%'")" "0"
+check "and the reply says which keys were skipped" "$(has bb_dup "_fl_builder_data")" "yes"
+wpc eval 'wp_delete_post( '"${DUPID:-0}"', true );' >/dev/null 2>&1
+
 echo "-- templates --"
 call tpl "$(tc beaver_templates '{}')"
 check "templates answers" "$(verdict tpl)" "ok"

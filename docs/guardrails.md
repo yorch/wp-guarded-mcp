@@ -1544,8 +1544,12 @@ asks is written down here.
 - **A page builder's layout is a meta key the generic tools refuse, by name.**
   `GMCP_Core::layout_meta_keys()` (`_fl_builder_data`, `_draft`, `_data_settings`,
   `_draft_settings`, `_enabled`; extendable through `gmcp_layout_meta_keys`) is refused by every
-  meta writer (through `protected_meta_refusal()`, so also by the net under the WordPress meta
-  functions while a tool is in flight) and by the keyed reader. The readers that list EVERY key
+  generic meta writer (`generic_writer_meta_refusal()`: the meta tools, copy, `meta_input` and the
+  REST `meta` argument) and by the keyed reader. It is deliberately NOT in the net under the
+  WordPress meta functions: Beaver Builder copies the layout onto a revision from its own
+  `save_post` hook, so a refusal there made `wp_update_post` on any builder page write the title
+  and then answer "failed" (measured), and another plugin's writer of these keys is therefore
+  not stopped. The readers that list EVERY key
   (`wp_get_post_meta` with no key, `wp_get_post_snapshot`) used to return the whole serialized
   tree, an `html` module's script included, to a read-only key: measured. They now list the key
   with `[withheld: page builder layout]` through `readable_meta()`. The key is judged as the
