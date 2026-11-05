@@ -881,6 +881,12 @@ class GMCP_Tools_Core {
   * @return array{0: array<string,array{bytes:int,rows:int}>, 1: array<string,string>} what was copied, and key => why it was skipped.
   */
   private function copy_post_meta( int $from, int $to, array $only, bool $overwrite ): array {
+    // The callers ask first and say why in a sentence. This is the same question asked where
+    // the rows actually move, so a caller added later cannot copy what a reader may not read.
+    $may_read = GMCP_Core::post_read_guard( $from );
+    if ( $may_read !== true ) {
+      return [ [], [ '(nothing)' => $may_read ] ];
+    }
     $source = get_post_meta( $from );
     $copied = [];
     $skipped = [];
@@ -1058,6 +1064,10 @@ class GMCP_Tools_Core {
     $commerce = GMCP_Core::commerce_post_guard( 0, 'Creating', sanitize_key( $a['post_type'] ?? 'post' ) );
     if ( $commerce !== true ) {
       return new WP_Error( 'gmcp_commerce_post', $commerce );
+    }
+    $submission = GMCP_Core::personal_data_retype_guard( 0, sanitize_key( $a['post_type'] ?? 'post' ) );
+    if ( $submission !== true ) {
+      return new WP_Error( 'gmcp_personal_data_post', $submission );
     }
     // Before anything is built or written. The net under wp_insert_post would catch it too,
     // but this says why in a sentence instead of as an exception from inside WordPress.
@@ -2541,7 +2551,13 @@ class GMCP_Tools_Core {
     // form submission. One check ahead of the switch rather than one per case, so a reader added
     // later to this list is the only edit a new route needs. The tool list is explicit: a
     // tool that is not named here is not covered, and docs/guardrails.md says which.
-    if ( in_array( $tool, [ 'wp_get_post', 'wp_get_post_snapshot', 'wp_get_post_meta', 'wp_read_post_meta_chunk' ], true ) ) {
+    //
+    // wp_alter_post and the previews are readers too. A regular-expression replace answers
+    // "how many places matched" (an oracle over the body of a message), and a preview of an
+    // update or a delete prints the title and the start of the body it is about to change.
+    $reads_one = in_array( $tool, [ 'wp_get_post', 'wp_get_post_snapshot', 'wp_get_post_meta', 'wp_read_post_meta_chunk', 'wp_alter_post' ], true )
+      || ( !empty( $a['preview'] ) && in_array( $tool, [ 'wp_update_post', 'wp_delete_post' ], true ) );
+    if ( $reads_one ) {
       $held = GMCP_Core::personal_data_post_guard( (int) ( $a['ID'] ?? 0 ) );
       if ( $held !== true ) {
         return $this->error( $r, $held, -32600 );
@@ -3531,6 +3547,11 @@ class GMCP_Tools_Core {
           if ( GMCP_Core::commerce_post_read_guard( $p ) !== true ) {
             continue;
           }
+          // The same for a form submission: the type check above only sees a type named in
+          // the request, and "any" names none.
+          if ( GMCP_Core::personal_data_post_guard( (int) $p->ID ) !== true ) {
+            continue;
+          }
           $rows[] = [
             'ID' => $p->ID,
             'post_title' => $p->post_title,
@@ -3757,6 +3778,10 @@ class GMCP_Tools_Core {
           if ( $item_commerce !== true ) {
             $unfit[] = 'item ' . $i . ': ' . $item_commerce;
           }
+          $item_submission = GMCP_Core::personal_data_retype_guard( 0, sanitize_key( (string) ( $item['post_type'] ?? 'post' ) ) );
+          if ( $item_submission !== true ) {
+            $unfit[] = 'item ' . $i . ': ' . $item_submission;
+          }
         }
         // A drafts-only key is refused the whole batch if any item would go live, and
         // before anything is written: a refusal at item twelve would leave eleven posts behind.
@@ -3848,6 +3873,13 @@ class GMCP_Tools_Core {
         $commerce = GMCP_Core::commerce_post_guard( $src->ID, 'Duplicating' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
+        // The source is read and its content and meta carried across, so the read policies
+        // apply to it as they would to wp_get_post: a form submission, or an order below admin.
+        $dup_read = GMCP_Core::post_read_guard( (int) $src->ID );
+        if ( $dup_read !== true ) {
+          $r = $this->error( $r, $dup_read, -32600 );
           break;
         }
         // The source is only read, so a live page may be copied by a drafts-only key; what
@@ -4143,6 +4175,13 @@ class GMCP_Tools_Core {
           $retype = GMCP_Core::commerce_post_guard( $post_id, 'Updating', is_scalar( $fields['post_type'] ) ? (string) $fields['post_type'] : '' );
           if ( $retype !== true ) {
             $r = $this->error( $r, $retype, -32600 );
+            break;
+          }
+          // The read guards are keyed on the post's type, so retyping a form submission to
+          // "post" makes it a post wp_get_post will return, body and all. Out of, or into.
+          $retype_pd = GMCP_Core::personal_data_retype_guard( $post_id, is_scalar( $fields['post_type'] ) ? (string) $fields['post_type'] : '' );
+          if ( $retype_pd !== true ) {
+            $r = $this->error( $r, $retype_pd, -32600 );
             break;
           }
         }
@@ -4630,7 +4669,16 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $commerce, -32600 );
           break;
         }
-        // The target is the write; the source is only read.
+        // The source is READ, and its meta travels to a post this caller can then read back.
+        // Asking only about the target left every key of a form submission (a Flamingo
+        // message's _meta holds the visitor's IP address and user agent) or of an order
+        // copyable onto a draft of the caller's own. The read policies apply to the source.
+        $source_read = GMCP_Core::post_read_guard( $from_id );
+        if ( $source_read !== true ) {
+          $r = $this->error( $r, $source_read, -32600 );
+          break;
+        }
+        // The target is the write.
         $drafts = GMCP_Core::drafts_only_guard( $to_id, 'Copying meta onto' );
         if ( $drafts !== true ) {
           $r = $this->error( $r, $drafts, -32600 );

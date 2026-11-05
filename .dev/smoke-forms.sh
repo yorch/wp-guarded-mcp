@@ -35,7 +35,8 @@ gmcp_make_key() { # gmcp_make_key <label> <level>
 }
 TOK=$(gmcp_make_key "smoke forms" admin)
 RO=$(gmcp_make_key "smoke forms readonly" readonly)
-for k in "$TOK" "$RO"; do
+RW=$(gmcp_make_key "smoke forms readwrite" readwrite)
+for k in "$TOK" "$RO" "$RW"; do
   case "$k" in
     gmcp_*) ;;
     *) echo "Could not create an API key for the suite. Is the plugin active?" >&2; exit 1 ;;
@@ -113,6 +114,98 @@ check "CONTROL: the same call on an ordinary post succeeds" "$(verdict g0)" "ok"
 check "and the probe finds the marker when it is there" "$(has g0 "$MARK")" "yes"
 callas "$RO" g0 "$(tc wp_get_post "{\"ID\":$NORMAL}")"
 check "CONTROL: wp_get_post on an ordinary post succeeds" "$(verdict g0)" "ok"
+
+# ---------------------------------------------------------------------------------------------
+echo "== Block 0b: a write tool is not a way round the read guard =="
+# A readwrite key cannot read a submission. These are the routes that would let it read one
+# anyway: copy the meta onto its own draft, retype the post into an ordinary type, duplicate it,
+# or read it through a URI. Each hostile call is followed by reading the STORED state, and the
+# state is put back before comparing. Controls run the same call on an ordinary post.
+docker compose exec -T cli sh -c 'cat > /var/www/html/wp-content/mu-plugins/gmcp-smoke-forms-type.php' <<'PHP'
+<?php
+// A form-submission type that "any" will return, which is how a per-row check is reached.
+add_action( 'init', function () {
+  register_post_type( 'flamingo_inbound', [ 'public' => true, 'show_in_rest' => false, 'label' => 'smoke submission' ] );
+}, 99 );
+PHP
+DRAFT=$(wpe 'echo wp_insert_post(["post_title"=>"smoke draft","post_type"=>"post","post_status"=>"draft"]);')
+SUBID=$(wpe 'echo wp_insert_post(["post_title"=>"smoke submission","post_type"=>"flamingo_inbound","post_status"=>"publish","post_content"=>"'"$MARK"'-body"]);')
+SUBID2=$(wpe 'echo wp_insert_post(["post_title"=>"smoke submission 2","post_type"=>"flamingo_inbound","post_status"=>"draft","post_content"=>"'"$MARK"'-body2"]);')
+CLEAN="$CLEAN $DRAFT $SUBID $SUBID2"
+wpe 'update_post_meta('"$SUBID"',"_meta",["remote_ip"=>"'"$MARK"'-ip"]);update_post_meta('"$SUBID"',"_field_message","'"$MARK"'-field");' >/dev/null
+check "CONTROL: the submission carries the marker in its meta, and the draft starts with none" \
+  "$(wpe 'echo get_post_meta('"$SUBID"',"_field_message",true), "|", count(get_post_meta('"$DRAFT"'));')" "$MARK-field|0"
+
+callas "$RW" w1 "$(tc wp_copy_post_meta "{\"from_id\":$SUBID,\"to_id\":$DRAFT}")"
+check "wp_copy_post_meta FROM a submission is refused" "$(verdict w1)" "error"
+check "STORED: the draft holds none of the submission's keys" \
+  "$(wpe 'echo count(array_intersect(array_keys(get_post_meta('"$DRAFT"')), ["_meta","_field_message"]));')" "0"
+check "and the refusal is the personal-data guard's" "$(has w1 "form submission")" "yes"
+callas "$RW" w1b "$(tc wp_copy_post_meta "{\"from_id\":$SUBID,\"to_id\":$DRAFT,\"keys\":[\"_meta\"]}")"
+check "naming the key does not help" "$(verdict w1b)" "error"
+check "STORED: still no _meta on the draft" "$(wpe 'echo metadata_exists("post",'"$DRAFT"',"_meta")?"yes":"no";')" "no"
+callas "$RW" w1c "$(tc wp_copy_post_meta "{\"from_id\":$NORMAL,\"to_id\":$DRAFT}")"
+check "CONTROL: copying from an ordinary post onto the same draft succeeds" "$(verdict w1c)" "ok"
+check "CONTROL: and STORED: the draft now holds the ordinary post's key (the probe can see a copy)" \
+  "$(wpe 'echo get_post_meta('"$DRAFT"',"_field_1",true);')" "$MARK-meta"
+
+callas "$RW" w2 "$(tc wp_update_post "{\"ID\":$SUBID,\"fields\":{\"post_type\":\"post\"}}")"
+check "retyping a submission to an ordinary type is refused" "$(verdict w2)" "error"
+check "STORED: its type is unchanged" "$(wpe 'echo get_post_type('"$SUBID"');')" "flamingo_inbound"
+callas "$RW" w2b "$(tc wp_update_post "{\"ID\":$SUBID,\"post_type\":\"page\"}")"
+check "the same with post_type at the top level" "$(verdict w2b)" "error"
+check "STORED: its type is still unchanged" "$(wpe 'echo get_post_type('"$SUBID"');')" "flamingo_inbound"
+callas "$RW" w2c "$(tc wp_get_post "{\"ID\":$SUBID}")"
+check "and wp_get_post still refuses it" "$(has w2c "$MARK")" "no"
+callas "$RW" w3 "$(tc wp_update_post "{\"ID\":$NORMAL,\"fields\":{\"post_type\":\"flamingo_inbound\"}}")"
+check "retyping an ordinary post INTO a submission type is refused" "$(verdict w3)" "error"
+check "STORED: it is still a post" "$(wpe 'echo get_post_type('"$NORMAL"');')" "post"
+callas "$RW" w3b "$(tc wp_update_post "{\"ID\":$NORMAL,\"fields\":{\"post_type\":\"page\"}}")"
+check "CONTROL: retyping an ordinary post to page succeeds" "$(verdict w3b)" "ok"
+check "CONTROL: and STORED: it is a page" "$(wpe 'echo get_post_type('"$NORMAL"');')" "page"
+wpe 'wp_update_post(["ID"=>'"$NORMAL"',"post_type"=>"post"]);' >/dev/null
+check "restored: the ordinary post is a post again" "$(wpe 'echo get_post_type('"$NORMAL"');')" "post"
+
+BEFORE=$(wpe 'echo count(get_posts(["post_type"=>"flamingo_inbound","post_status"=>"any","numberposts"=>-1]));')
+callas "$RW" w4 "$(tc wp_create_post '{"post_title":"forged","post_type":"flamingo_inbound"}')"
+check "creating a submission-type post is refused" "$(verdict w4)" "error"
+callas "$RW" w4b "$(tc wp_duplicate_post "{\"ID\":$SUBID}")"
+check "duplicating a submission is refused" "$(verdict w4b)" "error"
+check "STORED: no submission-type post was added by either" \
+  "$(wpe 'echo count(get_posts(["post_type"=>"flamingo_inbound","post_status"=>"any","numberposts"=>-1]));')" "$BEFORE"
+callas "$RW" w4c "$(tc wp_duplicate_post "{\"ID\":$NORMAL}")"
+check "CONTROL: duplicating an ordinary post succeeds" "$(verdict w4c)" "ok"
+DUPID=$(wpe 'echo (int) get_posts(["post_type"=>"post","post_status"=>"draft","numberposts"=>1,"orderby"=>"ID","order"=>"DESC","fields"=>"ids"])[0];')
+CLEAN="$CLEAN $DUPID"
+
+callas "$RW" w5 "$(tc wp_update_post "{\"ID\":$SUBID,\"post_title\":\"x\",\"preview\":true}")"
+check "previewing an update to a submission is refused (a preview prints the start of the body)" "$(verdict w5)" "error"
+callas "$RW" w5b "$(tc wp_alter_post "{\"ID\":$SUBID,\"field\":\"post_content\",\"search\":\"$MARK\",\"replace\":\"x\",\"preview\":true}")"
+check "previewing a search-and-replace on a submission is refused (a match count is an oracle)" "$(verdict w5b)" "error"
+callas "$RW" w5c "$(tc wp_alter_post "{\"ID\":$SUBID,\"field\":\"post_content\",\"search\":\"$MARK\",\"replace\":\"x\"}")"
+check "and so is the real one" "$(verdict w5c)" "error"
+check "STORED: the body is unchanged" "$(wpe 'echo get_post('"$SUBID"')->post_content;')" "$MARK-body"
+callas "$RW" w5d "$(tc wp_alter_post "{\"ID\":$NORMAL,\"field\":\"post_content\",\"search\":\"$MARK\",\"replace\":\"$MARK\",\"preview\":true}")"
+check "CONTROL: the same preview on an ordinary post succeeds" "$(verdict w5d)" "ok"
+
+callas "$RO" w6 "$(tc wp_get_posts '{"post_type":"any","post_status":"any","limit":50}')"
+check "CONTROL: wp_get_posts type any succeeds and lists the ordinary post (the probe sees a row)" \
+  "$(has w6 "\"ID\": $NORMAL")" "yes"
+check "wp_get_posts type any does not list a submission row" "$(has w6 "\"ID\": $SUBID")" "no"
+callas "$RO" w7 '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"gmcp://post/'"$SUBID2"'"}}'
+# resources/read answers under result.contents, which has() does not look at, so these two
+# search the raw reply. The control below proves the probe sees a body that is there.
+rawhas() { grep -qF -- "$2" "$OUT/$1" && echo yes || echo no; }
+check "reading a submission through a gmcp://post resource returns nothing" "$(rawhas w7 "$MARK-body2")" "no"
+check "CONTROL: that submission's body is stored, so its absence above is the guard's" "$(wpe 'echo get_post('"$SUBID2"')->post_content;')" "$MARK-body2"
+callas "$RO" w7b '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"gmcp://post/'"$NORMAL"'"}}'
+check "CONTROL: the same resource for an ordinary post returns its body" "$(rawhas w7b "$MARK-body")" "yes"
+callas "$RW" w8 "$(tc wp_create_preview_link "{\"post_id\":$DRAFT}")"
+check "CONTROL: a preview link for an ordinary draft is minted" "$(verdict w8)" "ok"
+callas "$RW" w8b "$(tc wp_create_preview_link "{\"post_id\":$SUBID2}")"
+check "a preview link to an unpublished submission is not minted" "$(verdict w8b)" "error"
+check "and the refusal is the personal-data guard's" "$(has w8b "form submission")" "yes"
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-forms-type.php >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------------------------
 echo "== Contact Form 7 + Flamingo =="

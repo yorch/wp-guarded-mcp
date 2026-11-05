@@ -912,17 +912,36 @@ As with the other groups, the storage described below is from memory and marked 
   could therefore read every answer, and for Flamingo the visitor's IP address, through the
   tool beside the admin-only ones. `GMCP_Core::personal_data_post_guard()` is asked, ahead of
   the dispatch switch, by `wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`,
-  `wp_read_post_meta_chunk` and, for the post type it names, `wp_get_posts`. It is on whether
-  or not the forms group is. The type list is filterable through
+  `wp_read_post_meta_chunk`, `wp_alter_post` (a match count over a body is an oracle) and the
+  previews of `wp_update_post` and `wp_delete_post` (which print a title and the start of the
+  body), for the post type `wp_get_posts` names, and per row in a `wp_get_posts` listing (type
+  `any` names none). The `gmcp://post/{id}` resource and `wp_create_preview_link` ask it too.
+  It is on whether or not the forms group is. The type list is filterable through
   `gmcp_personal_data_post_types`.
-- **What that guard does not cover.** It is a list of readers, not a property of the data,
+- **A tool that copies from a post is a reader.** `wp_copy_post_meta` used to ask the write
+  guards about the post it wrote TO and nothing about the post it read FROM, so a `readwrite`
+  key copied every meta key of a Flamingo message (its `_meta` holds the IP address and user
+  agent) or of a `shop_order` (HPOS off) onto a draft of its own and read the draft with
+  `wp_get_post_meta`. `GMCP_Core::post_read_guard()` (the personal-data guard, then the
+  commerce read guard, which only lets an admin key read an order's rows) is now asked about the
+  source by `wp_copy_post_meta` and `wp_duplicate_post`, and again inside the one function that
+  moves the rows. `wp_update_post` and `wp_create_post(s)` refuse to retype a post out of, or
+  into, a form-submission type (`GMCP_Core::personal_data_retype_guard()`): the read guards ask
+  what type a post is, so a message retyped to `post` was an ordinary post whose body
+  `wp_get_post` returns, and Flamingo builds that body from the fields, consent and meta. A
+  commerce post is not retypable either, because `commerce_post_guard()` refuses every generic
+  write to one.
+- **What the guards do not cover.** They are a list of readers, not a property of the data,
   and the same weakness the commerce guard has: a reader added later has to be added to it.
-  Not covered today: `wp_get_post_terms` (channel terms only), the REST-route tools when that
-  group is on and a plugin exposes the type through REST, the change journal (which records a
-  changed meta key, and withholds values that look credential-shaped), and every route to the
-  database that is not a post reader. WooCommerce orders stored as posts are in the same
-  position, and are not added to this list: that is a broader decision about generic
-  post-meta reads and is not made here.
+  Not covered today: `wp_get_post_terms` and the terms of a post in the resource header
+  (channel terms only), the REST-route tools when that group is on and a plugin exposes the
+  type through REST, the change journal (it records a changed meta key and withholds values
+  that look credential-shaped, and only for posts a tool changed), and every route to the
+  database that is not a post reader. WooCommerce orders stored as posts ARE covered by
+  `commerce_post_read_guard()` in `wp_get_posts`, `wp_get_post`, `wp_get_post_snapshot`,
+  `wp_get_post_meta`, `wp_read_post_meta_chunk`, `wp_get_comments` and, now, the copy tools
+  and the resource; that guard applies below admin level only, whereas the form-submission
+  guard applies at every level (an admin key uses the form tools).
 - **Fluent Forms and Ninja Forms tables are checked for existence before a count.**
   Fluent stores answers as one JSON document per submission and the schema as JSON on the
   form; a schema that does not parse means no answers. Ninja Forms is told whether each form

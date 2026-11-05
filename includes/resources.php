@@ -186,6 +186,13 @@ class GMCP_Resources {
     if ( !$post || $post->post_type === 'revision' || $post->post_status === 'auto-draft' ) {
       return null;
     }
+    // The body of a form submission or (below admin) an order is not readable through
+    // wp_get_post, and this is the same read under a URI. Flamingo builds a message's
+    // post_content from its fields, consent and meta, the visitor's IP address among them.
+    // Answered as "nothing readable", which is also what a missing post says.
+    if ( GMCP_Core::post_read_guard( (int) $post->ID ) !== true ) {
+      return null;
+    }
 
     $terms = [];
     foreach ( get_object_taxonomies( $post->post_type ) as $taxonomy ) {

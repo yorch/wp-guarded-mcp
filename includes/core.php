@@ -1183,6 +1183,61 @@ class GMCP_Core {
   }
 
   /**
+  * The two read policies about a post, asked together: a form submission is never returned by
+  * a generic reader, and a commerce post is returned only at admin level.
+  *
+  * Asked by every tool that takes a post id and COPIES from it or otherwise carries what it
+  * holds somewhere else. Those are reads wearing a write's name. wp_copy_post_meta guarded
+  * only the post it wrote to, so a readwrite key copied every meta key of a Flamingo message
+  * (its _meta holds the visitor's IP address and user agent) or of an order onto its own draft
+  * and read the draft back with wp_get_post_meta, which is a read the guards above would have
+  * refused on the original.
+  *
+  * @return true|string True when the post may be read through a generic tool, otherwise the refusal.
+  */
+  public static function post_read_guard( int $post_id ) {
+    $held = self::personal_data_post_guard( $post_id );
+    if ( $held !== true ) {
+      return $held;
+    }
+    return self::commerce_post_read_guard( $post_id );
+  }
+
+  /**
+  * A post may not be retyped out of, or into, a form-submission type.
+  *
+  * Retyping is the other way to make a read guard about a post type stop applying: the guard
+  * is asked "what type is this post", so a message retyped to "post" is an ordinary post whose
+  * body wp_get_post returns, and Flamingo builds that body from the submission's fields,
+  * consent and meta, the visitor's IP address and user agent among them. Retyping INTO one
+  * is refused for the same family of reasons as creating one (a forged submission that the
+  * form tools then report as received), and costs a legitimate caller nothing.
+  *
+  * A retype of a commerce post is refused by commerce_post_guard(), which refuses every
+  * generic write to one.
+  *
+  * @param int    $post_id     The post being changed, or 0 for a creation.
+  * @param string $target_type The post type the write would leave it with.
+  * @return true|string
+  */
+  public static function personal_data_retype_guard( int $post_id, string $target_type, string $verb = 'Updating' ) {
+    $target = strtolower( trim( $target_type ) );
+    $current = $post_id > 0 ? strtolower( (string) get_post_type( $post_id ) ) : '';
+    if ( $target === $current ) {
+      return true;
+    }
+    $held = array_map( 'strtolower', array_map( 'strval', self::personal_data_post_types() ) );
+    $from = $current !== '' && in_array( $current, $held, true );
+    $to = $target !== '' && in_array( $target, $held, true );
+    if ( !$from && !$to ) {
+      return true;
+    }
+    return ( $post_id > 0 ? $verb . ' a post to change its type ' . ( $from ? 'from' : 'to' ) . ' ' . ( $from ? $current : $target ) : 'Creating a ' . $target )
+      . ' is refused: ' . ( $from ? $current : $target ) . ' is a form submission, personal data that the generic post tools never return. '
+      . 'Retyping a submission would make it an ordinary post those tools read, and a submission made by hand is not one a visitor sent. The form tools read submissions; nothing here writes one.';
+  }
+
+  /**
   * Whether a post is an Elementor library template something still renders, and the
   * sentence to refuse with.
   *
