@@ -59,19 +59,16 @@ class GMCP_Tools_Core {
     unset( $r['error'] );
     return $r;
   }
-  private function clean_html( string $v ): string {
-    return wp_kses_post( wp_unslash( $v ) );
-  }
-
   /**
   * An argument filtered through kses, with nothing unslashed.
   *
-  * clean_html() unslashes first, which is right for nothing that reaches this class:
-  * arguments arrive from json_decode() of the request body, never from $_POST, so no
-  * slashes were added on the way in and the unslash removes real ones. Every WordPress
-  * writer then unslashes again, so a comment reading "C:\Users\x" was stored as
-  * "C:Usersx" and reported as created. Callers using this slash the array they hand to
-  * the writer, the way the post writers already do.
+  * There used to be a sibling that unslashed first. That is right for nothing that reaches
+  * this class: arguments arrive from json_decode() of the request body, never from $_POST,
+  * so no slashes were added on the way in and the unslash removes real ones. Every
+  * WordPress writer then unslashes again, so a comment reading "C:\Users\x" was stored as
+  * "C:Usersx" and reported as created, and the same sibling cost wp_write_blocks every
+  * backslash in a code or paragraph block. Callers of this slash the array they hand to the
+  * writer, the way the post writers already do.
   */
   private function kses_arg( string $v ): string {
     return wp_kses_post( $v );
@@ -174,7 +171,7 @@ class GMCP_Tools_Core {
   }
 
   // Return stored post_content verbatim for read tools (wp_get_post, snapshot).
-  // The DB value is NOT slashed, so clean_html()'s wp_unslash() would strip the
+  // The DB value is NOT slashed, so an unslash here would strip the
   // real backslash from block-JSON Unicode escapes (Gutenberg's \uXXXX form for
   // < and >, as Rank Math FAQ blocks use) and wp_kses_post() would drop the
   // admin-authored markup that store_html() preserved on write. A read must
@@ -274,7 +271,7 @@ class GMCP_Tools_Core {
   private function render_block_spec( string $type, array $b, string $at ): array {
     switch ( $type ) {
       case 'paragraph':
-        return [ "<!-- wp:paragraph -->\n<p>" . $this->clean_html( $b['content'] ?? '' ) . "</p>\n<!-- /wp:paragraph -->", null ];
+        return [ "<!-- wp:paragraph -->\n<p>" . $this->kses_arg( $b['content'] ?? '' ) . "</p>\n<!-- /wp:paragraph -->", null ];
 
       case 'heading':
         $level = isset( $b['level'] ) ? (int) $b['level'] : 2;
@@ -282,7 +279,7 @@ class GMCP_Tools_Core {
           return [ null, $at . ' heading level must be between 1 and 6.' ];
         }
         $attrs = $level === 2 ? '' : ' ' . wp_json_encode( [ 'level' => $level ] );
-        $text = $this->clean_html( $b['content'] ?? '' );
+        $text = $this->kses_arg( $b['content'] ?? '' );
         return [ '<!-- wp:heading' . $attrs . " -->\n<h" . $level . ' class="wp-block-heading">' . $text . '</h' . $level . ">\n<!-- /wp:heading -->", null ];
 
       case 'list':
@@ -295,13 +292,13 @@ class GMCP_Tools_Core {
         $listAttrs = $ordered ? ' ' . wp_json_encode( [ 'ordered' => true ] ) : '';
         $lis = '';
         foreach ( $items as $it ) {
-          $lis .= "<!-- wp:list-item -->\n<li>" . $this->clean_html( is_string( $it ) ? $it : '' ) . "</li>\n<!-- /wp:list-item -->\n";
+          $lis .= "<!-- wp:list-item -->\n<li>" . $this->kses_arg( is_string( $it ) ? $it : '' ) . "</li>\n<!-- /wp:list-item -->\n";
         }
         return [ '<!-- wp:list' . $listAttrs . " -->\n<" . $tag . ' class="wp-block-list">' . rtrim( $lis, "\n" ) . '</' . $tag . ">\n<!-- /wp:list -->", null ];
 
       case 'quote':
-        $qInner = "<!-- wp:paragraph -->\n<p>" . $this->clean_html( $b['content'] ?? '' ) . "</p>\n<!-- /wp:paragraph -->";
-        $cite = ( isset( $b['citation'] ) && $b['citation'] !== '' ) ? '<cite>' . $this->clean_html( $b['citation'] ) . '</cite>' : '';
+        $qInner = "<!-- wp:paragraph -->\n<p>" . $this->kses_arg( $b['content'] ?? '' ) . "</p>\n<!-- /wp:paragraph -->";
+        $cite = ( isset( $b['citation'] ) && $b['citation'] !== '' ) ? '<cite>' . $this->kses_arg( $b['citation'] ) . '</cite>' : '';
         return [ "<!-- wp:quote -->\n<blockquote class=\"wp-block-quote\">" . $qInner . $cite . "</blockquote>\n<!-- /wp:quote -->", null ];
 
       case 'image':
@@ -310,7 +307,7 @@ class GMCP_Tools_Core {
           return [ null, $at . ' image requires a "url".' ];
         }
         $alt = esc_attr( $b['alt'] ?? '' );
-        $caption = ( isset( $b['caption'] ) && $b['caption'] !== '' ) ? '<figcaption class="wp-element-caption">' . $this->clean_html( $b['caption'] ) . '</figcaption>' : '';
+        $caption = ( isset( $b['caption'] ) && $b['caption'] !== '' ) ? '<figcaption class="wp-element-caption">' . $this->kses_arg( $b['caption'] ) . '</figcaption>' : '';
         $img = '<img src="' . $url . '" alt="' . $alt . '"/>';
         return [ "<!-- wp:image -->\n<figure class=\"wp-block-image\">" . $img . $caption . "</figure>\n<!-- /wp:image -->", null ];
 
@@ -326,7 +323,7 @@ class GMCP_Tools_Core {
           }
           $href = esc_url_raw( $btn['url'] ?? '' );
           $hrefAttr = $href !== '' ? ' href="' . $href . '"' : '';
-          $btnInner .= "<!-- wp:button -->\n<div class=\"wp-block-button\"><a class=\"wp-block-button__link wp-element-button\"" . $hrefAttr . '>' . $this->clean_html( $btn['text'] ) . "</a></div>\n<!-- /wp:button -->\n";
+          $btnInner .= "<!-- wp:button -->\n<div class=\"wp-block-button\"><a class=\"wp-block-button__link wp-element-button\"" . $hrefAttr . '>' . $this->kses_arg( $btn['text'] ) . "</a></div>\n<!-- /wp:button -->\n";
         }
         return [ "<!-- wp:buttons -->\n<div class=\"wp-block-buttons\">" . rtrim( $btnInner, "\n" ) . "</div>\n<!-- /wp:buttons -->", null ];
 
@@ -363,11 +360,11 @@ class GMCP_Tools_Core {
         return [ '<!-- wp:spacer ' . wp_json_encode( [ 'height' => $h . 'px' ] ) . " -->\n<div style=\"height:" . $h . "px\" aria-hidden=\"true\" class=\"wp-block-spacer\"></div>\n<!-- /wp:spacer -->", null ];
 
       case 'code':
-        return [ "<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>" . esc_html( wp_unslash( (string) ( $b['content'] ?? '' ) ) ) . "</code></pre>\n<!-- /wp:code -->", null ];
+        return [ "<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>" . esc_html( (string) ( $b['content'] ?? '' ) ) . "</code></pre>\n<!-- /wp:code -->", null ];
 
       case 'html':
         // core/html stores raw HTML and is always valid on re-open. Sanitize to post-safe HTML.
-        return [ "<!-- wp:html -->\n" . $this->clean_html( $b['content'] ?? '' ) . "\n<!-- /wp:html -->", null ];
+        return [ "<!-- wp:html -->\n" . $this->kses_arg( $b['content'] ?? '' ) . "\n<!-- /wp:html -->", null ];
     }
     return [ null, $at . ' could not be rendered.' ];
   }
@@ -1144,7 +1141,7 @@ class GMCP_Tools_Core {
     if ( class_exists( 'GMCP_Changes' ) ) {
       foreach ( GMCP_Changes::captured() as $record ) {
         if ( ( $record['call'] ?? '' ) !== '' ) {
-          $group = GMCP_Journal::GROUP_PREFIX . $record['call'];
+          $group = (string) $record['call'];
           break;
         }
       }
@@ -1152,7 +1149,7 @@ class GMCP_Tools_Core {
     $note .= ' The custom fields this call wrote ARE journalled, grouped under this one call';
     return $group === ''
       ? $note . '; wp_list_changes shows the group.'
-      : $note . ' as "' . $group . '", and one wp_undo_change on that id removes all of them'
+      : $note . ', and wp_undo_change {"call":"' . $group . '"} removes all of them'
         . ' while leaving the posts standing.';
   }
 
@@ -3124,9 +3121,9 @@ class GMCP_Tools_Core {
           $value = '[redacted]';
         }
         else {
-          $value = GMCP_Core::redact( $value );
+          $value = GMCP_Core::redact( $value, 0, false );
         }
-        $r = $this->json( $r, $value );
+        $this->add_result_text( $r, wp_json_encode( $value, JSON_PRETTY_PRINT ) );
         break;
 
       case 'wp_set_theme_mod':
@@ -3180,8 +3177,8 @@ class GMCP_Tools_Core {
         // text. redact() walks the value and blanks the leaves the same way it does for
         // an audit-log argument, keeping the shape so the caller can still see what is
         // there without seeing what was in it.
-        $mods = GMCP_Core::redact( $mods );
-        $r = $this->json( $r, $mods );
+        $mods = GMCP_Core::redact( $mods, 0, false );
+        $this->add_result_text( $r, wp_json_encode( $mods, JSON_PRETTY_PRINT ) );
         break;
 
       case 'wp_remove_theme_mod':

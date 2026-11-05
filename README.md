@@ -137,7 +137,7 @@ path, scrubs every line, and says whether logging is off, the file is absent, or
 empty); `wp_fetch_page` requests one page of this site the way an anonymous visitor does
 and reports status, redirects, robots signals and a bounded excerpt of the text (this
 site's own host only, `admin` level); and `wp_create_preview_link` /
-`wp_revoke_preview_links` make and end an expiring, non-indexed link to one unpublished
+`wp_revoke_preview_links` (ending every link on the site needs an admin-level key) make and end an expiring, non-indexed link to one unpublished
 post, 24 hours by default and 7 days at most. Viewing a preview link is not logged.
 
 **WooCommerce**, off by default, and the switch only appears when the shop is installed:
@@ -326,7 +326,8 @@ post and some custom fields. Only writes made during a tool call are recorded, n
 person's own edits. **Creations, deletions and users are not covered**, and adding or
 deleting a menu item is a creation or a deletion. An undo is itself recorded, so
 reverting the undo puts the edit back; that second step is refused if the thing has
-changed since, so it cannot overwrite newer work with an older copy.
+changed since, so it cannot overwrite newer work with an older copy. For a custom
+field that includes a row someone added to the same key in the meantime.
 
 **Backups.** `wp_backup_status` reports what is known, `wp_list_backups` says which backups
 exist, and `wp_start_backup` asks the site's backup plugin to start one. Listings never

@@ -3065,6 +3065,114 @@ else
 fi
 docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
 
+echo "-- journal: an undo records no credential, and meta staleness sees every row --"
+# Run on its own through the docker stand-in against a local WordPress; see the note on the
+# diagnostics block below. Two defects, each asserted on stored state:
+#  1. Undoing a term edit wrote the value it overwrote into the journal entry that reverses the
+#     undo, with no credential test, while recording the edit itself did have one.
+#  2. The staleness hash of a meta entry read the FIRST row only, and a single-value restore
+#     ran update_post_meta() with no previous value, which rewrites every row of the key.
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+jx_find() { # jx_find <file> <python predicate on x> -> id of the newest matching entry, or MISSING
+  py "import json,sys
+rows = json.loads(json.load(sys.stdin)['result']['content'][0]['text'])
+hit = [x for x in rows if $2]
+print(hit[0]['id'] if hit else 'MISSING')" "$1"
+}
+jx_list() { call "$1" '{"jsonrpc":"2.0","id":500,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":40}}}'; }
+jx_undo() { call "$1" "{\"jsonrpc\":\"2.0\",\"id\":501,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$2\"}}}"; }
+jx_journal() { docker compose exec -T cli wp eval 'echo serialize( get_option( "gmcp_journal", [] ) );' 2>/dev/null; }
+
+# --- 1. the term description that becomes a credential, then is undone ---
+JX_T=$(docker compose exec -T cli wp eval 'echo wp_insert_term( "JX term", "category", [ "slug" => "jx-term", "description" => "plain" ] )["term_id"];' 2>/dev/null | tr -d '\r\n')
+check "control: the fixture term holds the plain description" "$(docker compose exec -T cli wp eval "echo get_term($JX_T,'category')->description;" 2>/dev/null | tr -d '\r\n')" "plain"
+call jx_t1 "{\"jsonrpc\":\"2.0\",\"id\":502,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_term\",\"arguments\":{\"term_id\":$JX_T,\"taxonomy\":\"category\",\"description\":\"{\\\"api_key\\\":\\\"sk_live_SECRETVALUE123\\\"}\"}}}"
+check "control: the secret is now the stored description (so the probe below has something to find)" \
+  "$(docker compose exec -T cli wp eval "echo strpos(get_term($JX_T,'category')->description,'SECRETVALUE123')!==false?'present':'absent';" 2>/dev/null | tr -d '\r\n')" "present"
+jx_list jx_l1
+JX_E1=$(jx_find jx_l1 "x['tool']=='wp_update_term' and 'JX term' in x['what']")
+check "control: the edit is journalled" "$([ "$JX_E1" != MISSING ] && echo yes || echo no)" "yes"
+check "stored state: the journal holds no copy of the secret after the edit" "$(jx_journal | grep -c SECRETVALUE123)" "0"
+check "control: that probe does find a value that IS in the journal (the earlier description)" "$([ "$(jx_journal | grep -c plain)" -ge 1 ] && echo yes || echo no)" "yes"
+jx_undo jx_u1 "$JX_E1"
+check "the undo put the plain description back" "$(docker compose exec -T cli wp eval "echo get_term($JX_T,'category')->description;" 2>/dev/null | tr -d '\r\n')" "plain"
+check "stored state: the entry that reverses the undo carries no copy of the secret" "$(jx_journal | grep -c SECRETVALUE123)" "0"
+jx_list jx_l2
+JX_U1=$(jx_find jx_l2 "x.get('undoes')=='$JX_E1'")
+check "the undo is on record" "$([ "$JX_U1" != MISSING ] && echo yes || echo no)" "yes"
+jx_undo jx_u2 "$JX_U1"
+check "reverting it is refused" "$(verdict jx_u2)" "error"
+check "stored state: the description is still the plain one" "$(docker compose exec -T cli wp eval "echo get_term($JX_T,'category')->description;" 2>/dev/null | tr -d '\r\n')" "plain"
+# The other direction is the control: a credential going OUT of a term is not copied either.
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+docker compose exec -T cli wp eval "wp_update_term($JX_T,'category',['description'=>'{\"api_key\":\"sk_live_SECRETVALUE123\"}']);" >/dev/null 2>&1
+call jx_t2 "{\"jsonrpc\":\"2.0\",\"id\":503,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_term\",\"arguments\":{\"term_id\":$JX_T,\"taxonomy\":\"category\",\"description\":\"plain again\"}}}"
+check "control: secret to plain is journalled with nothing stored" "$(jx_journal | grep -c SECRETVALUE123)" "0"
+check "control: and the entry exists" "$([ "$(jx_journal | grep -c 'JX term')" -ge 1 ] && echo yes || echo no)" "yes"
+docker compose exec -T cli wp term delete category "$JX_T" >/dev/null 2>&1
+
+# --- 2. post meta: the staleness check and the single-value restore see every row ---
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+JX_P=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"JX meta","post_type"=>"page","post_status"=>"draft"]);' 2>/dev/null | tr -d '\r\n')
+jx_rows() { docker compose exec -T cli wp eval "echo wp_json_encode( get_post_meta($JX_P,'$1',false) );" 2>/dev/null | tr -d '\r\n'; }
+jx_set() { call "$1" "{\"jsonrpc\":\"2.0\",\"id\":504,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post_meta\",\"arguments\":{\"ID\":$JX_P,\"key\":\"$2\",\"value\":\"$3\"}}}"; }
+# (a) The reported case: an undo, then somebody else adds a row, then the undo is reverted.
+docker compose exec -T cli wp eval "update_post_meta($JX_P,'jx_mrk','A');" >/dev/null 2>&1
+jx_set jx_s1 jx_mrk B
+jx_list jx_l3
+JX_M1=$(jx_find jx_l3 "x['tool']=='wp_update_post_meta' and 'jx_mrk' in x['what']")
+check "control: the tool's edit is journalled and stored" "$(jx_rows jx_mrk)|$([ "$JX_M1" != MISSING ] && echo yes || echo no)" '["B"]|yes'
+jx_undo jx_u3 "$JX_M1"
+check "the undo put A back" "$(jx_rows jx_mrk)" '["A"]'
+jx_list jx_l4
+JX_MU1=$(jx_find jx_l4 "x.get('undoes')=='$JX_M1'")
+check "control: the undo is itself on record" "$([ "$JX_MU1" != MISSING ] && echo yes || echo no)" "yes"
+docker compose exec -T cli wp eval "add_post_meta($JX_P,'jx_mrk','C-newer');" >/dev/null 2>&1
+check "control: a person added a second row" "$(jx_rows jx_mrk)" '["A","C-newer"]'
+jx_undo jx_u4 "$JX_MU1"
+check "reverting the undo is refused now that the key changed" "$(verdict jx_u4)" "error"
+check "stored state: both rows are exactly as the person left them" "$(jx_rows jx_mrk)" '["A","C-newer"]'
+# Control for the probe: with no row added, the same revert of an undo goes through.
+docker compose exec -T cli wp eval "update_post_meta($JX_P,'jx_ok','A');" >/dev/null 2>&1
+jx_set jx_s2 jx_ok B
+jx_list jx_l5
+JX_M2=$(jx_find jx_l5 "x['tool']=='wp_update_post_meta' and 'jx_ok' in x['what']")
+jx_undo jx_u5 "$JX_M2"
+jx_list jx_l6
+JX_MU2=$(jx_find jx_l6 "x.get('undoes')=='$JX_M2'")
+jx_undo jx_u6 "$JX_MU2"
+check "control: reverting an undo whose key did not change works" "$(jx_rows jx_ok)" '["B"]'
+# (b) A sibling row added after the tool's edit, then the edit is undone: the one recorded value
+# must not be written over every row.
+docker compose exec -T cli wp eval "update_post_meta($JX_P,'jx_sib','A');" >/dev/null 2>&1
+jx_set jx_s3 jx_sib B
+jx_list jx_l7
+JX_M3=$(jx_find jx_l7 "x['tool']=='wp_update_post_meta' and 'jx_sib' in x['what']")
+docker compose exec -T cli wp eval "add_post_meta($JX_P,'jx_sib','C-sibling');" >/dev/null 2>&1
+check "control: the key holds two rows" "$(jx_rows jx_sib)" '["B","C-sibling"]'
+jx_undo jx_u7 "$JX_M3"
+check "undoing a single-value edit of a key that now has several rows is refused" "$(verdict jx_u7)" "error"
+check "stored state: neither row was overwritten" "$(jx_rows jx_sib)" '["B","C-sibling"]'
+docker compose exec -T cli wp post delete "$JX_P" --force >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+
+echo "-- annotations: a get that writes is not advertised as read-only --"
+# wp_get_site_health is read level and named like a read, so the derived hints said
+# readOnlyHint true and openWorldHint false. It runs WordPress's own Site Health tests, one of
+# which asks api.wordpress.org for the PHP support status and stores it as a site transient.
+call an_list '{"jsonrpc":"2.0","id":600,"method":"tools/list"}'
+an_hint() { py "import json,sys;t={x['name']:x for x in json.load(sys.stdin)['result']['tools']};print(t['$1']['annotations'].get('$2'))" an_list; }
+check "control: a real read (wp_list_themes) is still read-only" "$(an_hint wp_list_themes readOnlyHint)" "True"
+check "control: and not open-world" "$(an_hint wp_list_themes openWorldHint)" "False"
+check "wp_get_site_health is not advertised as read-only" "$(an_hint wp_get_site_health readOnlyHint)" "False"
+check "wp_get_site_health is advertised as reaching outside the site" "$(an_hint wp_get_site_health openWorldHint)" "True"
+# The reason, from stored state: running it writes the transient.
+docker compose exec -T cli wp eval 'delete_site_transient( "php_check_" . md5( PHP_VERSION ) );' >/dev/null 2>&1
+check "control: the PHP-check transient is absent before the call" "$(docker compose exec -T cli wp eval 'echo get_site_transient( "php_check_" . md5( PHP_VERSION ) ) === false ? "absent" : "present";' 2>/dev/null | tr -d '\r\n')" "absent"
+call an_sh '{"jsonrpc":"2.0","id":601,"method":"tools/call","params":{"name":"wp_get_site_health","arguments":{}}}'
+check "wp_get_site_health answered" "$(verdict an_sh)" "ok"
+check "stored state: it wrote the PHP-check transient, which is why it is not read-only" "$(docker compose exec -T cli wp eval 'echo get_site_transient( "php_check_" . md5( PHP_VERSION ) ) === false ? "absent" : "present";' 2>/dev/null | tr -d '\r\n')" "present"
+
 echo "-- diagnostics: error log, page fetch, preview links --"
 # Written without a Docker daemon. This block was run, on its own, through a stand-in for the
 # docker CLI against a local WordPress with no daemon; the rest of this file was not run.
@@ -3167,12 +3275,41 @@ check "a write-level key cannot read the PHP error log" "$(py 'import json,sys;d
 kcall pv_ro_fetch "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":412,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_fetch_page\",\"arguments\":{\"url\":\"$BASE/\"}}}"
 check "a write-level key cannot fetch a page" "$(py 'import json,sys;d=json.load(sys.stdin);print("denied" if "error" in d and "Access denied" in d["error"]["message"] else "reached")' pv_ro_fetch)" "denied"
 
+# Ending EVERY link on the site is an admin-level act: a write-level key could end links other
+# keys and people made. One link exists here (PV_A, from pv_make3).
+check "control: a link exists before the all:true attempts" "$(pv_posts)" "$PV_A"
+kcall pv_all_rw "$K_PV_RW" '{"jsonrpc":"2.0","id":413,"method":"tools/call","params":{"name":"wp_revoke_preview_links","arguments":{"all":true}}}'
+check "a write-level key cannot revoke every link on the site" "$(verdict pv_all_rw)" "error"
+check "...and says it needs an admin-level key" "$(refusal pv_all_rw | grep -c 'admin-level key')" "1"
+check "stored state: the link is still there" "$(pv_posts)" "$PV_A"
+kcall pv_one_rw "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":414,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_revoke_preview_links\",\"arguments\":{\"post_id\":$PV_B}}}"
+check "control: the same key can still end the links of one post" "$(verdict pv_one_rw)" "ok"
+call pv_all_admin '{"jsonrpc":"2.0","id":415,"method":"tools/call","params":{"name":"wp_revoke_preview_links","arguments":{"all":true}}}'
+check "control: an admin-level key can revoke every link" "$(verdict pv_all_admin)" "ok"
+check "stored state: and the store is empty" "$(pv_posts)" ""
+kcall pv_make4 "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":416,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+PV_LAST=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_make4)
+
 # Fetch policy. The refusals are deterministic and need no network.
 fetch_verdict() { # fetch_verdict <url> -> "refused" when the POLICY refused, "admitted" otherwise
   call pv_f "{\"jsonrpc\":\"2.0\",\"id\":420,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_fetch_page\",\"arguments\":{\"url\":\"$1\"}}}"
   py 'import json,sys;d=json.load(sys.stdin);t=d["result"]["content"][0]["text"] if "result" in d else "";print("refused" if t.startswith("Refused:") else "admitted")' pv_f
 }
 check "control: the site's own front page is admitted by the policy" "$(fetch_verdict "$BASE/")" "admitted"
+# The ways of spelling a blocked target. Each of these returned a real response (a 200 JSON
+# list of users, for the first) before the policy compared the DECODED path and the keys as
+# PHP names them. Every one is checked against the policy's refusal, with the controls above
+# and below showing the probe can see an admitted URL.
+check "index.php in front of the REST route is refused" "$(fetch_verdict "$BASE/index.php/wp-json/wp/v2/users")" "refused"
+check "an encoded hyphen in wp-json is refused" "$(fetch_verdict "$BASE/wp%2Djson/wp/v2/users")" "refused"
+check "rest.route (PHP reads it as rest_route) is refused" "$(fetch_verdict "$BASE/?rest.route=/wp/v2/users")" "refused"
+check "rest+route is refused" "$(fetch_verdict "$BASE/?rest+route=/wp/v2/users")" "refused"
+check "an encoded p in wp-login.php is refused" "$(fetch_verdict "$BASE/wp-login.ph%70")" "refused"
+check "an encoded p in wp-cron.php is refused" "$(fetch_verdict "$BASE/wp-cron.ph%70")" "refused"
+check "gmcp.preview (PHP reads it as the preview parameter) is refused" "$(fetch_verdict "$BASE/?p=$PV_A&gmcp.preview=$PV_LAST")" "refused"
+check "doing.wp.cron is refused" "$(fetch_verdict "$BASE/?doing.wp.cron=1")" "refused"
+check "control: an ordinary page with a query and an encoded space is admitted" "$(fetch_verdict "$BASE/?s=a%20b")" "admitted"
+check "stored state: the dotted-key preview URL did not put the token in any audit row" "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE args LIKE '%$PV_LAST%'")" "0"
 check "another host is refused" "$(fetch_verdict 'http://example.com/')" "refused"
 # example.com is also refused by a host that cannot be resolved, so that check can pass for
 # the wrong reason on a stack with no DNS. A loopback literal resolves by definition, and on a
@@ -3190,6 +3327,40 @@ check "a file URL is refused" "$(fetch_verdict 'file:///etc/passwd')" "refused"
 check "the refused fetch above, which carried a token in its url, did not record it" "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE args LIKE '%$PV_LAST%'")" "0"
 check "control: that call was recorded, with its url argument and the mark" \
   "$([ "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE tool='wp_fetch_page' AND args LIKE '%gmcp_preview=[redacted]%'")" -ge 1 ] && echo yes || echo no)" "yes"
+
+# The pin and an environment proxy. libcurl honours http_proxy from the process environment, a
+# proxy resolves the host name itself, and so a fetch could be answered by the proxy while the
+# reply said the connection was pinned. The proxy here is a closed port: if it is used, the
+# request fails; if it is bypassed, the page comes back. Run in the CLI so the variable is in the
+# process that makes the request. The first fetch is the control: where the site cannot reach its
+# own advertised address (the compose stack, see above) nothing below can be read and it says so.
+pv_cli_fetch() { # pv_cli_fetch <proxy-env-or-empty> -> "<status>|<connection>"
+  docker compose exec -T cli wp eval '
+    if ( "'"$1"'" !== "" ) { putenv( "http_proxy='"$1"'" ); putenv( "HTTP_PROXY='"$1"'" ); putenv( "https_proxy='"$1"'" ); putenv( "ALL_PROXY='"$1"'" ); putenv( "no_proxy" ); putenv( "NO_PROXY" ); }
+    global $gmcp_core;
+    $t = new GMCP_Tools_Diagnostics( $gmcp_core );
+    $r = $t->handle_call( null, "wp_fetch_page", [ "url" => home_url( "/" ) ], 1 );
+    $j = json_decode( $r["result"]["content"][0]["text"] ?? "", true );
+    echo is_array( $j ) ? ( $j["status"] ?? "?" ) . "|" . ( $j["connection"] ?? "-" ) : "error|" . substr( (string) ( $r["result"]["content"][0]["text"] ?? "" ), 0, 120 );' 2>/dev/null | tr -d '\r\n'
+}
+PV_DIRECT=$(pv_cli_fetch "")
+if [ "${PV_DIRECT%%|*}" = "200" ]; then
+  check "control: the site fetches its own front page" "${PV_DIRECT%%|*}" "200"
+  PV_PROXIED=$(pv_cli_fetch "http://127.0.0.1:9")
+  check "with a dead http_proxy in the environment the page still comes back (the proxy is bypassed)" "${PV_PROXIED%%|*}" "200"
+  check "...and the reply says the connection was direct" "${PV_PROXIED#*|}" "direct (no proxy), pinned to the address that was checked"
+  # WordPress's own proxy setting applies to this host: refused, nothing requested.
+  PV_WPPROXY=$(docker compose exec -T cli wp eval '
+    define( "WP_PROXY_HOST", "127.0.0.1" ); define( "WP_PROXY_PORT", "9" );
+    add_filter( "pre_http_send_through_proxy", "__return_true" ); // WordPress exempts the site host itself unless a filter says otherwise
+    global $gmcp_core;
+    $t = new GMCP_Tools_Diagnostics( $gmcp_core );
+    $r = $t->handle_call( null, "wp_fetch_page", [ "url" => home_url( "/" ) ], 1 );
+    echo strpos( (string) ( $r["result"]["content"][0]["text"] ?? "" ), "WP_PROXY_HOST" ) !== false ? "refused" : "went through";' 2>/dev/null | tr -d '\r\n')
+  check "a site configured to proxy its own host (WP_PROXY_HOST) is refused, not routed around" "$PV_WPPROXY" "refused"
+else
+  echo "  ....  proxy bypass not checked: the site could not fetch its own front page here (${PV_DIRECT})"
+fi
 
 # The error log tool.
 call pv_log '{"jsonrpc":"2.0","id":430,"method":"tools/call","params":{"name":"wp_get_php_error_log","arguments":{"lines":5}}}'
@@ -3211,6 +3382,44 @@ if [ -n "$PV_LOGFILE" ] && docker compose exec -T cli test -w "$PV_LOGFILE" >/de
   check "the public IP address is not" "$(grep -c '203.0.114.9' "$OUT/pv_log2")" "0"
 else
   echo "  ....  log scrubbing end-to-end not checked: no writable error_log file is configured on this stack"
+fi
+
+# A read returns what the site stores. redact() scrubs a preview token out of every string it
+# is handed, which is right for what gets written down and wrong for a tool's reply: a theme
+# mod whose text happens to contain "gmcp_preview=" came back as "gmcp_preview=[redacted]".
+docker compose exec -T cli wp eval 'set_theme_mod( "fixc_note", "see gmcp_preview=abc123def456 for the draft" );' >/dev/null 2>&1
+call pv_tm '{"jsonrpc":"2.0","id":440,"method":"tools/call","params":{"name":"wp_get_theme_mod","arguments":{"key":"fixc_note"}}}'
+check "control: the stored theme mod holds the text" "$(docker compose exec -T cli wp eval 'echo strpos( (string) get_theme_mod( "fixc_note" ), "gmcp_preview=abc123def456" ) !== false ? "yes" : "no";' 2>/dev/null | tr -d '\r\n')" "yes"
+check "the reply carries the stored text, not a redaction mark" "$(grep -c 'gmcp_preview=abc123def456' "$OUT/pv_tm")" "1"
+# ...while the audit log, which writes arguments down, still scrubs the same shape.
+PV_TV="tokenvalue${RANDOM}${RANDOM}"
+call pv_tm2 "{\"jsonrpc\":\"2.0\",\"id\":441,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_theme_mod\",\"arguments\":{\"key\":\"fixc_none\",\"default\":\"see gmcp_preview=$PV_TV here\"}}}"
+check "the audit log still scrubs a token in an argument" "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE tool='wp_get_theme_mod' AND args LIKE '%$PV_TV%'")" "0"
+check "control: and that call is in the audit log, with the mark" "$([ "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE tool='wp_get_theme_mod' AND args LIKE '%gmcp_preview=[redacted]%'")" -ge 1 ] && echo yes || echo no)" "yes"
+docker compose exec -T cli wp eval 'remove_theme_mod( "fixc_note" );' >/dev/null 2>&1
+
+# The debug log (MCP debug mode) prints each call's arguments. It used to print them through
+# redact(), which judges field NAMES, so wp_update_option {key: "x_pwd", value: "..."} logged
+# the value: "value" is not a secret-looking field name, and the option name that makes it
+# one is in a sibling field. Needs a log file the stack writes to: GMCP_TEST_ERROR_LOG names
+# one for a stack that is not configured with its own.
+DBG_LOG="${GMCP_TEST_ERROR_LOG:-$PV_LOGFILE}"
+if [ -n "$DBG_LOG" ] && docker compose exec -T cli test -w "$DBG_LOG" >/dev/null 2>&1; then
+  DBG_WAS=$(docker compose exec -T cli wp eval 'echo empty( get_option( "gmcp_options", [] )["mcp_debug_mode"] ) ? "off" : "on";' 2>/dev/null | tr -d '\r\n')
+  docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_debug_mode"]=true;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+  # A value no earlier run can have left in the log file.
+  DBG_N="${RANDOM}${RANDOM}"
+  call dbg_1 "{\"jsonrpc\":\"2.0\",\"id\":450,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_option\",\"arguments\":{\"key\":\"fixc_vendor_pwd\",\"value\":\"HUNTER2-LOGLEAK-$DBG_N\"}}}"
+  call dbg_2 "{\"jsonrpc\":\"2.0\",\"id\":451,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_option\",\"arguments\":{\"key\":\"fixc_plain_opt\",\"value\":\"PLAINVALUE-LOGGED-$DBG_N\"}}}"
+  check "control: the secret-named option really was written" "$(docker compose exec -T cli wp option get fixc_vendor_pwd 2>/dev/null | tr -d '\r\n')" "HUNTER2-LOGLEAK-$DBG_N"
+  check "control: the debug log has this call's lines" "$([ "$(docker compose exec -T cli sh -c "grep -c 'tools/call - Tool: wp_update_option' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" -ge 2 ] && echo yes || echo no)" "yes"
+  check "control: an ordinary value IS printed in the arguments, so the probe can see one" "$([ "$(docker compose exec -T cli sh -c "grep -c 'PLAINVALUE-LOGGED-$DBG_N' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "the value stored under a secret-named option is not in the debug log" "$(docker compose exec -T cli sh -c "grep -c 'HUNTER2-LOGLEAK-$DBG_N' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" "0"
+  check "...but the option's name is, so the line still says what changed" "$([ "$(docker compose exec -T cli sh -c "grep -c 'fixc_vendor_pwd' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" -ge 1 ] && echo yes || echo no)" "yes"
+  docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_debug_mode"]='"$([ "$DBG_WAS" = on ] && echo true || echo false)"';update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+  docker compose exec -T cli wp option delete fixc_vendor_pwd fixc_plain_opt >/dev/null 2>&1
+else
+  echo "  ....  debug-log redaction not checked: no writable error_log file is configured on this stack (set GMCP_TEST_ERROR_LOG to one the web server writes to)"
 fi
 
 # Put the site back.

@@ -39,6 +39,23 @@ function taxonomy_exists( $t ) {
 function term_exists( $id, $t = '' ) {
   return in_array( (int) $id, $GLOBALS['gmcp_t_term_ids'], true ) ? [ 'term_id' => (int) $id ] : null;
 }
+function wp_slash( $v ) {
+  return $v;
+}
+function get_post_field( $field, $id, $context = 'display' ) {
+  return $GLOBALS['gmcp_t_posts'][ (int) $id ][ $field ] ?? '';
+}
+// Records what it was asked to write and applies it, so a test can see every field that went in.
+$GLOBALS['gmcp_t_post_writes'] = [];
+function wp_update_post( $arr, $wp_error = false ) {
+  $GLOBALS['gmcp_t_post_writes'][] = $arr;
+  foreach ( $arr as $k => $v ) {
+    if ( $k !== 'ID' ) {
+      $GLOBALS['gmcp_t_posts'][ (int) $arr['ID'] ][ $k ] = $v;
+    }
+  }
+  return (int) $arr['ID'];
+}
 function is_wp_error( $v ) {
   return false;
 }
@@ -377,6 +394,23 @@ check( 'a term entry whose id equals a live post id is not judged as that post',
 check( 'CONTROL: a termrel entry on that same id is judged as the live post',
   is_string( ( new ReflectionMethod( 'GMCP_Journal', 'drafts_only_refusal' ) )->invoke( null, [ 'kind' => 'termrel', 'ID' => 5, 'taxonomy' => 'category' ] ) ), true );
 $GLOBALS['gmcp_t_drafts_only'] = false;
+
+echo "-- a post undo restores only the fields the recorder watches --\n";
+// post_type is not one of them. An entry that names it was not made by the recorder, and
+// restoring it would put 'shop_order' on a page: the commerce guard is asked about the post as
+// it is now, never about the value being written.
+$GLOBALS['gmcp_t_posts'][78]['post_title'] = 'Changed title';
+$GLOBALS['gmcp_t_post_writes'] = [];
+$observer->observe( [ 'kind' => 'post', 'op' => 'updated', 'id' => 78, 'subject' => 'post', 'label' => 'P', 'tool' => 'wp_update_post', 'call' => 'c9a',
+  'fields' => [ 'post_title' => [ 'from' => 'Original title', 'to' => 'Changed title' ], 'post_type' => [ 'from' => 'shop_order', 'to' => 'post' ] ] ] );
+$all = journal();
+$pe = end( $all );
+check( 'CONTROL: the entry carries both fields, so the probe has a post_type to find', [ $pe['fields'], $pe['previous']['post_type'] ?? null ], [ [ 'post_title', 'post_type' ], 'shop_order' ] );
+$res = GMCP_Journal::revert( $pe['id'] );
+check( 'the undo of the entry succeeds', $res['ok'], true );
+check( 'CONTROL: the watched field was restored', $GLOBALS['gmcp_t_posts'][78]['post_title'], 'Original title' );
+check( 'post_type was never written', array_key_exists( 'post_type', $GLOBALS['gmcp_t_post_writes'][0] ?? [] ), false );
+check( 'the post is still the type it was', $GLOBALS['gmcp_t_posts'][78]['post_type'], 'post' );
 
 echo "\n$total checks, $fails failed\n";
 exit( min( 255, $fails ) );

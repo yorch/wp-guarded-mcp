@@ -1401,6 +1401,57 @@ check "  and still cannot write" "$(verdict o_c)/$(ptitle $DO_LIVE)" "error/DO o
 check "the grants are stored with the marker only where read-only was chosen" \
   "$(wpe 'global $wpdb; $n=["ro"=>0,"full"=>0]; foreach($wpdb->get_col("SELECT t.scope FROM {$wpdb->prefix}gmcp_oauth_tokens t JOIN {$wpdb->prefix}gmcp_oauth_clients c ON c.client_id=t.client_id WHERE c.client_name=\"drafts test\" AND t.revoked=0") as $sc){ $n[GMCP_OAuth::scope_is_readonly($sc)?"ro":"full"]++; } echo $n["ro"],"/",$n["full"];')" "1/2"
 
+echo "-- wp_create_posts with meta_input and the journal on: the reply is a success --"
+# The note that tells the caller how to undo the custom fields named a constant that does not
+# exist, so the reply was an isError of "Undefined constant" AFTER the posts and fields had
+# been written. An agent told a call failed retries it, and the posts were duplicated.
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=true;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+call bm1 '{"jsonrpc":"2.0","id":9101,"method":"tools/call","params":{"name":"wp_create_posts","arguments":{"items":[{"post_title":"BMX batch one","meta_input":{"bmx_f":"v1"}},{"post_title":"BMX batch two","meta_input":{"bmx_f":"v2"}}]}}}'
+check "the reply is not an error" "$(py 'import json,sys;d=json.load(sys.stdin);print("error" if ("error" in d or d["result"].get("isError")) else "ok")' bm1)" "ok"
+check "stored state: each post exists exactly once" "$(docker compose exec -T cli wp eval 'echo count( get_posts( [ "post_type" => "post", "post_status" => "any", "title" => "BMX batch one", "numberposts" => -1 ] ) ) . "," . count( get_posts( [ "post_type" => "post", "post_status" => "any", "title" => "BMX batch two", "numberposts" => -1 ] ) );' 2>/dev/null | tr -d '\r\n')" "1,1"
+check "stored state: and carries its custom field" "$(docker compose exec -T cli wp eval 'echo count( get_posts( [ "post_type" => "post", "post_status" => "any", "meta_key" => "bmx_f", "numberposts" => -1 ] ) );' 2>/dev/null | tr -d '\r\n')" "2"
+BM_CALL=$(py 'import json,re,sys;t=json.load(sys.stdin)["result"]["content"][0]["text"];m=re.search(r"wp_undo_change \{\"call\":\"([^\"]+)\"\}",json.loads(t)["undo"]);print(m.group(1) if m else "MISSING")' bm1)
+check "the reply names the call id to pass to wp_undo_change" "$([ "$BM_CALL" != MISSING ] && echo yes || echo no)" "yes"
+call bm2 "{\"jsonrpc\":\"2.0\",\"id\":9102,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"call\":\"$BM_CALL\"}}}"
+check "and that id works: the custom fields are gone" "$(docker compose exec -T cli wp eval 'echo count( get_posts( [ "post_type" => "post", "post_status" => "any", "meta_key" => "bmx_f", "numberposts" => -1 ] ) );' 2>/dev/null | tr -d '\r\n')" "0"
+check "...and the posts were left standing" "$(docker compose exec -T cli wp eval 'echo count( get_posts( [ "post_type" => "post", "post_status" => "any", "title" => "BMX batch one", "numberposts" => -1 ] ) );' 2>/dev/null | tr -d '\r\n')" "1"
+docker compose exec -T cli wp eval 'foreach ( get_posts( [ "post_type" => "post", "post_status" => "any", "numberposts" => -1, "s" => "BMX batch" ] ) as $p ) { wp_delete_post( $p->ID, true ); }' >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+
+echo "-- the theme mod readers answer --"
+# Both called $this->json(), a method this class does not have, so every call ended in
+# "Call to undefined method GMCP_Tools_Core::json()". Present at 7b966ad; nothing exercised them.
+docker compose exec -T cli wp eval 'set_theme_mod( "tmx_plain", "TMX-VISIBLE-VALUE" ); set_theme_mod( "tmx_api_key", "TMX-SECRET-VALUE" );' >/dev/null 2>&1
+check "control: the theme mods are stored" "$(docker compose exec -T cli wp eval 'echo get_theme_mod( "tmx_plain" ) . "|" . get_theme_mod( "tmx_api_key" );' 2>/dev/null | tr -d '\r\n')" "TMX-VISIBLE-VALUE|TMX-SECRET-VALUE"
+call tm1 '{"jsonrpc":"2.0","id":9301,"method":"tools/call","params":{"name":"wp_get_theme_mod","arguments":{"key":"tmx_plain"}}}'
+check "wp_get_theme_mod is not an error" "$(verdict tm1)" "ok"
+check "...and returns the stored value" "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["content"][0]["text"])' tm1)" '"TMX-VISIBLE-VALUE"'
+call tm2 '{"jsonrpc":"2.0","id":9302,"method":"tools/call","params":{"name":"wp_get_theme_mod","arguments":{"key":"tmx_api_key"}}}'
+check "a credential-named theme mod is blanked in the reply" "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["content"][0]["text"])' tm2)" '"[redacted]"'
+call tm3 '{"jsonrpc":"2.0","id":9303,"method":"tools/call","params":{"name":"wp_list_theme_mods","arguments":{}}}'
+check "wp_list_theme_mods is not an error" "$(verdict tm3)" "ok"
+check "...lists the plain one" "$(grep -c 'TMX-VISIBLE-VALUE' "$OUT/tm3")" "1"
+check "...and does not list the secret" "$(grep -c 'TMX-SECRET-VALUE' "$OUT/tm3")" "0"
+docker compose exec -T cli wp eval 'remove_theme_mod( "tmx_plain" ); remove_theme_mod( "tmx_api_key" );' >/dev/null 2>&1
+
+echo "-- wp_write_blocks keeps backslashes, on the blocks path as on the markdown path --"
+# The blocks path unslashed text that was never slashed and then slashed it once for the
+# writer, so a Windows path in a code block lost its separators and "a\b" became "ab", while
+# the markdown path stored the same text intact. Asserted on the stored post_content, with the
+# markdown path as the control that the probe can see an intact backslash.
+WB_P=$(docker compose exec -T cli wp eval 'echo wp_insert_post( [ "post_title" => "WBX backslash", "post_status" => "draft" ] );' 2>/dev/null | tr -d '\r\n')
+wb_stored() { docker compose exec -T cli wp eval "\$c = get_post($WB_P)->post_content; \$bs = chr(92); echo ( strpos( \$c, '<code>C:' . \$bs . 'Users' . \$bs . 'x</code>' ) !== false ? 'code-intact' : 'code-mangled' ) . ',' . ( strpos( \$c, '<p>a' . \$bs . 'b</p>' ) !== false ? 'para-intact' : 'para-mangled' );" 2>/dev/null | tr -d '\r\n'; }
+WB_JSON_BLOCKS=$(python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":9201,"method":"tools/call","params":{"name":"wp_write_blocks","arguments":{"ID":int(sys.argv[1]),"blocks":[{"type":"paragraph","content":"a\\b"},{"type":"code","content":"C:\\Users\\x"}]}}}))' "$WB_P")
+WB_JSON_MD=$(python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":9202,"method":"tools/call","params":{"name":"wp_write_blocks","arguments":{"ID":int(sys.argv[1]),"markdown":"a\\b\n\n```\nC:\\Users\\x\n```"}}}))' "$WB_P")
+call wb_md "$WB_JSON_MD"
+check "control: the markdown path reports success" "$(verdict wb_md)" "ok"
+check "control: the markdown path stored the backslashes (code block)" "$(docker compose exec -T cli wp eval "\$c = get_post($WB_P)->post_content; \$bs = chr(92); echo strpos( \$c, 'C:' . \$bs . 'Users' . \$bs . 'x' ) !== false ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
+call wb_bl "$WB_JSON_BLOCKS"
+check "the blocks path reports success" "$(verdict wb_bl)" "ok"
+check "stored state: the blocks path kept both backslashes" "$(wb_stored)" "code-intact,para-intact"
+docker compose exec -T cli wp post delete "$WB_P" --force >/dev/null 2>&1
+
 # Put the site back: the fixtures, the keys, the grants. A guard test must not leave them.
 wpe 'foreach(get_posts(["post_status"=>"any","post_type"=>["post","page","attachment"],"numberposts"=>-1,"s"=>"DO "]) as $p){ if(strpos($p->post_title,"DO ")===0){wp_delete_post($p->ID,true);} } foreach(wp_get_nav_menus() as $m){ if($m->name==="DO net menu"){wp_delete_nav_menu($m->term_id);} } foreach(GMCP_Tokens::all() as $t){ if(in_array($t["label"],["drafts only writer","plain writer","drafts only admin","pre-flag writer","do admin"],true)){GMCP_Tokens::revoke($t["id"]);} } global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_tokens WHERE client_id IN (SELECT client_id FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\")"); $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\"");' >/dev/null
 

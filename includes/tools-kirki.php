@@ -401,7 +401,7 @@ class GMCP_Tools_Kirki {
       $value = GMCP_Core::REDACTION_MARKER;
     }
     else {
-      $value = GMCP_Core::redact( $value );
+      $value = GMCP_Core::redact( $value, 0, false );
     }
 
     $storage = $this->storage( $field );
@@ -595,7 +595,7 @@ class GMCP_Tools_Kirki {
         $default = GMCP_Core::REDACTION_MARKER;
       }
       else {
-        $value = GMCP_Core::redact( $value );
+        $value = GMCP_Core::redact( $value, 0, false );
       }
 
       $fields[] = [
@@ -616,7 +616,7 @@ class GMCP_Tools_Kirki {
     // Configs: strip the 'id' key which duplicates the array key, and keep the rest.
     $configs = [];
     foreach ( \Kirki::$config as $id => $args ) {
-      $configs[ $id ] = GMCP_Core::redact( array_diff_key( $args, [ 'id' => 1 ] ) );
+      $configs[ $id ] = GMCP_Core::redact( array_diff_key( $args, [ 'id' => 1 ] ), 0, false );
     }
 
     return $this->json( $r, [

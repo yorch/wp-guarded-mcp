@@ -127,16 +127,31 @@ and carry their own guards:
   `store_html()` path as block markup written directly, so the rules above apply to
   it too. Neither layer is trusted alone: the converter is the one that knows what the
   source meant, and the filter is the one that knows what the editor will render.
+  Block specs given to the same tool are filtered leaf by leaf with `wp_kses_post()`
+  as each block is rendered, without unslashing (the text arrives from JSON, not from
+  `$_POST`, so a backslash in it is the author's), and that filtering is unconditional:
+  it does not honour `gmcp_allow_unfiltered_post_html`, which `store_html()` does, so a
+  site that opted into raw HTML still gets filtered text from block specs. That is the
+  stricter of the two and was left that way on purpose.
 - Tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
   `openWorldHint`) are advisory and are not a guard. Clients may use them to decide
   whether to ask first, so a wrong hint costs a prompt or skips one; it does not
-  change what the server allows. They are derived from the access level, with
-  `readOnlyHint` also set by a read verb directly after the group prefix, because
-  about two dozen admin-level tools only read (some of them personal data, such as
-  form entries and customers; others options and theme mods). A `readOnlyHint` on a
-  `read`-level tool is only as good as the tool's own code, and a read that writes
-  is a defect, not something the hint covers. Refusal and two-step confirmation are
-  enforced by the tools, whatever the hint says.
+  change what the server allows. They are derived from the access level and the
+  tool's name, and an individual tool may override them. `readOnlyHint` is set for a
+  `read`-level tool and for a tool with a read verb directly after the group prefix,
+  because about two dozen admin-level tools only read (some of them personal data,
+  such as form entries and customers; others options and theme mods). That makes it
+  a statement about what the registration looks like, not a measurement of what the
+  code does, and it is not claimed to be exact. The handlers of the tools it marks
+  were read for direct calls that write, reach out or schedule (the code of a
+  third-party plugin a read calls into was not exercised for the optional groups,
+  and a read that calls WordPress may prime an object cache, which is not counted):
+  `wp_get_site_health` was the one that did (it runs WordPress's own Site Health tests, which ask
+  api.wordpress.org about PHP and store the answer as a site transient), and it now
+  says so itself with `readOnlyHint: false` and `openWorldHint: true`. A
+  read that writes is a defect to fix or to override, and the hint does not cover it
+  either way. Refusal and two-step confirmation are enforced by the tools, whatever
+  the hint says.
 - The server's `instructions` text tells the model that content read from the site
   is data and not instructions. That is guidance, not a control: it is the reason
   the guards exist, and it must not be the only thing standing between a comment and
@@ -222,14 +237,22 @@ something that looks harmless and is not, so each says what it cannot promise.
   path. A configured file is still refused if its name is not log-shaped, if it
   is a script or a configuration file, or if it is a symbolic link, so a
   misconfigured or swapped value cannot turn it into a general file reader.
-  It reads from the end of the file, at most 256KB of it, through a handle whose
-  type is checked after it is opened, so a multi-gigabyte log costs what a small
-  one does. It has no search and no pattern argument; the model asks for the last
+  The path is looked at without following a link (`lstat`) before it is opened, so a
+  link, a pipe or a device is refused untouched (a FIFO would otherwise block the
+  worker on open), and the handle that was opened is compared with what was looked
+  at by device and inode and must be a regular file, which catches a file swapped in
+  between. PHP cannot open with `O_NOFOLLOW`, so the window between the two calls is
+  narrowed and not removed, and a site where an attacker can write to the log
+  directory is outside what this protects.
+  It reads from the end of the file, at most 256KB of it, so a multi-gigabyte log
+  costs what a small one does. It has no search and no pattern argument; the model asks for the last
   N lines and filters them itself.
 - Every line is scrubbed before it leaves: values under credential-shaped names
   (the same `gmcp_credential_field_patterns` list the audit log and journal
   use), bearer and basic credentials, user information in URLs, JWTs, password
-  hashes, this plugin's own keys, long opaque tokens, e-mail addresses, public IP
+  hashes, this plugin's own keys, long opaque tokens, the value in a
+  `define( 'DB_PASSWORD', '...' )` of a credential-named constant, `pw=...`, AWS
+  access key ids and 40-character AWS-style secret keys, e-mail addresses, public IP
   addresses (loopback and private ones stay, because `connect to 127.0.0.1` is
   the diagnosis), the argument values in stack frames, and the values in a failed
   SQL query past its first 120 characters. Paths are shown as `[content]/` and
@@ -268,9 +291,16 @@ something that looks harmless and is not, so each says what it cannot promise.
 - Why `admin` and not `read`: the request originates from the server, so it
   arrives from the one address a site's own IP allowlists and loopback-only
   handlers trust. `wp-admin`, `wp-json`, `wp-login.php`, `wp-cron.php`,
-  `xmlrpc.php`, any other `.php` file and a short list of query parameters that
-  change state on common plugins (`add-to-cart`, `wc-ajax`, `action` and others)
-  are refused. That list is a list. A front-end route on this site whose GET has
+  `xmlrpc.php`, any other `.php` file (and `index.php` with anything after it,
+  which is how WordPress is reached as `/index.php/wp-json/...`) and a short
+  list of query parameters that change state on common plugins (`add-to-cart`,
+  `wc-ajax`, `action` and others) are refused. The comparison is made on what a
+  server would route, not on the text that was sent: the path is decoded and
+  refused if it carries an encoded letter, digit, hyphen, underscore or tilde, an
+  encoded dot, slash, backslash or NUL, or a second layer of encoding (so
+  `/wp%2Djson/` and `/wp-login.ph%70` are the plain request), and a query key is
+  compared as PHP will name it (`rest.route`, `rest+route` and `rest[route` are
+  all `rest_route`; `gmcp.preview` is the preview parameter). That list is a list. A front-end route on this site whose GET has
   a side effect and an unfamiliar name is still reachable, and the tool says so
   in its description rather than implying otherwise.
 - Page text is somebody else's words. Everything under `page_content_untrusted`
@@ -288,6 +318,11 @@ something that looks harmless and is not, so each says what it cannot promise.
   because a signature cannot be revoked, carries whatever lifetime it was signed
   with, and would bring every old link back when a published post is reverted to
   a draft.
+  Ending every link on the site (`all: true`) needs an admin-level key, because it
+  also ends links other keys and other people made; every key acts as an
+  administrator user, so the user recorded with a link cannot tell keys apart and the
+  access level is the cut that exists. A key below admin can still end the links for
+  one post it can edit.
 - Verification happens on the front end, on the MAIN query only. `pre_get_posts`
   accepts the token only when the request is already a single-post request for
   exactly the post the token was issued for, and only then lets that query
@@ -304,9 +339,16 @@ something that looks harmless and is not, so each says what it cannot promise.
   Feeds, embeds, trackbacks and the REST API never honour a token.
 - The link is a bearer credential and it travels in a URL, where no field name
   marks it secret. `GMCP_Core::redact()` therefore scrubs the `gmcp_preview`
-  parameter out of every string it is handed, which is what the audit log's
+  parameter (in any spelling PHP maps to it: `gmcp.preview`, `gmcp+preview`,
+  `gmcp[preview]`, percent-encoded characters in the name or the `=`) out of every
+  string it is handed on the logging paths, which is what the audit log's
   arguments and the debug trace both use, and the audit log applies the same
-  scrub to the reply it keeps. Without it the tool that hands the link out would
+  scrub to the reply it keeps. It does not scrub what a tool returns to its caller:
+  a stored theme mod or field that happens to contain the text is the site's own
+  data, and the readers pass `scrub_preview = false` so it comes back as stored. The
+  debug trace prints a call's arguments through `redact_call_args()`, the same answer
+  the audit log gives, so a value under a credential-named option or meta key is not
+  printed there either. Without it the tool that hands the link out would
   have written it into the audit log in the clear in the same call, which the
   first test of it showed. The fetch tool refuses a URL carrying the parameter
   for the same reason: it would be recorded as an argument, and a preview
@@ -316,9 +358,14 @@ something that looks harmless and is not, so each says what it cannot promise.
   revoking are); anyone who is given the link can forward it; a link pasted into a
   post body or a message is outside what the audit log's scrub can see; the
   window between the address check and the connect is closed by pinning only
-  where the HTTP transport is cURL; and a site that is behind a proxy configured
-  through `WP_PROXY_HOST` has its connection made by the proxy, which pins
-  nothing.
+  where the HTTP transport is cURL. A proxy is never used for the fetch: libcurl
+  honours `http_proxy` and `HTTPS_PROXY` from the environment, and a proxy
+  resolves the host itself so the pin would hold nothing, so the request sets an
+  empty proxy and `NO_PROXY=*` on its own handle, and the response is discarded
+  unless both were accepted. A site whose WordPress proxy settings
+  (`WP_PROXY_HOST`, or the `pre_http_send_through_proxy` filter) apply to its
+  own host is refused outright rather than routed around. The reply's
+  `connection` field says so only for a response that passed that test.
 
 ## WooCommerce
 
@@ -1042,7 +1089,12 @@ Reverting a post, a custom field or a set of terms also asks
 `commerce_post_guard()`, because an order and a subscription are `wp_posts` rows
 and the policy about them belongs to the post type rather than to the tool that
 is writing it. Revert now enforces that for itself instead of relying on the
-original write having been refused.
+original write having been refused. The guard judges the post as it is now, not a
+value the revert would write, so a post revert also restores only the fields the
+recorder watches (title, content, excerpt, status, slug, parent, menu order) and
+never `post_type`. No route to a post_type restore was found: the recorder does not
+record that field, and the journal's own row cannot be edited through any tool. The
+filter is a backstop for an entry this plugin did not write.
 
 An undo is recorded as a change of its own. The entry keeps what the undo
 overwrote, names the entry it reversed, and carries the tool of the original, so
@@ -1054,9 +1106,14 @@ be put back on a post that has since been rewritten. The undo of an undo has no
 such excuse, because it restores a whole recorded value taken before whatever
 happened next, so it is refused when the target is no longer in the state the undo
 left it in. That state is stored as a hash measured from the stored value after the
-write, never as a second copy of it. Where the value the undo is about to overwrite
-holds a credential, the undo is recorded as not reversible instead of being copied,
-for the reason the original is not.
+write, never as a second copy of it. For a custom field it covers every row of the
+key, not the first, and an undo that would write one recorded value is refused when
+the key now holds several rows, because that write rewrites every row. Where the
+value the undo is about to overwrite holds a credential, the undo is recorded as
+not reversible instead of being copied, for the reason the original is not; that
+test runs for options, custom fields, theme settings and terms. A post's own fields
+(title, content, excerpt) are not tested for credential shapes, here or when the
+original edit is recorded. That is a gap, not a decision this document defends.
 
 Previous meta values live in a table of their own rather than in the journal's
 option row, because `_elementor_data` runs past 100KB and the option's per-value

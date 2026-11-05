@@ -1218,7 +1218,16 @@ class GMCP_Journal {
     }
     if ( $kind === 'meta' ) {
       $exists = metadata_exists( 'post', (int) $entry['ID'], (string) $entry['key'] );
-      return self::state_hash( $exists, $exists ? get_post_meta( (int) $entry['ID'], (string) $entry['key'], true ) : null );
+      if ( !$exists ) {
+        return self::state_hash( false, null );
+      }
+      // Every row, not the first. get_post_meta( ..., true ) is one row, so a row added by
+      // somebody else after an undo was invisible to the staleness check, and reverting the
+      // undo then overwrote it. One row hashes as the single value, exactly as it did before
+      // (entries already on record carry that hash), and several rows hash as a list under a
+      // wrapper key so one row holding an array can never collide with several rows.
+      $rows = (array) get_post_meta( (int) $entry['ID'], (string) $entry['key'], false );
+      return self::state_hash( true, count( $rows ) > 1 ? [ self::META_ROWS => array_values( $rows ) ] : ( $rows ? reset( $rows ) : null ) );
     }
     if ( $kind === 'post' ) {
       $values = [];
@@ -1319,6 +1328,13 @@ class GMCP_Journal {
             $restored_rows++;
           }
           $done = 'Custom field "' . $meta_key . '" on post ' . $meta_post . ': ' . $restored_rows . ' row' . ( $restored_rows === 1 ? '' : 's' ) . ' put back as they were.';
+        }
+        elseif ( $rows_now > 1 ) {
+          // One recorded value, and the key now holds several rows. update_post_meta() with no
+          // previous value rewrites EVERY row of the key to that one value, so restoring it here
+          // would turn rows somebody else added since into copies of it and lose what they held.
+          // The entry cannot say which row it was, so nothing is written.
+          return $fail( 'The custom field "' . $meta_key . '" on post ' . $meta_post . ' now holds ' . $rows_now . ' rows, and this change recorded one value. Restoring it would overwrite every row with that value, so nothing was changed.' );
         }
         else {
           // wp_slash for the reason prepare_meta_value() gives: update_post_meta()
@@ -1489,14 +1505,19 @@ class GMCP_Journal {
       if ( $skipped ) {
         $done .= ' The previous parent no longer exists, so the parent was left as it is.';
       }
-      return [
-        'ok' => true,
-        'message' => $done,
-        'redo' => [
-          'kind' => 'term', 'ID' => $term_id, 'taxonomy' => $taxonomy,
-          'fields' => array_keys( $args ), 'previous' => $redo_previous,
-        ],
-      ];
+      $redo = [ 'kind' => 'term', 'ID' => $term_id, 'taxonomy' => $taxonomy, 'fields' => array_keys( $args ) ];
+      // The entry that reverses this undo keeps what the undo overwrote, and what it
+      // overwrote is whatever the term held a moment ago, which may be a credential that was
+      // written after the entry being undone (observe_term() judges the value it records and
+      // this is the same value one step later). Judged the same way, and not copied.
+      if ( GMCP_Core::holds_credential( $redo_previous, 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+        $redo['redacted'] = true;
+        $done .= ' The value it replaced looked like it held a credential, so that is not recorded and this undo cannot be undone.';
+      }
+      else {
+        $redo['previous'] = $redo_previous;
+      }
+      return [ 'ok' => true, 'message' => $done, 'redo' => $redo ];
     }
 
     if ( $kind === 'termrel' ) {
@@ -1534,6 +1555,15 @@ class GMCP_Journal {
       $fields = [ 'ID' => $post_id ];
       foreach ( (array) ( $entry['fields'] ?? [] ) as $field ) {
         if ( !array_key_exists( $field, (array) $entry['previous'] ) ) {
+          continue;
+        }
+        // Only the fields the recorder watches. The commerce guard is asked about the post
+        // as it is NOW (reversible_kind), and it is never asked about a value an entry would
+        // write, so a field outside this list could be restored unchecked: post_type is the
+        // one that matters, since putting 'shop_order' on a page makes a hand-made order.
+        // Nothing records post_type today, and an entry that names it was not made by this
+        // plugin's recorder, so it is skipped rather than trusted.
+        if ( !in_array( $field, GMCP_Changes::POST_FIELDS, true ) ) {
           continue;
         }
         $value = $entry['previous'][ $field ];
