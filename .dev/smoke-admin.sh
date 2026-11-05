@@ -3156,6 +3156,23 @@ check "stored state: neither row was overwritten" "$(jx_rows jx_sib)" '["B","C-s
 docker compose exec -T cli wp post delete "$JX_P" --force >/dev/null 2>&1
 docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
 
+echo "-- annotations: a get that writes is not advertised as read-only --"
+# wp_get_site_health is read level and named like a read, so the derived hints said
+# readOnlyHint true and openWorldHint false. It runs WordPress's own Site Health tests, one of
+# which asks api.wordpress.org for the PHP support status and stores it as a site transient.
+call an_list '{"jsonrpc":"2.0","id":600,"method":"tools/list"}'
+an_hint() { py "import json,sys;t={x['name']:x for x in json.load(sys.stdin)['result']['tools']};print(t['$1']['annotations'].get('$2'))" an_list; }
+check "control: a real read (wp_list_themes) is still read-only" "$(an_hint wp_list_themes readOnlyHint)" "True"
+check "control: and not open-world" "$(an_hint wp_list_themes openWorldHint)" "False"
+check "wp_get_site_health is not advertised as read-only" "$(an_hint wp_get_site_health readOnlyHint)" "False"
+check "wp_get_site_health is advertised as reaching outside the site" "$(an_hint wp_get_site_health openWorldHint)" "True"
+# The reason, from stored state: running it writes the transient.
+docker compose exec -T cli wp eval 'delete_site_transient( "php_check_" . md5( PHP_VERSION ) );' >/dev/null 2>&1
+check "control: the PHP-check transient is absent before the call" "$(docker compose exec -T cli wp eval 'echo get_site_transient( "php_check_" . md5( PHP_VERSION ) ) === false ? "absent" : "present";' 2>/dev/null | tr -d '\r\n')" "absent"
+call an_sh '{"jsonrpc":"2.0","id":601,"method":"tools/call","params":{"name":"wp_get_site_health","arguments":{}}}'
+check "wp_get_site_health answered" "$(verdict an_sh)" "ok"
+check "stored state: it wrote the PHP-check transient, which is why it is not read-only" "$(docker compose exec -T cli wp eval 'echo get_site_transient( "php_check_" . md5( PHP_VERSION ) ) === false ? "absent" : "present";' 2>/dev/null | tr -d '\r\n')" "present"
+
 echo "-- diagnostics: error log, page fetch, preview links --"
 # Written without a Docker daemon. This block was run, on its own, through a stand-in for the
 # docker CLI against a local WordPress with no daemon; the rest of this file was not run.

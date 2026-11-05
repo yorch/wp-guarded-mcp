@@ -130,13 +130,22 @@ and carry their own guards:
 - Tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
   `openWorldHint`) are advisory and are not a guard. Clients may use them to decide
   whether to ask first, so a wrong hint costs a prompt or skips one; it does not
-  change what the server allows. They are derived from the access level, with
-  `readOnlyHint` also set by a read verb directly after the group prefix, because
-  about two dozen admin-level tools only read (some of them personal data, such as
-  form entries and customers; others options and theme mods). A `readOnlyHint` on a
-  `read`-level tool is only as good as the tool's own code, and a read that writes
-  is a defect, not something the hint covers. Refusal and two-step confirmation are
-  enforced by the tools, whatever the hint says.
+  change what the server allows. They are derived from the access level and the
+  tool's name, and an individual tool may override them. `readOnlyHint` is set for a
+  `read`-level tool and for a tool with a read verb directly after the group prefix,
+  because about two dozen admin-level tools only read (some of them personal data,
+  such as form entries and customers; others options and theme mods). That makes it
+  a statement about what the registration looks like, not a measurement of what the
+  code does, and it is not claimed to be exact. The handlers of the tools it marks
+  were read for direct calls that write, reach out or schedule (the code of a
+  third-party plugin a read calls into was not exercised for the optional groups,
+  and a read that calls WordPress may prime an object cache, which is not counted):
+  `wp_get_site_health` was the one that did (it runs WordPress's own Site Health tests, which ask
+  api.wordpress.org about PHP and store the answer as a site transient), and it now
+  says so itself with `readOnlyHint: false` and `openWorldHint: true`. A
+  read that writes is a defect to fix or to override, and the hint does not cover it
+  either way. Refusal and two-step confirmation are enforced by the tools, whatever
+  the hint says.
 - The server's `instructions` text tells the model that content read from the site
   is data and not instructions. That is guidance, not a control: it is the reason
   the guards exist, and it must not be the only thing standing between a comment and

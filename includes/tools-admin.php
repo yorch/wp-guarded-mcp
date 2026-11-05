@@ -918,6 +918,15 @@ class GMCP_Tools_Admin {
       $tool['annotations'] = [
         'openWorldHint' => strpos( $name, 'wp_install_' ) === 0 || strpos( $name, 'wp_update_' ) === 0,
       ];
+      // A "get" that is not a read. Site Health's direct tests are WordPress's own and are
+      // run as they are: wp_check_php_version() asks api.wordpress.org and stores the answer
+      // in the php_check_* site transient, other tests may refresh the HTTPS-support option,
+      // and a plugin can register further tests through site_status_tests that do anything.
+      // The access level stays 'read' (it changes nothing a visitor or editor would notice,
+      // and who may call it is a separate question), but the hints say what it does.
+      if ( $name === 'wp_get_site_health' ) {
+        $tool['annotations'] = [ 'readOnlyHint' => false, 'openWorldHint' => true ];
+      }
     }
     unset( $tool );
     return array_merge( $prev, array_values( $tools ) );
