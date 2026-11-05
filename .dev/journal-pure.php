@@ -116,6 +116,15 @@ class GMCP_Core {
   public static function is_commerce_post_type( $type ) {
     return $type === 'shop_order';
   }
+  // The real one's answer for the two cases this file drives: a post of the submission type,
+  // and (with a type named) the type itself. A post under one is not walked here.
+  public static function personal_data_post_guard( $id, $type = '' ) {
+    if ( $type === '' ) {
+      $post = get_post( $id );
+      $type = $post ? $post->post_type : '';
+    }
+    return $type === 'flamingo_inbound' ? 'A flamingo_inbound is a form submission.' : true;
+  }
   public static function commerce_post_guard( $id, $verb = 'Changing', $type = null ) {
     $post = get_post( $id );
     return $post && self::is_commerce_post_type( $post->post_type ) ? "$verb post #$id is refused: it is an order." : true;
@@ -584,6 +593,26 @@ $flat = json_encode( $summary );
 check( 'CONTROL: the summary carries the harmless values', [ strpos( $flat, 'A harmless excerpt' ) !== false, strpos( $flat, 'Also plain' ) !== false ], [ true, true ] );
 check( 'a short excerpt holding a bearer token is not in the audit summary, nor is a title that is one', strpos( $flat, $SECRET_BEARER ), false );
 check( 'it is recorded as redacted rather than dropped', $summary[0]['fields']['post_excerpt']['from'], '[redacted]' );
+
+echo "-- a form submission is neither named nor put back --\n";
+$GLOBALS['gmcp_t_posts'][90] = [ 'post_status' => 'publish', 'post_type' => 'flamingo_inbound', 'post_title' => 'Visitor subject line' ];
+check( 'CONTROL: an ordinary post is undoable (the probe can find a yes)', GMCP_Changes::undoable_post( 78 ), true );
+check( 'a submission is not undoable', GMCP_Changes::undoable_post( 90 ), false );
+// An entry written before records about submissions were withheld names the post by its title.
+update_option( GMCP_Journal::OPTION, [
+  [ 'id' => 'leg-sub', 't' => time(), 'kind' => 'post', 'ID' => 90, 'what' => 'Submission "Visitor subject line" changed: post_title', 'fields' => [ 'post_title' ], 'previous' => [ 'post_title' => 'x' ], 'tool' => 'wp_update_post', 'call' => 'k1' ],
+  [ 'id' => 'leg-ord', 't' => time(), 'kind' => 'post', 'ID' => 78, 'what' => 'Post "Ordinary title" changed: post_title', 'fields' => [ 'post_title' ], 'previous' => [ 'post_title' => 'x' ], 'tool' => 'wp_update_post', 'call' => 'k2' ],
+], false );
+$shown = GMCP_Journal::recent( 10 );
+$by = [];
+foreach ( $shown as $row ) { $by[ $row['id'] ] = $row; }
+check( 'CONTROL: an old entry about an ordinary post is listed with its title', strpos( $by['leg-ord']['what'], 'Ordinary title' ) !== false, true );
+check( 'an old entry about a submission is listed without its title', strpos( $by['leg-sub']['what'], 'Visitor subject line' ) === false, true );
+check( 'and says it is a form submission', strpos( $by['leg-sub']['what'], 'form submission' ) !== false, true );
+$GLOBALS['gmcp_t_post_writes'] = [];
+$res = GMCP_Journal::revert( 'leg-sub' );
+check( 'an old entry about a submission is not put back', $res['ok'], false );
+check( 'and nothing was written', $GLOBALS['gmcp_t_post_writes'], [] );
 
 echo "\n$total checks, $fails failed\n";
 exit( min( 255, $fails ) );

@@ -596,6 +596,13 @@ class GMCP_Journal {
     if ( ( $change['op'] ?? '' ) !== 'updated' || $taxonomy === '' || !isset( $pair['from'] ) ) {
       return;
     }
+    // A record about a form submission reaches this point with its values withheld, and what
+    // is left in 'from' is not a list of term ids: recording it would offer an undo that sets
+    // a submission's terms to nothing. Only that case is refused here. A commerce post stays
+    // recorded, so the undo path's own guard answers for it with its reason.
+    if ( GMCP_Core::personal_data_post_guard( (int) ( $change['id'] ?? 0 ) ) !== true ) {
+      return;
+    }
     self::record( [
       'kind' => 'termrel',
       'ID' => (int) ( $change['id'] ?? 0 ),
@@ -798,6 +805,15 @@ class GMCP_Journal {
     $log = is_array( $log ) ? $log : [];
     $out = [];
     foreach ( array_slice( array_reverse( $log ), 0, $limit ) as $entry ) {
+      // An entry written before records about form submissions were withheld names the post by
+      // its title, which is the visitor's subject line. Rewritten on the way out rather than
+      // trusted to have been written clean, because the stored row outlives the code that
+      // wrote it.
+      $what = (string) ( $entry['what'] ?? '' );
+      if ( in_array( $entry['kind'] ?? '', [ 'post', 'meta', 'termrel' ], true ) && !empty( $entry['ID'] )
+        && GMCP_Core::personal_data_post_guard( (int) $entry['ID'] ) !== true ) {
+        $what = 'A form submission (#' . (int) $entry['ID'] . ') was changed. Its title and values are not shown.';
+      }
       $row = [
         'id' => $entry['id'] ?? '',
         'when' => gmdate( 'Y-m-d H:i', (int) ( $entry['t'] ?? 0 ) ) . ' GMT',
@@ -805,7 +821,7 @@ class GMCP_Journal {
         // Entries sharing a call came from one tool call. A page build writes several
         // things and they read as unrelated events without this.
         'call' => $entry['call'] ?? '',
-        'what' => $entry['what'] ?? '',
+        'what' => $what,
         'reversible' => self::reversible( $entry ) === true,
       ];
       // An undo is an entry too. Naming what it reversed is what lets a caller see that
@@ -891,6 +907,9 @@ class GMCP_Journal {
   * types it knows, and undoable_post() says no for anything this journal does not record.
   */
   private static function not_journalled_refusal( int $post_id ): string {
+    if ( GMCP_Core::personal_data_post_guard( $post_id ) !== true ) {
+      return 'It belongs to a form submission, personal data this journal neither shows nor restores: the previous values of such a post are not kept, and an entry written before that was the case is not put back either.';
+    }
     return 'It belongs to a ' . self::post_type_label( $post_id ) . ', which the generic post tools do not write and this journal does not revert. '
       . 'Putting an order or a subscription back with a plain post write skips every status transition, stock and payment hook the shop runs, so the site and the payment gateway would disagree. '
       . 'Use the WooCommerce tools to change it.';

@@ -367,6 +367,57 @@ else
 fi
 wpe 'global $wpdb;$wpdb->update($wpdb->posts,["post_modified"=>current_time("mysql"),"post_modified_gmt"=>current_time("mysql",true)],["ID"=>'"$SUB"']);$wpdb->update($wpdb->posts,["post_modified"=>current_time("mysql"),"post_modified_gmt"=>current_time("mysql",true)],["ID"=>'"$CTL"']);clean_post_cache('"$SUB"');clean_post_cache('"$CTL"');' >/dev/null
 
+echo "-- the change journal and the audit log do not name or quote a submission --"
+JOURNAL_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_change_journal"]??"unset";')
+wpe '$o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=true;update_option("gmcp_options",$o,false);GMCP_Journal::clear();' >/dev/null
+callas "$RW" j1 "$(tc wp_update_post_meta "{\"ID\":$SUB,\"key\":\"_field_message\",\"value\":\"agent-wrote-this\"}")"
+check "the write to the submission's meta is not refused (this guard is about reading it)" "$(verdict j1)" "ok"
+check "STORED: the submission's meta really changed" "$(wpe 'echo get_post_meta('"$SUB"',"_field_message",true);')" "agent-wrote-this"
+callas "$RW" j2 "$(tc wp_update_post "{\"ID\":$SUB,\"fields\":{\"post_title\":\"$M2-retitled\"}}")"
+check "an edit of its title is not refused either" "$(verdict j2)" "ok"
+check "STORED: the title really changed" "$(wpe 'echo get_post('"$SUB"')->post_title;')" "$M2-retitled"
+callas "$RW" j3 "$(tc wp_update_post_meta "{\"ID\":$CTL,\"key\":\"_field_message\",\"value\":\"agent-wrote-this\"}")"
+check "CONTROL: the same write to an ordinary post succeeds" "$(verdict j3)" "ok"
+callas "$RO" j4 "$(tc wp_list_changes '{"limit":40}')"
+check "CONTROL: wp_list_changes answers" "$(verdict j4)" "ok"
+check "CONTROL: it names the ordinary post's change (the probe sees an entry)" "$(has j4 "$M2-ctl-title")" "yes"
+check "wp_list_changes does not name the submission by its title" "$(has j4 "$M2-sub")" "no"
+check "nor by its new title" "$(has j4 "$M2-retitled")" "no"
+check "STORED: the journal row holds nothing of the submission" \
+  "$(wpe 'echo strpos(serialize(get_option(GMCP_Journal::OPTION,[])),"'"$M2"'-sub")===false&&strpos(serialize(get_option(GMCP_Journal::OPTION,[])),"'"$M2"'-retitled")===false?"clean":"quoted";')" "clean"
+check "STORED: and no snapshot of a submission's meta was kept" \
+  "$(wpe 'global $wpdb;echo (int) $wpdb->get_var("SELECT COUNT(*) FROM ".GMCP_Journal::snapshot_table()." WHERE post_id='"$SUB"'");')" "0"
+check "CONTROL: a snapshot WAS kept for the ordinary post's meta (the probe sees a row)" \
+  "$(wpe 'global $wpdb;echo (int) $wpdb->get_var("SELECT COUNT(*) FROM ".GMCP_Journal::snapshot_table()." WHERE post_id='"$CTL"'")>0?"kept":"none";')" "kept"
+callas "$RW" j4w "$(tc wp_list_changes '{"limit":40}')"
+JID=$(python3 -c 'import json,sys
+t=json.load(sys.stdin)["result"]["content"][0]["text"]
+print("".join(e["id"] for e in json.loads(t) if "'"$M2"'-ctl-title" in e.get("what","") and e.get("reversible"))[:10])' < "$OUT/j4w")
+callas "$RW" j5 "$(tc wp_undo_change "{\"id\":\"$JID\"}")"
+check "CONTROL: the ordinary post's entry can be undone" "$(verdict j5)" "ok"
+# An entry written before records about submissions were withheld names the post by its title.
+wpe 'update_option(GMCP_Journal::OPTION,[["id"=>"legacy-sub","t"=>time(),"kind"=>"post","ID"=>'"$SUB"',"what"=>"Smoke submission \"'"$M2"'-sub-title\" changed: post_title","fields"=>["post_title"],"previous"=>["post_title"=>"x"],"tool"=>"wp_update_post","call"=>"c1"],["id"=>"legacy-ctl","t"=>time(),"kind"=>"post","ID"=>'"$CTL"',"what"=>"Post \"'"$M2"'-ctl-title\" changed: post_title","fields"=>["post_title"],"previous"=>["post_title"=>"x"],"tool"=>"wp_update_post","call"=>"c2"]],false);' >/dev/null
+callas "$RO" j6 "$(tc wp_list_changes '{"limit":40}')"
+check "CONTROL: an old entry about an ordinary post is listed with its title" "$(has j6 "$M2-ctl-title")" "yes"
+check "an old entry about a submission is listed without its title" "$(has j6 "$M2-sub")" "no"
+check "and says why" "$(has j6 "form submission")" "yes"
+callas "$RW" j7 "$(tc wp_undo_change '{"id":"legacy-sub"}')"
+check "an old entry about a submission is not put back" "$(verdict j7)" "error"
+wpe 'GMCP_Journal::clear();' >/dev/null
+if [ "$JOURNAL_WAS" = unset ]; then
+  wpe '$o=get_option("gmcp_options",[]);unset($o["mcp_change_journal"]);update_option("gmcp_options",$o,false);' >/dev/null
+else
+  wpe '$o=get_option("gmcp_options",[]);$o["mcp_change_journal"]='"$JOURNAL_WAS"';update_option("gmcp_options",$o,false);' >/dev/null
+fi
+callas "$TOK" j8 "$(tc wp_get_audit_log '{"limit":200}')"
+if [ "$(verdict j8)" = "ok" ]; then
+  check "CONTROL: the audit log names the ordinary post's change by its title (the probe sees a label)" "$(has j8 "$M2-ctl-title")" "yes"
+  check "the audit log does not quote the submission's previous title" "$(has j8 "$M2-sub-title")" "no"
+else
+  echo "  SKIP  wp_get_audit_log is not offered; the audit half of the change records was not exercised"
+fi
+wpe 'wp_update_post(["ID"=>'"$SUB"',"post_title"=>"'"$M2"'-sub-title"]);' >/dev/null
+
 echo "-- a scan that returns the titles of posts --"
 check "CONTROL: a post that quotes a template shortcode is reported by the scan" \
   "$(wpe 'add_filter("gmcp_caller_access_level",function(){return "readonly";});$r=GMCP_Tools_Elementor::shortcode_references(7771,50);echo strpos(json_encode($r),"'"$M2"'-ctl")!==false?"found":"missing";')" "found"
