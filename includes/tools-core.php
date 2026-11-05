@@ -512,6 +512,11 @@ class GMCP_Tools_Core {
       if ( $protected !== null ) {
         return $protected;
       }
+      // Writers only, and not through the net: @see GMCP_Core::attachment_file_meta_refusal().
+      $file_key = GMCP_Core::attachment_file_meta_refusal( $key );
+      if ( $file_key !== null ) {
+        return $file_key;
+      }
     } else {
       // Reads too, for this one family: a builder layout is not a trash timestamp. Reading it
       // hands over the content and, for the html module, script; the builder group reports the
@@ -583,7 +588,17 @@ class GMCP_Tools_Core {
   * for the real one.
   */
   private function readable_meta( string $key, $value ) {
-    return GMCP_Core::field_looks_secret( $key ) ? GMCP_Core::REDACTION_MARKER : $value;
+    if ( GMCP_Core::field_looks_secret( $key ) ) {
+      return GMCP_Core::REDACTION_MARKER;
+    }
+    // The readers that list EVERY key (wp_get_post_meta without a key, wp_snapshot) never asked
+    // meta_key_allowed(), so a page builder's layout, refused by name, came back in the list: the
+    // whole serialized tree including an html module's script (measured with a read key on a
+    // Beaver Builder page). The same answer here, for the key as the database compares it.
+    if ( GMCP_Core::layout_meta_refusal( $key ) !== null ) {
+      return '[withheld: page builder layout]';
+    }
+    return $value;
   }
 
   /**
@@ -935,6 +950,10 @@ class GMCP_Tools_Core {
         $skipped[ $key ] = 'is the schedule WordPress deletes posts by, so it is never copied onto another post';
         continue;
       }
+      if ( GMCP_Core::attachment_file_meta_refusal( (string) $key ) !== null ) {
+        $skipped[ $key ] = 'names the file an attachment serves, so it is never copied onto another post';
+        continue;
+      }
       if ( !$overwrite && metadata_exists( 'post', $to, $key ) ) {
         $skipped[ $key ] = 'already set on post #' . $to . '; pass overwrite to replace it';
         continue;
@@ -1119,7 +1138,7 @@ class GMCP_Tools_Core {
       // Before the post exists, so a refused key leaves nothing half made. The net under
       // update_post_metadata would stop it too, but only after wp_insert_post() had stored the row.
       foreach ( array_keys( $meta_input ) as $meta_k ) {
-        $protected = GMCP_Core::protected_meta_refusal( (string) $meta_k );
+        $protected = GMCP_Core::protected_meta_refusal( (string) $meta_k ) ?? GMCP_Core::attachment_file_meta_refusal( (string) $meta_k );
         if ( $protected !== null ) {
           return new WP_Error( 'gmcp_protected_meta', $protected . ' Nothing was created.' );
         }
@@ -5524,6 +5543,17 @@ class GMCP_Tools_Core {
         $att = intval( $a['ID'] );
         if ( get_post_type( $att ) !== 'attachment' ) {
           $r = $this->error( $r, 'No attachment with ID ' . $att . '. This tool serves media only.', -32602 );
+          break;
+        }
+        // The two read policies about a post come first, because a file hangs from the post it
+        // is attached to: an upload to a form submission (or to one of its revisions) is what a
+        // visitor sent, and an attachment to an order is a customer's. A submission is
+        // published as far as WordPress is concerned, so the parent test below let a read key
+        // through (measured). Below admin the answer is the one a missing attachment gets, word
+        // for word, so ids cannot be walked to learn which are guarded. @see GMCP_Core::post_read_guard().
+        $held = GMCP_Core::post_read_guard( $att );
+        if ( $held !== true ) {
+          $r = $this->error( $r, GMCP_Core::caller_access_level() === 'admin' ? $held : 'No attachment with ID ' . $att . '. This tool serves media only.', GMCP_Core::caller_access_level() === 'admin' ? -32600 : -32602 );
           break;
         }
         // The authorization decision is made HERE, because this is the only place the caller's

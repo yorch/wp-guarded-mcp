@@ -123,8 +123,13 @@ and `wp_duplicate_post` copy inside PHP so a large design never leaves the serve
 `wp_write_post_meta_chunk` and `wp_read_post_meta_chunk` stage a value across several
 calls. `wp_download_request` returns a one-time URL that streams an attachment's file, so a
 file's bytes never pass through a tool reply or the audit log; a file attached to a post that is
-not published can only be requested with an admin-level key, and the endpoint refuses anything
-that does not resolve inside the site's uploads directory. `wp_create_posts` creates up to twenty in one call. `wp_site_briefing` answers
+not published can only be requested with an admin-level key, a file attached to a form submission
+(or to anything hanging from one) is not available at any level and, below admin, answers exactly as
+a missing attachment does, the token expires after five minutes at the endpoint and not only in the
+reply, and the endpoint refuses anything that does not resolve inside the site's uploads directory.
+The token in the URL is scrubbed from the audit log and the debug log like a preview link's. No
+generic tool writes `_wp_attached_file`, because repointing an attachment at another file under
+uploads would move that file out from under these rules. `wp_create_posts` creates up to twenty in one call. `wp_site_briefing` answers
 "what am I looking at" in one call. `wp_write_blocks` takes either a list of block specs or
 a Markdown string (headings, paragraphs, lists, blockquotes, fenced code, emphasis, links
 and images); Markdown HTML is shown as text, not run.
@@ -378,7 +383,12 @@ reports both copies' node counts. The tools report the SHAPE and never the setti
 `settings` is the content and, for the `html` module, arbitrary markup including script, and
 `_fl_builder_data_settings` holds layout-level `css` and `js` that run on every page using the
 layout. So node types, counts and depth are returned, layout setting *names* are returned,
-whether custom code is present is returned, and no value of either is. There is no tool that
+whether custom code is present is returned, and no value of either is. The layout keys are not
+readable through the generic meta tools either: `wp_get_post_meta` and `wp_get_post_snapshot` list
+them as withheld, and a key is judged the way the database compares it, so an accented or
+space-padded spelling is the same key. `beaver_layout` reports a post's title, type and status, so
+it asks the same read policy the generic readers do: a form submission, and below admin an order
+or another plugin's configuration, answers as a post that does not exist. There is no tool that
 writes layout data at any level: it would be persistent script injection with no restore tool
 behind it, the same reasoning that keeps a Custom Code writer out of the Elementor Pro group.
 The one write is `beaver_clear_cache`, which deletes the generated CSS/JS so the builder

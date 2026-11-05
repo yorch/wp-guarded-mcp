@@ -1536,6 +1536,55 @@ and there is no restore tool behind any of them. WPForms is folded into the form
   `[withheld: typed text]` for the three templates Wordfence writes. A reason of another shape is
   returned as stored, because there is nothing to recognise it by.
 
+## Beaver Builder and the one-time download
+
+Both arrived together and both sit next to guards that were tightened first, so what each one
+asks is written down here.
+
+- **A page builder's layout is a meta key the generic tools refuse, by name.**
+  `GMCP_Core::layout_meta_keys()` (`_fl_builder_data`, `_draft`, `_data_settings`,
+  `_draft_settings`, `_enabled`; extendable through `gmcp_layout_meta_keys`) is refused by every
+  meta writer (through `protected_meta_refusal()`, so also by the net under the WordPress meta
+  functions while a tool is in flight) and by the keyed reader. The readers that list EVERY key
+  (`wp_get_post_meta` with no key, `wp_get_post_snapshot`) used to return the whole serialized
+  tree, an `html` module's script included, to a read-only key: measured. They now list the key
+  with `[withheld: page builder layout]` through `readable_meta()`. The key is judged as the
+  database compares it (`GMCP_Meta_Key`): on MariaDB `_fl_builder_dáta` was the layout row, and a
+  write through it replaced the stored layout. Not covered: another plugin's own reader, a
+  layout kept under a key a site has not added to the filter, and a builder other than the one
+  listed.
+- **`beaver_layout` is a reader of the post it names.** It returns a title, a type and a status,
+  so it asks `post_read_guard()`: below admin a form submission, anything hanging from one, an
+  order or another plugin's configuration answers exactly as a missing id does; admin is told why.
+  `beaver_templates` lists only the builder's own template type and asks nothing more.
+- **`wp_download_request` asks the same read policy before it mints a token.** The parent test
+  (a published, unprotected post, or admin) was not enough: a form submission is `publish` to
+  WordPress, so a read key got a URL for a visitor's upload (measured). `post_read_guard()` now
+  runs first, with the missing-attachment answer below admin, and a refused call mints nothing.
+  Admin is refused for a submission's upload as well, as every generic reader is; the form tools
+  are the way to it.
+- **The file an attachment serves cannot be repointed by a generic writer.** The rules above are
+  about the attachment row, and `_wp_attached_file` is what the endpoint streams, so a readwrite
+  key that set it on an ordinary attachment to the path of a submission's upload downloaded that
+  upload through the innocent row (measured). `GMCP_Core::attachment_file_meta_refusal()` is asked
+  by the meta tools, copy, `meta_input` and the REST `meta` argument, on the key as the database
+  compares it. It is deliberately not in the net: core writes the key itself during
+  `wp_upload_media`. Not covered: a plugin that writes it through core while a tool is in flight,
+  and the usual limit that the endpoint serves anything under uploads that an attachment row names.
+- **Expiry is enforced by the endpoint.** The endpoint reads the transient row directly, and
+  WordPress leaves a lapsed transient in place until something asks for it, so the five minutes
+  were stated by the reply and not enforced: a token whose timeout was ten minutes in the past
+  streamed the file (measured). The timeout row is read and a lapsed or missing one is refused.
+  The token is also consumed by a conditional delete, so two requests cannot both win; on a site
+  with a persistent object cache no token is minted at all.
+- **The token is scrubbed like a preview link's.** The reply is JSON, which writes `/` as `\/`, and
+  the first scrub matched only the bare `/download/`, so the token sat in the audit log's detail
+  column: measured. `GMCP_Diag_Util::scrub_preview_tokens()` now matches the route with any number
+  of backslashes or `%2F` in front of each slash, for `download` and for the `mcp/v1/upload` route
+  (the upload URL is a bearer credential of the same shape), so the audit log, the approval view and
+  the debug log share it. A bare token with no route in front of it is not recognised, and the debug
+  log was measured not to print a tool's reply.
+
 ## Theme mods
 
 Theme mods are the customizer's storage, and four generic tools cover them:

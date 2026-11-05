@@ -1558,6 +1558,29 @@ class GMCP_Core {
   * @return string|null The refusal, or null when the key is fine.
   */
   /**
+  * The refusal for the meta key that names an attachment's FILE, asked by the generic meta
+  * writers and not by the WordPress-level net.
+  *
+  * `_wp_attached_file` is the path wp_download_request streams, and the access rule that tool
+  * applies (an unattached file, or one on an unpublished post, is admin only; a submission's
+  * upload is never served below admin) is a rule about the attachment ROW. Repointing the row
+  * at another file under uploads moves the file out from under the rule: a readwrite key set
+  * `_wp_attached_file` on an ordinary published attachment to the relative path of a form
+  * submission's upload and downloaded it through that one (measured). Nothing a generic meta
+  * tool legitimately does needs the key, because the media tools write it through core
+  * (update_attached_file) and not through these writers. It is not in the net: the same core
+  * call runs under wp_upload_media while a tool is in flight and has to keep working.
+  *
+  * @return string|null The refusal, or null for any other key.
+  */
+  public static function attachment_file_meta_refusal( $key ): ?string {
+    if ( !is_string( $key ) || $key === '' || !GMCP_Meta_Key::is( $key, '_wp_attached_file' ) ) {
+      return null;
+    }
+    return 'The meta key "' . $key . '" names the file an attachment serves, and the generic meta tools do not write it: pointing one attachment at another file under uploads would hand over, to anyone who can download the first, a file the second one\'s access rules keep from them. Upload the file as a new attachment instead (wp_upload_request).';
+  }
+
+  /**
   * Meta keys that hold a page builder's LAYOUT, which no generic tool may read or write.
   *
   * A policy about a key belongs to the key, not to the tool that writes it: the Beaver Builder
@@ -1631,7 +1654,17 @@ class GMCP_Core {
     if ( !is_string( $key ) || $key === '' ) {
       return null;
     }
-    if ( !in_array( strtolower( rtrim( $key ) ), self::layout_meta_keys(), true ) ) {
+    // Judged as the database compares the key, not as it was typed: on a collation that ignores
+    // accents "_fl_builder_dáta" is the "_fl_builder_data" row, so a comparison of the typed
+    // spelling refused only the people who spell it right. @see GMCP_Meta_Key.
+    $hit = false;
+    foreach ( self::layout_meta_keys() as $layout_key ) {
+      if ( GMCP_Meta_Key::is( $key, $layout_key ) ) {
+        $hit = true;
+        break;
+      }
+    }
+    if ( !$hit ) {
       return null;
     }
     return 'The meta key "' . $key . '" holds a page builder layout, and the generic meta tools neither read nor write it: a node\'s settings is the content and the html module makes it executable, and the layout settings hold css and js that run on every page using it. Reading it would hand over a script payload and writing it would install one, with no restore tool behind it. Use the builder\'s own tools to read the structure (node types, counts, whether it carries custom code), or its editor in wp-admin to change it. A site can extend the list with the gmcp_layout_meta_keys filter.';
@@ -2169,7 +2202,7 @@ class GMCP_Core {
     }
     if ( isset( $args['meta'] ) && is_array( $args['meta'] ) ) {
       foreach ( $args['meta'] as $key => $value ) {
-        $why = self::protected_meta_refusal( (string) $key ) ?? self::pointer_meta_refusal( (string) $key, $value, $post_id );
+        $why = self::protected_meta_refusal( (string) $key ) ?? self::attachment_file_meta_refusal( (string) $key ) ?? self::pointer_meta_refusal( (string) $key, $value, $post_id );
         if ( $why !== null ) {
           return $why;
         }

@@ -1910,19 +1910,16 @@ class GMCP_Server {
     if ( $stored === null ) {
       return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired download token.' ], 403 );
     }
-    // EXPIRY IS CHECKED HERE, not by get_transient(). Reading the row directly is what makes
-    // consumption atomic, and it also bypasses the expiry check that get_transient() performs:
-    // a token whose row has not been garbage-collected yet would otherwise stay redeemable past
-    // its five minutes. Measured on this stack: the row outlives the timeout by hours.
-    $expires = (int) get_option( '_transient_timeout_' . $key, 0 );
-    if ( $expires > 0 && $expires < time() ) {
-      $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", $row ) );
-      delete_option( '_transient_timeout_' . $key );
-      return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired download token.' ], 403 );
-    }
+    // Expiry is enforced HERE. This path reads the row directly instead of through
+    // get_transient(), which is the only thing that notices a lapsed timeout: WordPress leaves an
+    // expired transient in the options table until something asks for it or the daily cleanup
+    // runs, so without this check "expires after 5 minutes" was true of the reply and false of the
+    // endpoint (measured: a token whose timeout was ten minutes in the past still streamed the
+    // file). A row with no timeout is refused too, since this plugin always writes one.
+    $timeout = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", '_transient_timeout_' . $key ) );
     $won = (int) $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", $row, $stored ) );
     delete_option( '_transient_timeout_' . $key );
-    if ( $won !== 1 ) {
+    if ( $won !== 1 || $timeout === null || (int) $timeout < time() ) {
       return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired download token.' ], 403 );
     }
     $data = maybe_unserialize( $stored );

@@ -225,6 +225,20 @@ class GMCP_Tools_Beaver {
       return $this->error( $r, 'A post id is required.' );
     }
     $post = get_post( $post_id );
+    // Reports the post's title, type and status, so it is a reader of the post and asks the same
+    // two read policies every generic reader does: a form submission (or anything hanging from
+    // one) and, below admin, an order or another plugin's configuration. Below admin the answer
+    // is the one a post that does not exist gets, word for word, so ids cannot be walked to learn
+    // which are guarded. @see GMCP_Core::post_read_guard().
+    if ( $post ) {
+      $held = GMCP_Core::post_read_guard( $post_id );
+      if ( $held !== true ) {
+        if ( GMCP_Core::caller_access_level() === 'admin' ) {
+          return $this->error( $r, $held, GMCP_Core::read_refusal_code( $post_id, $held ) );
+        }
+        $post = null;
+      }
+    }
     if ( !$post ) {
       return $this->json( $r, [ 'builder' => $this->builder_state(), 'layout' => null, 'note' => 'No post with id ' . $post_id . ' exists on this site.' ] );
     }
