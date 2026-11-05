@@ -346,7 +346,7 @@ class GMCP_Tools_Wsal {
       ],
       'wsal_list_events' => [
         'name' => 'wsal_list_events',
-        'description' => 'List individual events from WP Activity Log, newest first, including the actor\'s username and role. Admin level, the same as wp_get_audit_log, because an event row names a person and this plugin does not expose a third-party log more widely than its own. Filters are structured columns only: alert_id, a minimum severity, object, event_type, user_id, post_id, a security family and a date range. There is no free-text search over the log — an occurrence\'s message is rendered rather than stored, and searching it would mean searching the metadata table, which is an oracle for the IP addresses and user emails the tools deliberately withhold. Each row carries the alert\'s stored template with only allowlisted placeholders filled: the site facts (post title, role, plugin name) appear, and anything the filler does not recognise stays as literal %Name% text rather than being resolved. Rows concerning a failed login do not return their message at all, because the attempted username is where a mistyped password ends up. Paged, with truncated and next_offset when the reply reaches its size budget.',
+        'description' => 'List individual events from WP Activity Log, newest first, including the actor\'s username and role. Admin level, the same as wp_get_audit_log, because an event row names a person and this plugin does not expose a third-party log more widely than its own. Filters are structured columns only: alert_id, a minimum severity, object, event_type, user_id, post_id, a security family and a date range. There is no free-text search over the log — an occurrence\'s message is rendered rather than stored, and searching it would mean searching the metadata table, which is an oracle for the IP addresses and user emails the tools deliberately withhold. Each row carries the alert\'s stored template with only allowlisted placeholders filled: the site facts (post title, role, plugin name) appear, and anything the filler does not recognise stays as literal %Name% text rather than being resolved. Rows concerning a failed login do not return their message at all, because the attempted username is where a mistyped password ends up, and nor do rows about a form submission or its contact record, whose title is what a visitor typed. Paged, with truncated and next_offset when the reply reaches its size budget.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -958,6 +958,57 @@ class GMCP_Tools_Wsal {
   }
 
   /**
+  * Metadata names that carry the title or address of the post an event is about.
+  *
+  * Withheld, from an event about a guarded post, for the same reason its message is: a form
+  * submission's title is built from what a visitor typed (a store titles one "Enquiry from"
+  * and the visitor's IP address, or names a contact by email address), and a title is the
+  * one field of a post this log copies into every message and into the metadata.
+  */
+  const POST_TEXT_META = [ 'PostTitle', 'OldTitle', 'NewTitle', 'PostUrl' ];
+
+  /** Metadata names that identify the post an event is about without being text to print. */
+  const GUARD_META = [ 'PostType', 'PostID', 'AttachmentID', 'CommentID' ];
+
+  /**
+  * Whether an event is about a post the form-submission policy holds, whatever level asks.
+  *
+  * The policy belongs to the post, so it is asked here as it is by every reader of a post
+  * (GMCP_Core::personal_data_post_guard). Two questions, because the log outlives the post:
+  * the type the log recorded (and the PostType in its metadata), which is all that is left
+  * of a submission that was deleted, and the post's own chain through post_parent while it
+  * still exists, which catches a revision or an upload of a submission whose own row says
+  * "attachment". Before this the message of an event about a Flamingo message was filled
+  * with its title, visitor IP address included, and listed with an admin key.
+  *
+  * @param array $row  An occurrence row (post_id, post_type).
+  * @param array $meta Metadata names and values already read for it, for PostType.
+  */
+  private function concerns_guarded_post( array $row, array $meta = [] ): bool {
+    $types = [ (string) ( $row['post_type'] ?? '' ), (string) ( $meta['PostType'] ?? '' ) ];
+    foreach ( $types as $type ) {
+      if ( $type !== '' && GMCP_Core::personal_data_post_guard( 0, $type ) !== true ) {
+        return true;
+      }
+    }
+    // The posts an event can name besides its own row: an upload event records no post at all
+    // (post_id 0, no type) and names the file by AttachmentID, a comment event names the
+    // comment. Each is followed to the post it hangs from while that post exists.
+    $ids = [ (int) ( $row['post_id'] ?? 0 ), (int) ( $meta['PostID'] ?? 0 ), (int) ( $meta['AttachmentID'] ?? 0 ) ];
+    $comment_id = (int) ( $meta['CommentID'] ?? 0 );
+    if ( $comment_id > 0 ) {
+      $comment = get_comment( $comment_id );
+      $ids[] = $comment ? (int) $comment->comment_post_ID : 0;
+    }
+    foreach ( array_unique( $ids ) as $post_id ) {
+      if ( $post_id > 0 && GMCP_Core::personal_data_post_guard( $post_id ) !== true ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
   * Fill a stored template from allowlisted metadata and nothing else.
   *
   * Every placeholder the allowlist does not cover is left standing as %Name%. A reader that
@@ -1077,7 +1128,10 @@ class GMCP_Tools_Wsal {
     }
 
     $template = $templates[ $alert_id ] ?? '';
-    if ( !$this->templates_available() && !$suppressed ) {
+    if ( !$suppressed && $this->concerns_guarded_post( $row, $fill ) ) {
+      $event['message'] = null;
+      $event['message_withheld'] = 'The message for this event is not returned, because it is about a form submission or its contact record, and a message quotes the post\'s title, which is built from what a visitor typed (their email address or IP address among it). The event, its time and its actor are above; the form tools for that plugin report on submissions.';
+    } elseif ( !$this->templates_available() && !$suppressed ) {
       $event['message'] = null;
       $event['message_note'] = 'This version of WP Activity Log (' . ( defined( 'WSAL_VERSION' ) ? WSAL_VERSION : 'unknown' ) . ') does not expose the alert message templates this tool fills, so there is no message. The event itself is above.';
     } elseif ( $suppressed ) {
@@ -1116,7 +1170,9 @@ class GMCP_Tools_Wsal {
       return [];
     }
 
-    $names = array_merge( self::FILLABLE, array_keys( self::FILLABLE_NESTED ) );
+    // GUARD_META are read to decide whether an event is about a guarded post. They are not
+    // fillable: fill_message() leaves a placeholder for any name that is not on FILLABLE.
+    $names = array_merge( self::FILLABLE, array_keys( self::FILLABLE_NESTED ), self::GUARD_META );
     $placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
     $nameholders  = implode( ',', array_fill( 0, count( $names ), '%s' ) );
 
@@ -1155,11 +1211,23 @@ class GMCP_Tools_Wsal {
       return [ (object) [], [ 'metadata_note' => 'This event has no metadata rows.' ] ];
     }
 
+    $named = [];
+    foreach ( $rows as $meta ) {
+      $named[ (string) $meta['name'] ] = (string) $meta['value'];
+    }
+    $guarded = $this->concerns_guarded_post( $row, $named );
+
     $out = [];
     $withheld = [];
     $marked = false;
     foreach ( $rows as $meta ) {
       $name = (string) $meta['name'];
+      if ( $guarded && in_array( $name, self::POST_TEXT_META, true ) ) {
+        // Named, not returned, like every other name that is withheld.
+        $withheld[] = $name;
+        $marked = true;
+        continue;
+      }
       if ( !in_array( $name, self::RETURNED_META, true ) ) {
         $withheld[] = $name;
         if ( in_array( $name, self::PERSONAL_META, true ) ) {

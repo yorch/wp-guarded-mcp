@@ -1214,6 +1214,20 @@ re-read.
   for a submission is the visitor's subject line; it reports the newest post the caller may
   read). It is on whether or not the forms group is. The type list is filterable through
   `gmcp_personal_data_post_types`.
+- **The activity log quotes a post's title, so it asks the same question.** WP Activity Log
+  writes the title of the post an event concerns into the event's metadata and into the message
+  the WSAL tools fill, and a form store titles a submission from what the visitor typed ("Enquiry
+  from" and their IP address) and a contact by email address. `wsal_list_events` therefore
+  returned an IP address at admin level. This surfaced as an intermittent failure of the suite's
+  "no row carries a client IP" check: it failed only when a form suite had written such an event
+  within the newest hundred rows, so a re-run passed. `GMCP_Tools_Wsal::concerns_guarded_post()`
+  asks `personal_data_post_guard()` of the type the log recorded (and the `PostType` in its
+  metadata, all that remains once the post is deleted) and of the post chain behind the row's
+  `post_id`, the event's `PostID` and `AttachmentID` and the post a `CommentID` is on. A held
+  event keeps its id, time, actor and alert, loses its message, and `wsal_get_event` withholds
+  `PostTitle`, `OldTitle`, `NewTitle` and `PostUrl` by name. Not covered: an upload event records
+  no post and no type, so once the submission it was attached to is deleted nothing links it
+  and its `FileName` (a name the visitor chose) is returned like any other.
 - **Below admin, a submission is answered exactly as a post that does not exist.** The refusal
   used to say what the post was ("it is a revision under a flamingo_inbound"), and a key that can
   only read could walk ids and map which are submissions and which are their revisions and

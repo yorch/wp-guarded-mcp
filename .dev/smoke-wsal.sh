@@ -94,6 +94,28 @@ atleast() { # file field floor
 atmost() { # file field ceiling
   n=$(jnum "$1" "$2")
   if [ -n "$n" ] && [ "$n" -le "$3" ] 2>/dev/null; then echo yes; else echo no; fi; }
+# Every IPv4-shaped string in a reply, each with the JSON path of the field that holds it,
+# one "path = value" per line, nothing when there is none. The two "no client IP" checks used
+# to count a bare regex match over the whole reply and failed once, intermittently, with
+# nothing printed to say which field it was; naming the field is what makes a recurrence
+# diagnosable instead of a rerun.
+ip_fields() { py 'import json,sys,re
+t=json.load(sys.stdin)["result"]["content"][0]["text"]
+rx=re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
+def walk(v,path):
+    if isinstance(v,dict):
+        for k,x in v.items(): walk(x,path+"."+str(k))
+    elif isinstance(v,list):
+        for i,x in enumerate(v): walk(x,path+"."+str(i))
+    elif isinstance(v,str):
+        for m in rx.finditer(v): print(path.lstrip(".")+" = "+v[max(0,m.start()-30):m.end()+30].replace("\n"," "))
+    else:
+        for m in rx.finditer(str(v)): print(path.lstrip(".")+" = "+str(v))
+try: walk(json.loads(t),"")
+except ValueError:
+    for m in rx.finditer(t): print("(unparsed reply) = "+t[max(0,m.start()-30):m.end()+30])' "" "$1"; }
+# yes/no for ip_fields, printing the offending fields when there are any.
+has_ip() { local f; f=$(ip_fields "$1"); if [ -n "$f" ]; then echo "  ....  IPv4-shaped values in $1:" >&2; echo "$f" | sed 's/^/          /' >&2; echo yes; else echo no; fi; }
 # A yes/no answer for a scalar SQL query counting at least one row.
 sqlhas() { # sql
   n=$(dbq "$1")
@@ -192,9 +214,7 @@ check "it reports how many alert types are switched off" \
 
 echo "-- the counts carry no actor, no address and no user agent --"
 check "the briefing reply has no IP-shaped value" \
-  "$(py 'import json,sys,re
-t=json.load(sys.stdin)["result"]["content"][0]["text"]
-print("yes" if re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",t) else "no")' "" brief)" "no"
+  "$(has_ip brief)" "no"
 check "the briefing reply has no user agent" "$(has brief "Mozilla")" "no"
 check "the briefing reply has no username" "$(has brief "$MARK")" "no"
 
@@ -232,9 +252,7 @@ print("yes" if re.search(r"O:\d+:\\\"|s:\d+:\\\"|a:\d+:\{",t) else "no")' "" lis
 check "no row in the reply carries an email address" "$(has list "$EMAIL")" "no"
 check "no row in the reply carries the attempted username" "$(has list "$SECRET_USER")" "no"
 check "no row in the reply carries a client IP" \
-  "$(py 'import json,sys,re
-t=json.load(sys.stdin)["result"]["content"][0]["text"]
-print("yes" if re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",t) else "no")' "" list)" "no"
+  "$(has_ip list)" "no"
 
 echo "-- the failed-login row is listed, with its message withheld --"
 LOGIN_ID=$(dbq "SELECT id FROM wp_wsal_occurrences WHERE id > $BOUNDARY AND alert_id IN (1002,1003) ORDER BY id DESC LIMIT 1")
@@ -495,6 +513,77 @@ call notlog "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":
 check "CONTROL: an ordinary option with a similar name still writes" "$(verdict notlog)" "ok"
 check "and its value is really stored" "$(wpc eval 'echo get_option("wsalmarker_probe","MISSING");')" "kept"
 wpc eval 'delete_option("wsalmarker_probe");' >/dev/null 2>&1
+
+# ---------------------------------------------------------------------------------------
+echo
+echo "-- an event about a form submission quotes nothing of it --"
+# Found as an intermittent failure of "no row carries a client IP": a form store titles a
+# submission "Enquiry from <visitor IP>" and names a contact by email address, and WP Activity
+# Log records that title on every event about the post. The message filler printed it, and
+# wsal_get_event returned it as metadata, at admin level, where the form-submission policy
+# holds at every level. Which run failed depended on whether a form suite had written such an
+# event within the newest hundred, which is why it passed on a re-run.
+#
+# The submission types are the policy's own names (nf_sub is one), and the post is made with
+# wp_insert_post, so no form plugin has to be installed: WP Activity Log logs the type
+# whether or not it is registered. Three guarded events (created-then-retitled, then deleted,
+# which leaves only the log) and one upload under a live submission, whose own row says
+# "attachment" and is held only through its parent.
+G_ID=$(wpc eval 'global $wpdb; echo (int) $wpdb->get_var("SELECT COALESCE(MAX(id),0) FROM {$wpdb->prefix}wsal_occurrences");')
+GM="gmark$(date +%s)"
+wpc eval "
+  \$g = wp_insert_post( [ 'post_title' => 'Enquiry from 203.0.113.77 ${GM}-sub', 'post_type' => 'nf_sub', 'post_status' => 'publish' ] );
+  wp_update_post( [ 'ID' => \$g, 'post_title' => 'Enquiry from 203.0.113.78 ${GM}-sub2' ] );
+  wp_delete_post( \$g, true );
+  \$k = wp_insert_post( [ 'post_title' => 'Enquiry ${GM}-live', 'post_type' => 'nf_sub', 'post_status' => 'publish' ] );
+  wp_insert_attachment( [ 'post_title' => 'Upload ${GM}-att', 'post_mime_type' => 'text/plain', 'post_status' => 'inherit', 'guid' => home_url( '/${GM}-att.txt' ) ], '${GM}-att.txt', \$k );
+  \$c = wp_insert_post( [ 'post_title' => 'Ordinary ${GM}-ctl', 'post_type' => 'post', 'post_status' => 'publish' ] );
+  wp_update_post( [ 'ID' => \$c, 'post_title' => 'Ordinary ${GM}-ctl2' ] );
+  wp_delete_post( \$c, true );
+  update_option( 'gmcp_smoke_wsal_live', \$k, false );
+" >/dev/null 2>&1
+sleep 2
+G_LIVE=$(wpc eval 'echo (int) get_option("gmcp_smoke_wsal_live");')
+check "CONTROL: the log holds the guarded titles in its own metadata (the thing to be withheld exists)" \
+  "$(sqlhas "SELECT COUNT(*) FROM wp_wsal_metadata m JOIN wp_wsal_occurrences o ON o.id=m.occurrence_id WHERE o.id > $G_ID AND m.value LIKE '%${GM}-sub%'")" "yes"
+check "CONTROL: it holds the upload's file name, under an event whose own row names no post (the filler prints FileName)" \
+  "$(sqlhas "SELECT COUNT(*) FROM wp_wsal_metadata m JOIN wp_wsal_occurrences o ON o.id=m.occurrence_id WHERE o.id > $G_ID AND o.post_id=0 AND m.name='FileName' AND m.value LIKE '%${GM}-att%'")" "yes"
+check "CONTROL: and its address" \
+  "$(sqlhas "SELECT COUNT(*) FROM wp_wsal_metadata m JOIN wp_wsal_occurrences o ON o.id=m.occurrence_id WHERE o.id > $G_ID AND o.post_id=0 AND m.name='AttachmentUrl' AND m.value LIKE '%${GM}-att%'")" "yes"
+check "CONTROL: and the ordinary post's" \
+  "$(sqlhas "SELECT COUNT(*) FROM wp_wsal_metadata m WHERE m.value LIKE '%${GM}-ctl%'")" "yes"
+call gl "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"wsal_list_events\",\"arguments\":{\"limit\":100}}}"
+check "CONTROL: the listing reads the window these events are in" "$(has gl "${GM}-ctl")" "yes"
+check "a deleted submission's title is not in the listing" "$(has gl "${GM}-sub")" "no"
+check "nor its visitor IP address" "$(has gl "203.0.113.7")" "no"
+check "nor the title of an upload under a live submission" "$(has gl "${GM}-att")" "no"
+check "nor the live submission's title" "$(has gl "${GM}-live")" "no"
+check "and no IPv4-shaped value is in it" "$(has_ip gl)" "no"
+G_ROWS=$(dbq "SELECT GROUP_CONCAT(DISTINCT id) FROM wp_wsal_occurrences WHERE id > $G_ID AND (post_type='nf_sub' OR post_id = $G_LIVE OR (post_type='attachment' AND post_id IN (SELECT ID FROM wp_posts WHERE post_parent = $G_LIVE)))")
+check "CONTROL: the guarded events are in the listing as rows, withheld rather than dropped" \
+  "$(py 'import json,sys
+t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])
+rows=[e for e in t["events"] if e["id"]>int(sys.argv[1]) and e.get("post",{}).get("type")=="nf_sub"]
+print("yes" if rows and all(e["message"] is None and "message_withheld" in e for e in rows) else "no")' "$G_ID" gl)" "yes"
+for r in $(echo "$G_ROWS" | tr ',' ' '); do
+  call "gg_$r" "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"wsal_get_event\",\"arguments\":{\"id\":$r}}}"
+  check "event $r about a submission: no title or address in the reply" \
+    "$(has "gg_$r" "${GM}")$(has "gg_$r" "203.0.113")" "nono"
+  check "event $r: the withheld names are listed, so the absence is visible" "$(has "gg_$r" "withheld_metadata")" "yes"
+done
+check "CONTROL: at least one guarded event was read in full" "$([ -n "$G_ROWS" ] && echo yes || echo no)" "yes"
+C_ROW=$(dbq "SELECT o.id FROM wp_wsal_occurrences o JOIN wp_wsal_metadata m ON m.occurrence_id=o.id AND m.name='PostTitle' WHERE o.id > $G_ID AND m.value LIKE '%${GM}-ctl2' ORDER BY o.id DESC LIMIT 1")
+call gc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"wsal_get_event\",\"arguments\":{\"id\":${C_ROW:-0}}}}"
+check "CONTROL: the same read of an event about an ordinary post returns its title" "$(has gc "${GM}-ctl2")" "yes"
+wpc eval "wp_delete_post( (int) get_option('gmcp_smoke_wsal_live'), true ); delete_option('gmcp_smoke_wsal_live');" >/dev/null 2>&1
+
+# The probe itself, so a pass above means something: it finds a visitor IP in a reply and does
+# not mistake a three-part version for one.
+printf '%s' '{"result":{"content":[{"text":"{\"events\":[{\"message\":\"Enquiry from 203.0.113.9 x\"}]}"}]}}' > "$OUT/ipctl_yes"
+printf '%s' '{"result":{"content":[{"text":"{\"events\":[{\"message\":\"Updated to 5.6.8 and 1.2.3\"}]}"}]}}' > "$OUT/ipctl_no"
+check "CONTROL: the IP probe finds a visitor IP in a reply" "$(has_ip ipctl_yes 2>/dev/null)" "yes"
+check "CONTROL: and names the field it was in" "$(ip_fields ipctl_yes | grep -c '^events.0.message = ')" "1"
+check "CONTROL: and does not call a three-part version one" "$(has_ip ipctl_no 2>/dev/null)" "no"
 
 # ---------------------------------------------------------------------------------------
 echo

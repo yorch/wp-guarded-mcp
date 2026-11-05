@@ -315,7 +315,16 @@ plaintext. The names of what was withheld are listed so an absence is visible. A
 as a serialised object is never read, only marked, since casting one still exposes every
 property it holds. Filesystem paths are returned relative to the content directory. The
 failure-login alerts do not return their message at all, because it is built from what someone
-typed at the login form and that field regularly holds a mistyped password.
+typed at the login form and that field regularly holds a mistyped password. An event about a
+form submission or its contact record (the `gmcp_personal_data_post_types` list) returns no
+message and no title, old title, new title or address, at admin level too, because a form store
+titles a submission from what the visitor typed ("Enquiry from" and their IP address) and names
+a contact by email address, and the log copies that title into every event about the post. It
+is judged by the type the log recorded, which is all that is left once the submission is
+deleted, and by the post's parent chain while the post still exists, so an upload under a
+submission is held as well. What it does not cover: an upload to a submission that has since
+been deleted records no post and no type, and its file name (which a visitor chose) is not
+recognised.
 
 Each reply carries a `log_state` block, which is what separates "nothing happened" from
 "nothing is being recorded" — the same false-zero trap Gravity Forms and Elementor Pro have.
