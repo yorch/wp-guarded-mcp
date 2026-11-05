@@ -304,6 +304,12 @@ class GMCP_Audit {
         }
       }
     }
+    // Free text as well as names: wp_update_post's content, excerpt and title are strings
+    // that start with a tag or a word, so redact() above, which judges field names, keeps
+    // them whole, and a body with {"api_key":"..."} or a pasted define('DB_PASSWORD', ...) in
+    // it was written to this table verbatim. Only the first MAX_ARGS bytes of a leaf are
+    // scanned because no more than that can be stored: the encoded call is capped there.
+    $redacted = GMCP_Core::blank_credential_strings( $redacted, 0, self::MAX_ARGS );
     $json = wp_json_encode( $redacted, JSON_UNESCAPED_SLASHES );
     if ( $json === false ) {
       return '{"__gmcp":"arguments could not be encoded"}';
@@ -352,7 +358,7 @@ class GMCP_Audit {
       'client' => mb_substr( (string) ( $call['client_name'] ?: ( $call['client_id'] ?? '' ) ), 0, 191 ),
       'auth_method' => mb_substr( (string) ( $call['auth_method'] ?? '' ), 0, 32 ),
       'tool' => mb_substr( (string) $call['tool'], 0, 64 ),
-      'target' => $this->target( $args ),
+      'target' => self::scrub_text( $this->target( $args ), '[redacted]' ),
       'outcome' => $failed ? 'refused' : 'ok',
       'ms' => (int) ( $call['duration_ms'] ?? 0 ),
       'args' => self::storable_args( $args, $failed ),
@@ -512,7 +518,7 @@ class GMCP_Audit {
       return;
     }
     $actor = (int) ( $fields['actor'] ?? 0 );
-    $args = GMCP_Core::redact( is_array( $fields['args'] ?? null ) ? $fields['args'] : [] );
+    $args = GMCP_Core::blank_credential_strings( GMCP_Core::redact( is_array( $fields['args'] ?? null ) ? $fields['args'] : [] ), 0, self::MAX_ARGS );
     $json = wp_json_encode( $args, JSON_UNESCAPED_SLASHES );
     self::append( [
       'ts' => gmdate( 'Y-m-d H:i:s' ),
@@ -555,7 +561,17 @@ class GMCP_Audit {
     // A preview link is a bearer credential and its tool's reply is where it is handed out.
     // The reply is recorded here, so the token is cut out of it: an audit log that holds a
     // working link to an unpublished post is a second place that link can be read from.
-    return mb_substr( GMCP_Core::scrub_preview_tokens( $text ), 0, 1000 );
+    return self::scrub_text( mb_substr( GMCP_Core::scrub_preview_tokens( $text ), 0, 1000 ), '[redacted: the reply held something credential-shaped]' );
+  }
+
+  /**
+  * A short piece of free text as the log may keep it: itself, or $instead when it carries a
+  * credential. For the columns that hold text a tool was handed or answered with (the target
+  * a call names, the reply's first thousand characters), which no field name classifies.
+  * Only text already cut to its storable length is passed, so the scan is bounded.
+  */
+  public static function scrub_text( string $text, string $instead ): string {
+    return $text !== '' && GMCP_Credential_Scan::text_holds( $text ) ? $instead : $text;
   }
 
   /**

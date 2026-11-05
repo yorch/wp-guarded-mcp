@@ -399,7 +399,9 @@ something that looks harmless and is not, so each says what it cannot promise.
   anyway.
 - Not closed, and said so: viewing a link is not logged (only issuing and
   revoking are); anyone who is given the link can forward it; a link pasted into a
-  post body or a message is outside what the audit log's scrub can see; the
+  post body or a message is outside what the preview scrub can see (the audit log's
+  text test now blanks an argument that carries a credential-shaped string, but a
+  preview link is not one of the shapes it knows); the
   window between the address check and the connect is closed by pinning only
   where the HTTP transport is cURL. A proxy is never used for the fetch: libcurl
   honours `http_proxy` and `HTTPS_PROXY` from the environment, and a proxy
@@ -1227,8 +1229,9 @@ menu. A theme setting keeps the previous value of one key of the
 holds now, so undoing a menu-location assignment cannot discard a colour changed
 afterwards. A change that moves more than ten keys of the row at once is kept as
 one whole-row entry, as it used to be, so a single option write cannot fill the
-log by itself. Credential-shaped keys and values are judged by the same two
-tests as a meta value and are recorded as changed without a copy.
+log by itself. Credential-shaped keys and values are judged by the same tests as
+a meta value (field names, and the text test described below) and are recorded as
+changed without a copy.
 
 Reverting a post, a custom field or a set of terms also asks
 `commerce_post_guard()`, because an order and a subscription are `wp_posts` rows
@@ -1256,9 +1259,60 @@ key, not the first, and an undo that would write one recorded value is refused w
 the key now holds several rows, because that write rewrites every row. Where the
 value the undo is about to overwrite holds a credential, the undo is recorded as
 not reversible instead of being copied, for the reason the original is not; that
-test runs for options, custom fields, theme settings and terms. A post's own fields
-(title, content, excerpt) are not tested for credential shapes, here or when the
-original edit is recorded. That is a gap, not a decision this document defends.
+test runs for options, custom fields, theme settings, terms and a post's own
+fields. See "Free text" below for what that test is.
+
+Free text. The test above judges field names, and it opens a value only if the
+value begins as JSON or serialized data. A post body is prose, so `{"api_key":
+"..."}` pasted into the middle of one, a `define( 'DB_PASSWORD', '...' )` line or
+an `Authorization: Bearer ...` header named no field and was kept: in the journal as
+the previous value, in the redo entry as the value an undo overwrote, and in the
+audit log as the call's arguments and as the one-line change summary. A second test,
+`GMCP_Credential_Scan`, reads the text itself. It looks for what people actually
+paste: a quoted or bare `name = value` where the name ends in a secret word
+(`password`, `secret`, `token`, `api_key`, `access_token`, `DB_PASSWORD`) and the
+value has the shape of one, a `define()` of such a constant, a bearer or
+Authorization header, a private key block, user information in a URL, a JWT, and the
+published prefixes of the common key formats. It is a heuristic and not a promise: a
+secret that is a bare word with nothing around it is not recognisable as one.
+
+It is built to avoid the opposite failure as carefully, because a false positive
+costs an undo and the journal exists so that an ordinary edit can be put back. The
+last word of the name decides, so `passwordLabel` and `placeholder_text` are labels,
+and a name that merely contains a pattern (`author`, `keywords`) counts only when its
+value looks like a token. Prose that uses the word "password" is kept whole and
+undone byte for byte, and a block attribute such as `{"authorId":3}` is not touched;
+both are asserted. On a half-megabyte body it takes about 15 to 60 milliseconds,
+measured, and a failure of the regular-expression engine itself answers "yes, a
+credential", never "no".
+
+What a post entry does about it is per field. A field that holds one is left out of
+`previous` and named in `redacted_fields`; the other fields of the same edit stay
+restorable and the listing says the restore is partial. Nothing is stored in its
+place, because a placeholder in `previous` would be written over live content by the
+undo, which is the failure the option path's refill exists to prevent: a field that
+is not recorded is simply not restored. An entry whose every field was withheld is
+not reversible and says why. The same text test now covers the other kinds' string
+values, the title shown in an entry's "what" line, the audit log's change summary
+(short values and the post label), the arguments it stores (every string leaf, for
+the first 64,000 bytes, which is all that can be stored), the target column and the
+first thousand characters of a reply it keeps. The debug trace asks the same
+function. Not covered: an entry recorded before this check existed keeps whatever it
+recorded until the journal rolls past it, and the `gmcp_change` action, which a
+site's own code may hook, still carries the raw before and after values, because it
+is an in-process hook and not a store.
+
+Undoing an edit never writes a status WordPress deletes on. A recorded earlier
+status of `trash` or `auto-draft` is not restored, by the same refusal the write
+tools use (`GMCP_Core::status_write_refusal()`). Measured, not assumed. For
+`auto-draft` the route was real: promoting an old auto-draft with `wp_update_post` and
+then undoing that put the status back to `auto-draft` with nothing refusing, and
+`wp_delete_auto_drafts()`, the routine WordPress's daily event runs, then deleted the
+post. For `trash` it is defence in depth: a post moved out of the trash by a plain
+`wp_update_post` keeps its `_wp_trash_meta_time` stamp (measured), so writing `trash`
+back would re-arm the permanent delete, but the tool's own update path clears the
+stamp first, so no way to reach that through a tool was found. The rest of the entry
+is still restored, and the reply says the status was left alone.
 
 Previous meta values live in a table of their own rather than in the journal's
 option row, because `_elementor_data` runs past 100KB and the option's per-value
@@ -1266,7 +1320,8 @@ ceiling is 64KB, so sharing the budget would have recorded every Elementor edit
 as too large to keep. The table is pruned by age and by total size on the same
 daily event the audit log uses, and a snapshot that has expired makes its entry
 report the copy as gone rather than silently putting back something stale. A
-value past a megabyte, or one whose key name or contents look like a credential,
+value past a megabyte, or one whose key name or contents look like a credential
+(a secret-named field anywhere inside it, or a string with a pasted secret in it),
 is recorded as changed with no copy kept and says which.
 
 That contents check walks much deeper here than it does for an option. Both

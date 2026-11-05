@@ -1910,6 +1910,133 @@ check "a bearer credential in a token form field is absent from the log" "$(grep
 check "the debug option is back as it was" \
   "$(wpe 'global $gmcp_core; echo $gmcp_core->get_option("mcp_debug_mode") ? "on" : "off";')" "$DL_WAS"
 
+echo "-- a credential in a post body never reaches the journal or the audit log --"
+# holds_credential() judges field NAMES and opens only a value that BEGINS as JSON or serialized
+# data. A post body is prose, so a settings snippet, a pasted wp-config line or an Authorization
+# header inside it went into the journal option and the audit table verbatim: as the previous
+# value an undo keeps, as the value an undo overwrites, as the call's own arguments and as the
+# one-line change summary. Asserted on the stored rows, never on a reply. Every "is absent"
+# check has a control that finds a value of the same kind that SHOULD be there.
+JC_J_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_change_journal"] ?? 0 ? 1 : 0;')
+JC_A_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_activity_log"] ?? 0 ? 1 : 0;')
+wpe '$o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=true;$o["mcp_activity_log"]=true;update_option("gmcp_options",$o,false);delete_option("gmcp_journal");' >/dev/null
+K_JC=$(wpe '$a=GMCP_Tokens::create("jc admin","admin",0,[]);echo $a["secret"];')
+JC_POST=$(wpe 'echo wp_insert_post(["post_title"=>"JC journal post","post_status"=>"draft","post_content"=>"JC original body","post_excerpt"=>"JC original excerpt"]);')
+JC_FIRST_AUDIT=$(wpe 'global $wpdb; echo (int) $wpdb->get_var("SELECT COALESCE(MAX(id),0) FROM " . GMCP_Audit::table());')
+check "CONTROL: the key and the post exist" "$([ "${K_JC#gmcp_}" != "$K_JC" ] && [ "$JC_POST" -gt 0 ] && echo yes || echo no)" "yes"
+
+JC_S_JSON='sk_live_JCLEAKjson7Qz81'
+JC_S_DEF='JCLeakDefine9xTq'
+JC_S_BEARER='jcLeakBearer5aB3dE7gH9jK'
+# The JSON field names are written out here, not taken from a variable, so what the post holds
+# is what an agent would paste.
+jc_update() { # jc_update <id> <field> <value>
+  callk jc "$K_JC" "$(python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wp_update_post","arguments":{"ID":int(sys.argv[1]),"fields":{sys.argv[2]:sys.argv[3]}}}}))' "$1" "$2" "$3")"
+}
+jc_field() { wpe "wp_cache_flush(); echo get_post_field('$2', $1);"; }
+jc_entry() { # jc_entry <field-name>  -> id of the newest journal entry that names it
+  wpe 'foreach ( GMCP_Journal::recent( 40 ) as $e ) { if ( strpos( $e["what"], "'"$1"'" ) !== false ) { echo $e["id"]; break; } }'
+}
+
+# 1. content: clean -> credential -> clean. The second call's PREVIOUS value is the credential.
+jc_update "$JC_POST" post_content "Notes {\"api_key\":\"$JC_S_JSON\"} end"
+check "CONTROL: the credential body really was written" "$(jc_field "$JC_POST" post_content | grep -c "$JC_S_JSON")" "1"
+jc_update "$JC_POST" post_content "JC second body"
+# 2. a pasted wp-config line, as the excerpt, then as content
+jc_update "$JC_POST" post_excerpt "define('DB_PASSWORD','$JC_S_DEF');"
+jc_update "$JC_POST" post_excerpt "JC second excerpt"
+# 3. an Authorization header
+jc_update "$JC_POST" post_content "Send Authorization: Bearer $JC_S_BEARER with every request"
+jc_update "$JC_POST" post_content "JC third body"
+
+JC_JOURNAL_HAS() { wpe 'echo strpos( serialize( get_option( "gmcp_journal", [] ) ), "'"$1"'" ) === false ? "absent" : "present";'; }
+JC_AUDIT_HAS() { wpe 'global $wpdb; $t = GMCP_Audit::table(); echo (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $t WHERE id > %d AND CONCAT_WS(\"|\", args, COALESCE(changes,\"\"), detail, target) LIKE %s", '"$JC_FIRST_AUDIT"', "%'"$1"'%" ) );'; }
+check "CONTROL: the journal probe finds a value that was kept (an earlier body)" "$(JC_JOURNAL_HAS 'JC original body')" "present"
+check "CONTROL: the audit probe finds a value that was recorded (an ordinary argument)" "$([ "$(JC_AUDIT_HAS 'JC second body')" -ge 1 ] && echo yes || echo no)" "yes"
+check "CONTROL: the audit log recorded these calls at all" "$([ "$(wpe 'global $wpdb; echo (int) $wpdb->get_var( "SELECT COUNT(*) FROM " . GMCP_Audit::table() . " WHERE tool = \"wp_update_post\" AND id > '"$JC_FIRST_AUDIT"'" );')" -ge 6 ] && echo yes || echo no)" "yes"
+for s in "$JC_S_JSON" "$JC_S_DEF" "$JC_S_BEARER"; do
+  check "journal: $s is not stored" "$(JC_JOURNAL_HAS "$s")" "absent"
+  check "audit log (args, changes, detail, target): $s is not stored" "$(JC_AUDIT_HAS "$s")" "0"
+done
+callk jc_list "$K_JC" "$(tool_json 2 wp_list_changes '{"limit":40}')"
+check "CONTROL: wp_list_changes answers and lists the post's changes" "$([ "$(grep -c 'JC journal post' "$OUT/jc_list")" -gt 0 ] && echo yes || echo no)" "yes"
+check "wp_list_changes does not repeat a credential" "$(grep -c -e "$JC_S_JSON" -e "$JC_S_DEF" -e "$JC_S_BEARER" "$OUT/jc_list")" "0"
+
+# The entry whose previous value was the credential cannot be put back, and says why; the
+# post keeps the content it has.
+JC_ENTRY_CRED=$(wpe 'foreach ( get_option( "gmcp_journal", [] ) as $e ) { if ( ( $e["ID"] ?? 0 ) == '"$JC_POST"' && ! empty( $e["redacted_fields"] ) && in_array( "post_content", $e["redacted_fields"], true ) ) { echo $e["id"]; break; } }')
+check "the entry that would have kept a credential body is on record and marked withheld" "$([ -n "$JC_ENTRY_CRED" ] && echo yes || echo no)" "yes"
+check "  and is listed as not reversible" "$(wpe 'foreach ( GMCP_Journal::recent( 40 ) as $e ) { if ( $e["id"] === "'"$JC_ENTRY_CRED"'" ) { echo $e["reversible"] ? "reversible" : "not"; } }')" "not"
+JC_BEFORE=$(jc_field "$JC_POST" post_content)
+callk jc "$K_JC" "$(tool_json 3 wp_undo_change "{\"id\":\"$JC_ENTRY_CRED\"}")"
+check "  and an undo of it is refused and the post is unchanged" "$(verdict jc)/$(jc_field "$JC_POST" post_content)" "error/$JC_BEFORE"
+
+# What an undo OVERWRITES is judged as well: this edit has a clean previous body and replaces a
+# credential, so undoing it overwrites a credential, which is the one write that could copy it
+# into the undo's own record.
+jc_update "$JC_POST" post_content "Again {\"api_key\":\"$JC_S_JSON\"} here"
+JC_E1=$(jc_entry post_content)
+callk jc "$K_JC" "$(tool_json 4 wp_undo_change "{\"id\":\"$JC_E1\"}")"
+check "CONTROL: the undo of that edit goes through and restores the clean body" "$(verdict jc)/$(jc_field "$JC_POST" post_content)" "ok/JC third body"
+check "the credential the undo overwrote is not in the journal" "$(JC_JOURNAL_HAS "$JC_S_JSON")" "absent"
+check "and no undo ever wrote a placeholder over live content" "$(wpe 'echo get_post_field("post_content", '"$JC_POST"') === "[redacted]" || get_post_field("post_excerpt", '"$JC_POST"') === "[redacted]" ? "WROTE" : "never";')" "never"
+JC_REDO=$(wpe 'foreach ( get_option( "gmcp_journal", [] ) as $e ) { if ( ( $e["undoes"] ?? "" ) === "'"$JC_E1"'" ) { echo $e["id"]; } }')
+check "CONTROL: the undo is itself on record" "$([ -n "$JC_REDO" ] && echo yes || echo no)" "yes"
+callk jc "$K_JC" "$(tool_json 5 wp_undo_change "{\"id\":\"$JC_REDO\"}")"
+check "reverting that undo cannot restore the credential body, and the post keeps its content" "$(verdict jc)/$(jc_field "$JC_POST" post_content)" "error/JC third body"
+
+# The false-positive control: an ordinary body that only uses the word is journalled and undone
+# byte for byte. A scanner that refused it would pass every leak check above and ruin undo.
+JC_PROSE='Pick a strong password and never share your password. Keep the secret key and API key safe. Password: required. The token is shown once.'
+jc_update "$JC_POST" post_content "$JC_PROSE"
+jc_update "$JC_POST" post_content "JC after prose"
+JC_E2=$(jc_entry post_content)
+check "CONTROL: the prose body was kept, whole, as the previous value" "$(JC_JOURNAL_HAS 'Pick a strong password and never share your password')" "present"
+callk jc "$K_JC" "$(tool_json 6 wp_undo_change "{\"id\":\"$JC_E2\"}")"
+check "an undo restores it exactly" "$(verdict jc)/$([ "$(jc_field "$JC_POST" post_content)" = "$JC_PROSE" ] && echo identical || echo different)" "ok/identical"
+
+# A title that is itself a credential is not quoted in the entry's one-line description.
+jc_update "$JC_POST" post_title "define('DB_PASSWORD','$JC_S_DEF');"
+jc_update "$JC_POST" post_title "JC journal post"
+check "a title holding a credential is not quoted in a \"what\" line, the audit changes, or the target" "$(JC_JOURNAL_HAS "$JC_S_DEF")/$(JC_AUDIT_HAS "$JC_S_DEF")" "absent/0"
+
+# 3. Statuses WordPress deletes on are not restored by an undo.
+JC_AD=$(wpe 'echo wp_insert_post(["post_title"=>"JC old autodraft","post_status"=>"auto-draft","post_content"=>"JC autodraft body","post_date"=>gmdate("Y-m-d H:i:s",time()-30*DAY_IN_SECONDS),"post_date_gmt"=>gmdate("Y-m-d H:i:s",time()-30*DAY_IN_SECONDS)]);')
+JC_AD_CTRL=$(wpe 'echo wp_insert_post(["post_title"=>"JC control autodraft","post_status"=>"auto-draft","post_content"=>"x","post_date"=>gmdate("Y-m-d H:i:s",time()-30*DAY_IN_SECONDS),"post_date_gmt"=>gmdate("Y-m-d H:i:s",time()-30*DAY_IN_SECONDS)]);')
+check "CONTROL: both old auto-drafts exist as auto-drafts" "$(pstatus $JC_AD)/$(pstatus $JC_AD_CTRL)" "auto-draft/auto-draft"
+callk jc "$K_JC" "$(tool_json 7 wp_update_post "{\"ID\":$JC_AD,\"fields\":{\"post_status\":\"draft\",\"post_title\":\"JC promoted\"}}")"
+check "CONTROL: the tool promoted it out of auto-draft" "$(pstatus $JC_AD)" "draft"
+JC_E3=$(jc_entry "JC promoted")
+[ -z "$JC_E3" ] && JC_E3=$(wpe 'foreach ( get_option( "gmcp_journal", [] ) as $e ) { if ( ( $e["kind"] ?? "" ) === "post" && ( $e["ID"] ?? 0 ) == '"$JC_AD"' ) { echo $e["id"]; break; } }')
+check "CONTROL: that promotion is on record" "$([ -n "$JC_E3" ] && echo yes || echo no)" "yes"
+callk jc "$K_JC" "$(tool_json 8 wp_undo_change "{\"id\":\"$JC_E3\"}")"
+check "the undo does not set it back to auto-draft" "$(pstatus $JC_AD)" "draft"
+wpe 'wp_delete_auto_drafts();' >/dev/null
+check "the daily auto-draft clean-up leaves it standing" "$(wpe 'echo get_post('"$JC_AD"') ? "present" : "gone";')" "present"
+check "CONTROL: the same clean-up does delete an old auto-draft nobody promoted" "$(wpe 'echo get_post('"$JC_AD_CTRL"') ? "present" : "gone";')" "gone"
+
+# The same for a post an undo would send back to the trash.
+JC_TR=$(wpe 'echo wp_insert_post(["post_title"=>"JC trashed","post_status"=>"publish","post_content"=>"x"]);')
+wpe 'wp_trash_post('"$JC_TR"');' >/dev/null
+check "CONTROL: the post is in the trash with its trash stamp" "$(pstatus $JC_TR)/$(wpe 'echo get_post_meta('"$JC_TR"', "_wp_trash_meta_time", true) ? "stamped" : "unstamped";')" "trash/stamped"
+callk jc "$K_JC" "$(tool_json 10 wp_update_post "{\"ID\":$JC_TR,\"fields\":{\"post_status\":\"draft\",\"post_title\":\"JC untrashed\"}}")"
+check "CONTROL: the tool took it out of the trash" "$(pstatus $JC_TR)" "draft"
+JC_E4=$(wpe 'foreach ( get_option( "gmcp_journal", [] ) as $e ) { if ( ( $e["kind"] ?? "" ) === "post" && ( $e["ID"] ?? 0 ) == '"$JC_TR"' && isset( $e["previous"]["post_status"] ) ) { echo $e["id"]; break; } }')
+check "CONTROL: it is on record, and what it would put back is the status trash" "$([ -n "$JC_E4" ] && echo yes || echo no)/$(wpe 'foreach ( get_option( "gmcp_journal", [] ) as $e ) { if ( $e["id"] === "'"$JC_E4"'" ) { echo $e["previous"]["post_status"] ?? "none"; } }')" "yes/trash"
+callk jc "$K_JC" "$(tool_json 11 wp_undo_change "{\"id\":\"$JC_E4\"}")"
+check "the undo does not send it back to the trash" "$(pstatus $JC_TR)" "draft"
+
+# A forged entry naming fields outside the recorder's list is skipped, field by field.
+JC_FORGE_ID=$(wpe 'echo wp_insert_post(["post_title"=>"JC forge target","post_status"=>"draft","post_type"=>"post","post_content"=>"x","post_author"=>1]);')
+wpe 'update_option( "gmcp_journal", [ [ "id" => "jcforged01", "t" => time(), "tool" => "wp_update_post", "call" => "jcforgedcall", "kind" => "post", "ID" => '"$JC_FORGE_ID"', "what" => "forged", "fields" => [ "post_title", "post_type", "post_author", "post_date", "post_password" ], "previous" => [ "post_title" => "JC restored title", "post_type" => "page", "post_author" => 99, "post_date" => "1970-01-01 00:00:00", "post_password" => "forgedpw" ] ] ], false );' >/dev/null
+callk jc "$K_JC" "$(tool_json 9 wp_undo_change '{"id":"jcforged01"}')"
+check "CONTROL: the forged entry's watched field was restored" "$(verdict jc)/$(ptitle $JC_FORGE_ID)" "ok/JC restored title"
+check "post_type, author, password and date were not written by the undo" "$(wpe 'wp_cache_flush(); $p = get_post('"$JC_FORGE_ID"'); echo $p->post_type, "|", $p->post_author, "|", $p->post_password === "" ? "nopw" : "PW", "|", substr($p->post_date, 0, 4) === "1970" ? "EPOCH" : "date-kept";')" "post|1|nopw|date-kept"
+
+# Put the site back.
+wpe 'foreach ( [ '"$JC_POST"', '"$JC_TR"', '"$JC_AD"', '"$JC_AD_CTRL"', '"$JC_FORGE_ID"' ] as $i ) { wp_delete_post( $i, true ); } foreach ( GMCP_Tokens::all() as $t ) { if ( $t["label"] === "jc admin" ) { GMCP_Tokens::revoke( $t["id"] ); } } delete_option( "gmcp_journal" ); $o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=('"$JC_J_WAS"'===1);$o["mcp_activity_log"]=('"$JC_A_WAS"'===1);update_option("gmcp_options",$o,false);' >/dev/null
+check "put back: the fixtures are gone" "$(wpe 'echo count( get_posts( [ "post_type" => "any", "post_status" => "any", "numberposts" => -1, "s" => "JC " ] ) );')" "0"
+
 # Put the site back: the fixtures, the keys, the grants. A guard test must not leave them.
 wpe 'foreach(get_posts(["post_status"=>"any","post_type"=>["post","page","attachment"],"numberposts"=>-1,"s"=>"DO "]) as $p){ if(strpos($p->post_title,"DO ")===0){wp_delete_post($p->ID,true);} } foreach(wp_get_nav_menus() as $m){ if($m->name==="DO net menu"){wp_delete_nav_menu($m->term_id);} } foreach(GMCP_Tokens::all() as $t){ if(in_array($t["label"],["drafts only writer","plain writer","drafts only admin","pre-flag writer","do admin"],true)){GMCP_Tokens::revoke($t["id"]);} } global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_tokens WHERE client_id IN (SELECT client_id FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\")"); $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\"");' >/dev/null
 

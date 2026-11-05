@@ -119,6 +119,16 @@ blanks a credential written as an assignment inside a string (`smtp_pwd=...`, a
 added later without the helper is still covered. A bare token with no key in front
 of it is not recognised by any of this, and nothing in the docs claims it is.
 
+**Free text is judged as text, in one place.** `holds_credential()` reads field names and opens
+only values that begin as JSON or serialized data, so a post body with `{"api_key":"..."}` or a
+`define('DB_PASSWORD', ...)` line in the middle of it passed. `GMCP_Credential_Scan` is the text
+test, and the journal (`unsafe_to_keep()`, `post_previous()`, `label()`), `GMCP_Changes::describe()`,
+the audit log's arguments, target and reply, and `redact_reversible()` all ask it. A post field that
+fails is left out of `previous` and named in `redacted_fields`; a placeholder is never stored, because
+undo would write it over live content. Tune it against false positives as hard as against misses: an
+ordinary body that says "password" must stay undoable, and `.dev/journal-pure.php` holds that control.
+Undo also refuses to restore a status `status_write_refusal()` refuses (`trash`, `auto-draft`).
+
 **There is no restore tool, at any access level.** Backups can be started and read. That is
 deliberate and not an omission to be helpfully filled in.
 

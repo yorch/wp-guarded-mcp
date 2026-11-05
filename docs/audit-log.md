@@ -51,6 +51,18 @@ because the credential patterns are written for field names inside a value,
 where `key` signals a secret, and at the top level of a call it is the name of
 the thing being changed.
 
+Names are not the only signal. A post body, an excerpt or a title is a string that
+begins with a tag or a word, so `redact()` keeps it whole, and a body with a pasted
+`{"api_key": "..."}`, a `define( 'DB_PASSWORD', '...' )` line or an Authorization
+header in it used to be stored verbatim. Every string leaf of the arguments is now
+also read as text (`GMCP_Credential_Scan`) and replaced by `[redacted]` when it holds
+one, as are the target column, the first thousand characters of the reply the entry
+keeps (which then reads as withheld) and the short values and post label of the change
+summary. It is a heuristic: it finds the shapes people paste, such as quoted
+`name = value` pairs under a secret-ended name, bearer headers, private key blocks
+and the common key prefixes, and it does not find a secret that is a bare word.
+Ordinary prose that mentions a password is recorded as written.
+
 One credential has no field name to give it away: a draft preview link, whose
 token rides in a URL. `redact()` therefore also scrubs the `gmcp_preview`
 parameter (whichever spelling of its name PHP maps to it) out of any string it is
@@ -73,8 +85,8 @@ as its size: "the title changed, and the body went from 1.4 KB to 1.6 KB" is the
 useful sentence, and a field that did not change is simply absent. And some of
 those values are passwords. Anything credential-shaped is recorded as
 `[redacted]` on both sides, judged by the same `gmcp_credential_field_patterns`
-the change journal uses, so the log says a password was changed without saying
-to what.
+the change journal uses and, for the short text it does keep, by the same text test,
+so the log says a password was changed without saying to what.
 
 ### Each row hashes the one before it
 

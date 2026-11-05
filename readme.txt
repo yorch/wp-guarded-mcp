@@ -30,7 +30,7 @@ The guardrails exist because an agent administering your site also reads comment
 * Post and widget HTML is filtered regardless of who is calling.
 * The registration default role is checked by construction — anything above subscriber is refused.
 * It refuses to break itself: no deactivating or deleting the plugin mid-call, no deleting the active theme.
-* The plugin's own credentials are not readable through its own tools.
+* The plugin's own credentials are not readable through its own tools, and credential-shaped text is kept out of the change journal and the activity log.
 * The riskiest tools can preview what they would do before doing it.
 * Edits can be put back — one call reverts what an agent changed.
 
@@ -151,6 +151,8 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * Flush the object cache, expired transients or one post, and say plainly which CDN or reverse proxy it could not reach and you still have to purge yourself.
 * Undo also covers term edits, which terms a post carries, and individual theme settings, and an undo can itself be undone. Creations, deletions and users are still not undoable.
 * Undo covers post meta, which is what a page-builder site is made of, and the check that keeps credentials out of the record now walks far enough to reach the bottom of a page design. It used to stop six levels down and refuse everything below that, so a design was declined for being deep rather than for holding anything.
+* The change journal and the activity log no longer keep a credential pasted into the middle of a post. A body with a JSON settings snippet, a wp-config line or an Authorization header in it used to be copied whole; now that field is left out of the undo record, the rest of the edit stays undoable, and the log shows it as redacted. Prose that only mentions a password is unaffected. It is a heuristic for the shapes people paste, not a guarantee.
+* Undoing an edit no longer puts a post back to the status "trash" or "auto-draft", which WordPress deletes on from a daily job.
 * Create several posts in one call, up to twenty, stopping at the first failure and reporting what was created, what failed and what was never tried. Creations are still not undoable, and the reply says so.
 * Ask for a database-only or files-only backup where the backup plugin can express it, and get a reason where it cannot.
 * Read the Elementor kit's global colours, fonts and settings without writing any of them.

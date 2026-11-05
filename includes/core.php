@@ -690,7 +690,9 @@ class GMCP_Core {
   *
   * Deliberately about structure rather than content: guessing whether a bare string is a
   * secret means guessing, and guessing wrong in the permissive direction stores the
-  * secret. Settings hold these under named fields, and the names say so.
+  * secret. Settings hold these under named fields, and the names say so. Free text that
+  * can carry a pasted secret (a post body) is the one place that is not enough, and
+  * @see GMCP_Credential_Scan reads it.
   *
   * It has to walk more than arrays. An option holding a stdClass and an option holding a
   * JSON string are two of the three commonest ways plugins store settings, and checking
@@ -1773,7 +1775,9 @@ class GMCP_Core {
       return [ false, null ];
     }
     if ( is_string( $value ) ) {
-      return [ true, self::holds_credential( $value ) ? self::REDACTION_MARKER : $value ];
+      // Free text too: a string leaf with a pasted wp-config line in it names nothing, so the
+      // structural test passes it. @see GMCP_Credential_Scan.
+      return [ true, ( self::holds_credential( $value ) || GMCP_Credential_Scan::text_holds( $value ) ) ? self::REDACTION_MARKER : $value ];
     }
     if ( !is_array( $value ) ) {
       return [ true, $value ];
@@ -1951,19 +1955,27 @@ class GMCP_Core {
     return self::blank_credential_strings( $redacted );
   }
 
-  /** Every string leaf holds_credential() flags, replaced by the marker. */
-  private static function blank_credential_strings( $value, int $depth = 0 ) {
+  /**
+  * Every string leaf that holds a credential, replaced by the marker: one that
+  * holds_credential() flags (a JSON or serialized blob with a secret-named field inside) and
+  * one whose free text carries a pasted secret (GMCP_Credential_Scan), which is what a post
+  * body or an excerpt sent as an argument looks like.
+  *
+  * @param int $window When positive, only that many leading bytes of a string are scanned for
+  *                    free text. For a caller that can record no more than that much of it.
+  */
+  public static function blank_credential_strings( $value, int $depth = 0, int $window = 0 ) {
     if ( $depth > 8 ) {
       return $value;
     }
     if ( is_string( $value ) ) {
-      return self::holds_credential( $value ) ? self::REDACTION_MARKER : $value;
+      return ( self::holds_credential( $value ) || GMCP_Credential_Scan::holds( $value, 1, $window ) ) ? self::REDACTION_MARKER : $value;
     }
     if ( !is_array( $value ) ) {
       return $value;
     }
     foreach ( $value as $k => $inner ) {
-      $value[ $k ] = self::blank_credential_strings( $inner, $depth + 1 );
+      $value[ $k ] = self::blank_credential_strings( $inner, $depth + 1, $window );
     }
     return $value;
   }

@@ -53,6 +53,13 @@ if ( !defined( 'ABSPATH' ) ) {
 * because the name check is not enough: woocommerce_stripe_settings is an innocuous name
 * holding a live secret_key, and matching only on the name would journal it in full.
 *
+* The same goes for free text. A post body is prose, and a settings snippet or a pasted
+* wp-config line inside it names no field, so field names alone passed it. Every kind now
+* also asks GMCP_Credential_Scan about the strings it would keep, and a post field that
+* fails is left out of the entry and named in redacted_fields: the rest of the edit stays
+* undoable and nothing is stored in the field's place, because an undo would write a
+* placeholder over live content.
+*
 * This is a heuristic and it is not retroactive. A site that adds an option to
 * gmcp_protected_options later gets a correct refusal at revert time, but the plaintext
 * already recorded stays in the row until the log rolls past it. Clear the journal after
@@ -295,7 +302,7 @@ class GMCP_Journal {
       'tool' => (string) ( $change['tool'] ?? '' ),
       'call' => (string) ( $change['call'] ?? '' ),
     ];
-    if ( GMCP_Core::holds_credential( $old ) ) {
+    if ( GMCP_Core::holds_credential( $old ) || GMCP_Credential_Scan::holds( $old ) ) {
       // Keep the shape with the secret-looking leaves blanked, rather than dropping the
       // value whole. Dropping was costing every option that merely contains a field named
       // key, author or password-something its undo, which on an Elementor build is most of
@@ -360,7 +367,7 @@ class GMCP_Journal {
       'ID' => $post_id,
       'key' => $meta_key,
       'what' => ucfirst( (string) ( $change['subject'] ?? 'post' ) ) . ' "'
-        . mb_substr( (string) ( $change['label'] ?? '' ), 0, 60 ) . '" custom field "'
+        . self::label( (string) ( $change['label'] ?? '' ) ) . '" custom field "'
         . $meta_key . '" ' . $verb,
       'absent' => empty( $change['existed'] ),
       'tool' => (string) ( $change['tool'] ?? '' ),
@@ -406,8 +413,7 @@ class GMCP_Journal {
   private static function meta_body( array $entry, $previous ): array {
     $post_id = (int) $entry['ID'];
     $meta_key = (string) $entry['key'];
-    if ( GMCP_Core::field_looks_secret( $meta_key )
-      || GMCP_Core::holds_credential( $previous, 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+    if ( GMCP_Core::field_looks_secret( $meta_key ) || self::unsafe_to_keep( $previous ) ) {
       $entry['redacted'] = true;
       return $entry;
     }
@@ -493,8 +499,7 @@ class GMCP_Journal {
         'tool' => (string) ( $change['tool'] ?? '' ),
         'call' => (string) ( $change['call'] ?? '' ),
       ];
-      if ( GMCP_Core::field_looks_secret( $one['key'] )
-        || GMCP_Core::holds_credential( $one['from'], 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+      if ( GMCP_Core::field_looks_secret( $one['key'] ) || self::unsafe_to_keep( $one['from'] ) ) {
         // The same two tests as a meta value. The key is not restorable and says why; the
         // rest of the row is unaffected, which the whole-row entry could not offer.
         $entry['redacted'] = true;
@@ -570,12 +575,12 @@ class GMCP_Journal {
       'ID' => (int) ( $change['id'] ?? 0 ),
       'taxonomy' => $taxonomy,
       'what' => ucfirst( (string) ( $change['subject'] ?? 'term' ) ) . ' "'
-        . mb_substr( (string) ( $change['label'] ?? '' ), 0, 60 ) . '" changed: ' . implode( ', ', $fields ),
+        . self::label( (string) ( $change['label'] ?? '' ) ) . '" changed: ' . implode( ', ', $fields ),
       'fields' => $fields,
       'tool' => (string) ( $change['tool'] ?? '' ),
       'call' => (string) ( $change['call'] ?? '' ),
     ];
-    if ( GMCP_Core::holds_credential( $previous, 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+    if ( self::unsafe_to_keep( $previous ) ) {
       $entry['redacted'] = true;
     }
     else {
@@ -596,7 +601,7 @@ class GMCP_Journal {
       'ID' => (int) ( $change['id'] ?? 0 ),
       'taxonomy' => $taxonomy,
       'what' => ucfirst( (string) ( $change['subject'] ?? 'post' ) ) . ' "'
-        . mb_substr( (string) ( $change['label'] ?? '' ), 0, 60 ) . '" terms in "' . $taxonomy . '" changed',
+        . self::label( (string) ( $change['label'] ?? '' ) ) . '" terms in "' . $taxonomy . '" changed',
       'previous' => self::storable( array_values( array_map( 'intval', (array) $pair['from'] ) ) ),
       'tool' => (string) ( $change['tool'] ?? '' ),
       'call' => (string) ( $change['call'] ?? '' ),
@@ -625,14 +630,21 @@ class GMCP_Journal {
       'kind' => 'post',
       'ID' => (int) ( $change['id'] ?? 0 ),
       'what' => ucfirst( (string) ( $change['subject'] ?? 'post' ) ) . ' "'
-        . mb_substr( (string) ( $change['label'] ?? '' ), 0, 60 ) . '" changed: ' . implode( ', ', $changed ),
+        . self::label( (string) ( $change['label'] ?? '' ) ) . '" changed: ' . implode( ', ', $changed ),
       'fields' => $changed,
       'previous' => [],
       'tool' => (string) ( $change['tool'] ?? '' ),
       'call' => (string) ( $change['call'] ?? '' ),
     ];
+    $values = [];
     foreach ( $change['fields'] as $field => $pair ) {
-      $entry['previous'][ $field ] = self::storable( $pair['from'] ?? null );
+      $values[ $field ] = $pair['from'] ?? null;
+    }
+    [ $entry['previous'], $dropped ] = self::post_previous( $values );
+    if ( $dropped ) {
+      // Named, so the listing and the refusal can say which part was never recorded. The
+      // value is not here and is not anywhere else in the entry.
+      $entry['redacted_fields'] = $dropped;
     }
     if ( self::oversized( $entry['previous'] ) ) {
       $entry['note'] = 'Part of the previous version was too large to keep, so reverting will restore only what fits.';
@@ -678,6 +690,52 @@ class GMCP_Journal {
       $out[ $k ] = self::refill( $inner, $has_current ? $current[ $k ] : null, $kept );
     }
     return $out;
+  }
+
+  /**
+  * A title or name as it may appear in an entry's "what" line: cut to length, and withheld
+  * when it is itself credential-shaped. The line is shown by wp_list_changes and copied
+  * into the next undo's own line, and a post title is the one piece of free text it quotes.
+  */
+  private static function label( string $text, int $len = 60 ): string {
+    $cut = mb_substr( $text, 0, $len );
+    return GMCP_Credential_Scan::text_holds( $cut ) ? '[redacted]' : $cut;
+  }
+
+  /**
+  * Whether a value is unsafe to keep a copy of: a secret-named field anywhere in it, or free
+  * text carrying one (a pasted wp-config line, a JSON snippet, an Authorization header).
+  *
+  * The one question every kind asks of a value it is about to store. holds_credential() alone
+  * judges names and opens only values that BEGIN as JSON or serialized data, so a post body
+  * with {"api_key":"..."} in the middle of it was copied whole. @see GMCP_Credential_Scan.
+  */
+  private static function unsafe_to_keep( $value ): bool {
+    return GMCP_Credential_Scan::holds( $value );
+  }
+
+  /**
+  * Post fields split into what may be kept and what may not.
+  *
+  * Per field, so one credential-shaped body does not take the title's undo with it, and so the
+  * thing dropped is dropped and never replaced: a placeholder stored in `previous` would be
+  * written over live content by the undo, which is the failure the option path's refill()
+  * exists to prevent. A field left out of `previous` is simply not restored.
+  *
+  * @param array $values field => value
+  * @return array{0:array,1:string[]} [ what may be kept, the names of the fields that were dropped ]
+  */
+  private static function post_previous( array $values ): array {
+    $keep = [];
+    $dropped = [];
+    foreach ( $values as $field => $value ) {
+      if ( self::unsafe_to_keep( $value ) ) {
+        $dropped[] = (string) $field;
+        continue;
+      }
+      $keep[ $field ] = self::storable( $value );
+    }
+    return [ $keep, $dropped ];
   }
 
   /** Big previous values are described rather than copied, so the option stays small. */
@@ -762,7 +820,7 @@ class GMCP_Journal {
       // Said out loud rather than left to be discovered. "Reversible" on its own would
       // promise a restore this entry cannot give, and a caller deciding whether to undo
       // needs to know the credential-shaped fields will stay as they are.
-      elseif ( !empty( $entry['partly_redacted'] ) ) {
+      elseif ( !empty( $entry['partly_redacted'] ) || !empty( $entry['redacted_fields'] ) ) {
         $row['partial_restore'] = 'Fields that looked like credentials were never recorded. '
           . 'Everything else goes back; those are left exactly as they are now.';
       }
@@ -948,6 +1006,9 @@ class GMCP_Journal {
         if ( !self::too_large( $value ) ) {
           return true;
         }
+      }
+      if ( !empty( $entry['redacted_fields'] ) ) {
+        return 'The previous value looked like it held a credential, so it was never stored.';
       }
       return 'Every previous value was too large to keep.';
     }
@@ -1430,7 +1491,7 @@ class GMCP_Journal {
         $redo['previous'] = null;
         $redo['absent'] = true;
       }
-      elseif ( GMCP_Core::holds_credential( $current ) ) {
+      elseif ( GMCP_Core::holds_credential( $current ) || GMCP_Credential_Scan::holds( $current ) ) {
         // What the undo is about to overwrite holds a credential. It is not copied, for the
         // reason an ordinary entry does not copy one, so this undo cannot itself be undone.
         $redo['previous'] = null;
@@ -1480,8 +1541,7 @@ class GMCP_Journal {
       $had = array_key_exists( $key, $current_row );
       $redo = [ 'kind' => 'themod', 'row' => $row, 'key' => $key, 'absent' => !$had ];
       if ( $had ) {
-        if ( GMCP_Core::field_looks_secret( $key )
-          || GMCP_Core::holds_credential( $current_row[ $key ], 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+        if ( GMCP_Core::field_looks_secret( $key ) || self::unsafe_to_keep( $current_row[ $key ] ) ) {
           $redo['redacted'] = true;
         }
         else {
@@ -1540,7 +1600,7 @@ class GMCP_Journal {
       // overwrote is whatever the term held a moment ago, which may be a credential that was
       // written after the entry being undone (observe_term() judges the value it records and
       // this is the same value one step later). Judged the same way, and not copied.
-      if ( GMCP_Core::holds_credential( $redo_previous, 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+      if ( self::unsafe_to_keep( $redo_previous ) ) {
         $redo['redacted'] = true;
         $done .= ' The value it replaced looked like it held a credential, so that is not recorded and this undo cannot be undone.';
       }
@@ -1581,7 +1641,8 @@ class GMCP_Journal {
       $post_id = (int) $entry['ID'];
       $restored = [];
       $redo_fields = [];
-      $redo_previous = [];
+      $redo_values = [];
+      $refused = [];
       $fields = [ 'ID' => $post_id ];
       foreach ( (array) ( $entry['fields'] ?? [] ) as $field ) {
         if ( !array_key_exists( $field, (array) $entry['previous'] ) ) {
@@ -1600,11 +1661,23 @@ class GMCP_Journal {
         if ( self::too_large( $value ) ) {
           continue;
         }
+        // The statuses no write tool may set are not set by an undo either. WordPress deletes
+        // on them from a daily job: a trashed post that still carries its old trash stamp, an
+        // auto-draft older than a week. An undo of "published an auto-draft" would write the
+        // status back and hand the clean-up a deletion, through a tool that never deletes.
+        if ( $field === 'post_status' && GMCP_Core::status_write_refusal( $value ) !== null ) {
+          $refused[] = 'status';
+          continue;
+        }
         $fields[ $field ] = $value;
         $restored[] = str_replace( 'post_', '', $field );
         $redo_fields[] = $field;
-        $redo_previous[ $field ] = self::storable( get_post_field( $field, $post_id, 'raw' ) );
+        $redo_values[ $field ] = get_post_field( $field, $post_id, 'raw' );
       }
+      // What the undo is about to overwrite is what reverting the undo would put back, and it
+      // is judged exactly as a recorded value is: it may be a credential written after the
+      // entry being undone. Dropped field by field, never replaced by a placeholder.
+      [ $redo_previous, $redo_dropped ] = self::post_previous( $redo_values );
       if ( count( $fields ) > 1 ) {
         // Slashed, because wp_insert_post() unslashes what it is given and these are the
         // raw values off the WP_Post, exactly as stored. Unslashed, every backslash in the
@@ -1622,13 +1695,20 @@ class GMCP_Journal {
       $done = $restored
         ? 'Restored the ' . implode( ', ', array_unique( $restored ) ) . ' of post ' . $post_id . '.'
         : 'Nothing was left to restore on post ' . $post_id . '.';
-      return [
-        'ok' => true,
-        'message' => $done,
-        'redo' => $redo_fields
-          ? [ 'kind' => 'post', 'ID' => $post_id, 'fields' => $redo_fields, 'previous' => $redo_previous ]
-          : null,
-      ];
+      if ( $refused ) {
+        $done .= ' The earlier status was left as it is: it is "trash" or "auto-draft", which WordPress deletes on, and the write level does not delete. Use wp_delete_post.';
+      }
+      $redo = null;
+      if ( $redo_fields ) {
+        $redo = [ 'kind' => 'post', 'ID' => $post_id, 'fields' => $redo_fields, 'previous' => $redo_previous ];
+        if ( $redo_dropped ) {
+          $redo['redacted_fields'] = $redo_dropped;
+          $done .= ' What it replaced in ' . implode( ', ', array_map( function ( $f ) {
+            return str_replace( 'post_', '', $f );
+          }, $redo_dropped ) ) . ' looked like it held a credential, so that is not recorded and cannot be put back by undoing this.';
+        }
+      }
+      return [ 'ok' => true, 'message' => $done, 'redo' => $redo ];
     }
 
     return $fail( 'Unknown change type.' );

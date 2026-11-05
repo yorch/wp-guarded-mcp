@@ -56,6 +56,12 @@ function wp_update_post( $arr, $wp_error = false ) {
   }
   return (int) $arr['ID'];
 }
+function wp_json_encode( $v, $flags = 0 ) {
+  return json_encode( $v, $flags );
+}
+function size_format( $b ) {
+  return $b . ' B';
+}
 function is_wp_error( $v ) {
   return false;
 }
@@ -142,6 +148,10 @@ class GMCP_Core {
     }
     return false;
   }
+  // The real one's answer for the two statuses, in one line.
+  public static function status_write_refusal( $status, $noun = 'post' ) {
+    return in_array( strtolower( trim( (string) $status ) ), [ 'trash', 'auto-draft' ], true ) ? 'refused: a deletion by another name' : null;
+  }
   public static function redact_reversible( $v ) {
     return [ false, null ];
   }
@@ -150,6 +160,7 @@ class GMCP_Audit {
   const CRON_HOOK = 'gmcp_t_cron';
 }
 
+require __DIR__ . '/../includes/credential-scan.php';
 require __DIR__ . '/../includes/changes.php';
 require __DIR__ . '/../includes/journal.php';
 
@@ -411,6 +422,168 @@ check( 'the undo of the entry succeeds', $res['ok'], true );
 check( 'CONTROL: the watched field was restored', $GLOBALS['gmcp_t_posts'][78]['post_title'], 'Original title' );
 check( 'post_type was never written', array_key_exists( 'post_type', $GLOBALS['gmcp_t_post_writes'][0] ?? [] ), false );
 check( 'the post is still the type it was', $GLOBALS['gmcp_t_posts'][78]['post_type'], 'post' );
+
+echo "-- the text scanner: what it finds and, as much, what it leaves alone --\n";
+// Each row is a text and whether it is credential-shaped. The false rows are the controls: a
+// scanner that said yes to everything passes every leak check and ruins undo.
+$scan_cases = [
+  'a JSON snippet in the middle of a body'    => [ '<p>Config:</p>{"api_key":"sk_live_abcdefgh12345"}', true ],
+  'a define() of a password constant'         => [ "<pre>define('DB_PASSWORD','hunter2x');</pre>", true ],
+  'a define() of a salt in double quotes'     => [ 'define( "AUTH_KEY", "put your unique phrase here" );', true ],
+  'an Authorization header'                   => [ 'Send header Authorization: Bearer abcdefghijklmnop1234', true ],
+  'a bare bearer token'                       => [ 'use Bearer eyabcdefghijklmnopqrstuv', true ],
+  'an env-style assignment'                   => [ "DB_PASSWORD=s3cretpass99\nDB_HOST=localhost", true ],
+  'a token in a query string'                 => [ '<a href="https://x.test/?token=abc123def456">x</a>', true ],
+  'a private key block'                       => [ "-----BEGIN RSA PRIVATE KEY-----\nMIIE", true ],
+  'user information in a DSN'                 => [ 'mysql://root:pw123@db.local/x', true ],
+  'a JSON snippet with entity-encoded quotes' => [ '&quot;client_secret&quot;:&quot;zzzz1234&quot;', true ],
+  'a JSON snippet with escaped quotes'        => [ '{\"access_token\":\"abcd1234\"}', true ],
+  'a PHP array entry'                         => [ "'smtp_password' => 'abcdef'", true ],
+  'an AWS key id'                             => [ 'AKIAABCDEFGHIJKLMNOP', true ],
+  'a GitHub token'                            => [ 'ghp_abcdefghijklmnopqrstuvwx', true ],
+  'CONTROL: prose that says password, secret key, API key, token' => [ 'Pick a strong password and never share your password. Password: required. Keep your secret key safe; the API key and token are shown once.', false ],
+  'CONTROL: "password = required" and "token=none" in prose' => [ 'The password = required field and token=none here', false ],
+  'CONTROL: a Gutenberg block with authorId and authorName' => [ '<!-- wp:post-author {"authorId":3,"authorName":"Alexander","showAvatar":true} /-->', false ],
+  'CONTROL: block attributes called passwordLabel and keywords' => [ '<!-- wp:foo {"keywords":"seo wordpress plugin 2024 tips","passwordLabel":"Password","authToggle":"Enter your password"} -->', false ],
+  'CONTROL: a login form'                     => [ '<label>Password</label><input type="password" name="pwd" placeholder="Password"><input name="token" value="">', false ],
+  'CONTROL: an icon registry entry'           => [ '{"key":"eicon-star","author":"Jane Doe","title":"Hello"}', false ],
+  'CONTROL: a short quoted password assignment is too thin to call' => [ "'smtp_password' => 'abc'", false ],
+  'CONTROL: ordinary text'                    => [ str_repeat( 'Lorem ipsum dolor sit amet, consectetur. ', 20 ), false ],
+  'CONTROL: a commit hash'                    => [ 'commit 0123456789abcdef0123456789abcdef01234567', false ],
+  'CONTROL: an e-mail address and a URL with a port' => [ 'contact me at jane@example.com or http://example.com:8080/x', false ],
+];
+foreach ( $scan_cases as $label => [ $text, $want ] ) {
+  check( "scanner: $label", GMCP_Credential_Scan::text_holds( $text ), $want );
+}
+check( 'scanner: a camelCase name is split, so apiKey is a secret outright and passwordLabel only weakly one',
+  [ GMCP_Credential_Scan::name_strength( 'apiKey' ), GMCP_Credential_Scan::name_strength( 'passwordLabel' ), GMCP_Credential_Scan::name_strength( 'title' ) ], [ 2, 1, 0 ] );
+check( 'scanner: holds() walks arrays and objects to a string leaf',
+  [ GMCP_Credential_Scan::holds( [ 'a' => [ 'b' => (object) [ 'c' => 'Authorization: Bearer abcdefghijklmnop1234' ] ] ] ), GMCP_Credential_Scan::holds( [ 'a' => [ 'b' => 'fine' ] ] ) ], [ true, false ] );
+check( 'scanner: a window bounds what is read, and a secret past it is not in the part that can be stored',
+  [ GMCP_Credential_Scan::holds( str_repeat( 'a ', 5000 ) . ' define(\'DB_PASSWORD\',\'x9Zq77abc\');', 0, 1000 ), GMCP_Credential_Scan::holds( str_repeat( 'a ', 5000 ) . ' define(\'DB_PASSWORD\',\'x9Zq77abc\');' ) ], [ false, true ] );
+$big = substr( str_repeat( '<p>Lorem ipsum dolor sit amet, "consectetur": adipiscing elit, key = value; <a href="https://example.com/a?b=c&amp;d=e">link</a> password reset token.</p>' . "\n", 3600 ), 0, 512000 );
+$t0 = microtime( true );
+$big_held = GMCP_Credential_Scan::text_holds( $big );
+$big_ms = ( microtime( true ) - $t0 ) * 1000;
+check( 'scanner: a half-megabyte ordinary body is not flagged', $big_held, false );
+check( 'scanner: and is read in well under a second (a bound, not a benchmark; measured 10 to 60 ms)', $big_ms < 1000, true );
+check( 'CONTROL: the same body with one wp-config line appended IS flagged', GMCP_Credential_Scan::text_holds( $big . "\ndefine('DB_PASSWORD','x9Zq77abc');" ), true );
+
+echo "-- post fields never enter the journal carrying a credential --\n";
+// The gap: holds_credential() judges field names and opens only a value that BEGINS as JSON or
+// serialized data, so a post body with a settings snippet in the middle of it was copied whole.
+$SECRET_JSON = 'sk_live_Zq81JsH2pLm94Xa';
+$SECRET_DEFINE = 'Xq7!rT9vLm2Zp4';
+$SECRET_BEARER = 'aB3dE5gH7jK9mN1pQ3sT5';
+$body_json = '<p>Setup notes</p> {"api_key":"' . $SECRET_JSON . '"} <p>end</p>';
+$body_define = "<pre>define('DB_PASSWORD','" . $SECRET_DEFINE . "');</pre>";
+$body_bearer = 'Call it with Authorization: Bearer ' . $SECRET_BEARER . ' on every request.';
+$journal_has = function ( string $needle ): bool {
+  return strpos( serialize( journal() ), $needle ) !== false;
+};
+function last_entry(): array {
+  $all = journal();
+  return (array) end( $all );
+}
+function post_change( int $id, string $call, array $fields, string $label = 'Page' ): void {
+  global $observer;
+  $observer->observe( [ 'kind' => 'post', 'op' => 'updated', 'id' => $id, 'subject' => 'post', 'label' => $label,
+    'tool' => 'wp_update_post', 'call' => $call, 'fields' => $fields ] );
+}
+$GLOBALS['gmcp_t_posts'][90] = [ 'post_status' => 'draft', 'post_type' => 'post', 'post_title' => 'New title', 'post_content' => 'new body' ];
+$GLOBALS['gmcp_t_options'][ GMCP_Journal::OPTION ] = [];
+post_change( 90, 'k1', [ 'post_title' => [ 'from' => 'Old title', 'to' => 'New title' ], 'post_content' => [ 'from' => $body_json, 'to' => 'new body' ] ] );
+$e = last_entry();
+check( 'CONTROL: the probe finds a value that was kept (the title)', $journal_has( 'Old title' ), true );
+check( 'CONTROL: the probe would find the secret if it were there', strpos( serialize( [ 'x' => $body_json ] ), $SECRET_JSON ) !== false, true );
+check( 'a JSON snippet inside a post body is not in the journal', $journal_has( $SECRET_JSON ), false );
+check( 'the body field is named as never recorded', $e['redacted_fields'] ?? null, [ 'post_content' ] );
+check( 'and the title field is kept', array_keys( $e['previous'] ), [ 'post_title' ] );
+$listed = GMCP_Journal::recent( 5 )[0];
+check( 'the listing says it restores part of it', [ $listed['reversible'], isset( $listed['partial_restore'] ) ], [ true, true ] );
+$r = GMCP_Journal::revert( $e['id'] );
+check( 'the title undo goes through', $r['ok'], true );
+check( 'CONTROL: the title came back', $GLOBALS['gmcp_t_posts'][90]['post_title'], 'Old title' );
+check( 'the body was left as it is, and is not a placeholder', $GLOBALS['gmcp_t_posts'][90]['post_content'], 'new body' );
+
+foreach ( [ 'define' => [ $body_define, $SECRET_DEFINE ], 'bearer' => [ $body_bearer, $SECRET_BEARER ] ] as $shape => [ $body, $secret ] ) {
+  $GLOBALS['gmcp_t_options'][ GMCP_Journal::OPTION ] = [];
+  $GLOBALS['gmcp_t_post_writes'] = [];
+  post_change( 90, 'k2' . $shape, [ 'post_content' => [ 'from' => $body, 'to' => 'new body' ] ] );
+  $e = last_entry();
+  check( "a $shape line in a post body is not in the journal", $journal_has( $secret ), false );
+  check( "$shape: an entry whose only field was withheld is not reversible", GMCP_Journal::recent( 1 )[0]['reversible'], false );
+  $r = GMCP_Journal::revert( $e['id'] );
+  check( "$shape: reverting it is refused and writes nothing", [ $r['ok'], $GLOBALS['gmcp_t_post_writes'] ], [ false, [] ] );
+}
+
+// An ordinary body that only uses the word is still journalled and still undone.
+$prose = '<p>Pick a strong password, never share your password, and keep the secret key and API key safe. Password: required. The token is shown once.</p>'
+  . '<!-- wp:post-author {"authorId":3,"authorName":"Alexander","keywords":"password manager tips 2024"} /-->';
+$GLOBALS['gmcp_t_options'][ GMCP_Journal::OPTION ] = [];
+$GLOBALS['gmcp_t_posts'][90]['post_content'] = 'edited';
+post_change( 90, 'k3', [ 'post_content' => [ 'from' => $prose, 'to' => 'edited' ] ] );
+$e = last_entry();
+check( 'CONTROL (false positive): a body that merely says "password" is kept whole', [ $e['previous']['post_content'] ?? null, isset( $e['redacted_fields'] ) ], [ $prose, false ] );
+$r = GMCP_Journal::revert( $e['id'] );
+check( 'and is restored byte for byte', [ $r['ok'], $GLOBALS['gmcp_t_posts'][90]['post_content'] ], [ true, $prose ] );
+
+// What an undo overwrites is judged too: a credential written after the entry was recorded.
+$GLOBALS['gmcp_t_options'][ GMCP_Journal::OPTION ] = [];
+$GLOBALS['gmcp_t_posts'][90]['post_content'] = $body_json;
+$GLOBALS['gmcp_t_posts'][90]['post_title'] = 'Live title';
+post_change( 90, 'k4', [ 'post_title' => [ 'from' => 'Earlier title', 'to' => 'Live title' ], 'post_content' => [ 'from' => 'Earlier body', 'to' => $body_json ] ] );
+$e = last_entry();
+check( 'CONTROL: both earlier values were clean and are kept', array_keys( $e['previous'] ), [ 'post_title', 'post_content' ] );
+$r = GMCP_Journal::revert( $e['id'] );
+check( 'undo overwrites a body holding a credential', [ $r['ok'], $GLOBALS['gmcp_t_posts'][90]['post_content'] ], [ true, 'Earlier body' ] );
+check( 'and the credential it overwrote is not recorded anywhere in the journal', $journal_has( $SECRET_JSON ), false );
+$redo = entry_by( entry_by( $e['id'] )['undone_by'] );
+check( 'the undo is on record, with the title it replaced and the body field named as withheld', [ $redo['previous']['post_title'] ?? null, $redo['redacted_fields'] ?? null ], [ 'Live title', [ 'post_content' ] ] );
+$r = GMCP_Journal::revert( $redo['id'] );
+check( 'reverting that undo puts the title back and never writes a placeholder over the body',
+  [ $r['ok'], $GLOBALS['gmcp_t_posts'][90]['post_title'], $GLOBALS['gmcp_t_posts'][90]['post_content'] ], [ true, 'Live title', 'Earlier body' ] );
+
+// An undo whose recorded value is a status WordPress deletes on.
+$GLOBALS['gmcp_t_options'][ GMCP_Journal::OPTION ] = [];
+foreach ( [ 'auto-draft', 'trash', 'Trash ' ] as $deleting ) {
+  $GLOBALS['gmcp_t_posts'][90] = [ 'post_status' => 'publish', 'post_type' => 'post', 'post_title' => 'Changed', 'post_content' => 'x' ];
+  $GLOBALS['gmcp_t_post_writes'] = [];
+  post_change( 90, 'k5', [ 'post_title' => [ 'from' => 'Before', 'to' => 'Changed' ], 'post_status' => [ 'from' => $deleting, 'to' => 'publish' ] ] );
+  $r = GMCP_Journal::revert( last_entry()['id'] );
+  check( "status \"$deleting\": the undo succeeds for the rest of the entry", [ $r['ok'], $GLOBALS['gmcp_t_posts'][90]['post_title'] ], [ true, 'Before' ] );
+  check( "status \"$deleting\": the status is not written and is left published", [ array_key_exists( 'post_status', $GLOBALS['gmcp_t_post_writes'][0] ?? [] ), $GLOBALS['gmcp_t_posts'][90]['post_status'] ], [ false, 'publish' ] );
+}
+$GLOBALS['gmcp_t_posts'][90] = [ 'post_status' => 'publish', 'post_type' => 'post', 'post_title' => 'Changed', 'post_content' => 'x' ];
+$GLOBALS['gmcp_t_post_writes'] = [];
+post_change( 90, 'k6', [ 'post_status' => [ 'from' => 'draft', 'to' => 'publish' ] ] );
+GMCP_Journal::revert( last_entry()['id'] );
+check( 'CONTROL: an ordinary earlier status IS written back', $GLOBALS['gmcp_t_posts'][90]['post_status'], 'draft' );
+
+// A forged entry naming fields outside the recorder's list.
+$GLOBALS['gmcp_t_posts'][90] = [ 'post_status' => 'publish', 'post_type' => 'post', 'post_title' => 'Changed', 'post_content' => 'x', 'post_author' => 5, 'post_password' => '' ];
+$GLOBALS['gmcp_t_post_writes'] = [];
+post_change( 90, 'k7', [ 'post_title' => [ 'from' => 'Before', 'to' => 'Changed' ], 'post_type' => [ 'from' => 'shop_order', 'to' => 'post' ],
+  'post_author' => [ 'from' => 1, 'to' => 5 ], 'post_password' => [ 'from' => 'pw', 'to' => '' ], 'post_date' => [ 'from' => '1970-01-01', 'to' => 'now' ] ] );
+GMCP_Journal::revert( last_entry()['id'] );
+check( 'CONTROL: the watched field was written', array_keys( $GLOBALS['gmcp_t_post_writes'][0] ?? [] ), [ 'ID', 'post_title' ] );
+check( 'post_type, post_author, post_password and post_date are never written by an undo',
+  [ $GLOBALS['gmcp_t_posts'][90]['post_type'], $GLOBALS['gmcp_t_posts'][90]['post_author'], $GLOBALS['gmcp_t_posts'][90]['post_password'] ], [ 'post', 5, '' ] );
+
+echo "-- what lines and the audit summary never quote a credential --\n";
+$GLOBALS['gmcp_t_options'][ GMCP_Journal::OPTION ] = [];
+$GLOBALS['gmcp_t_posts'][90] = [ 'post_status' => 'publish', 'post_type' => 'post', 'post_title' => 'x', 'post_content' => 'x' ];
+post_change( 90, 'k8', [ 'post_title' => [ 'from' => 'Old', 'to' => 'x' ] ], "define('DB_PASSWORD','" . $SECRET_DEFINE . "')" );
+check( 'a title that is itself a credential is not quoted in the "what" line', [ $journal_has( $SECRET_DEFINE ), last_entry()['what'] ], [ false, 'Post "[redacted]" changed: post_title' ] );
+post_change( 90, 'k9', [ 'post_title' => [ 'from' => 'Old', 'to' => 'x' ] ], 'Plain title' );
+check( 'CONTROL: an ordinary title is quoted', last_entry()['what'], 'Post "Plain title" changed: post_title' );
+
+$summary = json_decode( (string) GMCP_Changes::summarise( [ [ 'kind' => 'post', 'op' => 'updated', 'id' => 90, 'subject' => 'post', 'label' => 'Bearer ' . $SECRET_BEARER,
+  'fields' => [ 'post_excerpt' => [ 'from' => $body_bearer, 'to' => 'A harmless excerpt' ], 'post_title' => [ 'from' => 'Plain', 'to' => 'Also plain' ] ] ] ], 16000 ), true );
+$flat = json_encode( $summary );
+check( 'CONTROL: the summary carries the harmless values', [ strpos( $flat, 'A harmless excerpt' ) !== false, strpos( $flat, 'Also plain' ) !== false ], [ true, true ] );
+check( 'a short excerpt holding a bearer token is not in the audit summary, nor is a title that is one', strpos( $flat, $SECRET_BEARER ), false );
+check( 'it is recorded as redacted rather than dropped', $summary[0]['fields']['post_excerpt']['from'], '[redacted]' );
 
 echo "\n$total checks, $fails failed\n";
 exit( min( 255, $fails ) );

@@ -1076,9 +1076,14 @@ class GMCP_Changes {
     }
     if ( is_scalar( $value ) ) {
       $text = (string) $value;
-      return mb_strlen( $text ) <= self::MAX_VALUE
-        ? $text
-        : '[' . size_format( strlen( $text ) ) . ' of text]';
+      if ( mb_strlen( $text ) > self::MAX_VALUE ) {
+        return '[' . size_format( strlen( $text ) ) . ' of text]';
+      }
+      // What is about to be written down is judged as text: a short title or excerpt with a
+      // pasted wp-config line in it names no field, so the structural test above passes it.
+      // Longer values are described by size and nothing of them is kept, so only this branch
+      // needs the scan, and it is bounded by MAX_VALUE characters.
+      return GMCP_Credential_Scan::text_holds( $text ) ? '[redacted]' : $text;
     }
     // An array or an object gets the same allowance as a string rather than being
     // described by size on principle. A widget's settings and most option values are a
@@ -1086,7 +1091,7 @@ class GMCP_Changes {
     // could act on when the whole value would have fitted.
     $json = wp_json_encode( $value, JSON_UNESCAPED_SLASHES );
     if ( is_string( $json ) && mb_strlen( $json ) <= self::MAX_VALUE ) {
-      return $json;
+      return GMCP_Credential_Scan::text_holds( $json ) ? '[redacted]' : $json;
     }
     return '[' . size_format( strlen( maybe_serialize( $value ) ) ) . ' of structured data]';
   }
@@ -1126,7 +1131,8 @@ class GMCP_Changes {
       }
       $out[] = [
         'what' => trim( ( $record['subject'] ?? $record['kind'] ) . ' ' . ( $record['id'] ?? '' ) ),
-        'label' => (string) ( $record['label'] ?? '' ),
+        // The label is a post's title, up to 80 characters of free text the agent chose.
+        'label' => GMCP_Credential_Scan::text_holds( (string) ( $record['label'] ?? '' ) ) ? '[redacted]' : (string) ( $record['label'] ?? '' ),
         'op' => (string) ( $record['op'] ?? '' ),
         'kind' => (string) ( $record['kind'] ?? '' ),
         'fields' => $fields,
