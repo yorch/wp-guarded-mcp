@@ -2673,10 +2673,27 @@ tc_groups() { # tc_groups <admin 0|1> <woo 0|1>
     $o["mcp_tools_core"] = true;
     $o["mcp_tools_admin"] = '"$1"' ? true : false;
     $o["mcp_tools_woo"]   = '"$2"' ? true : false;
-    // The export group is always available once its switch is on, so it is not one of the
-    // groups the table counts and must be off for this count: leaving it on would move every
-    // number for a reason that has nothing to do with the content/admin/woo surface.
+    // The two optional groups whose tool names carry no prefix the counter can exclude: the
+    // generated REST tools (list_pages, create_posts, ...) and the Subscriptions tools. Left
+    // as found they move every number in the table, and they are found switched on whenever
+    // an earlier block, another suite or a person on this site left them that way.
+    $o["mcp_tools_rest"] = false;
+    $o["mcp_tools_woo_subscriptions"] = false;
+    // The export group has its own switch and is not one the table counts; left on it would
+    // move every number for a reason unrelated to the content/admin/woo surface.
     $o["mcp_tools_export"] = false;
+    update_option( "gmcp_options", $o, false );' >/dev/null 2>&1
+}
+tc_unprefixed_groups() { # prints "<rest>,<subscriptions>" as stored: 1 when switched on
+  docker compose exec -T cli wp eval '
+    $o = get_option( "gmcp_options", [] );
+    echo ( ! empty( $o["mcp_tools_rest"] ) ? 1 : 0 ), ",", ( ! empty( $o["mcp_tools_woo_subscriptions"] ) ? 1 : 0 );' 2>/dev/null | tr -d '\r\n'
+}
+tc_restore_unprefixed() { # tc_restore_unprefixed <rest 0|1> <subscriptions 0|1>
+  docker compose exec -T cli wp eval '
+    $o = get_option( "gmcp_options", [] );
+    $o["mcp_tools_rest"] = '"$1"' ? true : false;
+    $o["mcp_tools_woo_subscriptions"] = '"$2"' ? true : false;
     update_option( "gmcp_options", $o, false );' >/dev/null 2>&1
 }
 # Optional groups are excluded by tool-name prefix, because the table counts only the groups
@@ -2725,6 +2742,15 @@ case "$(tc_doc admin 1)" in
   ''|'no such row') echo "  FAIL  the access-level table could not be parsed"; fail=$((fail+1));;
 esac
 
+TC_UNPREFIXED_WAS=$(tc_unprefixed_groups)
+tc_groups 0 0
+# The precondition, asserted: the counts below are only the table's if neither group is on.
+check "precondition: the REST and Subscriptions groups are off while counting" "$(tc_unprefixed_groups)" "0,0"
+# And a control that the probe sees the problem it guards against: with the REST group on,
+# the same counter must move off the documented number.
+tc_restore_unprefixed 1 0
+check "control: with the REST group on the content-only count is not the documented one" \
+  "$([ "$(tc_count "$TC_ADMIN")" != "$(tc_doc admin 1)" ] && echo moved || echo same)" "moved"
 tc_groups 0 0
 check "content only, admin level"     "$(tc_count "$TC_ADMIN")" "$(tc_doc admin 1)"
 check "content only, readwrite"       "$(tc_count "$TC_RW")"    "$(tc_doc readwrite 1)"
@@ -2746,6 +2772,10 @@ else
   echo "  ....  WooCommerce column not checked: the plugin is not active on this site"
 fi
 tc_groups 1 0
+# Put the two groups back as this block found them, so the later blocks and the next suite
+# see the site the way it was.
+tc_restore_unprefixed "${TC_UNPREFIXED_WAS%%,*}" "${TC_UNPREFIXED_WAS##*,}"
+check "the REST and Subscriptions groups are as they were before the count" "$(tc_unprefixed_groups)" "$TC_UNPREFIXED_WAS"
 gmcp_clear_other_keys "smoke suite"
 
 echo "-- scheduled events --"
