@@ -963,10 +963,31 @@ final class GMCP_Diag_Util {
       return mb_strlen( $m[2] ) > 120 ? $m[1] . mb_substr( $m[2], 0, 120 ) . ' …[rest of the query omitted]' : $m[0];
     }, $line );
 
+    // A private key printed whole (a JSON-escaped one is a single line), or from its first line
+    // to the end of the line when the log line was cut before the end marker. The lines of a key
+    // printed over several lines are handled by scrub_log_lines(); only a line holding the
+    // beginning of one is seen here.
+    $line = (string) preg_replace( '/-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----|$)/s', '[private-key-block]', $line );
+
+    // Cookies. A Cookie or Set-Cookie header is redacted to the end of the line: its value
+    // holds the login cookie (user name, expiry, session token and hash), and the name of a
+    // WordPress cookie is long and hex, so the name-based rules below would turn the NAME into
+    // a token marker and leave the value. Then the same cookies by name, for dumps of $_COOKIE
+    // and of a parsed header ("[wordpress_logged_in_<hash>] => admin|...").
+    $line = (string) preg_replace( '/\b((?:Set-)?Cookie2?\s*:\s*)[^\r\n]*/i', '$1[redacted]', $line );
+    $line = (string) preg_replace(
+      '/(?<![A-Za-z0-9_-])((?:wordpress_(?:logged_in|sec|rec)_[A-Za-z0-9]*|wordpress_[a-f0-9]{32}|wp-postpass_[A-Za-z0-9]*|wp_woocommerce_session_[A-Za-z0-9]*|comment_author_(?:email_|url_)?[A-Za-z0-9]*|PHPSESSID)\]?["\']?\s*(?:=>|[:=])\s*)("[^"]*"|\'[^\']*\'|[^\s;,&)\]}]+)/i',
+      '$1[redacted]',
+      $line
+    );
+
     // Credentials carried as headers or inside URLs.
     $line = (string) preg_replace( '/\b(Authorization\s*:\s*)(?:Bearer|Basic|Digest|Token)?\s*[^\s,;]+/i', '$1[redacted]', $line );
     $line = (string) preg_replace( '/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/=-]{8,}/i', '$1 [redacted]', $line );
-    $line = (string) preg_replace( '#(\b[a-z][a-z0-9+.-]*://)[^/\s:@]+(?::[^/\s@]*)?@#i', '$1[redacted]@', $line );
+    // Everything between "scheme://" and the last "@" of the authority, so an empty user name
+    // (redis://:password@host) and a password that itself contains "@" are covered, and so is
+    // "https://example.com@evil.example/", where the part before the "@" is not the host.
+    $line = (string) preg_replace( '~(\b[a-z][a-z0-9+.-]*://)[^/\s?#]*@~i', '$1[redacted]@', $line );
 
     // key=value, key: value, "key":"value", key => value, where the key looks secret. This
     // is also what clears ?token=... in a logged URL.
@@ -978,8 +999,21 @@ final class GMCP_Diag_Util {
         return preg_quote( $p, '#' );
       }, $patterns ) );
       $line = (string) preg_replace(
-        '#(["\']?[A-Za-z0-9_.\-\[\]]*(?:' . $alt . ')[A-Za-z0-9_.\-\[\]]*["\']?)(\s*(?:=>|[:=])\s*)("[^"]*"|\'[^\']*\'|[^\s&,;)\]}]+)#i',
+        // The lookbehind keeps a match from starting in the middle of a run of name characters.
+        // Without it the leading [A-Za-z0-9_.\-\[\]]* is tried from every position of a long run
+        // and backtracks over all of it each time, which is quadratic: measured at about 0.3 s for
+        // one 2000-character line with the PCRE JIT off (0.4 ms with it). The match that matters
+        // starts at the beginning of the run anyway, so what is redacted does not change.
+        '#(?<![A-Za-z0-9_.\-\[\]])(["\']?[A-Za-z0-9_.\-\[\]]*(?:' . $alt . ')[A-Za-z0-9_.\-\[\]]*["\']?)(\s*(?:=>|[:=])\s*)("[^"]*"|\'[^\']*\'|[^\s&,;)\]}]+)#i',
         '$1$2[redacted]',
+        $line
+      );
+      // The same thing inside a JSON string that is itself inside a log line, where the
+      // quotes arrive escaped: {\"password\":\"value\"}. The rule above needs the key to be
+      // followed by its separator, and a backslash is in the way.
+      $line = (string) preg_replace(
+        '#(\\\\"[A-Za-z0-9_.\-]*(?:' . $alt . ')[A-Za-z0-9_.\-]*\\\\"\s*:\s*)(\\\\"(?:(?!\\\\").)*\\\\"|[^\s,}\]\\\\]+)#i',
+        '$1[redacted]',
         $line
       );
     }
@@ -1008,6 +1042,10 @@ final class GMCP_Diag_Util {
       return ( preg_match( '/[A-Z]/', $m[0] ) && preg_match( '/[a-z]/', $m[0] ) && preg_match( '/\d/', $m[0] ) ) ? '[aws secret]' : $m[0];
     }, $line );
 
+    // Keys with a fixed vendor prefix, which a plugin's failed API call prints and which are
+    // shorter than the generic long-token rule or contain only letters: payment, source
+    // hosting, chat, mail and maps providers that WordPress sites commonly talk to.
+    $line = (string) preg_replace( '/\b(?:[sr]k_(?:live|test)_[A-Za-z0-9]{10,}|whsec_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abeprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,}|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|glpat-[A-Za-z0-9_-]{16,}|key-[0-9a-f]{32})(?![A-Za-z0-9_-])/', '[api key]', $line );
     $line = (string) preg_replace( '/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/', '[jwt]', $line );
     $line = (string) preg_replace( '#\$(?:P|H)\$[A-Za-z0-9./]{20,}|\$wp\$2y\$\d+\$[A-Za-z0-9./]{20,}|\$2[aby]\$\d{2}\$[A-Za-z0-9./]{40,}#', '[hash]', $line );
     $line = (string) preg_replace( '/\bgmcp_[A-Za-z0-9]{4,}_[A-Za-z0-9]{6,}/', '[gmcp key]', $line );
@@ -1028,6 +1066,54 @@ final class GMCP_Diag_Util {
       return ( preg_match( '/\d/', $m[0] ) && preg_match( '/[A-Za-z]/', $m[0] ) ) ? '[token]' : $m[0];
     }, $line );
 
+    // A line that is nothing but base64 is the body of something that was printed over several
+    // lines (a key, a certificate, an attachment), and one such line is not worth the risk
+    // of being a secret. Only when it fills the line: base64 inside a sentence is left to the
+    // rules above.
+    if ( preg_match( '~^\s*[A-Za-z0-9+/]{40,}={0,2}\s*$~', $line ) ) {
+      $line = '[base64 line redacted]';
+    }
+
     return $truncated ? $line . ' …[line truncated]' : $line;
+  }
+
+  /**
+  * Several lines of a log, scrubbed one by one, plus the one thing a single line cannot know:
+  * that it is inside a private key that began on an earlier line.
+  *
+  * From a line holding "-----BEGIN ... PRIVATE KEY-----" with no end marker, every following
+  * line is withheld up to the line with the end marker. A missing end marker cannot swallow the
+  * log: the block also ends at a line that starts a new log record (a timestamp in brackets or
+  * "PHP "), which no line of a key does, and after 100 lines. A window that starts in the middle
+  * of a key has no beginning to see; its base64 lines are caught by the whole-line rule in
+  * scrub_log_line().
+  *
+  * @param string[] $lines
+  * @return string[] the same number of lines.
+  */
+  public static function scrub_log_lines( array $lines, array $ctx = [] ): array {
+    $out = [];
+    $in_key = 0;
+    foreach ( $lines as $line ) {
+      $line = (string) $line;
+      if ( $in_key > 0 ) {
+        if ( preg_match( '/-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----/', $line ) ) {
+          $in_key = 0;
+          $out[] = '[private-key-block ends]';
+          continue;
+        }
+        if ( $in_key < 100 && !preg_match( '/^\[\d{1,2}-[A-Za-z]{3}-\d{4}[ \]]|^\[\d{4}-\d\d-\d\d|^PHP /', $line ) ) {
+          $in_key++;
+          $out[] = '[private-key-block line]';
+          continue;
+        }
+        $in_key = 0; // a new record, or too long: stop withholding and scrub this line normally
+      }
+      if ( preg_match( '/-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----/', $line ) && !preg_match( '/-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----/', $line ) ) {
+        $in_key = 1;
+      }
+      $out[] = self::scrub_log_line( $line, $ctx );
+    }
+    return $out;
   }
 }

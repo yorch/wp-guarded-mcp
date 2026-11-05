@@ -289,10 +289,24 @@ something that looks harmless and is not, so each says what it cannot promise.
   access key ids and 40-character AWS-style secret keys, e-mail addresses, public IP
   addresses (loopback and private ones stay, because `connect to 127.0.0.1` is
   the diagnosis), the argument values in stack frames, and the values in a failed
-  SQL query past its first 120 characters. Paths are shown as `[content]/` and
+  SQL query past its first 120 characters. Also: a `Cookie` or `Set-Cookie`
+  header to the end of its line, and the WordPress login, secure-login and
+  post-password cookies, PHP session id and the commenter-details cookies by name
+  wherever a dump prints them; credentials in any `scheme://user:password@host`
+  address (an empty user name and a password containing `@` included; a password
+  containing a literal `/` is not a valid URL and is not covered); the same
+  credential-named values inside JSON that is itself inside a log line, where the
+  quotes arrive escaped; keys with a fixed vendor prefix (Stripe, GitHub, Slack,
+  SendGrid, Google API, GitLab, Mailgun); a private key block, one line of which is
+  withheld along with every line up to its end marker (a missing end marker ends at
+  the next log record or after 100 lines), and any line that is nothing but 40 or more
+  base64 characters, which is what remains when the window starts inside a key.
+  Public certificates are not withheld. Paths are shown as `[content]/` and
   `[abspath]/`. This recognises shapes. A secret written into an ordinary
   sentence survives it, and so does personal data in a message PHP assembled from
-  a form, which is why the tool is `admin` and not `read`.
+  a form, which is why the tool is `admin` and not `read`. A line is cut at 2000
+  characters before any rule runs, and the rules are timed on pathological lines
+  with the regular-expression JIT on and off (`.dev/test-diagnostics-util.php`).
 - The reply distinguishes the cases that all look like "nothing to see":
   logging is not going to a file at all, a file is configured and does not exist
   yet, it exists and is empty, it has lines. It also reports `WP_DEBUG`,
