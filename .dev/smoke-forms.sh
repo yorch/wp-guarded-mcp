@@ -833,6 +833,76 @@ callas "$TOK" x7 "$(tc wp_delete_post "{\"ID\":$DEL,\"force\":true}")"
 check "CONTROL: an admin key's wp_delete_post of an ordinary post succeeds" "$(verdict x7)" "ok"
 check "CONTROL: and STORED: it is gone" "$(wpe 'echo get_post('"$DEL"')?"there":"gone";')" "gone"
 
+echo "-- a listing's page does not shrink when a row in its window is one the key may not read --"
+# Newest first: the submission's upload, then the order's, then the ordinary post's. A page of one
+# used to be fetched and then emptied, which says the newest row is one this key may not see.
+wpe 'global $wpdb;foreach(['"$SUBATT"'=>"2099-03-03 00:00:00",'"$ORDATT"'=>"2099-02-02 00:00:00",'"$CTLATT"'=>"2099-01-01 00:00:00"] as $i=>$d){$wpdb->update($wpdb->posts,["post_date"=>$d,"post_date_gmt"=>$d],["ID"=>$i]);clean_post_cache($i);}foreach(['"$SUBCOM"'=>"2099-03-03 00:00:00",'"$(sid ord comment)"'=>"2099-02-02 00:00:00",'"$CTLCOM"'=>"2099-01-01 00:00:00"] as $i=>$d){$wpdb->update($wpdb->comments,["comment_date"=>$d,"comment_date_gmt"=>$d],["comment_ID"=>$i]);clean_comment_cache($i);}' >/dev/null
+rows() { py 'import json,sys;t=json.load(sys.stdin)["result"]["content"][0]["text"];print(len(json.loads(t)))' "$1"; }
+callas "$RO" p1 "$(tc wp_get_posts '{"post_type":"attachment","post_status":"inherit","limit":1}')"
+check "wp_get_posts of attachments, limit 1, returns one row although the newest two are not readable" "$(rows p1)" "1"
+check "and it is the ordinary post's" "$(has p1 "$M2-ctl-att")" "yes"
+callas "$RO" p2 "$(tc wp_get_media '{"search":"'"$M2"'","limit":1}')"
+check "wp_get_media, limit 1, returns one row" "$(rows p2)" "1"
+check "and it is the ordinary post's" "$(has p2 "$M2-ctl-att")" "yes"
+callas "$RO" p3 "$(tc wp_get_comments '{"search":"'"$M2"'","limit":1,"status":"all"}')"
+check "wp_get_comments, limit 1, returns one row" "$(rows p3)" "1"
+check "and it is the ordinary post's" "$(has p3 "$M2-ctl-comment")" "yes"
+callas "$RO" p4a "$(tc wp_get_posts '{"post_type":"attachment","post_status":"inherit","limit":50}')"
+callas "$RO" p4 "$(tc wp_get_posts '{"post_type":"attachment","post_status":"inherit","limit":1,"offset":1}')"
+check "an offset counts readable rows: offset 1 is the second readable row of the full list" \
+  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0]["ID"])' p4)" \
+  "$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[1]["ID"])' p4a)"
+callas "$TOK" p5 "$(tc wp_get_media '{"search":"'"$M2"'","limit":1}')"
+check "CONTROL: an ADMIN key's page of one is the order's upload (orders are readable at admin, a submission's file never is)" "$(has p5 "$M2-ord-att")" "yes"
+
+echo "-- what hangs from a submission at any depth, in the scans and the REST listing --"
+D1=$(wpe 'echo wp_insert_post(["post_type"=>"page","post_status"=>"publish","post_parent"=>'"$SUB"',"post_title"=>"'"$M2"'-deep1","post_content"=>"[elementor-template id=\"7771\"]"]);')
+D2=$(wpe 'echo wp_insert_post(["post_type"=>"page","post_status"=>"publish","post_parent"=>'"$D1"',"post_title"=>"'"$M2"'-deep2","post_content"=>"[elementor-template id=\"7771\"]"]);')
+D3=$(wpe 'echo wp_insert_post(["post_type"=>"page","post_status"=>"publish","post_parent"=>'"$D2"',"post_title"=>"'"$M2"'-deep3","post_content"=>"[elementor-template id=\"7771\"]"]);')
+DA=$(wpe 'echo wp_insert_post(["post_type"=>"attachment","post_status"=>"inherit","post_parent"=>'"$D3"',"post_title"=>"'"$M2"'-deep-att","post_mime_type"=>"text/plain","guid"=>home_url("/'"$M2"'-deep.txt")]);')
+C1=$(wpe 'echo wp_insert_post(["post_type"=>"page","post_status"=>"publish","post_parent"=>'"$CTL"',"post_title"=>"'"$M2"'-cdeep1","post_content"=>"[elementor-template id=\"7771\"]"]);')
+C2=$(wpe 'echo wp_insert_post(["post_type"=>"page","post_status"=>"publish","post_parent"=>'"$C1"',"post_title"=>"'"$M2"'-cdeep2","post_content"=>"[elementor-template id=\"7771\"]"]);')
+C3=$(wpe 'echo wp_insert_post(["post_type"=>"page","post_status"=>"publish","post_parent"=>'"$C2"',"post_title"=>"'"$M2"'-cdeep3","post_content"=>"[elementor-template id=\"7771\"]"]);')
+CA=$(wpe 'echo wp_insert_post(["post_type"=>"attachment","post_status"=>"inherit","post_parent"=>'"$C3"',"post_title"=>"'"$M2"'-cdeep-att","post_mime_type"=>"text/plain","guid"=>home_url("/'"$M2"'-cdeep.txt")]);')
+wpe 'foreach(['"$D3"','"$C3"'] as $i){update_post_meta($i,"_elementor_data",wp_slash(wp_json_encode([["id"=>"abc","elType"=>"widget","widgetType"=>"template","settings"=>["template_id"=>"7771"]]])));}' >/dev/null
+CLEAN="$CLEAN $D1 $D2 $D3 $DA $C1 $C2 $C3 $CA"
+check "CONTROL: the chain is four deep: the attachment's grandparent's parent is the submission" \
+  "$(wpe 'echo get_post(get_post(get_post('"$DA"')->post_parent)->post_parent)->post_parent=='"$D1"'&&get_post('"$D1"')->post_parent=='"$SUB"'?"deep":"shallow";')" "deep"
+check "the scan of shortcodes reports no page in a submission's tree, however deep, below admin" \
+  "$(wpe 'add_filter("gmcp_caller_access_level",function(){return "readonly";});$j=json_encode(GMCP_Tools_Elementor::shortcode_references(7771,200));echo strpos($j,"'"$M2"'-deep")===false?"clean":"quoted";')" "clean"
+check "CONTROL: the same scan reports the pages of an ordinary post's tree (the probe sees depth)" \
+  "$(wpe 'add_filter("gmcp_caller_access_level",function(){return "readonly";});$j=json_encode(GMCP_Tools_Elementor::shortcode_references(7771,200));echo strpos($j,"'"$M2"'-cdeep3")!==false?"found":"missing";')" "found"
+check "the scan of Elementor data reports none either" \
+  "$(wpe 'add_filter("gmcp_caller_access_level",function(){return "readonly";});$j=json_encode(GMCP_Tools_Elementor::data_references(7771,200));echo strpos($j,"'"$M2"'-deep")===false?"clean":"quoted";')" "clean"
+check "CONTROL: and finds the ordinary tree's (the data scan reads the document)" \
+  "$(wpe 'add_filter("gmcp_caller_access_level",function(){return "readonly";});$j=json_encode(GMCP_Tools_Elementor::data_references(7771,200));echo strpos($j,"'"$M2"'-cdeep3")!==false?"found":"missing";')" "found"
+setrest true
+callas "$RO" y1 "$(tc list_media '{"search":"'"$M2"'","per_page":100,"_fields":"id,title"}')"
+check "list_media does not list a file four levels below a submission" "$(has y1 "$M2-deep-att")" "no"
+check "CONTROL: it lists the file four levels below an ordinary post" "$(has y1 "$M2-cdeep-att")" "yes"
+callas "$RO" y2 "$(tc list_pages '{"search":"'"$M2"'-deep","per_page":100,"_fields":"id,title"}')"
+check "list_pages does not list the pages of a submission's tree" "$(has y2 "$M2-deep")" "no"
+callas "$RO" y3 "$(tc list_pages '{"search":"'"$M2"'-cdeep","per_page":100,"_fields":"id,title"}')"
+check "CONTROL: it lists the pages of an ordinary tree" "$(has y3 "$M2-cdeep3")" "yes"
+callas "$RW" y4 "$(tc update_media "{\"id\":$CTLATT,\"post\":$SUB}")"
+check "update_media attaching an ordinary upload to a submission is refused" "$(verdict y4)" "error"
+check "STORED: its parent is unchanged" "$(parent_of $CTLATT)" "$CTL"
+callas "$RW" y5 "$(tc update_media "{\"id\":$SUBATT,\"post\":0}")"
+check "update_media detaching a submission's upload is refused" "$(verdict y5)" "error"
+check "STORED: it still hangs from the submission" "$(parent_of $SUBATT)" "$SUB"
+callas "$RW" y6 "$(tc update_media "{\"id\":$CTLATT,\"post\":$PG}")"
+check "CONTROL: update_media attaching an ordinary upload to an ordinary page succeeds" "$(verdict y6)" "ok"
+check "CONTROL: and STORED: it moved" "$(parent_of $CTLATT)" "$PG"
+wpe 'wp_update_post(["ID"=>'"$CTLATT"',"post_parent"=>'"$CTL"']);' >/dev/null
+callas "$RW" y7 "$(tc update_pages "{\"id\":$PG,\"parent\":$SUB}")"
+check "update_pages parenting an ordinary page under a submission is refused" "$(verdict y7)" "error"
+check "STORED: the page has no parent" "$(parent_of $PG)" "0"
+callas "$RW" y8 "$(tc update_pages "{\"id\":$PG,\"parent\":$PG2}")"
+check "CONTROL: update_pages parenting it under an ordinary page succeeds" "$(verdict y8)" "ok"
+check "CONTROL: and STORED: it moved" "$(parent_of $PG)" "$PG2"
+wpe 'wp_update_post(["ID"=>'"$PG"',"post_parent"=>0]);' >/dev/null
+setrest false
+
 echo "-- below admin a guarded post is answered exactly as one that does not exist --"
 MISSING=987654321
 norm() { python3 -c 'import json,sys

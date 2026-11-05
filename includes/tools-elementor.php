@@ -1152,22 +1152,17 @@ class GMCP_Tools_Elementor {
 
   /**
   * A SQL fragment keeping the scans below out of posts the caller may not read: a form
-  * submission, whatever the level, and an order below admin. These scans are read-level and
-  * return the title of every post that references a template, and a visitor controls what a
-  * submission's body says, so a message that quotes a template shortcode would be listed
-  * with its subject line. Asked once here because the scans are SQL and cannot ask the
-  * post guard row by row; the type list is the one that guard reads.
-  * @see GMCP_Core::read_excluded_post_types()
+  * submission and an order below admin, and whatever hangs from one at any depth the guard
+  * walks. These scans are read-level and return the title of every post that references a
+  * template, and a visitor controls what a submission's body says, so a message that quotes a
+  * template shortcode would be listed with its subject line. The scans are SQL and cannot ask
+  * the post guard row by row, so the chain is judged in the query, by the one function every
+  * scan uses. $type_col and $parent_col are the row's columns, qualified.
+  * @see GMCP_Core::unreadable_post_clauses()
   */
-  private static function unreadable_types_sql( string $column ): string {
-    $types = GMCP_Core::read_excluded_post_types();
-    if ( !$types ) {
-      return '';
-    }
-    $quoted = array_map( function ( $type ) {
-      return "'" . esc_sql( $type ) . "'";
-    }, $types );
-    return ' AND ' . $column . ' NOT IN (' . implode( ',', $quoted ) . ')';
+  private static function unreadable_clauses( string $type_col, string $parent_col ): array {
+    $c = GMCP_Core::unreadable_post_clauses( $type_col, $parent_col, 'gmcp_e' );
+    return [ 'join' => $c['join'], 'where' => $c['where'] === '' ? '' : ' AND ' . $c['where'] ];
   }
 
   /** Posts whose content holds [elementor-template id="N"], parsed rather than matched. */
@@ -1175,10 +1170,11 @@ class GMCP_Tools_Elementor {
     global $wpdb;
 
     $like = '%' . $wpdb->esc_like( '[' . self::TEMPLATE_SHORTCODE ) . '%';
+    $skip = self::unreadable_clauses( 'p.post_type', 'p.post_parent' );
     $candidates = $wpdb->get_results( $wpdb->prepare(
-      "SELECT ID, post_title, post_type, post_status, post_content FROM {$wpdb->posts}
-        WHERE post_content LIKE %s AND post_type != 'revision' AND post_status != 'auto-draft'" . self::unreadable_types_sql( 'post_type' ) . "
-        ORDER BY ID ASC LIMIT %d",
+      "SELECT p.ID, p.post_title, p.post_type, p.post_status, p.post_content FROM {$wpdb->posts} p" . $skip['join'] . "
+        WHERE p.post_content LIKE %s AND p.post_type != 'revision' AND p.post_status != 'auto-draft'" . $skip['where'] . "
+        ORDER BY p.ID ASC LIMIT %d",
       $like,
       self::SCAN_LIMIT + 1
     ) );
@@ -1260,11 +1256,12 @@ class GMCP_Tools_Elementor {
     // phpcs:disable WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- the
     // placeholder count is dynamic: 1 (meta_key) + count($likes) + 1 (LIMIT) = count($args).
     // The sniff cannot count the array_fill-generated placeholders in $where.
+    $skip = self::unreadable_clauses( 'p.post_type', 'p.post_parent' );
     $candidates = $wpdb->get_results( $wpdb->prepare(
       "SELECT p.ID, p.post_title, p.post_type, p.post_status, m.meta_value
-        FROM {$wpdb->postmeta} m INNER JOIN {$wpdb->posts} p ON p.ID = m.post_id
+        FROM {$wpdb->postmeta} m INNER JOIN {$wpdb->posts} p ON p.ID = m.post_id" . $skip['join'] . "
         WHERE m.meta_key = %s AND ( {$where} )
-          AND p.post_type != 'revision' AND p.post_status != 'auto-draft'" . self::unreadable_types_sql( 'p.post_type' ) . "
+          AND p.post_type != 'revision' AND p.post_status != 'auto-draft'" . $skip['where'] . "
         ORDER BY p.ID ASC LIMIT %d",
       array_merge( [ self::DATA_META ], $likes, [ self::SCAN_LIMIT + 1 ] )
     ) );
@@ -1770,12 +1767,13 @@ class GMCP_Tools_Elementor {
     $like = '%' . $wpdb->esc_like( 'globals' ) . '%';
     $examined = 0;
     $offset = 0;
+    $skip = self::unreadable_clauses( 'p.post_type', 'p.post_parent' );
     while ( $examined < self::SCAN_LIMIT ) {
       $batch = $wpdb->get_results( $wpdb->prepare(
         "SELECT p.ID, p.post_title, p.post_type, p.post_status, m.meta_value
-          FROM {$wpdb->postmeta} m INNER JOIN {$wpdb->posts} p ON p.ID = m.post_id
+          FROM {$wpdb->postmeta} m INNER JOIN {$wpdb->posts} p ON p.ID = m.post_id" . $skip['join'] . "
           WHERE m.meta_key = %s AND m.meta_value LIKE %s
-            AND p.post_type != 'revision' AND p.post_status != 'auto-draft'" . self::unreadable_types_sql( 'p.post_type' ) . "
+            AND p.post_type != 'revision' AND p.post_status != 'auto-draft'" . $skip['where'] . "
           ORDER BY p.ID ASC LIMIT %d OFFSET %d",
         self::DATA_META,
         $like,

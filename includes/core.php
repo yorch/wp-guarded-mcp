@@ -1042,6 +1042,89 @@ class GMCP_Core {
     return array_values( array_unique( $types ) );
   }
 
+  /**
+  * SQL for "this post is a held type, or hangs from one", for a query that cannot ask the guard
+  * row by row. The types are read_excluded_post_types(), so below admin an order's tree is in
+  * it too. $type_col and $parent_col name the columns of the row being judged, so the caller
+  * decides the table alias. The chain is the depth post_chain_types() walks: the row and
+  * seven parents above it.
+  *
+  * Joins, not nested subqueries. Seven EXISTS inside one another is correct on MySQL and
+  * overflows the parser of the SQLite driver WordPress can run on ("parser stack overflow",
+  * measured), so the parents are joined by primary key instead: each join yields at most one
+  * row, so no row is duplicated, and a missing parent is a NULL that the COALESCE reads as "not
+  * a held type". The caller puts 'join' after its FROM and 'where' behind an AND.
+  *
+  * @return array{join: string, where: string} Both empty when no type is excluded.
+  */
+  public static function unreadable_post_clauses( string $type_col, string $parent_col, string $alias = 'gmcp_u' ): array {
+    global $wpdb;
+    $in = implode( ',', array_map( function ( $type ) {
+      return "'" . esc_sql( $type ) . "'";
+    }, self::read_excluded_post_types() ) );
+    if ( $in === '' ) {
+      return [ 'join' => '', 'where' => '' ];
+    }
+    $joins = '';
+    $tests = [ 'LOWER(' . $type_col . ') IN (' . $in . ')' ];
+    $up = $parent_col;
+    for ( $level = 1; $level <= 7; $level++ ) {
+      $a = $alias . $level;
+      $joins .= " LEFT JOIN {$wpdb->posts} {$a} ON {$a}.ID = {$up}";
+      $tests[] = "COALESCE(LOWER({$a}.post_type),'') IN ({$in})";
+      $up = $a . '.post_parent';
+    }
+    return [ 'join' => $joins, 'where' => 'NOT (' . implode( ' OR ', $tests ) . ')' ];
+  }
+
+  /**
+  * Rows a listing may return, collected until the page is full.
+  *
+  * A listing that fetches a page and then drops what the caller may not read returns a short
+  * page, and the length of the page is itself an answer: with a limit of one, an empty reply
+  * says the newest row is one the caller may not see. So the unreadable rows are skipped as
+  * the page is filled, and a hidden row changes nothing a caller can count.
+  *
+  * Bounded, so a window of nothing but unreadable rows cannot run a query forever; past the
+  * bound the page can come back short, which the guardrails page states.
+  *
+  * @param callable $fetch (int $offset, int $size): array, the next raw rows in listing order.
+  * @param callable $keep  (mixed $row): bool, whether the caller may see the row.
+  * @param int      $skip  Readable rows to pass over first, the caller's offset.
+  */
+  public static function collect_readable( callable $fetch, callable $keep, int $limit, int $skip = 0, int $max_scan = 5000 ): array {
+    $out = [];
+    $raw = 0;
+    $scanned = 0;
+    $max_scan += $skip;
+    $size = max( 50, min( 500, $limit * 2 ) );
+    while ( $scanned < $max_scan ) {
+      $rows = $fetch( $raw, $size );
+      if ( !is_array( $rows ) || !$rows ) {
+        break;
+      }
+      foreach ( $rows as $row ) {
+        $scanned++;
+        if ( !$keep( $row ) ) {
+          continue;
+        }
+        if ( $skip > 0 ) {
+          $skip--;
+          continue;
+        }
+        $out[] = $row;
+        if ( count( $out ) >= $limit ) {
+          break 2;
+        }
+      }
+      $raw += count( $rows );
+      if ( count( $rows ) < $size ) {
+        break;
+      }
+    }
+    return $out;
+  }
+
   #region Drafts-only keys
 
   /**

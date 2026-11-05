@@ -2258,20 +2258,27 @@ class GMCP_Tools_Admin {
       $front['posts_page'] = $posts_id ? [ 'ID' => $posts_id, 'title' => get_the_title( $posts_id ) ] : null;
     }
 
-    $latest = get_posts( [
-      'post_type' => 'any',
-      'post_status' => [ 'publish', 'draft', 'pending', 'private' ],
-      // More than one, because the newest may be one this key must not be told about: the
-      // title of a form submission is the visitor's subject line, and "any" returns a type a
-      // plugin has not excluded from search. The first readable one is what is reported.
-      'numberposts' => 25,
-      'orderby' => 'modified',
-      'order' => 'DESC',
-      'suppress_filters' => false,
-    ] );
-    $latest = array_values( array_filter( $latest, function ( $candidate ) {
-      return GMCP_Core::post_read_guard( (int) $candidate->ID ) === true;
-    } ) );
+    // The newest post this caller may read. Unreadable ones are skipped while the answer is
+    // found rather than dropped from a fixed window, so a hidden newest post (a form submission
+    // is `publish`, and "any" returns a type a plugin has not excluded from search) neither
+    // appears nor changes which post is reported. @see GMCP_Core::collect_readable().
+    $latest = GMCP_Core::collect_readable(
+      function ( int $from, int $size ) {
+        return get_posts( [
+          'post_type' => 'any',
+          'post_status' => [ 'publish', 'draft', 'pending', 'private' ],
+          'numberposts' => $size,
+          'offset' => $from,
+          'orderby' => 'modified',
+          'order' => 'DESC',
+          'suppress_filters' => false,
+        ] );
+      },
+      function ( $candidate ) {
+        return GMCP_Core::post_read_guard( (int) $candidate->ID ) === true;
+      },
+      1
+    );
 
     return $this->json( $r, [
       'site' => [

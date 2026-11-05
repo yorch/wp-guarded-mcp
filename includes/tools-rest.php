@@ -166,26 +166,24 @@ class GMCP_Tools_Rest {
 
   /**
   * A WHERE fragment, for WP_Query, that leaves out what the caller may not read: posts of the
-  * excluded types, and posts hanging from one (two levels up, which covers a media row, a
-  * revision or a child of a submission or an order).
+  * excluded types, and posts hanging from one at any depth post_chain_types() walks (a media
+  * row, a revision or a child of a submission or an order).
   *
   * Installed around the REST dispatch of a list call. The listing is built by WordPress's own
   * query, and its rows are filtered by what _fields leaves in them, so an id-based filter on
-  * the rows afterwards would miss every call that does not ask for the id.
+  * the rows afterwards would miss every call that does not ask for the id. The SQL is the one
+  * the other listings and scans use. @see GMCP_Core::unreadable_post_sql()
   */
   public function exclude_unreadable_posts( $where ) {
     global $wpdb;
-    $types = GMCP_Core::read_excluded_post_types();
-    if ( !$types ) {
-      return $where;
-    }
-    $in = implode( ',', array_map( function ( $type ) {
-      return "'" . esc_sql( $type ) . "'";
-    }, $types ) );
-    $root = "SELECT ID FROM {$wpdb->posts} WHERE post_type IN ({$in})";
-    return $where . " AND {$wpdb->posts}.post_type NOT IN ({$in})"
-      . " AND {$wpdb->posts}.post_parent NOT IN ({$root})"
-      . " AND {$wpdb->posts}.post_parent NOT IN (SELECT ID FROM {$wpdb->posts} WHERE post_parent IN ({$root}))";
+    $c = GMCP_Core::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_r' );
+    return $c['where'] === '' ? $where : $where . ' AND ' . $c['where'];
+  }
+
+  /** The parents the WHERE above judges, joined. @see exclude_unreadable_posts() */
+  public function join_unreadable_posts( $join ) {
+    global $wpdb;
+    return $join . GMCP_Core::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_r' )['join'];
   }
 
   private function build_schema_from_args( $args ) {
@@ -412,6 +410,7 @@ class GMCP_Tools_Rest {
     // one dispatch.
     $listing = $method === 'GET' && $action === 'list';
     if ( $listing ) {
+      add_filter( 'posts_join', [ $this, 'join_unreadable_posts' ] );
       add_filter( 'posts_where', [ $this, 'exclude_unreadable_posts' ] );
     }
     try {
@@ -420,6 +419,7 @@ class GMCP_Tools_Rest {
     finally {
       if ( $listing ) {
         remove_filter( 'posts_where', [ $this, 'exclude_unreadable_posts' ] );
+        remove_filter( 'posts_join', [ $this, 'join_unreadable_posts' ] );
       }
     }
 

@@ -2901,14 +2901,24 @@ class GMCP_Tools_Core {
           $args['paged'] = max( 1, intval( $a['paged'] ) );
         }
         $list = [];
-        foreach ( get_comments( $args ) as $c ) {
-          // Order notes are comments on the order post, and they quote the order: status
-          // changes, refunds, the customer's own note. Same rule as reading the order.
-          // Comments on a form submission are the same: they sit on a post whose body no
-          // generic reader returns, and ask the same question, personal-data policy included.
-          if ( (int) $c->comment_post_ID > 0 && GMCP_Core::post_read_guard( (int) $c->comment_post_ID ) !== true ) {
-            continue;
-          }
+        // Order notes are comments on the order post, and they quote the order: status
+        // changes, refunds, the customer's own note. Same rule as reading the order.
+        // Comments on a form submission are the same: they sit on a post whose body no
+        // generic reader returns, and ask the same question, personal-data policy included.
+        // Skipped while the page is filled, so a short page does not say one was left out.
+        $c_limit = (int) $args['number'];
+        $c_skip = isset( $args['offset'] ) ? (int) $args['offset'] : ( isset( $args['paged'] ) ? ( (int) $args['paged'] - 1 ) * $c_limit : 0 );
+        unset( $args['offset'], $args['paged'] );
+        foreach ( GMCP_Core::collect_readable(
+          function ( int $from, int $size ) use ( $args ) {
+            return get_comments( [ 'offset' => $from, 'number' => $size ] + $args );
+          },
+          function ( $row ) {
+            return !( (int) $row->comment_post_ID > 0 && GMCP_Core::post_read_guard( (int) $row->comment_post_ID ) !== true );
+          },
+          $c_limit,
+          $c_skip
+        ) as $c ) {
           $list[] = [
             'comment_ID' => $c->comment_ID,
             'comment_post_ID' => $c->comment_post_ID,
@@ -3634,17 +3644,30 @@ class GMCP_Tools_Core {
           $q['date_query'] = [ $date ];
         }
         $rows = [];
-        foreach ( get_posts( $q ) as $p ) {
-          // "any" can still reach a commerce row: WordPress expands it to the registered
-          // types not excluded from search, which says nothing about a type registered by a
-          // plugin that sets it differently. Filtered per row rather than trusted.
-          //
-          // Both policies, and both follow the post's parents: a revision or a media row of
-          // a submission is an ordinary type on its own, and naming "revision" or
-          // "attachment" as the type reached it through a check that only saw the name.
-          if ( GMCP_Core::post_read_guard( (int) $p->ID ) !== true ) {
-            continue;
-          }
+        // "any" can still reach a commerce row: WordPress expands it to the registered
+        // types not excluded from search, which says nothing about a type registered by a
+        // plugin that sets it differently. Filtered per row rather than trusted.
+        //
+        // Both policies, and both follow the post's parents: a revision or a media row of
+        // a submission is an ordinary type on its own, and naming "revision" or
+        // "attachment" as the type reached it through a check that only saw the name.
+        //
+        // Skipped while the page is filled, not dropped after it is fetched: a page that
+        // came back short would say that a row this key may not read sits in its window.
+        // @see GMCP_Core::collect_readable().
+        $list_limit = (int) $q['posts_per_page'];
+        $list_skip = isset( $q['offset'] ) ? (int) $q['offset'] : ( isset( $q['paged'] ) ? ( (int) $q['paged'] - 1 ) * $list_limit : 0 );
+        unset( $q['offset'], $q['paged'] );
+        foreach ( GMCP_Core::collect_readable(
+          function ( int $from, int $size ) use ( $q ) {
+            return get_posts( [ 'offset' => $from, 'posts_per_page' => $size ] + $q );
+          },
+          function ( $row ) {
+            return GMCP_Core::post_read_guard( (int) $row->ID ) === true;
+          },
+          $list_limit,
+          $list_skip
+        ) as $p ) {
           $rows[] = [
             'ID' => $p->ID,
             'post_title' => $p->post_title,
@@ -5370,12 +5393,18 @@ class GMCP_Tools_Core {
           $q['date_query'] = [ $d ];
         }
         $list = [];
-        foreach ( get_posts( $q ) as $m ) {
-          // A file attached to a form submission or an order is what a visitor uploaded, and
-          // is judged as the post it hangs from. Media attached to nothing is ordinary.
-          if ( GMCP_Core::post_read_guard( (int) $m->ID ) !== true ) {
-            continue;
-          }
+        // A file attached to a form submission or an order is what a visitor uploaded, and
+        // is judged as the post it hangs from. Media attached to nothing is ordinary. Skipped
+        // while the page is filled, so a short page does not say a row was left out.
+        foreach ( GMCP_Core::collect_readable(
+          function ( int $from, int $size ) use ( $q ) {
+            return get_posts( [ 'offset' => $from, 'posts_per_page' => $size ] + $q );
+          },
+          function ( $row ) {
+            return GMCP_Core::post_read_guard( (int) $row->ID ) === true;
+          },
+          (int) $q['posts_per_page']
+        ) as $m ) {
           $list[] = [ 'ID' => $m->ID, 'title' => $m->post_title, 'url' => wp_get_attachment_url( $m->ID ) ];
         }
         $this->add_result_text( $r, wp_json_encode( $list, JSON_PRETTY_PRINT ) );
