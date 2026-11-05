@@ -197,21 +197,32 @@ class GMCP_Tools_Diagnostics {
     if ( !$logish || $script ) {
       return [ 'state' => 'refused', 'path' => '', 'message' => 'The configured error log file does not look like a log (its name has no "log", "error" or "debug" in it, or it is a script or configuration file), so it is not read.' ];
     }
-    if ( file_exists( $ini ) && is_link( $ini ) ) {
+    if ( @is_link( $ini ) ) {
       return [ 'state' => 'refused', 'path' => '', 'message' => 'The configured error log file is a symbolic link, which is not followed: a link can be swapped to point at any file the web server can read.' ];
     }
-    $dir = realpath( dirname( $ini ) );
-    if ( $dir === false ) {
-      return [ 'state' => 'absent', 'path' => $ini, 'message' => 'The directory the log would be written to does not exist.' ];
+    // Where the file must be, worked out from the install's own directories and not by
+    // canonicalising the whole path: see GMCP_Diag_Util::resolve_log().
+    $loc = GMCP_Diag_Util::resolve_log( $ini, $this->log_roots() );
+    if ( !$loc['ok'] ) {
+      if ( strpos( $loc['error'], 'does not exist' ) !== false ) {
+        return [ 'state' => 'absent', 'path' => $ini, 'message' => 'The directory the log would be written to does not exist.' ];
+      }
+      return [ 'state' => 'refused', 'path' => '', 'message' => $loc['error'] ];
     }
-    $real = $dir . DIRECTORY_SEPARATOR . basename( $ini );
-    if ( !file_exists( $real ) ) {
+    $real = $loc['expected'];
+    $st = @lstat( $real );
+    if ( !$st ) {
       return [ 'state' => 'absent', 'path' => $real, 'message' => 'The log file does not exist yet. PHP creates it on the first error it logs, so this means either nothing has been logged since logging was set up, or logging is not actually enabled (see "logging"). It does not mean the site has no errors.' ];
     }
-    if ( !is_file( $real ) || !is_readable( $real ) ) {
+    if ( ( $st['mode'] & 0170000 ) !== 0100000 || !is_readable( $real ) ) {
       return [ 'state' => 'unreadable', 'path' => $real, 'message' => 'The log path exists but is not a readable regular file.' ];
     }
-    return [ 'state' => 'ok', 'path' => $real, 'message' => '' ];
+    return [ 'state' => 'ok', 'path' => $real, 'message' => '', 'configured' => $ini ];
+  }
+
+  /** The directories a log path is anchored to: the content directory and the WordPress root. */
+  private function log_roots(): array {
+    return array_values( array_filter( [ defined( 'WP_CONTENT_DIR' ) ? (string) WP_CONTENT_DIR : '', (string) ABSPATH ], 'strlen' ) );
   }
 
   private function error_log_tail( array $r, array $a ): array {
@@ -249,11 +260,19 @@ class GMCP_Tools_Diagnostics {
       return $this->json( $r, $out );
     }
 
-    $tail = GMCP_Diag_Util::read_tail( $file['path'], $n, self::LOG_WINDOW_BYTES );
+    $uid = function_exists( 'posix_geteuid' ) ? posix_geteuid() : null;
+    $gids = function_exists( 'posix_getgroups' ) ? array_map( 'intval', (array) posix_getgroups() ) : [];
+    if ( function_exists( 'posix_getegid' ) ) {
+      $gids[] = posix_getegid();
+    }
+    $tail = GMCP_Diag_Util::read_log( $file['configured'], $this->log_roots(), $n, self::LOG_WINDOW_BYTES, $uid, $gids );
     if ( !$tail['ok'] ) {
       $out['state'] = 'unreadable';
       $out['message'] = $tail['error'];
       return $this->json( $r, $out );
+    }
+    if ( $tail['warnings'] ) {
+      $out['warnings'] = $tail['warnings'];
     }
     $out['size_bytes'] = $tail['size'];
     $out['modified_utc'] = $tail['mtime'] ? gmdate( 'Y-m-d H:i:s', $tail['mtime'] ) : null;

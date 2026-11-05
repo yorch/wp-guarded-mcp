@@ -243,6 +243,59 @@ check( 'same_regular_file: a link where a file was', GMCP_Diag_Util::same_regula
 check( 'same_regular_file: a pipe was opened', GMCP_Diag_Util::same_regular_file( $ls, [ 'mode' => 0010600 ] + $ls ), false );
 unlink( "$dir/link.log" );
 
+echo "-- resolve_log, dir_chain_problem, open_verified, read_log --\n";
+// (The race itself is .dev/stress-log-race.php. These are the pieces, one at a time.)
+mkdir( "$dir/site/wp-content/logs", 0755, true );
+mkdir( "$dir/elsewhere", 0755 );
+file_put_contents( "$dir/site/wp-content/logs/debug.log", "alpha\nbeta\n" );
+file_put_contents( "$dir/elsewhere/other.log", "gamma\n" );
+$roots = [ "$dir/site/wp-content", "$dir/site" ];
+$loc = GMCP_Diag_Util::resolve_log( "$dir/site/wp-content/logs/debug.log", $roots );
+check( 'resolve_log: a path under the content directory is anchored to it', $loc['ok'] && $loc['below_root'], true );
+check( '  ...expected path is the root plus the configured components', $loc['expected'], realpath( "$dir/site/wp-content" ) . '/logs/debug.log' );
+check( '  ...and the one directory below the root is the one to check', $loc['dirs'], [ realpath( "$dir/site/wp-content" ) . '/logs' ] );
+check( 'resolve_log: the longest root wins (content directory, not the install root)', strpos( $loc['expected'], realpath( "$dir/site/wp-content" ) ) === 0 && $loc['dirs'] === [ realpath( "$dir/site/wp-content" ) . '/logs' ], true );
+check( 'resolve_log: ".." is refused', GMCP_Diag_Util::resolve_log( "$dir/site/wp-content/../wp-content/logs/debug.log", $roots )['ok'], false );
+check( 'resolve_log: "." is refused', GMCP_Diag_Util::resolve_log( "$dir/site/wp-content/./logs/debug.log", $roots )['ok'], false );
+check( 'resolve_log: a relative path is refused', GMCP_Diag_Util::resolve_log( 'logs/debug.log', $roots )['ok'], false );
+check( 'resolve_log: a NUL byte is refused', GMCP_Diag_Util::resolve_log( "$dir/site/wp-content/logs/debug.log\0.txt", $roots )['ok'], false );
+$out = GMCP_Diag_Util::resolve_log( "$dir/elsewhere/other.log", $roots );
+check( 'resolve_log: a path outside both roots is canonicalised once, not anchored', $out['ok'] && !$out['below_root'], true );
+check( '  ...expected is the canonical directory plus the name', $out['expected'], realpath( "$dir/elsewhere" ) . '/other.log' );
+check( 'resolve_log: a missing directory outside the roots says so', GMCP_Diag_Util::resolve_log( "$dir/nowhere/x.log", $roots )['ok'], false );
+check( 'dir_chain_problem: control, plain directories pass', GMCP_Diag_Util::dir_chain_problem( [ "$dir/site/wp-content/logs" ] )[0], null );
+symlink( "$dir/elsewhere", "$dir/site/wp-content/linked" );
+check( 'dir_chain_problem: a directory that is a link is refused', GMCP_Diag_Util::dir_chain_problem( [ "$dir/site/wp-content/linked" ] )[0] !== null, true );
+check( 'dir_chain_problem: a component that is a file is refused', GMCP_Diag_Util::dir_chain_problem( [ "$dir/site/wp-content/logs/debug.log" ] )[0] !== null, true );
+check( 'dir_chain_problem: a missing component is refused', GMCP_Diag_Util::dir_chain_problem( [ "$dir/site/wp-content/gone" ] )[0] !== null, true );
+unlink( "$dir/site/wp-content/linked" );
+chmod( "$dir/elsewhere", 0777 );
+check( 'dir_chain_problem: a world-writable directory without the sticky bit is reported, not refused', [ GMCP_Diag_Util::dir_chain_problem( [ "$dir/elsewhere" ], 12345, [] )[0], count( GMCP_Diag_Util::dir_chain_problem( [ "$dir/elsewhere" ], 12345, [] )[1] ) ], [ null, 1 ] );
+chmod( "$dir/elsewhere", 01777 );
+check( 'dir_chain_problem: control, the sticky bit (as /tmp has it) is not reported', GMCP_Diag_Util::dir_chain_problem( [ "$dir/elsewhere" ], 12345, [] )[1], [] );
+chmod( "$dir/elsewhere", 0755 );
+check( 'dir_chain_problem: control, a private directory is not reported', GMCP_Diag_Util::dir_chain_problem( [ "$dir/elsewhere" ], 12345, [] )[1], [] );
+$v = GMCP_Diag_Util::open_verified( "$dir/site/wp-content/logs/debug.log", $loc['expected'] );
+check( 'open_verified: the real file opens at its expected path', is_resource( $v['fh'] ), true );
+if ( is_resource( $v['fh'] ) ) {
+  check( '  ...and nothing was read yet (the handle is positioned at the start)', ftell( $v['fh'] ), 0 );
+  fclose( $v['fh'] );
+}
+$v = GMCP_Diag_Util::open_verified( "$dir/site/wp-content/logs/debug.log", "$dir/elsewhere/debug.log" );
+check( 'open_verified: a file that is not at the expected path is refused', $v['fh'], null );
+$full = GMCP_Diag_Util::read_log( "$dir/site/wp-content/logs/debug.log", $roots, 10, 1000, 12345, [] );
+check( 'read_log: control, reads the lines', $full['lines'], [ 'alpha', 'beta' ] );
+check( 'read_log: and reports the path the kernel must see', $full['expected'], $loc['expected'] );
+rename( "$dir/site/wp-content/logs", "$dir/site/wp-content/logs.hold" );
+symlink( "$dir/elsewhere", "$dir/site/wp-content/logs" );
+file_put_contents( "$dir/elsewhere/debug.log", "CANARY\n" );
+$full = GMCP_Diag_Util::read_log( "$dir/site/wp-content/logs/debug.log", $roots, 10, 1000, 12345, [] );
+check( 'read_log: control, the swapped directory really does contain a readable debug.log', @file_get_contents( "$dir/site/wp-content/logs/debug.log" ), "CANARY\n" );
+check( 'read_log: a directory below the root swapped for a link is refused', $full['ok'], false );
+check( '  ...and nothing of the other file is returned', strpos( implode( '', $full['lines'] ) . $full['error'], 'CANARY' ), false );
+unlink( "$dir/site/wp-content/logs" );
+rename( "$dir/site/wp-content/logs.hold", "$dir/site/wp-content/logs" );
+
 echo "-- scrub_log_line --\n";
 $ctx = [ 'content_dir' => '/srv/www/site/wp-content', 'abspath' => '/srv/www/site/', 'patterns' => [ 'pass', 'pwd', 'secret', 'token', 'key', 'auth', 'salt', 'nonce', 'credential', 'bearer', 'signature', 'licence', 'license', 'private' ] ];
 $s = static function ( string $l ) use ( $ctx ): string {

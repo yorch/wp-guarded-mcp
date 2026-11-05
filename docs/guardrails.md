@@ -237,13 +237,47 @@ something that looks harmless and is not, so each says what it cannot promise.
   path. A configured file is still refused if its name is not log-shaped, if it
   is a script or a configuration file, or if it is a symbolic link, so a
   misconfigured or swapped value cannot turn it into a general file reader.
-  The path is looked at without following a link (`lstat`) before it is opened, so a
-  link, a pipe or a device is refused untouched (a FIFO would otherwise block the
-  worker on open), and the handle that was opened is compared with what was looked
-  at by device and inode and must be a regular file, which catches a file swapped in
-  between. PHP cannot open with `O_NOFOLLOW`, so the window between the two calls is
-  narrowed and not removed, and a site where an attacker can write to the log
-  directory is outside what this protects.
+  The file is read through one handle that was checked after it was opened, and the
+  path is never consulted again:
+  the path is looked at without following a link (`lstat`); it is opened non-blocking
+  (`fopen` mode `n`, so a FIFO swapped in after that look returns at once and is
+  refused instead of holding the worker in `open()` for good: measured, a blocking
+  open does hang); the handle must be a regular file with the device and inode that
+  were looked at; the path is looked at again and must still be that file; and, where
+  `/proc/self/fd` exists, the kernel is asked where the open file really is and the
+  answer must equal the path the log is configured to live at, which is what catches a
+  directory above the log swapped for a link (the other checks cannot see that: the look
+  and the open both walk the swapped directory and agree). A log under the content
+  directory or the WordPress root is anchored to that root and not canonicalised as a
+  whole, a directory below the root that is a link is refused, and `.` or `..` in the
+  configured path is refused. A directory on the way that other accounts can write to
+  (world-writable without the sticky bit, or group-writable by a group the web user is
+  not in) is reported in a `warnings` field and not refused, because refusing would
+  disable the tool on shared hosts for a condition the checks already catch when it is
+  acted on.
+  What remains, and it cannot be zero in PHP, which has no `O_NOFOLLOW` and no
+  `openat`: (1) the window between the first `lstat` and `open()` is narrowed, not
+  closed, and whatever is opened in it is refused only after the open. A swap to a
+  device or other special file is opened (non-blocking) and refused, so a device whose
+  open has side effects is still opened once. (2) A HARD LINK to a file on the same
+  filesystem put at the log's path is a regular file with its own directory entry, and
+  nothing here can tell it from the log; measured in the race test, the canary is returned whenever the link is in place.
+  On Linux with `fs.protected_hardlinks` on (the default on current kernels), an
+  unprivileged account cannot make one to a file it does not own or cannot read and
+  write. (3) Where `/proc` is unavailable (not Linux, or hidden from the process) the
+  open file's location cannot be confirmed; the chain of directories is looked at again
+  after the read and the lines are discarded if it no longer holds, which narrows a
+  swapped directory and does not exclude it; that path has not been exercised here. (4)
+  A log outside both roots (`/var/log/php/error.log`) has no anchor: its directory is
+  canonicalised once and trusted from there up. (5) A site where an attacker can write
+  to the log directory is outside what this protects; the checks make a swap visible and
+  refuse it, they do not stop an attacker who owns the directory from trying again.
+  `.dev/stress-log-race.php` races a swapper against the reader (directory swapped for a
+  link, the log swapped for a link to a canary file, a pipe, a hard link) with the logic
+  this replaced as a control: under the directory swap the old logic returned the canary
+  and the new one never did; the pipe made the old logic block in `open()`; the link
+  swap was already refused by the old inode comparison, and is a control that the new
+  reader has not lost it; the hard link is measured and not asserted.
   It reads from the end of the file, at most 256KB of it, so a multi-gigabyte log
   costs what a small one does. It has no search and no pattern argument; the model asks for the last
   N lines and filters them itself.

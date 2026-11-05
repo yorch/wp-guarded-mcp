@@ -530,38 +530,253 @@ final class GMCP_Diag_Util {
   }
 
   /**
+  * Where, lexically, a configured log path sits relative to the install, and the path the kernel
+  * must report for the file once it is open.
+  *
+  * A path under the content directory or the WordPress root is rebuilt from that root's
+  * canonical form plus the components the configuration names, with no "." or ".." allowed. It
+  * is NOT canonicalised as a whole: realpath() of the whole path would follow a directory that
+  * has been swapped for a link, and the answer would then agree with whatever the swap
+  * pointed at. Everything below the root is therefore a component the install put there, and a
+  * component that is a link is refused (see dir_chain_problem()). A path outside both roots
+  * (a host's /var/log/php/error.log) has no install to anchor to, so its directory is
+  * canonicalised once and trusted from there up.
+  *
+  * @param string[] $roots the content directory and the WordPress root.
+  * @return array{ok:bool,error:string,expected:string,dirs:string[],below_root:bool}
+  */
+  public static function resolve_log( string $configured, array $roots ): array {
+    $fail = static function ( string $why ): array {
+      return [ 'ok' => false, 'error' => $why, 'expected' => '', 'dirs' => [], 'below_root' => false ];
+    };
+    if ( $configured === '' || $configured[0] !== '/' || strpos( $configured, "\0" ) !== false ) {
+      return $fail( 'The configured log path is not an absolute path.' );
+    }
+    $best = null;
+    clearstatcache( true ); // including the realpath cache, which is not re-validated for minutes
+    foreach ( $roots as $root ) {
+      $root = rtrim( (string) $root, '/\\' );
+      if ( $root === '' ) {
+        continue;
+      }
+      $real = realpath( $root );
+      if ( $real === false ) {
+        continue;
+      }
+      foreach ( array_unique( [ $root, $real ] ) as $prefix ) {
+        if ( strpos( $configured, $prefix . '/' ) === 0 && ( $best === null || strlen( $prefix ) > strlen( $best[0] ) ) ) {
+          $best = [ $prefix, $real ];
+        }
+      }
+    }
+    if ( $best !== null ) {
+      $rel = array_values( array_filter( explode( '/', substr( $configured, strlen( $best[0] ) + 1 ) ), static function ( $seg ) {
+        return $seg !== '';
+      } ) );
+      foreach ( $rel as $seg ) {
+        if ( $seg === '.' || $seg === '..' ) {
+          return $fail( 'The configured log path contains "." or ".." components, so it is not read.' );
+        }
+      }
+      if ( !$rel ) {
+        return $fail( 'The configured log path is a directory.' );
+      }
+      $dirs = [];
+      $cur = $best[1];
+      foreach ( array_slice( $rel, 0, -1 ) as $seg ) {
+        $cur .= '/' . $seg;
+        $dirs[] = $cur;
+      }
+      return [ 'ok' => true, 'error' => '', 'expected' => $cur . '/' . end( $rel ), 'dirs' => $dirs, 'below_root' => true, 'root' => $best[1] ];
+    }
+    $dir = realpath( dirname( $configured ) );
+    if ( $dir === false ) {
+      return $fail( 'The directory the log would be written to does not exist.' );
+    }
+    return [ 'ok' => true, 'error' => '', 'expected' => rtrim( $dir, '/' ) . '/' . basename( $configured ), 'dirs' => [], 'below_root' => false, 'root' => $dir ];
+  }
+
+  /**
+  * A reason the directories between the install and the log cannot be trusted, or null.
+  *
+  * Refused: a component that is a symbolic link or is not a directory, or is missing. Reported
+  * but not refused (the second element): a directory that accounts other than the web user can
+  * write to (world-writable without the sticky bit, or group-writable by a group the web user is
+  * not in), because whoever can write to a directory can rename what is in it, which is the
+  * race this module narrows. Refusing there would disable the tool on shared hosts for a
+  * condition the other checks already catch when it is acted on.
+  *
+  * @param string[] $dirs absolute directories, outermost first.
+  * @param int[]    $gids the groups the web user belongs to; null $uid skips the permission report.
+  * @return array{0:?string,1:string[]}
+  */
+  public static function dir_chain_problem( array $dirs, ?int $uid = null, array $gids = [] ): array {
+    $weak = [];
+    clearstatcache( true );
+    foreach ( $dirs as $d ) {
+      $st = @lstat( $d );
+      if ( !$st ) {
+        return [ 'A directory on the path to the log (' . basename( $d ) . ') is missing.', $weak ];
+      }
+      $type = $st['mode'] & 0170000;
+      if ( $type === 0120000 ) {
+        return [ 'A directory on the path to the log (' . basename( $d ) . ') is a symbolic link, which is not followed: a link can be swapped to point somewhere else.', $weak ];
+      }
+      if ( $type !== 0040000 ) {
+        return [ 'A component on the path to the log (' . basename( $d ) . ') is not a directory.', $weak ];
+      }
+      if ( $uid !== null ) {
+        $m = $st['mode'];
+        if ( $m & 01000 ) {
+          continue; // sticky: others can add to the directory but cannot rename or remove what is not theirs
+        }
+        if ( $m & 0002 ) {
+          $weak[] = basename( $d ) . ' is writable by every account on the host';
+        }
+        elseif ( ( $m & 0020 ) && !in_array( (int) $st['gid'], $gids, true ) ) {
+          $weak[] = basename( $d ) . ' is writable by a group the web server user is not in';
+        }
+      }
+    }
+    return [ null, $weak ];
+  }
+
+  /**
+  * The paths by which this process holds a file open, read from /proc, or null where /proc
+  * cannot say (not Linux, or hidden). The kernel reports the path of the open file itself, with
+  * every link already resolved, so it names where the bytes in the handle really are, whatever
+  * the path used to open them said. A file opened and then unlinked reports " (deleted)".
+  *
+  * @param array $fstat fstat() of the handle.
+  * @return string[]|null
+  */
+  private static function open_paths( array $fstat ): ?array {
+    $dir = '/proc/self/fd';
+    if ( !@is_dir( $dir ) ) {
+      return null;
+    }
+    $names = @scandir( $dir );
+    if ( !is_array( $names ) ) {
+      return null;
+    }
+    $paths = [];
+    foreach ( $names as $n ) {
+      if ( !ctype_digit( $n ) ) {
+        continue;
+      }
+      $x = @stat( "$dir/$n" );
+      if ( !$x || $x['ino'] !== $fstat['ino'] || $x['dev'] !== $fstat['dev'] ) {
+        continue;
+      }
+      $l = @readlink( "$dir/$n" );
+      if ( is_string( $l ) ) {
+        $paths[] = $l;
+      }
+    }
+    return $paths ?: null;
+  }
+
+  /**
+  * fopen() for reading with O_NONBLOCK ("n"). Opening a pipe for reading blocks until a writer
+  * appears; a file that is swapped for a pipe between the check and this call would hold the
+  * worker there for good. Non-blocking, the open returns, and the caller sees from fstat()
+  * that it is not a regular file. Harmless for a regular file. Kept apart so a test can open a
+  * pipe through exactly this.
+  *
+  * @return resource|false
+  */
+  public static function open_nonblocking( string $path ) {
+    return @fopen( $path, 'rn' );
+  }
+
+  /**
+  * Open a file for reading only if it is, and stays, the regular file at the expected path.
+  *
+  * PHP cannot ask the kernel to refuse a link (there is no O_NOFOLLOW), so this does not claim
+  * to prevent a swap; it makes the swap visible and refuses to read when it is seen:
+  *
+  *  1. lstat() the path: a link, a pipe or a device is refused untouched.
+  *  2. Open with the "n" mode flag (O_NONBLOCK). A pipe swapped in after step 1 would otherwise
+  *     block this worker in open() until something wrote to it; non-blocking, the open returns
+  *     and step 3 refuses it.
+  *  3. fstat() the handle: a regular file, with the device and inode that step 1 saw.
+  *  4. lstat() the path again: still that regular file. A path that stopped being it while it
+  *     was being opened is refused, even though the handle is now fixed, because "what was
+  *     read" and "what is at the path" should not have been allowed to disagree.
+  *  5. Where /proc exists, ask the kernel where the open file really is and require it to be
+  *     $expected. That is the check that catches a swapped DIRECTORY, which the three above
+  *     cannot: lstat and open both walk the swapped directory and agree with each other.
+  *
+  * Everything after this reads the handle and never the path again.
+  *
+  * @return array{fh:?resource,error:string,identity:string,stat:array}
+  */
+  public static function open_verified( string $path, ?string $expected = null ): array {
+    $o = [ 'fh' => null, 'error' => '', 'identity' => 'unchecked', 'stat' => [] ];
+    // PHP keeps a stat cache (and a realpath cache) for the request. It is cleared when PHP
+    // itself changes a file, not when someone else does, so a second look at the same path is
+    // not guaranteed to be a second look. Not measured to matter here; cheap enough not to rely on.
+    clearstatcache( true );
+    $before = @lstat( $path );
+    if ( !$before || ( $before['mode'] & 0170000 ) !== 0100000 ) {
+      $o['error'] = 'The path is not a regular file (a symbolic link, pipe or device is not read).';
+      return $o;
+    }
+    $fh = self::open_nonblocking( $path );
+    if ( !$fh ) {
+      $o['error'] = 'The file could not be opened for reading.';
+      return $o;
+    }
+    $st = fstat( $fh );
+    if ( !$st || !self::same_regular_file( $before, $st ) ) {
+      fclose( $fh );
+      $o['error'] = 'The path is not the regular file it was a moment ago (it was replaced while being opened), so it was not read.';
+      return $o;
+    }
+    clearstatcache( true, $path );
+    $after = @lstat( $path );
+    if ( !$after || !self::same_regular_file( $after, $st ) ) {
+      fclose( $fh );
+      $o['error'] = 'The path stopped being that regular file while it was being opened (replaced or rotated), so it was not read. Asking again is safe.';
+      return $o;
+    }
+    if ( $expected !== null ) {
+      $paths = self::open_paths( $st );
+      if ( $paths !== null ) {
+        if ( !in_array( $expected, $paths, true ) ) {
+          fclose( $fh );
+          $o['error'] = 'The file that was opened is not at the path the log is configured to live at (a directory on the way was swapped), so it was not read.';
+          return $o;
+        }
+        $o['identity'] = 'kernel';
+      }
+    }
+    $o['fh'] = $fh;
+    $o['stat'] = $st;
+    return $o;
+  }
+
+  /**
   * The end of a file, read from the end.
   *
   * Never reads more than $max_bytes (+1, to learn whether the first line it has is whole),
   * so a log of several gigabytes costs the same as a log of several kilobytes. The handle is
   * checked after it is opened rather than the path before, because a path can change
-  * between a check and an open and a handle cannot: it must be a regular file.
+  * between a check and an open and a handle cannot (see open_verified()).
   *
-  * @return array{ok:bool,error:string,size:int,mtime:int,lines:string[],lines_available:int,starts_mid_file:bool}
+  * @param string|null $expected the canonical path the file must be open at (open_verified()).
+  * @return array{ok:bool,error:string,size:int,mtime:int,lines:string[],lines_available:int,starts_mid_file:bool,identity:string}
   */
-  public static function read_tail( string $path, int $max_lines, int $max_bytes ): array {
-    $r = [ 'ok' => false, 'error' => '', 'size' => 0, 'mtime' => 0, 'lines' => [], 'lines_available' => 0, 'starts_mid_file' => false ];
-    // lstat() does not follow a link and does not open anything, so a symbolic link, a FIFO
-    // (an open for reading would block this worker until something wrote to it) or a device is
-    // refused before it is touched. The caller checked the same things a moment earlier; a file
-    // can be swapped in the gap, which is why this asks again and then compares what it opened
-    // with what it looked at.
-    $before = @lstat( $path );
-    if ( !$before || ( $before['mode'] & 0170000 ) !== 0100000 ) {
-      $r['error'] = 'The path is not a regular file (a symbolic link, pipe or device is not read).';
+  public static function read_tail( string $path, int $max_lines, int $max_bytes, ?string $expected = null ): array {
+    $r = [ 'ok' => false, 'error' => '', 'size' => 0, 'mtime' => 0, 'lines' => [], 'lines_available' => 0, 'starts_mid_file' => false, 'identity' => 'unchecked' ];
+    $o = self::open_verified( $path, $expected );
+    if ( !$o['fh'] ) {
+      $r['error'] = $o['error'];
       return $r;
     }
-    $fh = @fopen( $path, 'rb' );
-    if ( !$fh ) {
-      $r['error'] = 'The file could not be opened for reading.';
-      return $r;
-    }
-    $st = fstat( $fh );
-    if ( !$st || !self::same_regular_file( $before, $st ) ) {
-      fclose( $fh );
-      $r['error'] = 'The path is not the regular file it was a moment ago (it was replaced while being opened), so it was not read.';
-      return $r;
-    }
+    $fh = $o['fh'];
+    $st = $o['stat'];
+    $r['identity'] = $o['identity'];
     $size = (int) $st['size'];
     $r['size'] = $size;
     $r['mtime'] = (int) $st['mtime'];
@@ -593,6 +808,43 @@ final class GMCP_Diag_Util {
     $r['lines'] = array_slice( $lines, -$max_lines );
     $r['ok'] = true;
     return $r;
+  }
+
+  /**
+  * A configured log path, checked and read: resolve_log(), then dir_chain_problem(), then
+  * read_tail() against the path the kernel must report. The one entry point the tool and the
+  * race test both use, so the test exercises what ships.
+  *
+  * Where /proc cannot confirm the open file's path, the directory chain is checked again after
+  * the read and the lines are discarded if it no longer holds.
+  *
+  * @param string[] $roots content directory and WordPress root.
+  * @return array{ok:bool,error:string,size:int,mtime:int,lines:string[],lines_available:int,starts_mid_file:bool,identity:string,warnings:string[],expected:string}
+  */
+  public static function read_log( string $configured, array $roots, int $max_lines, int $max_bytes, ?int $uid = null, array $gids = [] ): array {
+    $r = [ 'ok' => false, 'error' => '', 'size' => 0, 'mtime' => 0, 'lines' => [], 'lines_available' => 0, 'starts_mid_file' => false, 'identity' => 'unchecked', 'warnings' => [], 'expected' => '' ];
+    $loc = self::resolve_log( $configured, $roots );
+    if ( !$loc['ok'] ) {
+      $r['error'] = $loc['error'];
+      return $r;
+    }
+    $r['expected'] = $loc['expected'];
+    $perm_dirs = array_merge( [ $loc['root'] ], $loc['dirs'] );
+    [ $problem, $weak ] = self::dir_chain_problem( $perm_dirs, $uid, $gids );
+    if ( $problem !== null ) {
+      $r['error'] = $problem;
+      return $r;
+    }
+    $t = self::read_tail( $loc['expected'], $max_lines, $max_bytes, $loc['expected'] );
+    $t['warnings'] = $weak ? [ 'Directories on the path to the log are writable by other accounts (' . implode( '; ', $weak ) . '). Whoever can write to a directory can swap the log for something else while it is being read. The reader refuses a swap it sees, but a race cannot be ruled out from inside PHP.' ] : [];
+    $t['expected'] = $loc['expected'];
+    if ( $t['ok'] && $t['identity'] !== 'kernel' ) {
+      [ $again ] = self::dir_chain_problem( $perm_dirs );
+      if ( $again !== null ) {
+        return [ 'ok' => false, 'error' => $again . ' (found after the read; nothing is returned).', 'lines' => [] ] + $r;
+      }
+    }
+    return $t;
   }
 
   /* ----------------------------------------------------------------- preview tokens */
