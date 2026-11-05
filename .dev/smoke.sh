@@ -446,7 +446,11 @@ check "and carries no author email" "$(grep -c 'author_email' "$OUT/rcmt" || tru
 
 call init2 '{"jsonrpc":"2.0","id":35,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
 check "server reports its real version" \
-  "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["serverInfo"]["version"])' init2)" "1.0.0"
+  "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["serverInfo"]["version"])' init2)" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_VERSION;' 2>/dev/null | tr -d '\r\n')"
+# CONTROL for the line above: the expected value is a version, not an empty string that an empty reply would equal.
+check "CONTROL: the expected version was read from the plugin and looks like one" \
+  "$(docker compose exec -T cli wp eval 'echo preg_match( "/^[0-9]+\\.[0-9]+\\.[0-9]+/", GMCP_VERSION );' 2>/dev/null | tr -d '\r\n')" "1"
 check "tools, prompts and resources are all declared" \
   "$(py 'import json,sys;c=json.load(sys.stdin)["result"]["capabilities"];print(",".join(sorted(c)))' init2)" "prompts,resources,tools"
 
