@@ -310,9 +310,16 @@ something that looks harmless and is not, so each says what it cannot promise.
   between PHP and the HTTP client has nothing to exploit. The host is resolved
   here, every address returned must be acceptable (a name with one public and one
   internal record is refused), and the connection is pinned to the address that
-  was checked, so the answer cannot change between the check and the connect. If
-  the pin cannot be applied (the HTTP transport is not cURL, or another plugin
-  short-circuits the HTTP API) the response is discarded. Link-local, reserved
+  was checked, so the answer cannot change between the check and the connect. Only
+  cURL can pin, so the tool asks WordPress's HTTP layer which transport it will use
+  and refuses, before anything is sent, when that is not cURL (the others resolve the
+  host name again when they connect). A plugin that swaps the transport for one request
+  is caught again in the last hook before the transport is chosen, which aborts the
+  request; a response that still arrives with no pin applied (another plugin
+  short-circuits the HTTP API) is discarded. Measured against a transport swapped by
+  the transport cache and by an action: the earlier code sent the request and then
+  discarded the answer, so the site saw an unpinned request; now it sees none.
+  Link-local, reserved
   and multicast addresses are refused for every site, which is where the cloud
   metadata service lives. Private and loopback addresses are accepted only when
   the site's own host name is local (`localhost`, a bare name, an IP in those
@@ -403,7 +410,17 @@ something that looks harmless and is not, so each says what it cannot promise.
   text test now blanks an argument that carries a credential-shaped string, but a
   preview link is not one of the shapes it knows); the
   window between the address check and the connect is closed by pinning only
-  where the HTTP transport is cURL. A proxy is never used for the fetch: libcurl
+  where the HTTP transport is cURL. What that rests on, exactly: the transport check
+  calls a method of WordPress's HTTP library that is not public (through reflection,
+  with the answer "not cURL" if it cannot), another plugin that can still alter the
+  cURL handle after this tool has (an `http_api_curl` callback later than priority
+  9999) can undo the pin, and a host name's pin is one address, the first checked.
+  IPv6: the entry for a host name that resolves to an IPv6 address is bracketed
+  (`name:80:[::1]`); libcurl 8.5 accepts it and connects to that address, which was
+  verified only as far as the connect attempt, because the sandbox it was tested in has
+  no IPv6 at all, so no IPv6 page was ever actually fetched. A site address that is an IP
+  literal gets no entry (there is no name to resolve); an entry there, `::1:80:[::1]`,
+  is rejected by libcurl and failed the whole request before this was changed. A proxy is never used for the fetch: libcurl
   honours `http_proxy` and `HTTPS_PROXY` from the environment, and a proxy
   resolves the host itself so the pin would hold nothing, so the request sets an
   empty proxy and `NO_PROXY=*` on its own handle, and the response is discarded

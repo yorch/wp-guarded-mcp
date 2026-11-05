@@ -383,6 +383,21 @@ final class GMCP_Diag_Util {
     return [ 'ok' => true, 'reason' => '', 'url' => $rebuilt, 'scheme' => $scheme, 'host' => $host, 'port' => $port, 'ips' => $ips, 'pin' => $ips[0] ];
   }
 
+  /**
+  * The CURLOPT_RESOLVE entry that pins a host name to the address that was checked, or null
+  * when the host is itself an IP address (nothing to resolve, nothing to pin).
+  *
+  * The format is "name:port:address", an IPv6 address in brackets. Measured against libcurl
+  * 8.5: "name:80:[::1]" is accepted and connects to ::1; "::1:80:[::1]" (a literal as the
+  * name) is rejected with "Couldn't parse CURLOPT_RESOLVE entry" and fails the request.
+  */
+  public static function resolve_entry( string $host, int $port, string $ip ): ?string {
+    if ( filter_var( self::canonical_host( $host ), FILTER_VALIDATE_IP ) !== false ) {
+      return null;
+    }
+    return $host . ':' . $port . ':' . ( strpos( $ip, ':' ) !== false ? '[' . $ip . ']' : $ip );
+  }
+
   /** A redirect target resolved against the URL that issued it. Pure string work; the result is then validated like any other URL. */
   public static function resolve_location( string $base, string $location ): string {
     $location = trim( $location );

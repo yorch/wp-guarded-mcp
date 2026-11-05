@@ -143,6 +143,15 @@ check( 'the filter does not open the never class', ( function () use ( $fetch ) 
   return $fetch( 'https://meta.example.com/', 'https://meta.example.com', true )['ok'];
 } )(), false );
 
+echo "-- resolve_entry (the CURLOPT_RESOLVE pin) --\n";
+check( 'a name pinned to an IPv4 address', GMCP_Diag_Util::resolve_entry( 'example.com', 443, '93.184.216.34' ), 'example.com:443:93.184.216.34' );
+check( 'a name pinned to an IPv6 address is bracketed', GMCP_Diag_Util::resolve_entry( 'example.com', 8080, '2606:2800:220:1:248:1893:25c8:1946' ), 'example.com:8080:[2606:2800:220:1:248:1893:25c8:1946]' );
+check( 'a name pinned to ::1 is bracketed', GMCP_Diag_Util::resolve_entry( 'dev.test', 80, '::1' ), 'dev.test:80:[::1]' );
+check( 'an IPv6 literal host has no entry (libcurl rejects "::1:80:[::1]")', GMCP_Diag_Util::resolve_entry( '::1', 80, '::1' ), null );
+check( 'a bracketed IPv6 literal host has no entry', GMCP_Diag_Util::resolve_entry( '[::1]', 80, '::1' ), null );
+check( 'an IPv4 literal host has no entry', GMCP_Diag_Util::resolve_entry( '127.0.0.1', 8223, '127.0.0.1' ), null );
+check( 'control: a name that merely contains digits and dots still gets one', GMCP_Diag_Util::resolve_entry( 'a1.2b.test', 80, '10.0.0.1' ), 'a1.2b.test:80:10.0.0.1' );
+
 echo "-- resolve_location --\n";
 foreach ( [
   [ 'https://example.com/a/b', '/c', 'https://example.com/c' ],

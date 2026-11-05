@@ -3385,6 +3385,48 @@ else
   echo "  ....  proxy bypass not checked: the site could not fetch its own front page here (${PV_DIRECT})"
 fi
 
+# The transport. Only cURL can pin, so when WordPress would use another transport the tool must
+# refuse BEFORE a request is made, not send it unpinned and throw the answer away. Two ways to
+# change the transport are exercised: Requests' public transport cache, and an action that sets
+# the transport for one request. The recording transport counts how often it was asked to send;
+# the control forces the same transport onto an ordinary request and must see it counted, or a
+# zero below could be a probe that cannot see anything.
+PV_TRANSPORT=$(docker compose exec -T cli wp eval '
+  if ( ! class_exists( "WpOrg\\Requests\\Requests" ) ) { echo "skip"; return; }
+  class H4Rec implements \WpOrg\Requests\Transport {
+    public static $n = 0;
+    public function request( $url, $headers = [], $data = [], $options = [] ) { self::$n++; return ( new \WpOrg\Requests\Transport\Fsockopen() )->request( $url, $headers, $data, $options ); }
+    public function request_multiple( $requests, $options ) { self::$n++; return []; }
+    public static function test( $capabilities = [] ) { return true; }
+  }
+  $force = static function ( &$url, &$headers, &$data, &$type, &$options ) { $options["transport"] = "H4Rec"; };
+  add_action( "requests-requests.before_request", $force, 10, 5 );
+  wp_remote_get( home_url( "/" ), [ "timeout" => 3 ] );
+  $control = H4Rec::$n;
+  H4Rec::$n = 0;
+  global $gmcp_core;
+  $t = new GMCP_Tools_Diagnostics( $gmcp_core );
+  $r = $t->handle_call( null, "wp_fetch_page", [ "url" => home_url( "/" ) ], 1 );
+  $hook_n = H4Rec::$n;
+  $hook_err = ! empty( $r["result"]["isError"] ) && strpos( (string) $r["result"]["content"][0]["text"], "not cURL" ) !== false ? "refused" : "not-refused";
+  remove_action( "requests-requests.before_request", $force, 10 );
+  \WpOrg\Requests\Requests::$transport = [ serialize( [ "ssl" => false ] ) => "WpOrg\\Requests\\Transport\\Fsockopen", serialize( [ "ssl" => true ] ) => "WpOrg\\Requests\\Transport\\Fsockopen" ];
+  $handed = 0;
+  add_filter( "pre_http_request", static function ( $pre ) use ( &$handed ) { $handed++; return $pre; } );
+  $r = $t->handle_call( null, "wp_fetch_page", [ "url" => home_url( "/" ) ], 1 );
+  $cache_err = ! empty( $r["result"]["isError"] ) && strpos( (string) $r["result"]["content"][0]["text"], "not cURL" ) !== false ? "refused" : "not-refused";
+  echo $control . "|" . $hook_n . "|" . $hook_err . "|" . $handed . "|" . $cache_err;' 2>/dev/null | tr -d '\r\n')
+if [ "$PV_TRANSPORT" = "skip" ]; then
+  echo "  ....  transport check not run: this WordPress has no WpOrg\\Requests"
+else
+  IFS='|' read -r PV_T_CONTROL PV_T_HOOKN PV_T_HOOKERR PV_T_HANDED PV_T_CACHEERR <<< "$PV_TRANSPORT"
+  check "control: a request forced onto the recording transport is counted by it" "$([ "${PV_T_CONTROL:-0}" -ge 1 ] && echo yes || echo no)" "yes"
+  check "a transport swapped in by an action: the tool refuses" "$PV_T_HOOKERR" "refused"
+  check "...and that transport was never asked to send" "$PV_T_HOOKN" "0"
+  check "the transport cache set to a non-cURL transport: the tool refuses" "$PV_T_CACHEERR" "refused"
+  check "...before the HTTP API was handed a request at all" "$PV_T_HANDED" "0"
+fi
+
 # The error log tool.
 call pv_log '{"jsonrpc":"2.0","id":430,"method":"tools/call","params":{"name":"wp_get_php_error_log","arguments":{"lines":5}}}'
 check "the log tool answers with a state, not a bare list" \

@@ -330,6 +330,51 @@ class GMCP_Tools_Diagnostics {
     return array_values( array_unique( $ips ) );
   }
 
+  /** The transports that can apply a CURLOPT_RESOLVE pin, by class name (WordPress 6.2 and later, then earlier). */
+  const CURL_TRANSPORTS = [ 'wporg\\requests\\transport\\curl', 'requests_transport_curl' ];
+
+  /**
+  * The transport the HTTP API will use for a request, and whether it can pin.
+  *
+  * Only cURL can be told to connect to an address chosen here (CURLOPT_RESOLVE); the others
+  * resolve the host name themselves, at connect time, which is exactly the gap the pin closes.
+  * WordPress picks its transport inside Requests (the http_api_transports filter no longer
+  * reaches it since 6.4), by a method that is not public, and a plugin can override the choice
+  * through the public Requests::$transport cache or through the requests-requests.before_request
+  * action. So the answer is asked of Requests itself and asked again at the last moment, in
+  * that action, instead of being inferred from the PHP extensions that happen to be loaded.
+  * Anything that cannot be determined is "not cURL": this fails closed.
+  *
+  * @param mixed $forced the 'transport' option if an earlier hook set one.
+  * @return array{curl:bool,name:string}
+  */
+  public static function effective_transport( bool $ssl, $forced = null ): array {
+    if ( !empty( $forced ) ) {
+      $name = is_object( $forced ) ? get_class( $forced ) : (string) $forced;
+      return [ 'curl' => in_array( strtolower( $name ), self::CURL_TRANSPORTS, true ), 'name' => $name ];
+    }
+    $req = class_exists( 'WpOrg\\Requests\\Requests' ) ? 'WpOrg\\Requests\\Requests' : ( class_exists( 'Requests' ) ? 'Requests' : '' );
+    if ( $req === '' ) {
+      return [ 'curl' => false, 'name' => 'unknown' ];
+    }
+    foreach ( [ 'get_transport_class', 'get_transport' ] as $method ) {
+      if ( !method_exists( $req, $method ) ) {
+        continue;
+      }
+      try {
+        $rm = new ReflectionMethod( $req, $method );
+        $rm->setAccessible( true );
+        $t = $rm->invoke( null, [ 'ssl' => $ssl ] );
+      }
+      catch ( \Throwable $e ) {
+        return [ 'curl' => false, 'name' => 'none' ];
+      }
+      $name = is_object( $t ) ? get_class( $t ) : (string) $t;
+      return [ 'curl' => in_array( strtolower( $name ), self::CURL_TRANSPORTS, true ), 'name' => $name === '' ? 'none' : $name ];
+    }
+    return [ 'curl' => false, 'name' => 'unknown' ];
+  }
+
   /**
   * One request, to an address that has already been checked, with the connection pinned to it.
   *
@@ -353,8 +398,10 @@ class GMCP_Tools_Diagnostics {
       if ( $url !== $check['url'] ) {
         return;
       }
-      $ip = $check['pin'];
-      $entry = $check['host'] . ':' . $check['port'] . ':' . ( strpos( $ip, ':' ) !== false ? '[' . $ip . ']' : $ip );
+      // null for a host that is itself an IP address: there is no name to resolve, so nothing
+      // to pin, and libcurl rejects "::1:80:[::1]" as an unparseable entry (and fails the whole
+      // request), so an IPv6 literal site could not be fetched at all with an entry here.
+      $entry = GMCP_Diag_Util::resolve_entry( $check['host'], (int) $check['port'], $check['pin'] );
       // No proxy, whatever the environment says. libcurl honours http_proxy / HTTPS_PROXY /
       // ALL_PROXY from the process environment when nothing is set on the handle, and a proxy
       // resolves the host name itself: CURLOPT_RESOLVE then pins nothing and the response is
@@ -362,7 +409,7 @@ class GMCP_Tools_Diagnostics {
       // off. Both must be accepted for the connection to count as pinned.
       $direct = curl_setopt( $handle, CURLOPT_PROXY, '' ) && curl_setopt( $handle, CURLOPT_NOPROXY, '*' );
       // Pin first: whatever else this does, the connection must go where the check looked.
-      if ( $direct && curl_setopt( $handle, CURLOPT_RESOLVE, [ $entry ] ) ) {
+      if ( $direct && ( $entry === null || curl_setopt( $handle, CURLOPT_RESOLVE, [ $entry ] ) ) ) {
         $pinned = true;
       }
       if ( defined( 'CURLOPT_PROTOCOLS' ) ) {
@@ -371,6 +418,22 @@ class GMCP_Tools_Diagnostics {
       curl_setopt( $handle, CURLOPT_FOLLOWLOCATION, false );
     };
     add_action( 'http_api_curl', $callback, 9999, 3 );
+    // The last word before the transport is chosen. An earlier hook can set the transport for
+    // this request; if it is not cURL the request is aborted here, before a connection is made,
+    // and the HTTP API turns the exception into an error.
+    $not_curl = null;
+    $guard = static function ( &$url, &$headers, &$data, &$type, &$options ) use ( $check, &$not_curl ) {
+      if ( $url !== $check['url'] ) {
+        return;
+      }
+      $t = self::effective_transport( stripos( (string) $url, 'https://' ) === 0, $options['transport'] ?? null );
+      if ( !$t['curl'] ) {
+        $not_curl = $t['name'];
+        $ex = class_exists( 'WpOrg\\Requests\\Exception' ) ? 'WpOrg\\Requests\\Exception' : ( class_exists( 'Requests_Exception' ) ? 'Requests_Exception' : '' );
+        throw $ex !== '' ? new $ex( 'transport is not cURL', 'gmcp_transport' ) : new \RuntimeException( 'transport is not cURL' );
+      }
+    };
+    add_action( 'requests-requests.before_request', $guard, PHP_INT_MAX, 5 );
     $response = wp_remote_get( $check['url'], [
       'timeout' => 8,
       'redirection' => 0,
@@ -383,7 +446,11 @@ class GMCP_Tools_Diagnostics {
       'decompress' => true,
     ] );
     remove_action( 'http_api_curl', $callback, 9999 );
+    remove_action( 'requests-requests.before_request', $guard, PHP_INT_MAX );
 
+    if ( $not_curl !== null ) {
+      return [ 'ok' => false, 'error' => 'The HTTP transport for this request is ' . $not_curl . ', not cURL, so the connection cannot be pinned to the address that was checked. Nothing was sent.' ];
+    }
     if ( is_wp_error( $response ) ) {
       return [ 'ok' => false, 'error' => $response->get_error_message() ];
     }
@@ -425,6 +492,13 @@ class GMCP_Tools_Diagnostics {
     }
 
     $home = home_url();
+    // Fail closed before anything is sent: the transport WordPress will actually use must be
+    // cURL, the only one that can pin. (request() asks again at the last moment, and discards
+    // the response if the pin was not applied, for whatever got past this.)
+    $transport = self::effective_transport( stripos( $home, 'https://' ) === 0 );
+    if ( !$transport['curl'] ) {
+      return $this->error( $r, 'Refused: the HTTP transport WordPress will use for this site is ' . $transport['name'] . ', not cURL. Only cURL can connect to the address that was checked (the others resolve the host name again when they connect), so nothing was requested.' );
+    }
     // A site that really does resolve its own name to a private address (split-horizon DNS)
     // can say so. The link-local and reserved ranges cannot be opened this way.
     $allow_private = (bool) apply_filters( 'gmcp_fetch_allow_private', false, $home );
