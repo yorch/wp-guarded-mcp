@@ -148,7 +148,13 @@ whole value from the log; the journal keeps its whole-field drop, because a part
 cannot be restored. The aggressive assignment scrub (any value after a secret-named key) belongs to
 the debug log only: in a record of what a call said it blanked ordinary prose. A value that is a
 documented placeholder (`password_here`, `YOUR_TOKEN_HERE`, `********`, `${VAR}`, `user:pass@`) is not
-a credential, with a counterpart test for each that a real-looking value under the same name still is. A post field that
+a credential, with a counterpart test for each that a real-looking value under the same name still is.
+The short one-line columns (the journal's `what` and `label()`, the audit log's change summary, target and
+reply) ask the wider `GMCP_Core::looks_credentialed()` (the scanner plus the assignment rule), because
+`password: hunter2` and `smtp_pwd=hunter` passed the scanner and were recorded in the clear in a column read
+by a read-level tool; over-redacting a label is the cheap direction. The journal's decision whether to KEEP a
+value for undo stays the narrow scanner (`unsafe_to_keep()`): a value it refuses to keep is a value it cannot
+restore. A stored `what` is re-checked when entries are listed, because it outlives the code that wrote it. A post field that
 fails is left out of `previous` and named in `redacted_fields`; a placeholder is never stored, because
 undo would write it over live content. Tune it against false positives as hard as against misses: an
 ordinary body that says "password" must stay undoable, and `.dev/journal-pure.php` holds that control.

@@ -276,7 +276,7 @@ class GMCP_Journal {
       self::record( [
         'kind' => 'option',
         'key' => $key,
-        'what' => "Option \"{$key}\" created",
+        'what' => 'Option "' . self::label( $key, 120 ) . '" created',
         'previous' => null,
         'absent' => true,
         'tool' => (string) ( $change['tool'] ?? '' ),
@@ -298,7 +298,7 @@ class GMCP_Journal {
     $entry = [
       'kind' => 'option',
       'key' => $key,
-      'what' => "Option \"{$key}\" changed",
+      'what' => 'Option "' . self::label( $key, 120 ) . '" changed',
       'tool' => (string) ( $change['tool'] ?? '' ),
       'call' => (string) ( $change['call'] ?? '' ),
     ];
@@ -494,7 +494,7 @@ class GMCP_Journal {
         'kind' => 'themod',
         'row' => $row,
         'key' => $one['key'],
-        'what' => 'Theme setting "' . mb_substr( $one['key'], 0, 60 ) . '" of "' . mb_substr( $theme, 0, 60 ) . '" ' . $verb,
+        'what' => 'Theme setting "' . self::label( (string) $one['key'], 60 ) . '" of "' . self::label( (string) $theme, 60 ) . '" ' . $verb,
         'absent' => $one['absent'],
         'tool' => (string) ( $change['tool'] ?? '' ),
         'call' => (string) ( $change['call'] ?? '' ),
@@ -706,7 +706,25 @@ class GMCP_Journal {
   */
   private static function label( string $text, int $len = 60 ): string {
     $cut = mb_substr( $text, 0, $len );
-    return GMCP_Credential_Scan::text_holds( $cut ) ? '[redacted]' : $cut;
+    // The wider test (GMCP_Core::looks_credentialed()), not the scanner alone. A title of
+    // "smtp_pwd=hunter" was quoted in the entry, and wp_list_changes is a read-level tool.
+    // Over-redacting a label is the cheap direction. This is NOT how the journal decides whether
+    // to keep a value for undo (unsafe_to_keep() is, and stays, the precise scanner): a value it
+    // refuses to keep is a value it cannot put back.
+    return GMCP_Core::looks_credentialed( $cut ) ? '[redacted]' : $cut;
+  }
+
+  /**
+  * A whole "what" line as it may be stored and shown: itself, or a plain sentence when it holds
+  * something credential-shaped.
+  *
+  * Applied when an entry is recorded (so an undo's "Undo of: ..." line, which copies the original's,
+  * cannot carry one forward) and again when entries are listed, because a stored entry outlives
+  * the code that wrote it: one recorded before the label was checked this way can still name a
+  * post by a title that is a credential.
+  */
+  private static function safe_what( string $what ): string {
+    return GMCP_Core::looks_credentialed( $what ) ? 'A change whose description held something credential-shaped (withheld).' : $what;
   }
 
   /**
@@ -770,6 +788,9 @@ class GMCP_Journal {
 
   private static function record( array $entry ): void {
     $entry['t'] = time();
+    if ( isset( $entry['what'] ) ) {
+      $entry['what'] = self::safe_what( (string) $entry['what'] );
+    }
     $entry['tool'] = (string) ( $entry['tool'] ?? '' );
     $entry['call'] = (string) ( $entry['call'] ?? GMCP_Changes::call_id() );
     // Minted here unless the caller already has one. A meta entry writes its snapshot row
@@ -809,7 +830,7 @@ class GMCP_Journal {
       // its title, which is the visitor's subject line. Rewritten on the way out rather than
       // trusted to have been written clean, because the stored row outlives the code that
       // wrote it.
-      $what = (string) ( $entry['what'] ?? '' );
+      $what = self::safe_what( (string) ( $entry['what'] ?? '' ) );
       if ( in_array( $entry['kind'] ?? '', [ 'post', 'meta', 'termrel' ], true ) && !empty( $entry['ID'] )
         && GMCP_Core::personal_data_post_guard( (int) $entry['ID'] ) !== true ) {
         $what = 'A form submission (#' . (int) $entry['ID'] . ') was changed. Its title and values are not shown.';

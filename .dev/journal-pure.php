@@ -164,6 +164,12 @@ class GMCP_Core {
   public static function redact_reversible( $v ) {
     return [ false, null ];
   }
+  // The real one is the scanner plus the debug log's assignment rule; here, the scanner plus a
+  // pattern for "a secret-looking name, a separator, something".
+  public static function looks_credentialed( $text ) {
+    return GMCP_Credential_Scan::text_holds( (string) $text )
+      || (bool) preg_match( '/(?:pass|pwd|secret|token|key)[A-Za-z0-9_.\-\[\]]*["\']?\s*(?:=>|=|:)\s*\S/i', (string) $text );
+  }
 }
 class GMCP_Audit {
   const CRON_HOOK = 'gmcp_t_cron';
@@ -442,6 +448,8 @@ $scan_cases = [
   'an Authorization header'                   => [ 'Send header Authorization: Bearer abcdefghijklmnop1234', true ],
   'a bare bearer token'                       => [ 'use Bearer eyabcdefghijklmnopqrstuv', true ],
   'an env-style assignment'                   => [ "DB_PASSWORD=s3cretpass99\nDB_HOST=localhost", true ],
+  'a "password: value" line'                  => [ 'login password: hunter2 and the rest', true ],
+  'a token behind a URL with a colon in it'   => [ 'redirect:https://x.test/cb?token=abc123def456', true ],
   'a token in a query string'                 => [ '<a href="https://x.test/?token=abc123def456">x</a>', true ],
   'a private key block'                       => [ "-----BEGIN RSA PRIVATE KEY-----\nMIIE", true ],
   'user information in a DSN'                 => [ 'mysql://root:pw123@db.local/x', true ],
@@ -617,6 +625,41 @@ post_change( 90, 'k8', [ 'post_title' => [ 'from' => 'Old', 'to' => 'x' ] ], "de
 check( 'a title that is itself a credential is not quoted in the "what" line', [ $journal_has( $SECRET_DEFINE ), last_entry()['what'] ], [ false, 'Post "[redacted]" changed: post_title' ] );
 post_change( 90, 'k9', [ 'post_title' => [ 'from' => 'Old', 'to' => 'x' ] ], 'Plain title' );
 check( 'CONTROL: an ordinary title is quoted', last_entry()['what'], 'Post "Plain title" changed: post_title' );
+
+echo "-- the wider test for one-line descriptions, and the narrow one for what undo keeps --\n";
+// A title that reads like an assignment but is not a shape the scanner recognises: six lowercase
+// letters, no digit. It is in the "what" line and the audit summary, both shown by read-level
+// tools, so it is withheld there. The value an undo would put back is judged by the scanner alone.
+$SECRET_SHORT = 'hunterz';
+post_change( 90, 'k10', [ 'post_title' => [ 'from' => 'Reset your password: easy guide', 'to' => 'x' ] ], 'smtp_pwd=' . $SECRET_SHORT );
+$e = last_entry();
+check( 'CONTROL: the scanner alone does not call that title a credential (so the wider test is what withholds it)', GMCP_Credential_Scan::text_holds( 'smtp_pwd=' . $SECRET_SHORT ), false );
+check( 'a title that is an assignment is not quoted in the "what" line', [ strpos( $e['what'], $SECRET_SHORT ), $e['what'] ], [ false, 'Post "[redacted]" changed: post_title' ] );
+check( 'CONTROL: the previous value, which only reads like prose about a password, is still kept for undo', $e['previous']['post_title'] ?? null, 'Reset your password: easy guide' );
+check( 'CONTROL: and its entry is reversible', GMCP_Journal::recent( 1 )[0]['reversible'], true );
+$observer->observe( [ 'kind' => 'option', 'op' => 'updated', 'id' => 'my_secret=' . $SECRET_SHORT, 'fields' => [ 'value' => [ 'from' => 'a', 'to' => 'b' ] ], 'tool' => 'wp_update_option', 'call' => 'k11' ] );
+check( 'an option named like an assignment is not quoted in the "what" line', [ strpos( last_entry()['what'], $SECRET_SHORT ), last_entry()['what'] ], [ false, 'Option "[redacted]" changed' ] );
+// An entry recorded before the check existed is re-read on the way out and on the way into an undo's line.
+update_option( GMCP_Journal::OPTION, [
+  [ 'id' => 'leg-cred', 't' => time(), 'kind' => 'post', 'ID' => 78, 'what' => 'Post "smtp_pwd=' . $SECRET_SHORT . '" changed: post_title', 'fields' => [ 'post_title' ], 'previous' => [ 'post_title' => 'x' ], 'tool' => 'wp_update_post', 'call' => 'kz1' ],
+  [ 'id' => 'leg-ok', 't' => time(), 'kind' => 'post', 'ID' => 78, 'what' => 'Post "Ordinary" changed: post_title', 'fields' => [ 'post_title' ], 'previous' => [ 'post_title' => 'x' ], 'tool' => 'wp_update_post', 'call' => 'kz2' ],
+], false );
+$by = [];
+foreach ( GMCP_Journal::recent( 10 ) as $row ) {
+  $by[ $row['id'] ] = $row;
+}
+check( 'CONTROL: a stored entry with an ordinary description is listed as it was', $by['leg-ok']['what'], 'Post "Ordinary" changed: post_title' );
+check( 'a stored entry whose description holds an assignment is listed withheld', [ strpos( $by['leg-cred']['what'], $SECRET_SHORT ), $by['leg-cred']['what'] ], [ false, 'A change whose description held something credential-shaped (withheld).' ] );
+$undone = GMCP_Journal::revert( 'leg-cred' );
+$undo_entry = null;
+foreach ( journal() as $row ) {
+  if ( ( $row['undoes'] ?? '' ) === 'leg-cred' ) {
+    $undo_entry = $row;
+  }
+}
+check( 'CONTROL: that stored entry can still be undone', $undone['ok'], true );
+check( "and the undo's own line does not carry the assignment forward", [ $undo_entry !== null, strpos( (string) ( $undo_entry['what'] ?? '' ), $SECRET_SHORT ) ], [ true, false ] );
+$GLOBALS['gmcp_t_options'][ GMCP_Journal::OPTION ] = [];
 
 $summary = json_decode( (string) GMCP_Changes::summarise( [ [ 'kind' => 'post', 'op' => 'updated', 'id' => 90, 'subject' => 'post', 'label' => 'Bearer ' . $SECRET_BEARER,
   'fields' => [ 'post_excerpt' => [ 'from' => $body_bearer, 'to' => 'A harmless excerpt' ], 'post_title' => [ 'from' => 'Plain', 'to' => 'Also plain' ] ] ] ], 16000 ), true );

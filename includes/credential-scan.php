@@ -336,17 +336,45 @@ final class GMCP_Credential_Scan {
       }
     }
 
-    // DB_PASSWORD=value and ?token=value: an unquoted assignment, secret-named outright only.
+    // DB_PASSWORD=value, ?token=value and "password: value": an unquoted assignment, secret-named
+    // outright only, and the value has to look like one (six characters with a digit, or sixteen),
+    // which is what keeps "Password: required" and "token=none" in prose unflagged.
+    //
+    // The name and separator are matched on their own and the value is read only for a secret name,
+    // so a value is never consumed on behalf of a name that is not one: "redirect:https://x?token=..."
+    // must still show the token, and "https://x" is not "https" assigned "//x". The value is read at
+    // most once per byte (a name that starts inside an earlier credential's span is skipped) and up
+    // to 512 bytes at a time, which keeps a text of "password=password=password=..." linear.
     $n = preg_match_all(
-      '/(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{1,63})[ \t]*=[ \t]*([^\s<>"\'&;,)]{6,})/',
+      '/(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{1,63})[ \t]*(?:=|:(?!\/\/))[ \t]*/',
       $plain, $m, PREG_SET_ORDER | PREG_OFFSET_CAPTURE
     );
     if ( $n === false ) {
       return null;
     }
+    $covered = 0;
     foreach ( $m as $one ) {
-      if ( self::name_strength( $one[1][0] ) === 2 && self::value_fits( 2, $one[2][0], false ) ) {
-        $add( $one[2][1], strlen( $one[2][0] ) );
+      $value_at = $one[0][1] + strlen( $one[0][0] );
+      if ( $one[0][1] < $covered || self::name_strength( $one[1][0] ) !== 2 ) {
+        continue;
+      }
+      $value = '';
+      for ( $from = $value_at; ; $from += 512 ) {
+        $got = preg_match( '/\G[^\s<>"\'&;,)]{1,512}/', $plain, $v, 0, $from );
+        if ( $got === false ) {
+          return null;
+        }
+        if ( !$got ) {
+          break;
+        }
+        $value .= $v[0];
+        if ( strlen( $v[0] ) < 512 ) {
+          break;
+        }
+      }
+      if ( strlen( $value ) >= 6 && self::value_fits( 2, $value, false ) ) {
+        $add( $value_at, strlen( $value ) );
+        $covered = $value_at + strlen( $value );
         if ( $first ) {
           return $spans;
         }

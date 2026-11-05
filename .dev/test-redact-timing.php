@@ -141,6 +141,11 @@ function child(): void {
     'x="  x 16 KB' => str_repeat( 'x="', 5461 ),
     'spaces' => 'a' . str_repeat( ' ', 65536 ) . 'b',
     'urls a:// x 16 KB' => str_repeat( 'a://', 4096 ),
+    'password= chained 64 KB' => str_repeat( 'password=', 7282 ),
+    'password: chained 64 KB' => str_repeat( 'password:', 7282 ),
+    'distinct names x=1 64 KB' => implode( ' ', array_map( function ( $i ) { return "n$i=1"; }, range( 1, 9000 ) ) ),
+    'distinct quoted names 64 KB' => implode( ' ', array_map( function ( $i ) { return "q$i=\"v\""; }, range( 1, 7000 ) ) ),
+    'define( chain 32 KB' => str_repeat( 'define("a","b") ', 2000 ),
   ];
 
   foreach ( $inputs as $label => $text ) {

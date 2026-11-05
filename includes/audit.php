@@ -615,9 +615,15 @@ class GMCP_Audit {
   * credential. For the columns that hold text a tool was handed or answered with (the target
   * a call names, the reply's first thousand characters), which no field name classifies.
   * Only text already cut to its storable length is passed, so the scan is bounded.
+  *
+  * Judged by GMCP_Core::looks_credentialed(), the scanner plus the debug log's assignment rule:
+  * these columns are short, and a reply or a target that reads "password: hunter2" was recorded
+  * in the clear because the scanner alone does not call that a credential. Over-redacting a
+  * reply costs a line of explanation; the arguments column, which is read for what the call
+  * said, uses the scanner alone and blanks only the span.
   */
   public static function scrub_text( string $text, string $instead ): string {
-    return $text !== '' && GMCP_Credential_Scan::text_holds( $text ) ? $instead : $text;
+    return $text !== '' && GMCP_Core::looks_credentialed( $text ) ? $instead : $text;
   }
 
   /**

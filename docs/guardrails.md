@@ -1458,14 +1458,18 @@ place, because a placeholder in `previous` would be written over live content by
 undo, which is the failure the option path's refill exists to prevent: a field that
 is not recorded is simply not restored. An entry whose every field was withheld is
 not reversible and says why. The same text test now covers the other kinds' string
-values, the title shown in an entry's "what" line, the audit log's change summary
-(short values and the post label), the arguments it stores (every string leaf, for
-the first 64,000 bytes, which is all that can be stored), the target column and the
-first thousand characters of a reply it keeps. The debug trace asks the same
-function. Not covered: an entry recorded before this check existed keeps whatever it
-recorded until the journal rolls past it, and the `gmcp_change` action, which a
-site's own code may hook, still carries the raw before and after values, because it
-is an in-process hook and not a store.
+values and the arguments the audit log stores (every string leaf, for the first 64,000
+bytes, which is all that can be stored, with only the credential replaced). The title
+shown in an entry's "what" line, the audit log's change summary (short values and the post
+label), its target column and the first thousand characters of a reply it keeps are held to a
+wider test, `GMCP_Core::looks_credentialed()`: the scanner, or anything that reads like an
+assignment under a secret-named word, because a label that says `smtp_pwd=hunter` or
+`password: hunter2` is read by a read-level tool and over-redacting a label is cheap. Whether
+to keep a value for undo stays the narrow scanner. The debug trace has its own, wider rule.
+Not covered: an entry recorded before these checks existed keeps the `previous` values it
+recorded until the journal rolls past it (its one-line description is re-checked each time
+entries are listed), and the `gmcp_change` action, which a site's own code may hook, still
+carries the raw before and after values, because it is an in-process hook and not a store.
 
 Undoing an edit never writes a status WordPress deletes on. A recorded earlier
 status of `trash` or `auto-draft` is not restored, by the same refusal the write

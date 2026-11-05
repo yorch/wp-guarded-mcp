@@ -78,6 +78,18 @@ does not cost a post its undo. Ordinary prose that mentions a password is record
 written, and so is a caller named by a key id: the approval events' `caller` is an
 identity, not a secret, and is never blanked.
 
+The short columns use a wider test than the arguments do. A target, a reply, a short changed
+value and a post label are read to see what happened, not to see what was said, so a string
+there is withheld when the scanner flags it OR when it reads like an assignment under a
+secret-named word (`GMCP_Core::looks_credentialed()`). The scanner alone passed
+`smtp_pwd=hunter` (six lowercase letters, no digit) and `password: hunter2` in a changed value,
+and the same call's arguments column said `password: [redacted]` while its changes column said
+`"to":"password: hunter2"`. The cost is a title such as "Reset your password: easy guide"
+showing as `[redacted]` in a label, which is chosen over the alternative. The journal uses the
+same wider test for the line it shows for an entry (and re-checks a stored line when it lists
+it), but not for deciding whether to keep a value for undo: that stays the narrow scanner, so
+an ordinary title about passwords is still put back byte for byte.
+
 One credential has no field name to give it away: a draft preview link, whose
 token rides in a URL. `redact()` therefore also scrubs the `gmcp_preview`
 parameter (whichever spelling of its name PHP maps to it) out of any string it is

@@ -297,6 +297,8 @@ echo "-- the matrix: inputs by channel --\n";
 // scanner must hide it (false = a documented gap the debug log still covers) ].
 $matrix = [
   [ 'an assignment with a digit', 'a smtp_pwd=hunter2x9 b', 'hunter2x9', true ],
+  [ 'a "password: value" line', 'the password: hunter2 end', 'hunter2', true ],
+  [ 'a token behind a URL that has a colon in it', 'redirect:https://x.test/cb?token=abc123def456 end', 'abc123def456', true ],
   [ 'a define() line', "see define('DB_PASSWORD','h8Kq2xLm9pQ') here", 'h8Kq2xLm9pQ', true ],
   [ 'JSON in a body', 'cfg {"api_key":"sk_live_abcdef1234567890"} end', 'abcdef1234567890', true ],
   [ 'an Authorization header', 'Authorization: Bearer abcdefghijklmnop12345678 x', 'abcdefghijklmnop12345678', true ],
@@ -313,6 +315,24 @@ foreach ( $matrix as [ $label, $text, $secret, $audit_hides ] ) {
   check( "audit args: $label", strpos( $in_audit, $secret ) === false, $audit_hides );
   check( "debug log: $label is hidden", strpos( GMCP_Core::log_text( $text ), $secret ), false );
 }
+
+echo "-- the matrix, continued: the short columns (changes, target, reply) use the wider test --\n";
+function changes_text( $to, string $label = 'Plain label' ): string {
+  return (string) GMCP_Changes::summarise( [ [ 'kind' => 'option', 'op' => 'updated', 'id' => 'blogdescription', 'subject' => 'option', 'label' => $label,
+    'fields' => [ 'value' => [ 'from' => 'before', 'to' => $to ] ] ] ], 16000 );
+}
+foreach ( $matrix as [ $label, $text, $secret, $audit_hides ] ) {
+  check( "audit changes (value): $label is hidden", strpos( changes_text( $text ), $secret ), false );
+  check( "audit changes (label): $label is hidden", strpos( changes_text( 'x', $text ), $secret ), false );
+  check( "audit target and reply: $label is hidden", strpos( GMCP_Audit::scrub_text( $text, '[redacted]' ), $secret ), false );
+}
+check( 'CONTROL: the changes column does carry a plain value and label', [ strpos( changes_text( 'A plain sentence' ), 'A plain sentence' ) !== false, strpos( changes_text( 'x', 'Plain label' ), 'Plain label' ) !== false ], [ true, true ] );
+check( 'CONTROL: a target and a reply that hold nothing are kept', [ GMCP_Audit::scrub_text( 'Option updated.', '[redacted]' ), GMCP_Audit::scrub_text( 'wp_update_option', '[redacted]' ) ], [ 'Option updated.', 'wp_update_option' ] );
+check( 'a value of "password: hunter2" is recorded as redacted, not as written', json_decode( changes_text( 'password: hunter2' ), true )[0]['fields']['value']['to'], '[redacted]' );
+check( 'a post title of "smtp_pwd=hunter" is recorded as redacted in the label', json_decode( changes_text( 'x', 'smtp_pwd=hunter' ), true )[0]['label'], '[redacted]' );
+check( 'a reply that says "password: hunter2" is withheld whole, with the reason', GMCP_Audit::scrub_text( 'Saved. password: hunter2', '[redacted: the reply held something credential-shaped]' ), '[redacted: the reply held something credential-shaped]' );
+check( 'CONTROL: the scanner alone passes a six-letter lowercase value (so the wider test is what covers a label like that)',
+  [ GMCP_Credential_Scan::text_holds( 'smtp_pwd=hunter' ), GMCP_Credential_Scan::text_holds( 'Our password: required' ) ], [ false, false ] );
 
 echo "\n$total checks, $fails failed\n";
 exit( min( 255, $fails ) );

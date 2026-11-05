@@ -1944,10 +1944,10 @@ class GMCP_Core {
   * Aggressive on purpose: any value after a secret-named key is blanked, whatever it looks like,
   * so "To reset your password: click the link" becomes "...password: [redacted] the link". That
   * is right for a log nobody should find a secret in, and wrong for a record of what a post said,
-  * which is why the audit log's arguments and the journal use GMCP_Credential_Scan (the shapes
-  * and assignments whose VALUE looks like a credential) and this is the debug log's. The audit
-  * log also asks it as a test, for the short free-text columns where over-redacting a label is
-  * cheaper than leaking one. @see log_text(), @see GMCP_Audit::scrub_text()
+  * which is why the audit log's arguments and the journal's undo records use GMCP_Credential_Scan
+  * (the shapes and assignments whose VALUE looks like a credential). The short free-text columns,
+  * where over-redacting a label is cheaper than leaking one, ask looks_credentialed(), which is
+  * this rule's assignment half joined to the scanner. @see log_line(), @see looks_credentialed()
   *
   * Still structural. A bare token with no key in front of it is not recognised, and this says so
   * rather than pretending otherwise.
@@ -1970,9 +1970,41 @@ class GMCP_Core {
       preg_replace( '/\b(Bearer|Basic)\s++[A-Za-z0-9._~+\/=-]{8,}+/i', '$1 ' . self::REDACTION_MARKER, $text ),
       $text
     );
-    if ( $text === self::UNSCRUBBABLE ) {
-      return $text;
+    return $text === self::UNSCRUBBABLE ? $text : self::scrub_assignments( $text );
+  }
+
+  /**
+  * Whether a short piece of free text should be withheld from a record of what changed: the
+  * scanner's answer (a credential by shape, or by the value after a secret-named name), or
+  * anything scrub_assignments() or the preview-link rule would change.
+  *
+  * Wider than the scanner on purpose, and only for the places where over-redacting costs a
+  * label: the audit log's target, reply and change summary, and the journal's one-line
+  * description of an entry. "password: hunter2" and "smtp_pwd=hunter" passed the scanner (the
+  * first has no assignment shape it recognises; the second is six lowercase letters) and were
+  * recorded in the clear in the changes column, the journal and wp_list_changes, which is a
+  * read-level tool. NOT used to decide whether the journal keeps a value for undo: a value it
+  * refuses to keep is a value it cannot restore, and the narrower scanner is what keeps ordinary
+  * edits undoable.
+  *
+  * Fails closed: when PCRE gives up, scrub_assignments() returns UNSCRUBBABLE, which differs.
+  */
+  public static function looks_credentialed( string $text ): bool {
+    if ( $text === '' ) {
+      return false;
     }
+    if ( GMCP_Credential_Scan::text_holds( $text ) ) {
+      return true;
+    }
+    $previews = self::scrub_preview_tokens( $text );
+    return $previews !== $text || self::scrub_assignments( $text ) !== $text;
+  }
+
+  /**
+  * The assignment half of scrub_written_text(): the value after a secret-named name replaced.
+  * @see scrub_written_text() for the rule and for why it is written the way it is.
+  */
+  public static function scrub_assignments( string $text ): string {
     $names = [];
     foreach ( (array) self::credential_field_patterns() as $pattern ) {
       if ( is_string( $pattern ) && $pattern !== '' && stripos( $text, $pattern ) !== false ) {

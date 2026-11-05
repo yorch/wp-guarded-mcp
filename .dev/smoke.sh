@@ -2000,6 +2000,53 @@ check "an event still blanks a credential in another argument" "$(printf %s "$AR
 wpe 'foreach ( get_posts( [ "title" => "AR probe", "post_status" => "any", "numberposts" => -1 ] ) as $p ) { wp_delete_post( $p->ID, true ); } $o=get_option("gmcp_options",[]);$o["mcp_activity_log"]=('"$AR_A_WAS"'===1);update_option("gmcp_options",$o,false);' >/dev/null
 check "put back: the probe posts are gone" "$(wpe 'echo count( get_posts( [ "title" => "AR probe", "post_status" => "any", "numberposts" => -1 ] ) );')" "0"
 
+echo "-- one-line descriptions: an assignment-shaped title, value or target is withheld in every column --"
+# The arguments column of an audit row, the changes column, the target column and the journal's one
+# line (shown by wp_list_changes, a read-level tool) each took their own test, and they disagreed:
+# wp_update_option {blogdescription: "password: ..."} had its argument scrubbed and its change
+# recorded as written, and a post titled "smtp_pwd=..." was quoted in the journal line, the changes
+# column and the target. Asserted on the stored rows, each with a control that finds a plain value
+# of the same kind in the same column. The journal keeps the OVERWRITTEN title for undo (that test
+# is the narrow one), so only the descriptions are checked for the secret, never the undo record.
+IL_J_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_change_journal"] ?? 0 ? 1 : 0;')
+IL_A_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_activity_log"] ?? 0 ? 1 : 0;')
+IL_DESC_WAS=$(wpe 'echo get_option("blogdescription");')
+wpe '$o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=true;$o["mcp_activity_log"]=true;update_option("gmcp_options",$o,false);delete_option("gmcp_journal");' >/dev/null
+IL_FIRST=$(wpe 'global $wpdb; echo (int) $wpdb->get_var("SELECT COALESCE(MAX(id),0) FROM " . GMCP_Audit::table());')
+IL_POST=$(wpe 'echo wp_insert_post(["post_title"=>"IL base post","post_status"=>"draft","post_content"=>"IL body"]);')
+il_call() { # il_call <tool> <arguments-json>
+  python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":sys.argv[1],"arguments":json.loads(sys.argv[2])}}))' "$1" "$2" > "$OUT/il.json"
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d @"$OUT/il.json" -o "$OUT/il_resp"
+}
+il_call wp_update_post '{"ID":'"$IL_POST"',"fields":{"post_title":"smtp_pwd=ilhunterq"}}'
+check "CONTROL: the title was written (the call ran)" "$(ptitle "$IL_POST")" "smtp_pwd=ilhunterq"
+il_call wp_update_post '{"ID":'"$IL_POST"',"fields":{"post_title":"IL plain title"}}'
+il_call wp_update_option '{"key":"blogdescription","value":"password: ilsecret9"}'
+check "CONTROL: the option value was written" "$(wpe 'wp_cache_flush(); echo get_option("blogdescription");')" "password: ilsecret9"
+il_call wp_update_option '{"key":"blogdescription","value":"IL plain description"}'
+il_call wp_create_post '{"post_title":"smtp_pwd=iltargetq","post_status":"draft"}'
+il_call wp_create_post '{"post_title":"IL plain target","post_status":"draft"}'
+IL_COLS() { # every column the audit log keeps except the arguments, for the rows of this block
+  wpe 'global $wpdb; $t = GMCP_Audit::table(); echo implode( "|", (array) $wpdb->get_col( "SELECT CONCAT_WS(\"|\", COALESCE(changes,\"\"), target, detail) FROM $t WHERE id > '"$IL_FIRST"' ORDER BY id" ) );'
+}
+IL_ROWS=$(IL_COLS)
+IL_LINES=$(wpe 'foreach ( GMCP_Journal::recent( 40 ) as $e ) { echo $e["what"], "|"; }')
+callk il_list "$TOK" "$(tool_json 2 wp_list_changes '{"limit":40}')"
+check "CONTROL: the audit rows were written, and carry a plain title in the changes column" "$(printf %s "$IL_ROWS" | grep -c 'IL plain title')" "1"
+check "CONTROL: a plain target is recorded in the target column" "$(printf %s "$IL_ROWS" | grep -c 'IL plain target')" "1"
+check "CONTROL: the journal describes the edits it recorded" "$(printf %s "$IL_LINES" | grep -c 'IL plain title')" "1"
+check "CONTROL: wp_list_changes answers with the journal's lines" "$([ "$(grep -c 'IL plain title' "$OUT/il_list")" -ge 1 ] && echo yes || echo no)" "yes"
+for IL_SECRET in ilhunterq ilsecret9 iltargetq; do
+  check "audit changes, target and reply: $IL_SECRET is not recorded" "$(printf %s "$IL_ROWS" | grep -c "$IL_SECRET")" "0"
+  check "journal one-line descriptions: $IL_SECRET is not recorded" "$(printf %s "$IL_LINES" | grep -c "$IL_SECRET")" "0"
+  check "wp_list_changes: $IL_SECRET is not repeated" "$(grep -c "$IL_SECRET" "$OUT/il_list")" "0"
+done
+check "CONTROL: the title each edit overwrote is still kept for undo (the narrow test), so both entries are reversible" \
+  "$(wpe 'wp_set_current_user( 1 ); add_filter( "gmcp_can_call_tool", "__return_true" ); $r = []; foreach ( GMCP_Journal::recent( 40 ) as $e ) { if ( $e["tool"] === "wp_update_post" ) { $r[] = $e["reversible"] ? "yes" : "no"; } } echo count( $r ) >= 2 ? implode( ",", array_unique( $r ) ) : "too few";')" "yes"
+wpe 'foreach ( get_posts( [ "title" => "smtp_pwd=iltargetq", "post_status" => "any", "numberposts" => -1 ] ) as $p ) { wp_delete_post( $p->ID, true ); } foreach ( get_posts( [ "title" => "IL plain target", "post_status" => "any", "numberposts" => -1 ] ) as $p ) { wp_delete_post( $p->ID, true ); } wp_delete_post( '"$IL_POST"', true ); update_option( "blogdescription", '"$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$IL_DESC_WAS")"' ); delete_option( "gmcp_journal" ); $o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=('"$IL_J_WAS"'===1);$o["mcp_activity_log"]=('"$IL_A_WAS"'===1);update_option("gmcp_options",$o,false);' >/dev/null
+check "put back: the fixtures are gone and the description is as it was" "$(wpe 'wp_cache_flush(); echo count( get_posts( [ "s" => "iltarget", "post_status" => "any", "numberposts" => -1 ] ) ), "/", get_option("blogdescription") === '"$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$IL_DESC_WAS")"' ? "same" : "changed";')" "0/same"
+
 echo "-- a form submission and a credential in one call: the withholding comes first --"
 # The change record for a personal-data post is withheld whole before anything else judges it, and
 # an ordinary post edited in the same call still gets the credential scan. Asserted on what the
