@@ -2048,6 +2048,18 @@ class GMCP_Tools_Core {
         ],
         'accessLevel' => 'write',
       ],
+      'wp_download_request' => [
+        'name' => 'wp_download_request',
+        'description' => 'Get a one-time URL to download an attachment\'s file from this site. Call it with the attachment ID; it returns a URL that serves the file once and expires after 5 minutes. Use this instead of reading bytes through a tool reply: a base64 body in a result would be copied into this plugin\'s own audit log and stay there for its retention window, where no field-name redaction can find a secret inside it. Read level, with one restriction: a file attached to a post that is NOT published can only be requested with an admin-level key, because uploads is a storage location rather than a public-data classification and a csv or pdf there can be a customer export. The endpoint streams the file, refuses anything that does not resolve inside this site\'s uploads directory, and refuses files over 20MB. Attachment IDs only: there is no path argument, because a path argument is how a download tool becomes a read of wp-config.php.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'ID' => [ 'type' => 'integer', 'minimum' => 1, 'description' => 'The attachment id, as returned by wp_get_media or wp_list_media.' ],
+          ],
+          'required' => [ 'ID' ],
+        ],
+        'accessLevel' => 'read',
+      ],
       'wp_update_media' => [
         'name' => 'wp_update_media',
         'description' => 'Update attachment meta.',
@@ -5366,7 +5378,54 @@ class GMCP_Tools_Core {
         }
         break;
 
-        /* ===== Media: update ===== */
+        case 'wp_download_request':
+        if ( empty( $a['ID'] ) ) {
+          $r = $this->error( $r, 'ID required', -32602 );
+          break;
+        }
+        $att = intval( $a['ID'] );
+        if ( get_post_type( $att ) !== 'attachment' ) {
+          $r = $this->error( $r, 'No attachment with ID ' . $att . '. This tool serves media only.', -32602 );
+          break;
+        }
+        // The authorization decision is made HERE, because this is the only place the caller's
+        // level exists: the download endpoint is authenticated by the token alone and carries
+        // no identity to make it with. A file attached to something unpublished is admin-only.
+        // A non-admin key needs a POSITIVE reason to be given the file, not the absence of a
+        // reason not to. The first version refused only a nonzero unpublished parent, so an
+        // unattached file (post_parent 0) passed — and an unattached export is exactly the case
+        // this rule exists for. So: a published, unprotected parent, or admin.
+        if ( GMCP_Core::caller_access_level() !== 'admin' ) {
+          $parent = (int) wp_get_post_parent_id( $att );
+          $parent_post = $parent > 0 ? get_post( $parent ) : null;
+          $parent_ok = $parent_post
+            && (string) $parent_post->post_status === 'publish'
+            && (string) $parent_post->post_password === '';
+          if ( !$parent_ok ) {
+            $r = $this->error( $r, 'A ' . GMCP_Core::caller_access_level() . '-level key can only download a file attached to a published, unprotected post. This file is ' . ( $parent > 0 ? 'attached to something that is not published or is password protected' : 'not attached to a post at all' ) . ', and uploads is a storage location rather than a public-data classification: a csv or pdf in it can be a customer export. An admin-level key can download it.', -32600 );
+            break;
+          }
+        }
+        // Single use is enforced by a conditional DELETE at redemption, which needs the token in
+        // the options table. A persistent object cache moves transients out of it, so the
+        // guarantee cannot be made on such a site; refused here rather than handed a URL that
+        // would be reusable.
+        if ( function_exists( 'wp_using_ext_object_cache' ) && wp_using_ext_object_cache() ) {
+          $r = $this->error( $r, 'This site uses a persistent object cache, so transients are not stored in the options table and a download token could not be consumed atomically. Refusing rather than issuing a link that may be usable more than once.', -32603 );
+          break;
+        }
+        $dl_token = wp_generate_password( 32, false );
+        set_transient( 'gmcp_download_' . $dl_token, [ 'ID' => $att, 'site' => get_current_blog_id() ], 5 * MINUTE_IN_SECONDS );
+        $dl_url = rest_url( 'mcp/v1/download/' . $dl_token );
+        $this->add_result_text( $r, wp_json_encode( [
+          'download_url' => $dl_url,
+          'expires_in' => '5 minutes',
+          'usage' => 'curl -L -o "' . basename( (string) get_attached_file( $att ) ) . '" "' . $dl_url . '"',
+          'note' => 'One use only. The file is streamed to you, so its bytes never pass through a tool reply or the audit log.',
+        ], JSON_PRETTY_PRINT ) );
+        break;
+
+      /* ===== Media: update ===== */
       case 'wp_update_media':
         if ( empty( $a['ID'] ) ) {
           $r = $this->error( $r, 'ID required', -32602 );

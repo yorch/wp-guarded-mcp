@@ -33,9 +33,25 @@ if ( !defined( 'ABSPATH' ) ) {
 * script injection primitive and a reconnaissance tool, and this plugin copies every reply
 * into its own audit log for the retention window. So the tools report the SHAPE: node types,
 * how many of each, how deep the tree is, and which keys a layout's settings hold — never a
-* value. There is no tool that writes layout data, at any level: it would be persistent
-* script injection with no restore tool behind it, which is the same reason the Elementor Pro
-* group has no Custom Code writer.
+* value. There is no tool that writes layout data, at any level, and that was decided against a
+* written proposal rather than for want of one. Three measured reasons, each of which killed a
+* narrower design that looked safe on its own:
+*
+*   1. Applying a saved template, or simply enabling the builder on a page, activates `html`
+*      modules and layout `js`/`css` that are ALREADY STORED. The caller never submits script;
+*      it picks a template that contains one. A module allowlist constrains new input and this
+*      route adds none.
+*   2. The change journal cannot undo a layout write. Its meta restore calls update_post_meta(),
+*      and GMCP_Core::layout_meta_refusal() refuses those keys during a tool call, so the
+*      plugin's own undo would be blocked by the plugin's own guard. A snapshot the tool writes
+*      is not a journal entry either, so wp_undo_change would not find it.
+*   3. A module allowlist does not prove non-executable content: `text`, `button` and `heading`
+*      all take values that can carry markup or a link, and nothing here has read Beaver's
+*      renderers to say otherwise.
+*
+* The smallest version that survived review was one plain-text field on an existing heading node
+* of a draft post, with a dedicated journal kind and a renderer audit. That is a great deal of
+* machinery for one field, so the group stays read-only and says so here.
 *
 * Module and template names are site configuration, so they are returned: knowing a page uses
 * `html` and `heading` modules is how an operator finds the page that is misbehaving. Which is

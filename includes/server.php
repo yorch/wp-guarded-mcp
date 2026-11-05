@@ -208,6 +208,15 @@ class GMCP_Server {
 
     // File upload endpoint for wp_upload_request
     // Uses a one-time token in the URL for authentication (no bearer header needed from curl)
+    // One-time download endpoint for wp_download_request. Same shape as /upload: the token in
+    // the URL is the whole credential, it is consumed on first use, and it was minted by an
+    // authorised tool call that had the caller's access level available.
+    register_rest_route( $this->namespace, '/download/(?P<token>[a-zA-Z0-9]+)', [
+      'methods' => 'GET',
+      'callback' => [ $this, 'handle_download' ],
+      'permission_callback' => '__return_true',
+      'show_in_index' => false,
+      ] );
     register_rest_route( $this->namespace, '/upload/(?P<token>[a-zA-Z0-9]+)', [
       'methods' => 'POST',
       'callback' => [ $this, 'handle_upload' ],
@@ -1860,6 +1869,89 @@ class GMCP_Server {
       'attachment_id' => $attachment_id,
       'url' => wp_get_attachment_url( $attachment_id ),
     ], 200 );
+  }
+
+  /**
+  * Serve one attachment to a one-time download token.
+  *
+  * The bytes are streamed, never returned as a tool result: a reply is copied into this
+  * plugin's chained audit log for its retention window, and base64 of a file cannot be
+  * redacted by field name.
+  */
+  public function handle_download( WP_REST_Request $request ) {
+    $token = (string) $request->get_param( 'token' );
+    $key = 'gmcp_download_' . $token;
+    $row = $token === '' ? '' : '_transient_' . $key;
+    global $wpdb;
+    // Read, then consume with a CONDITIONAL delete. A read followed by delete_transient() lets
+    // two concurrent requests both see the value and both stream the file, which defeats the
+    // one-use promise; here only the request whose DELETE matches the row wins, and the loser
+    // gets the same 403 as an expired token. Measured against the default options-backed
+    // transient; minting refuses when a persistent object cache would move it out of this table.
+    $stored = $row === '' ? null : $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $row ) );
+    if ( $stored === null ) {
+      return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired download token.' ], 403 );
+    }
+    $won = (int) $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", $row, $stored ) );
+    delete_option( '_transient_timeout_' . $key );
+    if ( $won !== 1 ) {
+      return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired download token.' ], 403 );
+    }
+    $data = maybe_unserialize( $stored );
+    if ( empty( $data['ID'] ) ) {
+      return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired download token.' ], 403 );
+    }
+
+    $file = $this->downloadable_file( (int) $data['ID'] );
+    if ( is_wp_error( $file ) ) {
+      return new WP_REST_Response( [ 'success' => false, 'message' => $file->get_error_message() ], 403 );
+    }
+    [ $path, $mime ] = $file;
+
+    nocache_headers();
+    header( 'X-Content-Type-Options: nosniff' );
+    header( 'Content-Type: ' . $mime );
+    header( 'Content-Length: ' . (string) filesize( $path ) );
+    header( 'Content-Disposition: attachment; filename="' . sanitize_file_name( basename( $path ) ) . '"' );
+    readfile( $path );
+    exit;
+  }
+
+  /**
+  * The file behind an attachment, checked again at serve time.
+  *
+  * Re-checked rather than trusted from the transient: the token is short-lived, the filesystem
+  * is not immutable, and a path that was inside uploads when the token was minted could have
+  * been replaced by a symlink since. Containment is tested on the REAL path against a directory
+  * boundary, so /uploads-evil does not pass for /uploads, and a file that resolves outside the
+  * site's uploads directory is refused rather than served.
+  *
+  * @return array{0:string,1:string}|WP_Error Path and mime type, or the refusal.
+  */
+  private function downloadable_file( int $attachment_id ) {
+    if ( get_post_type( $attachment_id ) !== 'attachment' ) {
+      return new WP_Error( 'gmcp_download', 'No attachment with that id.' );
+    }
+    $path = get_attached_file( $attachment_id );
+    if ( !is_string( $path ) || $path === '' ) {
+      return new WP_Error( 'gmcp_download', 'That attachment has no local file; it may be served from remote storage.' );
+    }
+    $real = realpath( $path );
+    if ( $real === false || !is_file( $real ) || !is_readable( $real ) ) {
+      return new WP_Error( 'gmcp_download', 'The attachment file is not readable on this server.' );
+    }
+    $uploads = wp_get_upload_dir();
+    $root = realpath( (string) ( $uploads['basedir'] ?? '' ) );
+    if ( $root === false || strpos( $real, $root . DIRECTORY_SEPARATOR ) !== 0 ) {
+      return new WP_Error( 'gmcp_download', 'The attachment file is not inside this site\'s uploads directory.' );
+    }
+    $size = filesize( $real );
+    if ( $size !== false && $size > 20 * MB_IN_BYTES ) {
+      return new WP_Error( 'gmcp_download', 'That file is larger than 20MB, which this endpoint will not stream. Fetch it from the site directly.' );
+    }
+    $type = wp_check_filetype( $real );
+    $mime = is_array( $type ) && !empty( $type['type'] ) ? (string) $type['type'] : 'application/octet-stream';
+    return [ $real, $mime ];
   }
   #endregion
 
