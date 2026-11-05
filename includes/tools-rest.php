@@ -9,11 +9,12 @@
 class GMCP_Tools_Rest {
   // Bump the suffix when build_schema_from_args() changes so old cached schemas are ignored.
   // v5: _fields advertised.
+  // v6: a resource whose route belongs to a guarded post type is not generated.
   //
   // Public, and a constant rather than a property, because GMCP_Core clears it on an
   // upgrade and the name has to have one home. Spelled out in two files, it is a name that
   // gets bumped in one of them.
-  const CACHE_KEY = 'gmcp_tools_cache_v5';
+  const CACHE_KEY = 'gmcp_tools_cache_v6';
   private $cache_key = self::CACHE_KEY;
   private $allowed = [ 'posts', 'pages', 'media' ];
 
@@ -35,6 +36,15 @@ class GMCP_Tools_Rest {
       $routes = $server->get_routes();
 
       foreach ( $this->allowed as $resource ) {
+        // A route that a guarded post type has taken over is not turned into tools at all.
+        // The names above are fixed, so today a guarded type cannot reach here; a plugin
+        // that registers one with show_in_rest and a rest_base of "posts", "pages" or
+        // "media" could make these tools read and write it through its own controller, past
+        // every guard the generic post tools ask. Not generating the tools is the answer
+        // that needs no second list of what to refuse. @see resource_is_guarded().
+        if ( $this->resource_is_guarded( $resource ) ) {
+          continue;
+        }
         $base = "/wp/v2/{$resource}";
         $item = "{$base}/(?P<id>[\d]+)";
 
@@ -130,6 +140,52 @@ class GMCP_Tools_Rest {
     }
 
     return array_merge( array_values( $cached ), $prevTools );
+  }
+
+  /**
+  * Whether a REST resource name belongs to a post type the generic post tools must not
+  * read or write: a form submission type, or a commerce type.
+  *
+  * Both lists, whatever the caller's level, because the tools are generated once and cached
+  * for every key. An order type is then also unavailable to an admin key here, which costs
+  * nothing: the WooCommerce tools are the way to read one.
+  */
+  private function resource_is_guarded( string $resource ): bool {
+    $guarded = array_merge(
+      array_map( 'strtolower', array_map( 'strval', GMCP_Core::personal_data_post_types() ) ),
+      GMCP_Core::commerce_post_types()
+    );
+    foreach ( get_post_types( [ 'show_in_rest' => true ], 'objects' ) as $type ) {
+      $base = $type->rest_base ? (string) $type->rest_base : (string) $type->name;
+      if ( $base === $resource && in_array( strtolower( (string) $type->name ), $guarded, true ) ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+  * A WHERE fragment, for WP_Query, that leaves out what the caller may not read: posts of the
+  * excluded types, and posts hanging from one (two levels up, which covers a media row, a
+  * revision or a child of a submission or an order).
+  *
+  * Installed around the REST dispatch of a list call. The listing is built by WordPress's own
+  * query, and its rows are filtered by what _fields leaves in them, so an id-based filter on
+  * the rows afterwards would miss every call that does not ask for the id.
+  */
+  public function exclude_unreadable_posts( $where ) {
+    global $wpdb;
+    $types = GMCP_Core::read_excluded_post_types();
+    if ( !$types ) {
+      return $where;
+    }
+    $in = implode( ',', array_map( function ( $type ) {
+      return "'" . esc_sql( $type ) . "'";
+    }, $types ) );
+    $root = "SELECT ID FROM {$wpdb->posts} WHERE post_type IN ({$in})";
+    return $where . " AND {$wpdb->posts}.post_type NOT IN ({$in})"
+      . " AND {$wpdb->posts}.post_parent NOT IN ({$root})"
+      . " AND {$wpdb->posts}.post_parent NOT IN (SELECT ID FROM {$wpdb->posts} WHERE post_parent IN ({$root}))";
   }
 
   private function build_schema_from_args( $args ) {
@@ -302,6 +358,14 @@ class GMCP_Tools_Rest {
       if ( empty( $args['id'] ) ) {
         return $this->error( $id, 'Missing parameter: id', -32602 );
       }
+      // The same read policies the generic post tools ask, about the post and about what it
+      // hangs from. The controller refuses an id of the wrong type with a 404 and so answers
+      // for a submission's own id, but a media row attached to one is a perfectly good
+      // attachment to the media controller, and an update or a delete replies with the row.
+      $held = GMCP_Core::post_read_guard( intval( $args['id'] ) );
+      if ( $held !== true ) {
+        return $this->error( $id, $held, -32600 );
+      }
       $path .= '/' . intval( $args['id'] );
     }
 
@@ -336,7 +400,20 @@ class GMCP_Tools_Rest {
       $request->set_body_params( $args );
     }
 
-    $response = rest_do_request( $request );
+    // A listing is filtered where it is built. Only for GET, and only for the lifetime of this
+    // one dispatch.
+    $listing = $method === 'GET' && $action === 'list';
+    if ( $listing ) {
+      add_filter( 'posts_where', [ $this, 'exclude_unreadable_posts' ] );
+    }
+    try {
+      $response = rest_do_request( $request );
+    }
+    finally {
+      if ( $listing ) {
+        remove_filter( 'posts_where', [ $this, 'exclude_unreadable_posts' ] );
+      }
+    }
 
     if ( is_wp_error( $response ) || $response->get_status() >= 400 ) {
       $error_obj = is_wp_error( $response ) ? $response : $response->as_error();

@@ -435,6 +435,51 @@ callas "$RO" r2 '{"jsonrpc":"2.0","id":1,"method":"resources/list"}'
 check "resources/list names no submission" "$(rawhas r2 "$M2-sub")" "no"
 check "CONTROL: and does list the ordinary post (the probe sees a row)" "$(rawhas r2 "$M2-ctl")" "yes"
 
+echo "-- the REST-generated tools --"
+REST_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_tools_rest"]??"unset";')
+setrest() { wpe '$o=get_option("gmcp_options",[]);$o["mcp_tools_rest"]='"$1"';update_option("gmcp_options",$o,false);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null; }
+setrest true
+callas "$RO" t0 '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+check "CONTROL: the REST tools are offered with the group on" \
+  "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"list_media","get_media","list_posts","list_pages"}-n) or True)' t0)" "True"
+callas "$RO" t1 "$(tc list_media '{"search":"'"$M2"'","per_page":100}')"
+check "list_media: answers" "$(verdict t1)" "ok"
+check "CONTROL: list_media finds the ordinary post's file" "$(has t1 "$M2-ctl-att")" "yes"
+check "list_media does not list a file attached to a submission" "$(has t1 "$M2-sub-att")" "no"
+check "nor one attached to an order, below admin" "$(has t1 "$M2-ord-att")" "no"
+callas "$RO" t2 "$(tc list_media '{"_fields":"id","per_page":100}')"
+check "with _fields naming only the id, the id of a submission's file is not listed" "$(has t2 "\"id\": $SUBATT")" "no"
+check "CONTROL: and the ordinary post's file id is" "$(has t2 "\"id\": $CTLATT")" "yes"
+callas "$RO" t3 "$(tc get_media "{\"id\":$SUBATT}")"
+check "get_media on a file attached to a submission is refused" "$(verdict t3)" "error"
+check "and it carries nothing of it" "$(has t3 "$M2-sub")" "no"
+callas "$RO" t3 "$(tc get_media "{\"id\":$CTLATT}")"
+check "CONTROL: get_media on a file attached to an ordinary post succeeds" "$(verdict t3)" "ok"
+callas "$RW" t4 "$(tc update_media "{\"id\":$SUBATT,\"title\":\"agent-retitled\"}")"
+check "update_media on a file attached to a submission is refused" "$(verdict t4)" "error"
+check "STORED: its title is unchanged" "$(wpe 'echo get_post('"$SUBATT"')->post_title;')" "$M2-sub-att-title"
+callas "$RW" t5 "$(tc update_media "{\"id\":$CTLATT,\"title\":\"agent-retitled\"}")"
+check "CONTROL: update_media on a file attached to an ordinary post succeeds" "$(verdict t5)" "ok"
+check "CONTROL: and STORED: its title changed" "$(wpe 'echo get_post('"$CTLATT"')->post_title;')" "agent-retitled"
+callas "$RO" t6 "$(tc get_posts "{\"id\":$SUB}")"
+check "get_posts on a submission's id is refused" "$(verdict t6)" "error"
+check "and returns nothing of it" "$(has t6 "$M2-sub")" "no"
+# A route that a guarded type has taken over is not turned into tools at all.
+wpe 'update_option("gmcp_smoke_guard_pages",1);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null
+callas "$RO" t7 '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+check "when the page type is a guarded type, no tool is generated for the pages route" \
+  "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"list_pages","get_pages"}&n) or "none")' t7)" "none"
+check "CONTROL: and the posts route still is" \
+  "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"list_posts","get_posts"}-n) or "present")' t7)" "present"
+wpe 'delete_option("gmcp_smoke_guard_pages");delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null
+callas "$RO" t8 '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+check "CONTROL: with the option removed the pages tools are back" \
+  "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"list_pages","get_pages"}-n) or "present")' t8)" "present"
+if [ "$REST_WAS" = unset ]; then
+  wpe '$o=get_option("gmcp_options",[]);unset($o["mcp_tools_rest"]);update_option("gmcp_options",$o,false);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null
+else
+  setrest "$REST_WAS"
+fi
 wpe 'foreach(["gmcp_smoke_channel","gmcp_smoke_shared","category"] as $tx){foreach(get_terms(["taxonomy"=>$tx,"hide_empty"=>false,"search"=>"'"$M2"'"]) as $t){wp_delete_term($t->term_id,$tx);}}foreach(get_comments(["search"=>"'"$M2"'","status"=>"all"]) as $c){wp_delete_comment($c->comment_ID,true);}' >/dev/null
 docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-smoke-forms-rel.php >/dev/null 2>&1
 
