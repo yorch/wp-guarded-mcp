@@ -2,12 +2,12 @@
 # Smoke test for the form-submission tools: Contact Form 7 (with Flamingo), Fluent Forms and
 # Ninja Forms, plus the generic-reader guard they depend on.
 #
-# STATUS: UNRUN. Written on a machine with no Docker daemon and none of the three plugins
-# installed, from memory of how each stores a submission. Every storage assumption is marked
-# UNVERIFIED in includes/tools-forms.php. The seeding code below calls each plugin's own
-# writer where one is believed to exist, and those calls are the likeliest lines to be wrong:
-# a seeding failure here is reported as a seeding failure, not as a failure of the tool. Run
-# it, read each failure, and decide which it is.
+# STATUS: written blind, then run against the real Contact Form 7 6.2.4.1 + Flamingo 2.6.4,
+# Fluent Forms 6.2.17 and Ninja Forms 3.16.0 on a SQLite stack (no Docker). Their storage matched
+# what the tools read. Two checks fail there for an environmental reason: the Fluent block
+# simulates a missing table with RENAME TABLE, which the SQLite drop-in does not perform, so
+# "readable is false" and "counts are null" need MySQL or MariaDB. Seeds go through each
+# plugin's own writer where one exists (Flamingo_Inbound_Message::add, wpcf7_flamingo_add_channel).
 #
 # BLOCK 0 needs no form plugin at all. It builds posts of the submission post types by hand
 # and proves the generic readers refuse them, because that guard is in the always-on content
@@ -216,10 +216,23 @@ else
   check "the cf7 tools are offered" \
     "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"cf7_messages_briefing","cf7_list_messages","cf7_get_message"}-n) or True)' cf_list)" "True"
   # A form with a typed field and one whose name looks credential-shaped, saved through CF7.
-  FORM_SLUG=$(wpe '$f=WPCF7_ContactForm::get_template();$f->set_title("Smoke form");$f->set_properties(["form"=>"[text* your-name] [email* your-email] [text api-key] [textarea your-message]"]);$f->save();echo $f->name();')
-  echo "  Form slug: $FORM_SLUG"
-  # Seeded through Flamingo's own writer (signature UNVERIFIED).
-  MID=$(wpe '$m=Flamingo_Inbound_Message::add(["channel"=>"'"$FORM_SLUG"'","subject"=>"Smoke subject","from"=>"Ann <ann@example.test>","from_name"=>"Ann","from_email"=>"ann@example.test","fields"=>["your-name"=>"Ann Smoke","your-email"=>"ann@example.test","api-key"=>"CF7KEYLEAK","your-message"=>"hello there","not-in-form"=>"CF7ORPHAN"],"meta"=>["remote_ip"=>"203.0.113.77","user_agent"=>"UA-SMOKE-MARK"],"akismet"=>null,"spam"=>false]);echo is_object($m)?$m->id():0;')
+  # A form is saved through CF7, and given a Flamingo channel the way CF7 itself does it on the
+  # first stored message (modules/flamingo.php, wpcf7_flamingo_submit): the channel term is
+  # made by wpcf7_flamingo_add_channel() and its id is kept in the form post's _flamingo meta.
+  # That link, not the slug, is what ties a message to its form. Verified against Contact
+  # Form 7 6.2.4.1 and Flamingo 2.6.4. cf7_seed <title> <form-template> <additional-settings>
+  # prints "form_id:slug".
+  cf7_seed() {
+    local php='$f=WPCF7_ContactForm::get_template();$f->set_title("__T__");$f->set_properties(["form"=>"__F__","additional_settings"=>"__S__"]);$f->save();$id=$f->id();$slug=get_post($id)->post_name;$ch=wpcf7_flamingo_add_channel($slug,"__T__");update_post_meta($id,"_flamingo",["channel"=>$ch]);echo $id.":".$slug;'
+    php="${php//__T__/$1}"; php="${php//__F__/$2}"; php="${php//__S__/$3}"
+    wpe "$php"
+  }
+  FORM_SEED=$(cf7_seed "Smoke form" "[text* your-name] [email* your-email] [text api-key] [textarea your-message] [text your-subject]" "")
+  FORM_ID="${FORM_SEED%%:*}"; FORM_SLUG="${FORM_SEED#*:}"
+  echo "  Form $FORM_ID, slug: $FORM_SLUG"
+  CLEAN="$CLEAN $FORM_ID"
+  # Seeded through Flamingo's own writer (signature verified against Flamingo 2.6.4).
+  MID=$(wpe '$m=Flamingo_Inbound_Message::add(["channel"=>"'"$FORM_SLUG"'","subject"=>"Smoke subject","from"=>"Ann <ann@example.test>","from_name"=>"Ann","from_email"=>"ann@example.test","fields"=>["your-name"=>"Ann Smoke","your-email"=>"ann@example.test","api-key"=>"CF7KEYLEAK","your-message"=>"hello there","your-subject"=>"Smoke subject","not-in-form"=>"CF7ORPHAN"],"meta"=>["remote_ip"=>"203.0.113.77","user_agent"=>"UA-SMOKE-MARK"],"akismet"=>null,"spam"=>false]);echo is_object($m)?$m->id():0;')
   echo "  Message: $MID"
   CLEAN="$CLEAN $MID"
   if [ "${MID:-0}" = "0" ]; then
@@ -260,6 +273,55 @@ else
     call cf_s "$(tc cf7_list_messages '{"search":"Ann"}')"
     check "an extra search argument does not turn into a search (the unfiltered count is returned)" \
       "$(jget cf_s total)" "$(jget cf_list_a total)"
+
+    echo "-- the subject is only returned when it is the visitor's own your-subject --"
+    check "CONTROL: a default form returns its subject (the probe sees one that is allowed)" "$(jget cf_get message.subject)" "Smoke subject"
+    # A form whose flamingo_subject template carries the IP address and user agent, so the
+    # stored _subject (what Flamingo builds with wpcf7_mail_replace_tags) contains both.
+    SEED2=$(cf7_seed "Smoke form tpl" "[text your-name] [text your-subject]" 'flamingo_subject: \"Enquiry from [_remote_ip] [_user_agent]\"')
+    F2ID="${SEED2%%:*}"; F2SLUG="${SEED2#*:}"; CLEAN="$CLEAN $F2ID"
+    MID2=$(wpe '$m=Flamingo_Inbound_Message::add(["channel"=>"'"$F2SLUG"'","subject"=>"Enquiry from 203.0.113.99 UA-TPL-MARK","from"=>"Bo <bo@example.test>","from_name"=>"Bo","from_email"=>"bo@example.test","fields"=>["your-name"=>"Bo Smoke","your-subject"=>"typed subject"],"meta"=>["remote_ip"=>"203.0.113.99","user_agent"=>"UA-TPL-MARK"],"akismet"=>null,"spam"=>false]);echo is_object($m)?$m->id():0;')
+    CLEAN="$CLEAN $MID2"
+    check "CONTROL: the template really is stored on the form, and the IP really is in the stored subject" \
+      "$(wpe 'echo get_post_meta('"$MID2"',"_subject",true);')" "Enquiry from 203.0.113.99 UA-TPL-MARK"
+    check "CONTROL: the form reports that template" "$(wpe 'echo wpcf7_strip_quote(WPCF7_ContactForm::get_instance('"$F2ID"')->pref("flamingo_subject"));')" "Enquiry from [_remote_ip] [_user_agent]"
+    call cf_get2 "$(tc cf7_get_message "{\"message_id\":$MID2}")"
+    check "get succeeds" "$(verdict cf_get2)" "ok"
+    check "the subject is not returned when the template is not the default" "$(jget cf_get2 message.subject)" "null"
+    check "the IP address from the subject is not in the reply" "$(has cf_get2 "203.0.113.99")" "no"
+    check "the user agent from the subject is not in the reply" "$(has cf_get2 "UA-TPL-MARK")" "no"
+    check "and the reply says the subject was withheld" "$(has cf_get2 "Withheld")" "yes"
+    check "CONTROL: the ordinary answer on that form is still returned" "$(has cf_get2 "Bo Smoke")" "yes"
+
+    echo "-- a form is found through its channel link, not its slug --"
+    # F1 owns the message through its _flamingo link and types doc as a FILE (never returned).
+    # F1 is then renamed, and F3 takes F1's old slug and types the same name as plain text.
+    SEED1=$(cf7_seed "Smoke linked form" "[file doc] [text who]" "")
+    F1ID="${SEED1%%:*}"; F1SLUG="${SEED1#*:}"; CLEAN="$CLEAN $F1ID"
+    MID3=$(wpe '$m=Flamingo_Inbound_Message::add(["channel"=>"'"$F1SLUG"'","subject"=>"s","from"=>"c <c@example.test>","from_name"=>"c","from_email"=>"c@example.test","fields"=>["doc"=>"DOCVALUE-FROM-FILE-FIELD","who"=>"Cy Smoke"],"meta"=>["remote_ip"=>"203.0.113.5","user_agent"=>"u"],"akismet"=>null,"spam"=>false]);echo is_object($m)?$m->id():0;')
+    CLEAN="$CLEAN $MID3"
+    wpe 'wp_update_post(["ID"=>'"$F1ID"',"post_name"=>"smoke-renamed-'"$RANDOM"'"]);' >/dev/null
+    SEED3=$(cf7_seed "Smoke impostor form" "[text doc] [text who]" "")
+    F3ID="${SEED3%%:*}"; CLEAN="$CLEAN $F3ID"
+    wpe 'delete_post_meta('"$F3ID"',"_flamingo");wp_update_post(["ID"=>'"$F3ID"',"post_name"=>"'"$F1SLUG"'"]);' >/dev/null
+    check "CONTROL: the impostor form now holds the message channel's slug, and the real one does not" \
+      "$(wpe 'echo get_post('"$F3ID"')->post_name==="'"$F1SLUG"'" && get_post('"$F1ID"')->post_name!=="'"$F1SLUG"'" ? "swapped":"not swapped";')" "swapped"
+    call cf_get3 "$(tc cf7_get_message "{\"message_id\":$MID3}")"
+    check "get succeeds" "$(verdict cf_get3)" "ok"
+    check "the answer the LINKED form types as a file is withheld, not typed by the slug-matched form" "$(has cf_get3 "DOCVALUE-FROM-FILE-FIELD")" "no"
+    check "CONTROL: a plain-text answer on the linked form is returned" "$(has cf_get3 "Cy Smoke")" "yes"
+
+    echo "-- a field name with capitals is answered under its lower-cased stored key --"
+    # Flamingo stores sanitize_key( '_field_' . name ), so Your-Name is _field_your-name. The
+    # answer must be returned, and a credential-shaped capitalised name must still be withheld.
+    SEED4=$(cf7_seed "Smoke caps form" "[text Your-Name] [text API-Key]" "")
+    F4ID="${SEED4%%:*}"; F4SLUG="${SEED4#*:}"; CLEAN="$CLEAN $F4ID"
+    MID4=$(wpe '$m=Flamingo_Inbound_Message::add(["channel"=>"'"$F4SLUG"'","subject"=>"s","from"=>"d <d@example.test>","from_name"=>"d","from_email"=>"d@example.test","fields"=>["Your-Name"=>"Dee Capital","API-Key"=>"CAPSKEYLEAK"],"meta"=>["remote_ip"=>"203.0.113.6","user_agent"=>"u"],"akismet"=>null,"spam"=>false]);echo is_object($m)?$m->id():0;')
+    CLEAN="$CLEAN $MID4"
+    check "CONTROL: Flamingo stored the answer under the lower-cased key" "$(wpe 'echo get_post_meta('"$MID4"',"_field_your-name",true);')" "Dee Capital"
+    call cf_get4 "$(tc cf7_get_message "{\"message_id\":$MID4}")"
+    check "the capitalised field's answer is returned" "$(has cf_get4 "Dee Capital")" "yes"
+    check "the capitalised credential-shaped answer is still withheld" "$(has cf_get4 "CAPSKEYLEAK")" "no"
   fi
 
   echo "-- log_state: Flamingo gone --"
@@ -303,6 +365,14 @@ else
     check "the briefing works at read and is counts only" "$(verdict ff_bro)" "ok"
     check "and carries a readable log_state" "$(jget ff_bro log_state.readable)" "true"
     check "and returns no answer" "$(has ff_bro "Fiona Smoke")" "no"
+    # delete_entry_on_submission exists in Fluent Forms (formSettings in fluentform_form_meta).
+    # A form set to it keeps nothing, so log_state names it instead of letting a zero stand.
+    check "log_state lists no form that deletes entries when none is set" "$(jget ff_bro log_state.forms_that_delete_entries_on_submission)" "[]"
+    wpe 'wpFluent()->table("fluentform_form_meta")->insert(["form_id"=>'"$FFID"',"meta_key"=>"formSettings","value"=>json_encode(["delete_entry_on_submission"=>"yes"])]);' >/dev/null
+    check "CONTROL: the setting is stored where Fluent keeps it" "$(wpe 'global $wpdb;echo $wpdb->get_var("SELECT value FROM '"${PFX}"'fluentform_form_meta WHERE form_id='"$FFID"' AND meta_key=\"formSettings\"");')" '{"delete_entry_on_submission":"yes"}'
+    callas "$RO" ff_bro2 "$(tc fluentform_briefing '{}')"
+    check "log_state now names the form that deletes entries on submission" "$(jget ff_bro2 log_state.forms_that_delete_entries_on_submission)" "[$FFID]"
+    wpe 'wpFluent()->table("fluentform_form_meta")->where("form_id",'"$FFID"')->where("meta_key","formSettings")->delete();' >/dev/null
     # A form whose definition is broken fails closed.
     wpe 'wpFluent()->table("fluentform_forms")->where("id",'"$FFID"')->update(["form_fields"=>"{broken"]);' >/dev/null
     call ff_badform "$(tc fluentform_get_entry "{\"entry_id\":$FSID}")"

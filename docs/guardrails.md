@@ -890,8 +890,12 @@ Read only, and the absence of a write is the design. As with Gravity Forms, a su
 the one record on the site a member of the public wrote. Unlike Gravity Forms there is no
 tool here that edits, trashes, marks as spam or deletes one, because nothing in this plugin
 can verify such a write against these three plugins and there is no restore tool behind it.
-As with the other groups, the storage described below is from memory and marked UNVERIFIED in
-`includes/tools-forms.php`; the suite `smoke-forms.sh` was written and not run.
+The storage of Contact Form 7 + Flamingo, Fluent Forms and Ninja Forms was checked against the
+real plugins (Contact Form 7 6.2.4.1, Flamingo 2.6.4, Fluent Forms 6.2.17, Ninja Forms 3.16.0)
+by running `smoke-forms.sh` on them; two of its checks (the ones that simulate a missing table
+with `RENAME TABLE`) cannot pass on a SQLite stack, which does not perform that statement, and
+need MySQL or MariaDB. Items still marked UNVERIFIED in `includes/tools-forms.php` were not
+re-read.
 
 - **The three briefings are `read` and return counts only; every tool that returns a
   submission is `admin`.** Same split as `gf_forms_briefing` against `gf_list_entries`. A
@@ -910,12 +914,30 @@ As with the other groups, the storage described below is from memory and marked 
   file-upload fields fail by not being on the list, and are named in a `withheld` list so the
   absence is visible. A field that was answered but has since been removed from the form is
   withheld, because nothing says what it was. If the definition cannot be read, no answer is
-  returned. This is the shape the WP Activity Log group arrived at after a denylist returned
+  returned. Two details of Contact Form 7 matter and were found by reading its source and
+  Flamingo's. The form a message belongs to is found through the form post's own
+  `_flamingo` meta (`['channel' => term id]`, written when the form first stores a message),
+  not through the channel's slug: a slug is only the form's name when the term was made, and
+  `get_page_by_path()` on it picks a different form once one is renamed and another takes the
+  old name, whose field types would then decide what is returned. The slug is used only for a
+  form with no channel link at all (an imported or hand-made message), never for one linked
+  elsewhere. And Flamingo stores each answer under `sanitize_key( '_field_' . name )`, which
+  lower-cases, so the allowlist is keyed the same way: a field named `Your-Name` is returned
+  and one named `API-Key` is still withheld as credential-shaped. Before this, a capitalised
+  name matched nothing and its answer was withheld for the wrong reason. This is the shape the WP Activity Log group arrived at after a denylist returned
   a credential, and it costs the same: a legitimate field is occasionally withheld, because
   its name contains `pass`, `key` or `auth`. That is the right way round.
 - **No IP address, user agent or referring URL is returned, at any level.** They are in the
   plugins' storage and are never selected: the Fluent and Ninja queries name their columns,
   and the Flamingo reader takes only `_field_*` meta, never the `_meta` row that holds them.
+  The one other place they can get in is the message's mail **subject**, and it is handled:
+  Flamingo does not store what a visitor typed, it stores `wpcf7_mail_replace_tags()` of the
+  form's `flamingo_subject` setting, which may be `Enquiry from [_remote_ip] ([_user_agent])` or
+  contain any answer. `cf7_get_message` therefore returns the subject only when the form's
+  template is exactly the default `[your-subject]` and that field is one the answer filter
+  would return; otherwise `subject` is `null` and `subject_note` says it was withheld. A site
+  that filters `wpcf7_flamingo_get_value` can make the stored text anything, which is not
+  visible from here.
 - **No search over answers.** A text search over submissions is an oracle: "does any entry
   contain `diff@`" confirms a value no tool will print, one guess at a time. Filters are by
   form, status and date only. This is the reason Gravity Forms' own search was rebuilt
@@ -958,6 +980,13 @@ As with the other groups, the storage described below is from memory and marked 
   `wp_get_post_meta`, `wp_read_post_meta_chunk`, `wp_get_comments` and, now, the copy tools
   and the resource; that guard applies below admin level only, whereas the form-submission
   guard applies at every level (an admin key uses the form tools).
+- **Fluent Forms has a setting that keeps no entries, and `fluentform_briefing` reports it.**
+  `formSettings.delete_entry_on_submission` (a form's settings JSON in `fluentform_form_meta`,
+  default `no`) deletes each entry as it is stored, and `delete_after_x_days` with
+  `auto_delete_days` purges old ones. A zero for such a form means nothing, so `log_state` lists
+  the forms with the first setting and the forms with the second (and a `null` means the settings
+  could not be read, not that none is set). Ninja Forms' equivalent is the "has an active action
+  that records submissions" check below.
 - **Fluent Forms and Ninja Forms tables are checked for existence before a count.**
   Fluent stores answers as one JSON document per submission and the schema as JSON on the
   form; a schema that does not parse means no answers. Ninja Forms is told whether each form

@@ -181,7 +181,10 @@ trashed or deleted.** A counts-only briefing per plugin at `read`; listing and r
 individual submissions at `admin`, because a submission is personal data a member of the
 public wrote. Only fields present in the form's current definition and of a plain-input type
 are returned (an allowlist), password and file-upload answers are named but never returned,
-and IP addresses, user agents and referring URLs are never returned at any level. There is
+and IP addresses, user agents and referring URLs are never returned at any level (which includes
+the Contact Form 7 mail subject: Flamingo builds it from a template that can contain them, so it is
+returned only when the form uses the default `[your-subject]`, and otherwise withheld with a note;
+Fluent Forms' own setting that deletes entries on submission is reported, since a zero for such a form means nothing). There is
 no search over answers, because a text search over submissions is an oracle for the values
 withheld. Every reply carries a `log_state` block that separates "none arrived" from "the
 plugin that stores them is not installed", "its table is missing" and, for Ninja Forms, "this
