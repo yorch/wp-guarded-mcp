@@ -1419,6 +1419,22 @@ check "...and the posts were left standing" "$(docker compose exec -T cli wp eva
 docker compose exec -T cli wp eval 'foreach ( get_posts( [ "post_type" => "post", "post_status" => "any", "numberposts" => -1, "s" => "BMX batch" ] ) as $p ) { wp_delete_post( $p->ID, true ); }' >/dev/null 2>&1
 docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
 
+echo "-- the theme mod readers answer --"
+# Both called $this->json(), a method this class does not have, so every call ended in
+# "Call to undefined method GMCP_Tools_Core::json()". Present at 7b966ad; nothing exercised them.
+docker compose exec -T cli wp eval 'set_theme_mod( "tmx_plain", "TMX-VISIBLE-VALUE" ); set_theme_mod( "tmx_api_key", "TMX-SECRET-VALUE" );' >/dev/null 2>&1
+check "control: the theme mods are stored" "$(docker compose exec -T cli wp eval 'echo get_theme_mod( "tmx_plain" ) . "|" . get_theme_mod( "tmx_api_key" );' 2>/dev/null | tr -d '\r\n')" "TMX-VISIBLE-VALUE|TMX-SECRET-VALUE"
+call tm1 '{"jsonrpc":"2.0","id":9301,"method":"tools/call","params":{"name":"wp_get_theme_mod","arguments":{"key":"tmx_plain"}}}'
+check "wp_get_theme_mod is not an error" "$(verdict tm1)" "ok"
+check "...and returns the stored value" "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["content"][0]["text"])' tm1)" '"TMX-VISIBLE-VALUE"'
+call tm2 '{"jsonrpc":"2.0","id":9302,"method":"tools/call","params":{"name":"wp_get_theme_mod","arguments":{"key":"tmx_api_key"}}}'
+check "a credential-named theme mod is blanked in the reply" "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["content"][0]["text"])' tm2)" '"[redacted]"'
+call tm3 '{"jsonrpc":"2.0","id":9303,"method":"tools/call","params":{"name":"wp_list_theme_mods","arguments":{}}}'
+check "wp_list_theme_mods is not an error" "$(verdict tm3)" "ok"
+check "...lists the plain one" "$(grep -c 'TMX-VISIBLE-VALUE' "$OUT/tm3")" "1"
+check "...and does not list the secret" "$(grep -c 'TMX-SECRET-VALUE' "$OUT/tm3")" "0"
+docker compose exec -T cli wp eval 'remove_theme_mod( "tmx_plain" ); remove_theme_mod( "tmx_api_key" );' >/dev/null 2>&1
+
 echo "-- wp_write_blocks keeps backslashes, on the blocks path as on the markdown path --"
 # The blocks path unslashed text that was never slashed and then slashed it once for the
 # writer, so a Windows path in a code block lost its separators and "a\b" became "ab", while

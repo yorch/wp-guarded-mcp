@@ -3123,7 +3123,7 @@ class GMCP_Tools_Core {
         else {
           $value = GMCP_Core::redact( $value );
         }
-        $r = $this->json( $r, $value );
+        $this->add_result_text( $r, wp_json_encode( $value, JSON_PRETTY_PRINT ) );
         break;
 
       case 'wp_set_theme_mod':
@@ -3178,7 +3178,7 @@ class GMCP_Tools_Core {
         // an audit-log argument, keeping the shape so the caller can still see what is
         // there without seeing what was in it.
         $mods = GMCP_Core::redact( $mods );
-        $r = $this->json( $r, $mods );
+        $this->add_result_text( $r, wp_json_encode( $mods, JSON_PRETTY_PRINT ) );
         break;
 
       case 'wp_remove_theme_mod':
