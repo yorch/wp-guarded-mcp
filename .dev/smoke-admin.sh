@@ -1957,6 +1957,23 @@ check "control: the timestamps to order by are actually distinct" \
   "$(lb "str(len({b['completed'] for b in d['backups'] if b['completed']}) >= 2)" lb_two)" "True"
 check "and they come back newest first" \
   "$(lb "str([b['completed'] for b in d['backups'] if b['completed']] == sorted([b['completed'] for b in d['backups'] if b['completed']], reverse=True))" lb_two)" "True"
+# The same assertion, made deterministic. Backuply's own list is ordered by the timestamp in
+# the info filename (when a backup started) while btime is when it finished, so a long backup
+# that began first and ended last comes back second. Whether the check above met that depended
+# on timing: it passed on a small site and failed on one large enough for a full backup to
+# outlast a database-only one. Two records are planted here with the inversion built in, the
+# control proves Backuply itself orders them by start, and the tool must not.
+docker compose exec -T cli bash -c 'D=$(ls -d /var/www/html/wp-content/backuply/backups_info-*); A=$(ls -d /var/www/html/wp-content/backuply/backups-*);
+printf "<?php exit();?>\n{\"name\":\"wp__2026-09-20_00-00-00\",\"backup_dir\":\"1\",\"backup_db\":\"1\",\"ext\":\"tar.gz\",\"size\":1,\"btime\":1900000000}" > "$D/wp__2026-09-20_00-00-00.php"
+printf "partial" > "$A/wp__2026-09-20_00-00-00.tar.gz"
+printf "<?php exit();?>\n{\"name\":\"wp__2026-09-21_00-00-00\",\"backup_dir\":\"1\",\"backup_db\":\"1\",\"ext\":\"tar.gz\",\"size\":1,\"btime\":1899999000}" > "$D/wp__2026-09-21_00-00-00.php"
+printf "partial" > "$A/wp__2026-09-21_00-00-00.tar.gz"' >/dev/null 2>&1
+check "control: Backuply itself lists the one that started later first, though it finished earlier" \
+  "$(docker compose exec -T cli wp eval '$n = []; foreach ( (array) backuply_get_backups_info() as $i ) { if ( is_object( $i ) ) { $n[] = (string) $i->name; } } $a = array_search( "wp__2026-09-21_00-00-00", $n, true ); $b = array_search( "wp__2026-09-20_00-00-00", $n, true ); echo ( $a !== false && $b !== false && $a < $b ) ? "orders-by-start" : "unexpected:" . implode( ",", $n );' 2>/dev/null | tr -d '\r\n')" "orders-by-start"
+call lb_inv '{"jsonrpc":"2.0","id":263,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{"limit":100}}}'
+check "and the tool lists them by when they finished, newest first" \
+  "$(lb "str([b['completed'] for b in d['backups'] if b['completed']][:2])" lb_inv)" "[1900000000, 1899999000]"
+docker compose exec -T cli bash -c 'rm -f /var/www/html/wp-content/backuply/backups_info-*/wp__2026-09-2[01]_00-00-00.php /var/www/html/wp-content/backuply/backups-*/wp__2026-09-2[01]_00-00-00.tar.gz' >/dev/null 2>&1
 TOTAL=$(py "import json,sys;print(json.loads(json.load(sys.stdin)['result']['content'][0]['text'])['total'])" lb_two)
 call lb_one '{"jsonrpc":"2.0","id":253,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{"limit":1}}}'
 check "a capped listing says it was capped and how many exist" "$(lb "str(d['shown']) + ',' + str(d['truncated']) + ',' + str(d['total'])" lb_one)" "1,True,$TOTAL"
