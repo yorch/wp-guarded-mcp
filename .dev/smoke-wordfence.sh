@@ -205,7 +205,10 @@ check "an unknown severity is refused rather than matched as 0" "$(verdict wf_sc
 # first version looped over getIssues() and matched on shortMsg, which those rows do not carry
 # under that name — measured, it returned rows without the key, so the loop deleted nothing
 # and the suite reported the tool as leaving a fixture behind that was its own.
-for issue_id in $(dbq "SELECT id FROM wp_wfissues WHERE shortMsg LIKE '%$MARK%'"); do
+# One id per line, read without dbq(): dbq strips the newlines, so two seeded issues came back
+# as one number ("1213"), deleteIssue() was called with an id that exists nowhere, and the
+# fixture was left behind for the next run to count.
+for issue_id in $(docker compose exec -T cli wp db query "SELECT id FROM wp_wfissues WHERE shortMsg LIKE '%$MARK%'" --skip-column-names 2>/dev/null | tr -d '\r'); do
   wpc eval 'wfIssues::shared()->deleteIssue( '"$issue_id"' );' >/dev/null 2>&1
 done
 check "put back: the seeded issue is gone" \
