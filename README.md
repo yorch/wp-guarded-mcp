@@ -211,9 +211,13 @@ Because Flamingo and Ninja Forms keep a submission as a post, the generic post r
 (`wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`, `wp_read_post_meta_chunk`,
 `wp_get_posts`, `wp_get_post_terms`, `wp_get_comments`, `wp_get_media`, the briefing, the
 resources and the REST-generated tools) refuse those post types and what hangs off them (a
-revision, an upload, a comment, a child post), and the change records never quote one,
-whether or not this group is on. That guard is a list of readers, and the guardrails page
-says exactly what it does not cover (counts, for one).
+revision, an upload, a comment, a child post), and below admin answer one exactly as they
+answer a post that does not exist. No generic tool writes to a submission or to anything in its
+tree, at any access level, and none moves a post or a comment into or out of such a tree or
+points a featured image or a menu item at one, so the tree cannot be rearranged to get round
+the readers. The change records withhold a submission's title and values whichever state of it
+they describe, whether or not this group is on. Those guards are a list of readers and writers,
+and the guardrails page says exactly what they do not cover (counts, for one).
 
 **WPForms** is in that group and is deliberately the smallest part of it: two tools, a form's
 schema and a submission briefing, and **no entry tool at all**. Measured on WPForms Lite
@@ -414,7 +418,8 @@ and a reader written without it installed is how a confident "no translations" i
 Generated once and cached for a day; the cache is thrown away on the first request after
 the plugin's version changes. A route that belongs to a form-submission or commerce post
 type is not generated at all, and every call is judged by the same read policies as the
-generic post tools (including media attached to a submission or an order).
+generic post tools (including media attached to a submission or an order); a list leaves
+those rows out where the query is built, to the full depth of their tree.
 
 **Preview.** Six tools whose effect is not visible from the call accept `preview`, which
 describes what would happen and changes nothing: `wp_delete_post`, `wp_update_post`,

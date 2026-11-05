@@ -1176,19 +1176,35 @@ re-read.
   Forms keep a submission as a post, `wp_get_post_meta` is a `read`-level tool that returns
   any key on any post (its own source says post meta reads are ungated), and a read-only key
   could therefore read every answer, and for Flamingo the visitor's IP address, through the
-  tool beside the admin-only ones. `GMCP_Core::personal_data_post_guard()` is asked, ahead of
-  the dispatch switch, by `wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`,
+  tool beside the admin-only ones. `GMCP_Core::post_read_guard()` (the personal-data policy,
+  then the commerce read policy) is asked, ahead of the dispatch switch, by `wp_get_post`,
+  `wp_get_post_snapshot` (and the featured image it would return), `wp_get_post_meta`,
   `wp_read_post_meta_chunk`, `wp_get_post_terms`, `wp_add_post_terms` (its reply lists the terms
   the post now holds), `wp_alter_post` (a match count over a body is an oracle) and the
   previews of `wp_update_post` and `wp_delete_post` (which print a title and the start of the
   body), for the post type `wp_get_posts` names, and per row in a `wp_get_posts` listing (type
   `any` names none), a `wp_get_comments` listing and a `wp_get_media` listing. The
-  `gmcp://post/{id}` resource, the resource listing and `wp_create_preview_link` ask it too, as
-  does `wp_site_briefing` (it quotes the title of the most recently modified post, which for a
-  submission is the visitor's subject line; it now reports the newest post the caller may read)
-  and `wp_add_menu_item` (a submission is `publish`, and a menu item would copy its title into
-  the public navigation). It is on whether or not the forms group is. The type list is
-  filterable through `gmcp_personal_data_post_types`.
+  `gmcp://post/{id}` resource, the resource listing, `wp_create_preview_link`, the preview of
+  `wp_delete_comment`, the SEO tools' and Polylang's post lookups and the target of every menu
+  item (`wp_get_menu_items`, `wp_menu_health`, `wp_update_menu_item`, `wp_add_menu_item`) ask it
+  too, as does `wp_site_briefing` (it quotes the title of the most recently modified post, which
+  for a submission is the visitor's subject line; it reports the newest post the caller may
+  read). It is on whether or not the forms group is. The type list is filterable through
+  `gmcp_personal_data_post_types`.
+- **Below admin, a submission is answered exactly as a post that does not exist.** The refusal
+  used to say what the post was ("it is a revision under a flamingo_inbound"), and a key that can
+  only read could walk ids and map which are submissions and which are their revisions and
+  uploads. `post_read_guard()` now answers a caller below admin with `GMCP_Core::post_not_found_text()`,
+  the sentence a missing id gets, and every tool that has its own wording for a missing post
+  (`wp_get_post`, `wp_copy_post_meta`'s source, the menu tools, the REST tools, which dispatch the
+  id as one that names nothing) answers both the same way; `smoke-forms.sh` compares the two
+  replies for each of them after replacing the id. An admin key is told why (it uses the form
+  tools anyway), and the audit log records the call and the reply it got. A listing that NAMES a
+  submission type is refused with the reason, because it names a type and not a post.
+  Not made uniform, and said so: the refusal of a **write** to a submission or its tree explains
+  itself (a write-level key learns that an id is a submission, or hangs from one, by trying to
+  write to it; it never learns what it holds), and the commerce refusal below admin still names
+  the order type. Counts are an existence oracle below, kept on purpose.
 - **The policy follows the post's parents.** A revision of a submission holds its body, a file
   attached to one is what the visitor uploaded, and a child post is part of it, yet each is an
   ordinary row of another type (`revision`, `attachment`, `page`) that passes every check made
@@ -1200,6 +1216,53 @@ re-read.
   `attachment`), `wp_get_media`, and the comments on it through `wp_get_comments`.
   `wp_duplicate_post` of such a row was allowed and copied it into a draft that
   `wp_get_post` then returned.
+- **No generic tool writes to a submission, or to anything in its tree, or moves anything into
+  or out of it.** The guard above is only as true as the tree is stable, and every generic writer could
+  change the tree. Measured with a read-write key doing the write and a read-only key the read:
+  `wp_update_post` with `post_parent` 0 on a revision of a submission, and the revision was an
+  ordinary post whose title and body `wp_get_post` returned; the same for a visitor's upload
+  given an ordinary parent (then `wp_get_media` and `wp_get_post_meta` returned it) and for a
+  comment given another `comment_post_ID` (`wp_get_comments`). The same gap let a key hide one of
+  its own pages from every generic reader by parenting it under a submission. So the policy is
+  symmetric with the commerce one, which has always refused every generic write to an order:
+  `GMCP_Core::personal_data_write_guard()` refuses every generic write to a post whose chain
+  holds a submission type, at every access level, and is asked from `commerce_post_guard()`
+  (which `wp_update_post`, `wp_update_post_meta`, `wp_delete_post_meta`, `wp_copy_post_meta`'s
+  target, `wp_write_post_meta_chunk`, `wp_duplicate_post`, `wp_delete_post`, `wp_alter_post`,
+  `wp_set_featured_image`, `wp_add_post_terms`, the SEO, ACF, Yoast and Elementor writers and the
+  journal's undo already ask) and, where no commerce question was ever asked, by `wp_update_media`,
+  `wp_delete_media` and `wp_create_comment`, `wp_update_comment` and `wp_delete_comment`
+  (`comment_write_guard()`). `tree_move_guard()` refuses any write that changes `post_parent` of an
+  existing post when its current chain or the new parent's chain holds a submission type or a
+  commerce type, and `comment_write_guard()` the same for `comment_post_ID`, so nothing is moved
+  out of a guarded tree (it would become readable) or into one (it would be hidden). A new post
+  under a submission is refused; a new child of an order is not, because WooCommerce makes its
+  own (a refund hangs from its order) and the generic create tools take no parent. Nobody
+  legitimately edits a visitor's submission through an administration agent and the form tools
+  only read, so this costs nothing. Two values that POINT at a post are held to the same rule,
+  because each prints what it points at: a featured image (`_thumbnail_id`: set through
+  `wp_set_featured_image`, the meta tools or any writer) and a menu item's target
+  (`_menu_item_object_id`, `_menu_item_object`, `_menu_item_type`, judged in both orders so a
+  taxonomy item switched back to a post item does not carry the id through), refused when the
+  target is, or hangs from, a submission or an order. `wp_get_menu_items`, `wp_menu_health` and
+  `wp_update_menu_item` leave out an item whose target the caller may not read, because
+  WordPress fills an empty item title from the object, and the snapshot omits such a
+  thumbnail. **The net.** `GMCP_Core::install_personal_data_net()` asks the same questions under
+  WordPress, for writers that ask none, while a tool call is in flight (so wp-admin, cron and
+  wp-cli are untouched): `wp_insert_post_data` and `wp_insert_attachment_data` (a write to
+  something that hangs from a submission, or a new parent in a guarded tree), post meta added,
+  updated or deleted by key and by id, term assignment, trash, untrash and deletion,
+  `wp_update_comment_data`, `preprocess_comment` and `delete_comment` / `trash_comment`. It
+  throws, like the drafts-only net, so a writer cannot report success over a write that did not
+  happen. It refuses what hangs FROM a submission and does not refuse a write to the submission's
+  own row, on purpose: a form plugin keeps those rows itself from hooks a tool call can fire
+  (Flamingo saves a contact, a post of a guarded type with meta and terms, whenever a user
+  profile is saved), and a net that refused it broke `wp_update_user` and `wp_create_user` on a
+  site that has Flamingo (measured on the first full run). The generic tools refuse that write
+  themselves, through `commerce_post_guard()`. Deleting a submission through
+  `wp_delete_post` would also have orphaned its uploads as ordinary readable media (WordPress
+  hands a deleted post's children to its parent); it is refused. The drafts-only guard and the
+  commerce guard are unchanged and asked in the same places.
 - **Terms: decided on evidence.** The terms ON a post are asked about through the post
   (`wp_get_post_terms`, the snapshot and the resource header all refuse a guarded post).
   Whether a term is itself personal data was read from the plugins: Flamingo assigns a channel
@@ -1216,22 +1279,35 @@ re-read.
   reached by its own id (checked live: `get_posts` of a submission id is `rest_post_invalid_id`).
   What did reach it was a media row attached to one: `get_media`, `list_media` and `update_media`
   returned and, for `update_media`, retitled a file attached to a seeded submission. Now every
-  tool that takes an `id` asks `post_read_guard()` first; a list call runs with a
-  `posts_where` filter that leaves out the guarded types and posts hanging from them (two
-  levels), so rows are removed where the query is built and not afterwards, because `_fields`
-  can leave the id out of the rows; and a route whose post type is a guarded type (a plugin
-  registering one with `show_in_rest` and a `rest_base` of `posts`, `pages` or `media`) is not
-  turned into tools at all. The tool cache key moved to `v6` so a cached list is rebuilt.
+  tool that takes an `id` asks `post_read_guard()` first (below admin the id is dispatched as
+  one that names nothing, so the answer is the controller's own answer for a missing id); a list
+  call runs with `posts_join` and `posts_where` filters that leave out the guarded types and posts
+  hanging from them to the same depth the guards walk (the row and seven parents,
+  `GMCP_Core::unreadable_post_clauses()`, joins because seven nested subqueries overflow the
+  SQLite driver's parser), so rows are removed where the query is built and not afterwards,
+  because `_fields` can leave the id out of the rows and a page filtered afterwards is short; a
+  write that moves a row into or out of a tree (`update_media` with `post`, `update_pages` with
+  `parent`) is refused by the net under `wp_insert_post_data`; and a route whose post type is a
+  guarded type (a plugin registering one with `show_in_rest` and a `rest_base` of `posts`,
+  `pages` or `media`) is not turned into tools at all. The tool cache key moved to `v6` so a
+  cached list is rebuilt. The Elementor reference scans (`elementor_template_references` and the
+  scan for where an Elementor global is used) use the same SQL, so they too stop at the guarded tree and not at the second
+  level.
 - **The change records do not quote a submission.** A read-level key can call `wp_list_changes`,
-  and each entry names the post by the first 60 characters of its title. A `readwrite` key can
-  write to a submission (this guard is about reading it, and a write is not refused), which
-  recorded its title and the previous values in the journal, its snapshot table and the audit
-  summary. `GMCP_Changes::record()`, the one place every record passes, now replaces the label
-  with the id and every before/after value with `[withheld]`, and drops the previous values;
-  `undoable_post()` refuses such a post, so the journal records nothing to put back and an old
-  entry is not put back either. An entry written before this change is rewritten on the way out
-  of `wp_list_changes`. Nothing in these paths ever returned a previous value to the caller
-  (`wp_list_changes` lists no values and `wp_undo_change`'s reply names none).
+  and each entry names the post by the first 60 characters of its title. Writes to a submission
+  are refused now, so a record about one can only come from a writer that asks no guard, and the
+  records are built after the write: a post moved out of a submission's tree (by such a writer)
+  is an ordinary row when the record is made, which quoted an upload's title and named the
+  submission as the parent it came from, in the journal, its snapshot table and the audit `changes`
+  column (measured). `GMCP_Changes::record()`, the one place every record passes, judges the post
+  as it is NOW and as it was BEFORE (the observers pass the state they held), and when either is
+  in a submission's tree replaces the label with the id and every before/after value with
+  `[withheld]`, and drops the previous values; the journal does not record a withheld entry at
+  all, so no undo can write the markers over a post, `undoable_post()` refuses such a post, and an
+  old entry is not put back either. An entry written before this change is rewritten on the way
+  out of `wp_list_changes`. Nothing in these paths ever returned a previous value to the caller
+  (`wp_list_changes` lists no values and `wp_undo_change`'s reply names none). `smoke-forms.sh`
+  proves it with a test-only tool that writes through WordPress with the net taken out.
 - **A tool that copies from a post is a reader.** `wp_copy_post_meta` used to ask the write
   guards about the post it wrote TO and nothing about the post it read FROM, so a `readwrite`
   key copied every meta key of a Flamingo message (its `_meta` holds the IP address and user
@@ -1245,22 +1321,43 @@ re-read.
   `wp_get_post` returns, and Flamingo builds that body from the fields, consent and meta. A
   commerce post is not retypable either, because `commerce_post_guard()` refuses every generic
   write to one.
-- **What the guards do not cover.** They are a list of readers, not a property of the data,
-  and the same weakness the commerce guard has: a reader added later has to be added to it.
-  Exactly, today:
+- **What the guards do not cover.** They are a list of readers and writers, not a property of the
+  data, and the same weakness the commerce guard has: a reader or writer added later has to be
+  added to it. Exactly, today:
   - Counts. `wp_count_posts`, `wp_count_media`, `wp_count_terms`, the per-type counts and the
     per-term `count` in `wp_site_briefing` and `wp_get_terms`, and the type names in
     `wp_get_post_types` and `wp_get_taxonomies` say how many rows exist and never return one.
     An existence oracle for the number of submissions, which the read-level form briefings
-    return on purpose. Kept, not an oversight.
-  - The audit log keeps the arguments an agent sent, including a value it wrote to a
-    submission, because that is the record of what it did. It never holds what the post held
+    return on purpose. Kept, not an oversight. Id gaps and the ids a write refusal names are the
+    same kind of oracle and the same size.
+  - The answer is uniform for READS below admin, not for writes: a refusal of a write to a
+    submission or anything in its tree explains itself, so a key that can write learns that an
+    id is one, or hangs from one, never what it holds. The commerce refusal below admin names
+    the order type. A listing that names a submission type is refused with the reason.
+  - The audit log keeps the arguments an agent sent, including a value it sent to a tool that was
+    then refused, because that is the record of what it did. It never holds what the post held
     before, and it is an admin-level read.
   - A journal entry about a submission that was **deleted** before this change still carries
     the title it was written with: once the post is gone its type cannot be looked up.
-  - Posts hanging from a guarded post are found through `post_parent`: eight levels in the
-    guards, two in the REST list filter. A row related to a submission by anything else (a meta
-    value holding its id, a plugin's own table) is not.
+  - Posts hanging from a guarded post are found through `post_parent`, to eight levels (the post
+    and seven parents) in the guards and in every SQL filter. A row related to a submission by a
+    meta value holding its id is not, except the two pointers that print what they name, a
+    featured image and a menu item's target, which are refused when written and left out when
+    read. An id inside any other value (an ACF relationship field, an Elementor widget naming a
+    post, a plugin's own table) is neither refused when written nor filtered when read.
+  - A writer that is not one of the generic tools can still write a submission's own row (its
+    title, body, meta and terms) while a tool call is in flight, because the net covers what
+    hangs from a submission and not the row itself. That cannot move data out of the tree, which
+    the net does protect; it can alter what the form tools later report.
+  - Writers the net cannot see: a plugin that writes `wp_posts`, `wp_postmeta` or `wp_comments`
+    with `$wpdb`, `wp_set_comment_status()` (no hook in front of it) and `wp_insert_comment()`
+    (none either; the comment tool asks the guard itself, and `wp_new_comment()` is covered). And
+    anything outside a tool call: a person deleting a submission in wp-admin hands its uploads
+    to the deleted post's parent, as WordPress does, and they are ordinary media from then on.
+  - A listing fills its page by skipping what the caller may not read, and stops after 5000
+    rows (plus the offset) have been looked at, so a window of more than that many consecutive
+    unreadable rows can still return a short page. The REST listings and the scans judge the
+    chain in SQL and have no such bound.
   - A taxonomy shared between a submission type and an ordinary type is listed by
     `wp_get_terms`, and the same applies to its terms on an ordinary post.
   - Every route to the database that is not a post reader, and the optional groups' own stores
@@ -1268,10 +1365,6 @@ re-read.
     log), which are gated by their own tools and levels and not by this guard.
 
   WooCommerce orders stored as posts ARE covered by `commerce_post_read_guard()` in
-  `wp_get_posts`, `wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`,
-  `wp_read_post_meta_chunk`, `wp_get_comments`, `wp_get_media`, the copy tools, the resource,
-  the REST tools and the template-reference scans. That guard applies below admin level only,
-  whereas the form-submission guard applies at every level (an admin key uses the form tools).
 - **Fluent Forms has a setting that keeps no entries, and `fluentform_briefing` reports it.**
   `formSettings.delete_entry_on_submission` (a form's settings JSON in `fluentform_form_meta`,
   default `no`) deletes each entry as it is stored, and `delete_after_x_days` with

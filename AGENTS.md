@@ -64,11 +64,39 @@ policy below admin) judges a post as the nearest guarded post above it through `
 because a revision of a submission, a file attached to one and a comment on one are ordinary
 rows of another type that pass any check made on their own type. Every tool that returns a
 post, its meta, its comments, its terms, its media or its title asks it, and so do the REST
-tools, the briefing and the resources. The change records go through `GMCP_Changes::record()`
-and carry a submission as an id with `[withheld]` values, because `wp_list_changes` is a
-read-level tool and names a post by its title. A new reader of any of these asks the guard;
-`smoke-forms.sh` block 0c seeds a submission with a revision, an upload, a comment and a term
-and calls every reader with a read-only key.
+tools, the briefing, the resources, the featured image in the snapshot and the target of a menu
+item. Below admin it answers a submission with the sentence a post that does not exist gets
+(`post_not_found_text()`), so a key that can only read cannot walk ids and map which are
+submissions and which hang from one; a tool that has its own "not found" wording uses the same
+function for both. A listing never fetches a page and then drops rows: it skips what the caller
+may not read while it fills the page (`collect_readable()`), or judges the chain in SQL
+(`unreadable_post_clauses()`, joins and not nested subqueries: the SQLite driver overflows its
+parser on seven nested `EXISTS`). The change records go through `GMCP_Changes::record()` and
+carry a submission as an id with `[withheld]` values, judged on the state before the write as
+well as after it, because `wp_list_changes` is a read-level tool and names a post by its title.
+A new reader of any of these asks the guard; `smoke-forms.sh` block 0c seeds a submission with a
+revision, an upload, a comment and a term and calls every reader with a read-only key.
+
+**A write policy about a post belongs to the post's tree, and the read policy depends on it.**
+A read guard judges a post by what it hangs from, so anything that changes `post_parent`,
+`comment_post_ID` or a value that points at a post (a featured image, a menu item's target) is
+a way round every read guard at once. So the form-submission policy is symmetric with the
+commerce one: `GMCP_Core::personal_data_write_guard()` (asked from `commerce_post_guard()`,
+which every generic writer already asks, and by the media and comment tools that never did)
+refuses every generic write to a submission and to anything in its tree, at every access level;
+`tree_move_guard()` and `comment_write_guard()` refuse a write that moves a post or comment into
+or out of a submission's or an order's tree, which also stops a key hiding its own page under
+one; `pointer_meta_refusal()` refuses `_thumbnail_id` and the `_menu_item_*` keys pointing into
+one; and `install_personal_data_net()` asks the same of every writer that goes through
+WordPress while a tool call is in flight (insert and attachment data, post meta by key and by
+id, term assignment, deletion, comment update, creation and removal), for what hangs FROM a
+submission and not for the submission's own row, because a form plugin writes that itself from
+hooks a tool call fires (Flamingo saves a contact whenever a profile is saved, which broke
+`wp_update_user` when the net refused it). A new tool that writes a
+post, its meta, its terms or a comment asks the guard; the net is the backstop, not the plan.
+`smoke-forms.sh` block 0c attacks each route with a read-write key and reads the STORED row, and
+a test-only tool registered by its mu-plugin writes through WordPress with the net taken out to
+show that the change records hold when a writer asks nothing.
 
 **A deletion is not always a delete tool.** WordPress deletes on markers it reads from
 ordinary rows: `wp_scheduled_delete()` removes every post with an old `_wp_trash_meta_time`
