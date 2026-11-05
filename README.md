@@ -517,7 +517,9 @@ repeats the identical call and it runs once.
 - The screen shows the call in one canonical order (sorted, the tool's declared arguments
   first) and never shortens it: a call with an argument its tool does not declare, nested
   more than 12 levels, or longer than 16000 bytes written out is refused with an error
-  instead of queued, because an approval covers every byte. A credential is hidden, and the
+  instead of queued, because an approval covers every byte. A credential is hidden, whether it
+  sits under a field named like one or is written into free text (a `define( 'DB_PASSWORD', ... )`
+  line inside a tagline), and the
   screen says how many values are hidden and which fields, so you know a value you cannot
   see is part of what you approve (the hash covers the real value). Requests,
   approvals, declines, lapses, uses and refused replays are written to the audit log.

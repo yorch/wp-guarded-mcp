@@ -536,7 +536,11 @@ class GMCP_Approvals {
       $value = get_object_vars( $value );
     }
     if ( is_string( $value ) ) {
-      if ( GMCP_Core::scrub_preview_tokens( $value ) !== $value || GMCP_Core::holds_credential( $value, 0, 12 ) ) {
+      // Three tests, because each reads a different thing: a preview token, a credential named
+      // by its field or packed in JSON or serialized data, and one written into free text (a
+      // wp-config line in a tagline). The first two alone showed, and stored, a secret the
+      // audit log blanks. The stored arguments the approval is bound to are untouched.
+      if ( GMCP_Core::scrub_preview_tokens( $value ) !== $value || GMCP_Core::holds_credential( $value, 0, 12 ) || GMCP_Credential_Scan::text_holds( $value ) ) {
         $redacted[] = $path === '' ? '(value)' : $path;
         return GMCP_Core::REDACTION_MARKER;
       }
@@ -755,8 +759,10 @@ class GMCP_Approvals {
       'tool_class' => $class,
       'args_mac' => $mac,
       // Exactly the text the screen prints, and the names of what it hides. Built by
-      // build_view() from the same credential test the audit log uses, so what a person
-      // reads here and what the log keeps cannot disagree about what a credential is.
+      // build_view() from the credential tests the audit log uses (field names, structured
+      // values, and GMCP_Credential_Scan for free text), so what a person reads here and what
+      // the log keeps agree about what a credential is. Agree is not a promise of identical:
+      // the log also judges the whole argument list as one text, and this judges each value.
       'args_view' => $view['text'],
       'args_redacted' => wp_json_encode( $view['redacted'] ),
     ] );

@@ -135,7 +135,8 @@ of it is not recognised by any of this, and nothing in the docs claims it is.
 only values that begin as JSON or serialized data, so a post body with `{"api_key":"..."}` or a
 `define('DB_PASSWORD', ...)` line in the middle of it passed. `GMCP_Credential_Scan` is the text
 test, and the journal (`unsafe_to_keep()`, `post_previous()`, `label()`), `GMCP_Changes::describe()`,
-the audit log's arguments, target and reply, and `redact_reversible()` all ask it. A post field that
+the audit log's arguments, target and reply, `redact_reversible()` and the approval queue's stored and
+printed view of a call (`GMCP_Approvals::view_value()`, per string value) all ask it. A post field that
 fails is left out of `previous` and named in `redacted_fields`; a placeholder is never stored, because
 undo would write it over live content. Tune it against false positives as hard as against misses: an
 ordinary body that says "password" must stay undoable, and `.dev/journal-pure.php` holds that control.

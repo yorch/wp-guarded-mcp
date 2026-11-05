@@ -4003,6 +4003,40 @@ if grep -q wordpress_logged_in "$AP_JAR"; then
   ap_decide decline "$AP_R7"
   check "(cleanup) the user request is declined" "$(ap_status "$AP_R7")" "declined"
 
+  echo "   -- a credential written into free text is not shown either --"
+  # The field name here is innocent ("value") and the text is a tagline with a wp-config line in
+  # it: the structural tests pass it, the audit log's text test blanks it, and the queue used to
+  # store and print it. The control is an ordinary tagline, which must be shown in full.
+  AP_SECRET_TXT="Our tagline. define('DB_PASSWORD', 'Hunter2-rv3-secret');"
+  AP_PLAIN_TXT="Our ordinary tagline about passwords and keys"
+  ap_call ap_ft1 wp_update_option "{\"key\":\"blogdescription\",\"value\":\"Our tagline. define('DB_PASSWORD', 'Hunter2-rv3-secret');\"}"
+  AP_R8=$(ap_rid ap_ft1)
+  ap_call ap_ft2 wp_update_option "{\"key\":\"blogdescription\",\"value\":\"$AP_PLAIN_TXT\"}"
+  AP_R9=$(ap_rid ap_ft2)
+  check "both calls are held" "$(ap_state ap_ft1)/$(ap_state ap_ft2)" "awaiting_human_approval/awaiting_human_approval"
+  check "CONTROL: the stored view of the ordinary tagline holds it in full" \
+    "$(ap_q 'SELECT args_view LIKE \"%'"$AP_PLAIN_TXT"'%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R9")" "1"
+  check "CONTROL: ...and it lists nothing as hidden" "$(ap_q 'SELECT args_redacted FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R9")" "[]"
+  check "the stored view of the credential-bearing tagline does not hold the secret" \
+    "$(ap_q 'SELECT args_view LIKE \"%Hunter2-rv3-secret%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8")" "0"
+  check "  nor the password constant's name and value" \
+    "$(ap_q 'SELECT args_view LIKE \"%DB_PASSWORD%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8")" "0"
+  check "  and lists the value as hidden" "$(ap_q 'SELECT args_redacted FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8")" '["value"]'
+  check "the approval is still bound to the real arguments (the keyed hash covers the secret)" \
+    "$(ap_eval 'global $wpdb; $m=(string)$wpdb->get_var("SELECT args_mac FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8"'");
+      $a=["key"=>"blogdescription","value"=>"Our tagline. define('"'"'DB_PASSWORD'"'"', '"'"'Hunter2-rv3-secret'"'"');"];
+      echo $m === hash_hmac("sha256","wp_update_option\x1f".GMCP_Approvals::canonical_json($a),wp_salt("auth")) ? "bound" : "DIFFERENT";')" "bound"
+  AP_PAGE=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null)
+  check "CONTROL: the page shows the ordinary tagline" "$([ "$(printf '%s' "$AP_PAGE" | grep -c "$AP_PLAIN_TXT")" -ge 1 ] && echo yes || echo no)" "yes"
+  check "the page does not show the secret" "$(printf '%s' "$AP_PAGE" | grep -c 'Hunter2-rv3-secret')" "0"
+  check "the page says a value is hidden yet part of the approval, and names it" \
+    "$(printf '%s' "$AP_PAGE" | grep -c 'is still part of what you approve:</strong> &quot;value&quot;')" "1"
+  check "the audit log does not hold the secret" "$(leaked_audit Hunter2-rv3-secret)" "0"
+  check "the option was not written by a held call" "$(ap_eval 'echo get_option("blogdescription") === "reset" ? "unchanged" : "CHANGED";')" "unchanged"
+  ap_decide decline "$AP_R8"
+  ap_decide decline "$AP_R9"
+  check "(cleanup) both requests are declined" "$(ap_status "$AP_R8")/$(ap_status "$AP_R9")" "declined/declined"
+
   echo "   -- an account the agent made cannot approve for the agent --"
   # The attack: with the mode at "deletes" an admin key created an administrator with a
   # password it chose, signed in at wp-login.php, and approved its own held calls. The two
