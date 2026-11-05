@@ -388,6 +388,16 @@ class GMCP_Tools_Rest {
         break;
     }
 
+    // The arguments that name another post, judged before the controller writes anything. The net
+    // would refuse them too, but from inside the controller after it had inserted the row, so the
+    // reply said refused over a draft that stood in the table. @see GMCP_Core::rest_write_refusal().
+    if ( $method === 'POST' ) {
+      $refused = GMCP_Core::rest_write_refusal( $action === 'update' ? (int) ( $args['id'] ?? 0 ) : 0, $args );
+      if ( $refused !== null ) {
+        return $this->error( $id, $refused . ' Nothing was written.', 'gmcp_refused' );
+      }
+    }
+
     $request = new WP_REST_Request( $method, $path );
 
     if ( $method === 'GET' ) {
@@ -413,10 +423,48 @@ class GMCP_Tools_Rest {
       add_filter( 'posts_join', [ $this, 'join_unreadable_posts' ] );
       add_filter( 'posts_where', [ $this, 'exclude_unreadable_posts' ] );
     }
+    // Rows a create makes, so one the net refuses AFTER it was inserted can be taken back out.
+    $made = [];
+    $track = static function ( $post_id, $post = null, $update = false ) use ( &$made ) {
+      if ( !$update ) {
+        $made[] = (int) $post_id;
+      }
+    };
+    if ( $action === 'create' ) {
+      add_action( 'wp_insert_post', $track, 0, 3 );
+    }
     try {
       $response = rest_do_request( $request );
     }
+    catch ( GMCP_Policy_Refusal | GMCP_Drafts_Only_Refusal $refusal ) {
+      // The controller inserts, then applies the featured image, terms and meta, and the net throws
+      // from that tail. rest_write_refusal() names what it can before the call; this is for the rest.
+      // A refused create must not leave a row, so it is removed, and the reply says which.
+      remove_action( 'wp_insert_post', $track, 0 );
+      $gone = [];
+      $stuck = [];
+      foreach ( $made as $new_id ) {
+        try {
+          if ( wp_delete_post( $new_id, true ) ) {
+            $gone[] = $new_id;
+            continue;
+          }
+        }
+        catch ( Throwable $e ) {
+          // Reported below.
+        }
+        $stuck[] = $new_id;
+      }
+      $note = $gone ? ' The ' . ( count( $gone ) === 1 ? 'post' : 'posts' ) . ' this call had already inserted (#' . implode( ', #', $gone ) . ') ' . ( count( $gone ) === 1 ? 'was' : 'were' ) . ' removed again, so nothing was created.' : '';
+      if ( $stuck ) {
+        $note .= ' Could not remove #' . implode( ', #', $stuck ) . ', which this call had already inserted: delete it with wp_delete_post.';
+      }
+      return $this->error( $id, $refusal->getMessage() . $note, 'gmcp_refused' );
+    }
     finally {
+      if ( $action === 'create' ) {
+        remove_action( 'wp_insert_post', $track, 0 );
+      }
       if ( $listing ) {
         remove_filter( 'posts_where', [ $this, 'exclude_unreadable_posts' ] );
         remove_filter( 'posts_join', [ $this, 'join_unreadable_posts' ] );

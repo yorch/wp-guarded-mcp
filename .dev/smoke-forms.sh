@@ -341,6 +341,19 @@ add_filter( 'gmcp_callback', function ( $existing, $tool, $args ) {
   }
   return is_wp_error( $r ) ? 'error: ' . $r->get_error_message() : 'done ' . wp_json_encode( $r );
 }, 10, 3 );
+// The REST controller ignores featured_media on a type that does not support thumbnails, and a site whose
+// theme does not declare the support would make the featured-image checks below pass for nothing.
+add_action( 'after_setup_theme', function () {
+  add_theme_support( 'post-thumbnails' );
+}, 99 );
+// A writer that does something a pre-check cannot name, AFTER the REST controller has inserted the row:
+// repoints the new post's featured image, which the net refuses by throwing from inside the controller.
+add_action( 'rest_after_insert_post', function ( $post ) {
+  $att = (int) get_option( 'gmcp_smoke_late_att' );
+  if ( $att && strpos( (string) $post->post_title, '-late' ) !== false ) {
+    update_post_meta( $post->ID, '_thumbnail_id', $att );
+  }
+} );
 PHP
 SEED=$(wpe 'echo wp_json_encode(gmcp_smoke_seed("'"$M2"'"));')
 sid() { python3 -c 'import json,sys;print(json.loads(sys.argv[1])[sys.argv[2]][sys.argv[3]])' "$SEED" "$1" "$2"; }
@@ -902,6 +915,44 @@ check "CONTROL: update_pages parenting it under an ordinary page succeeds" "$(ve
 check "CONTROL: and STORED: it moved" "$(parent_of $PG)" "$PG2"
 wpe 'wp_update_post(["ID"=>'"$PG"',"post_parent"=>0]);' >/dev/null
 setrest false
+
+echo "-- a REST create that is refused leaves nothing behind, and no create tool can hide its own page --"
+# The controller inserts the row and then applies the featured image, the parent-like fields and the meta,
+# and a refusal thrown from that tail left the row it had inserted under a reply that said refused. Asserted
+# on the table, with a control for each (the same call with an ordinary target stores one row).
+rows_titled() { wpe 'global $wpdb; echo (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_title = %s", "'"$1"'" ) );'; }
+# The submission's upload gets a file URL for the duration, because set_post_thumbnail() refuses an attachment
+# that has none and the net is only reached when it does not.
+SUBATT_MIME=$(wpe 'echo get_post_mime_type( '"$SUBATT"' );')
+wpe 'update_post_meta( '"$SUBATT"', "_wp_attached_file", "'"$M2"'-z1.png" ); wp_update_post( [ "ID" => '"$SUBATT"', "post_mime_type" => "image/png" ] );' >/dev/null
+callas "$RW" z1 "$(tc create_posts "{\"title\":\"$M2-z1\",\"status\":\"draft\",\"featured_media\":$SUBATT}")"
+check "create_posts with a submission's upload as featured_media is refused" "$(verdict z1)" "error"
+check "STORED: and no post was left behind" "$(rows_titled "$M2-z1")" "0"
+# set_post_thumbnail() refuses an attachment that has no file URL, so the ordinary upload gets one.
+wpe 'update_post_meta( '"$CTLATT"', "_wp_attached_file", "'"$M2"'-z2.png" ); wp_update_post( [ "ID" => '"$CTLATT"', "post_mime_type" => "image/png" ] );' >/dev/null
+callas "$RW" z2 "$(tc create_posts "{\"title\":\"$M2-z2\",\"status\":\"draft\",\"featured_media\":$CTLATT}")"
+check "CONTROL: the same call with an ordinary upload succeeds" "$(verdict z2)/$(rows_titled "$M2-z2")" "ok/1"
+check "CONTROL: and STORED: its featured image is that upload" "$(wpe 'echo (int) get_post_meta( (int) get_posts( [ "title" => "'"$M2"'-z2", "post_status" => "any", "fields" => "ids", "numberposts" => 1 ] )[0], "_thumbnail_id", true );')" "$CTLATT"
+callas "$RW" z3 "$(tc create_pages "{\"title\":\"$M2-z3\",\"status\":\"publish\",\"parent\":$ORD}")"
+check "create_pages under an order is refused (a page there is unreadable below admin, so a key could hide its own page)" "$(verdict z3)" "error"
+check "STORED: and no page was created under the order" "$(rows_titled "$M2-z3")" "0"
+callas "$RW" z4 "$(tc create_pages "{\"title\":\"$M2-z4\",\"status\":\"publish\",\"parent\":$SUB}")"
+check "create_pages under a submission is refused" "$(verdict z4)" "error"
+check "STORED: and no page was created under the submission" "$(rows_titled "$M2-z4")" "0"
+callas "$RW" z5 "$(tc create_pages "{\"title\":\"$M2-z5\",\"status\":\"publish\",\"parent\":$PG2}")"
+check "CONTROL: create_pages under an ordinary page succeeds" "$(verdict z5)/$(rows_titled "$M2-z5")" "ok/1"
+callas "$RW" z7 "$(tc create_posts "{\"title\":\"$M2-z7\",\"status\":\"draft\",\"meta\":{\"_wp_trash_meta_time\":\"1\"}}")"
+check "create_posts with a trash stamp in meta is refused before anything is written" "$(verdict z7)/$(rows_titled "$M2-z7")" "error/0"
+# What no pre-check names: a hook that repoints the new post's featured image after the controller inserted it.
+wpe 'update_option("gmcp_smoke_late_att",'"$SUBATT"');' >/dev/null
+callas "$RW" z6 "$(tc create_posts "{\"title\":\"$M2-late\",\"status\":\"draft\"}")"
+check "a refusal thrown from inside the controller, after the insert, is still a refusal" "$(verdict z6)" "error"
+check "STORED: and the row it had inserted is gone again" "$(rows_titled "$M2-late")" "0"
+check "and the reply says it was removed" "$(has z6 "removed again")" "yes"
+wpe 'update_option("gmcp_smoke_late_att",0);' >/dev/null
+callas "$RW" z8 "$(tc create_posts "{\"title\":\"$M2-late\",\"status\":\"draft\"}")"
+check "CONTROL: with the hook idle, the same call stores one post (the removal above was the refusal's doing)" "$(verdict z8)/$(rows_titled "$M2-late")" "ok/1"
+wpe 'foreach ( get_posts( [ "post_type" => "any", "post_status" => "any", "numberposts" => -1, "s" => "'"$M2"'-z" ] ) as $p ) { wp_delete_post( $p->ID, true ); } foreach ( get_posts( [ "post_type" => "any", "post_status" => "any", "numberposts" => -1, "s" => "'"$M2"'-late" ] ) as $p ) { wp_delete_post( $p->ID, true ); } delete_option( "gmcp_smoke_late_att" ); delete_post_meta( '"$SUBATT"', "_wp_attached_file" ); wp_update_post( [ "ID" => '"$SUBATT"', "post_mime_type" => "'"$SUBATT_MIME"'" ] );' >/dev/null
 
 echo "-- below admin a guarded post is answered exactly as one that does not exist --"
 MISSING=987654321

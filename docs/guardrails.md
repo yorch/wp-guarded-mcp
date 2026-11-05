@@ -1254,8 +1254,27 @@ re-read.
   existing post when its current chain or the new parent's chain holds a submission type or a
   commerce type, and `comment_write_guard()` the same for `comment_post_ID`, so nothing is moved
   out of a guarded tree (it would become readable) or into one (it would be hidden). A new post
-  under a submission is refused; a new child of an order is not, because WooCommerce makes its
-  own (a refund hangs from its order) and the generic create tools take no parent. Nobody
+  under a submission is refused, by the net at every level. A new child of an order is refused
+  when the CALLER names the parent, and not under the net: the REST tools `create_pages` (`parent`)
+  and `create_media` (`post`) do take one, and a page created under an order is unreadable below
+  admin, so a write key could hide its own new page (measured with a stand-in order, before this).
+  `GMCP_Core::rest_write_refusal()` asks `tree_move_guard()` with the caller-named flag before the
+  controller is called. The net leaves a creation under an order alone because WooCommerce
+  makes its own children of one (a refund hangs from its order) from code a tool call can reach, so
+  a plugin's own creation of a child of an order while a tool call is in flight is allowed and is
+  a residual below. The same function pre-checks the other arguments of the REST create and update
+  tools that name another post: `featured_media` (`pointer_meta_refusal()`) and the registered
+  `meta` keys. It exists because the controller inserts the row and then applies the featured
+  image and the meta, and the net throws from that tail: `create_posts` with a submission's upload
+  as `featured_media` answered "refused" and left the draft it had inserted in the table
+  (measured: a tool answering failure over a write that happened). Pre-checked, nothing has been
+  written when it says no; and for what no pre-check names, `GMCP_Tools_Rest::handle_call()`
+  records the rows a create inserts and, if the net or the drafts-only net refuses from inside
+  the controller, deletes those rows again and says so in the reply ("removed again"). That
+  removal is of a row the same call made, and it does not make a delete tool of the create tool:
+  nothing the caller did not just create can be named by it. A refusal WordPress itself returns
+  after the insert (an invalid term, an unknown template) is not the net's and keeps WordPress's
+  behaviour of leaving the row. Nobody
   legitimately edits a visitor's submission through an administration agent and the form tools
   only read, so this costs nothing. Two values that POINT at a post are held to the same rule,
   because each prints what it points at: a featured image (`_thumbnail_id`: set through

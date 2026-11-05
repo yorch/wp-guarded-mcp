@@ -1975,21 +1975,27 @@ class GMCP_Core {
   * under a submission). Both are refused, and for the commerce trees as well as the
   * submission ones, because the commerce read policy follows the same chain.
   *
-  * @param int $post_id    The post being written, or 0 for a creation.
-  * @param int $new_parent The parent the write leaves it with.
+  * @param int  $post_id    The post being written, or 0 for a creation.
+  * @param int  $new_parent The parent the write leaves it with.
+  * @param bool $caller_named_it The parent was named by the caller of a tool (a create tool's
+  *                         `parent` or `post` argument), as opposed to by a plugin's own code
+  *                         under the net. A creation is then judged against commerce trees too.
   * @return true|string
   */
-  public static function tree_move_guard( int $post_id, int $new_parent, string $verb = 'Changing the parent of' ) {
+  public static function tree_move_guard( int $post_id, int $new_parent, string $verb = 'Changing the parent of', bool $caller_named_it = false ) {
     $current = $post_id > 0 ? (int) get_post_field( 'post_parent', $post_id ) : 0;
     if ( $new_parent === $current ) {
       return true;
     }
     $from = $post_id > 0 ? self::guarded_tree_hit( $post_id, true ) : null;
-    // A creation is judged against submission trees only. Commerce plugins make child rows of
-    // an order themselves (a refund hangs from its order), so refusing every new child of a
-    // commerce post would break their own tools, and a new row cannot be hidden by it: the
-    // generic create tools take no parent. An EXISTING post is moved into or out of either.
-    $to = $new_parent > 0 ? self::guarded_tree_hit( $new_parent, $post_id > 0 ) : null;
+    // A creation the net sees is judged against submission trees only. Commerce plugins make
+    // child rows of an order themselves (a refund hangs from its order), so refusing every
+    // new child of a commerce post under the net would break their own tools. A creation whose
+    // parent the CALLER named is judged against both: a new page parented under an order is
+    // unreadable below admin, so a write key could otherwise hide its own page (REST
+    // create_pages takes `parent`, create_media takes `post`). An EXISTING post is moved into or
+    // out of either.
+    $to = $new_parent > 0 ? self::guarded_tree_hit( $new_parent, $post_id > 0 || $caller_named_it ) : null;
     if ( $from === null && $to === null ) {
       return true;
     }
@@ -2115,6 +2121,47 @@ class GMCP_Core {
       }
     }
     return self::pointer_meta_refusal( $key, $value, $object_id );
+  }
+
+  /**
+  * What the arguments of a REST create or update tool may not say, judged BEFORE the controller
+  * is asked.
+  *
+  * The controller inserts the row and then applies the featured image, the parent-like fields and
+  * the registered meta, and the net throws from inside that tail. A refusal from there leaves the
+  * row it had already inserted, under a reply that says the write failed: measured, create_posts
+  * with featured_media naming a form submission's upload answered "refused" and a draft stood in
+  * the table. Asked here, nothing has been written when it says no. The net remains the backstop
+  * for what this does not name, and handle_call() removes a row the net refused after it was made.
+  *
+  * @param int   $post_id The post an update names, or 0 for a creation.
+  * @param array $args    The tool's arguments.
+  * @return string|null The refusal, or null when nothing in them is refused.
+  */
+  public static function rest_write_refusal( int $post_id, array $args ): ?string {
+    if ( array_key_exists( 'featured_media', $args ) && is_scalar( $args['featured_media'] ) ) {
+      $why = self::pointer_meta_refusal( '_thumbnail_id', $args['featured_media'], $post_id );
+      if ( $why !== null ) {
+        return $why;
+      }
+    }
+    foreach ( [ 'parent', 'post' ] as $field ) {
+      if ( array_key_exists( $field, $args ) && is_scalar( $args[ $field ] ) ) {
+        $why = self::tree_move_guard( $post_id, (int) $args[ $field ], $post_id > 0 ? 'Changing the parent of' : 'Creating', true );
+        if ( $why !== true ) {
+          return $why;
+        }
+      }
+    }
+    if ( isset( $args['meta'] ) && is_array( $args['meta'] ) ) {
+      foreach ( $args['meta'] as $key => $value ) {
+        $why = self::protected_meta_refusal( (string) $key ) ?? self::pointer_meta_refusal( (string) $key, $value, $post_id );
+        if ( $why !== null ) {
+          return $why;
+        }
+      }
+    }
+    return null;
   }
 
   private static $personal_net_installed = false;

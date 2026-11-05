@@ -119,6 +119,14 @@ tables; rebuild `includes/meta-key-fold-map.php` with it, and run `.dev/test-met
 (with `GMCP_FOLD_DSN` to check the fold against a live server in both directions) and the
 MariaDB-only block in `smoke.sh`, which says it skipped on SQLite.
 
+**A tool that answers failure over a write that happened is a defect, and the REST tools were one.**
+The controller inserts a row and then applies the featured image, parent-like fields and meta, and
+the nets throw from that tail. `GMCP_Core::rest_write_refusal()` asks the pointer, parent and meta
+policies before the controller is called (like `create_one_post()` does for `meta_input`), and
+`GMCP_Tools_Rest::handle_call()` deletes a row its own create inserted if a net still refuses from
+inside the controller, and says so. A new create or update path that writes in two steps pre-checks
+the second step or undoes the first; `smoke-forms.sh` asserts the table, not the reply.
+
 **A deletion is not always a delete tool.** WordPress deletes on markers it reads from
 ordinary rows: `wp_scheduled_delete()` removes every post with an old `_wp_trash_meta_time`
 and `wp_delete_auto_drafts()` every old auto-draft. So `GMCP_Core::status_write_refusal()`
