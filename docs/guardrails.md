@@ -1479,6 +1479,33 @@ made here and the previous one is still there to switch back to. A site that
 genuinely wants an import has the Elementor screen for it, where a person sees
 what is about to happen.
 
+## Considered and not built
+
+Two things get proposed often enough to write down why they are not here.
+
+**A bridge to the WordPress Abilities API.** Other plugins register abilities there, each
+with its own permission callback, and a tool could expose them all to an agent. Every
+guard in this plugin belongs to the thing it protects: `option_write_policy()` to the
+option, `commerce_post_guard()` and `personal_data_post_guard()` to the post type,
+`status_write_refusal()` to the status. An ability that writes an option or a post
+reaches the same rows through a door none of those are asked at, and its permission callback
+answers "may this user do this" for a person, not "should an agent be handed this". The
+approval queue cannot classify it either, because it derives what a call does from the
+tool's registration and a generic bridge registers one tool for all of them. If it is ever
+built it has to be off by default, `admin` level, restricted to abilities that declare
+themselves read-only, or else every call through it held for approval.
+
+**Connections for roles below administrator.** `gmcp_oauth_user_can_authorize` already
+lets a site widen who may approve an OAuth connection, but everything downstream assumes the
+caller is an administrator: the tool set, the key's level cap, the approval screen, and the
+rule that a key stops working when its account stops holding `manage_options`. An editor
+connection needs its own, smaller tool set, drafts-only by default, and a check on every
+tool for what that user may edit, not for what the key may call. That is a product decision
+about who this plugin is for, not a missing feature.
+
+Not built for the same reason as the group above: translation plugins other than Polylang.
+See the WPML note under Redirection and Polylang.
+
 ## Deletion by another name
 
 The `readwrite` level is defined as "create and update, no destructive tools", and the
