@@ -228,36 +228,39 @@ echo "== Block 0c: what hangs off a submission, and the other readers of a post 
 # comment on one, its terms, the change journal that names it, the briefing that quotes the newest
 # post and the REST-generated tools all reach the same data through something that is not of that
 # type. Every hostile call is made with a read-only key against a SEEDED submission (a
-# flamingo_inbound registered by a mu-plugin, so no form plugin is needed), and every check that
+# gmcp_smoke_sub registered by a mu-plugin and handed to the guard through the filter, so no form
+# plugin is needed and none that is installed can change it), and every check that
 # something is absent is paired with a control that the same call finds the marker on an ordinary
-# post. A shop order stands in for the commerce half, below admin.
+# post. A fixture order type, registered the same way, stands in for the commerce half, below admin.
 M2="H2MARK-$RANDOM"
 docker compose exec -T cli sh -c 'cat > /var/www/html/wp-content/mu-plugins/gmcp-smoke-forms-rel.php' <<'PHP'
 <?php
-// A submission type with a taxonomy, revisions and comments; a vocabulary shared with ordinary
-// posts; a stand-in order type when no shop plugin registers one.
+// Three fixture post types under names no real plugin registers, so this block tests the guard
+// and not what happens to be installed: a submission type (revisions, comments, searchable), a
+// contact type for the bookkeeping block, and a stand-in order type. Flamingo's own types are
+// not public and carry no revisions, and WooCommerce's order type is not a posts-table type at
+// all under HPOS, so fixtures built on those names failed on a site that had the plugins and
+// passed on one that did not. The guards are told about these types through the same filters a
+// site with another form store or shop plugin would use.
 add_action( 'init', function () {
-  if ( !post_type_exists( 'flamingo_inbound' ) ) {
-    register_post_type( 'flamingo_inbound', [ 'public' => true, 'show_in_rest' => false, 'label' => 'smoke submission',
-      'supports' => [ 'title', 'editor', 'excerpt', 'comments', 'revisions', 'custom-fields' ] ] );
-  }
-  // With the real form plugin active the type already exists, non-public and without revisions or
-  // comments. The seed below needs a submission with a revision and a comment that "any" can find.
-  foreach ( [ 'revisions', 'comments', 'title', 'editor', 'excerpt', 'custom-fields' ] as $feature ) {
-    add_post_type_support( 'flamingo_inbound', $feature );
-  }
-  if ( isset( $GLOBALS['wp_post_types']['flamingo_inbound'] ) ) {
-    $GLOBALS['wp_post_types']['flamingo_inbound']->exclude_from_search = false;
-  }
-  register_taxonomy( 'gmcp_smoke_channel', [ 'flamingo_inbound' ], [ 'public' => true, 'hierarchical' => true, 'label' => 'smoke channel' ] );
-  register_taxonomy( 'gmcp_smoke_shared', [ 'flamingo_inbound', 'post' ], [ 'public' => true, 'hierarchical' => true, 'label' => 'smoke shared' ] );
-  if ( !post_type_exists( 'shop_order' ) ) {
-    register_post_type( 'shop_order', [ 'public' => true, 'show_in_rest' => false, 'label' => 'smoke order', 'supports' => [ 'title', 'editor', 'comments', 'custom-fields' ] ] );
-  }
+  register_post_type( 'gmcp_smoke_sub', [ 'public' => true, 'show_in_rest' => false, 'label' => 'smoke submission',
+    'supports' => [ 'title', 'editor', 'excerpt', 'comments', 'revisions', 'custom-fields' ] ] );
+  register_post_type( 'gmcp_smoke_con', [ 'public' => true, 'show_in_rest' => false, 'label' => 'smoke contact',
+    'supports' => [ 'title', 'editor', 'custom-fields' ] ] );
+  register_post_type( 'gmcp_smoke_ord', [ 'public' => true, 'show_in_rest' => false, 'label' => 'smoke order',
+    'supports' => [ 'title', 'editor', 'excerpt', 'comments', 'revisions', 'custom-fields' ] ] );
+  register_taxonomy( 'gmcp_smoke_channel', [ 'gmcp_smoke_sub' ], [ 'public' => true, 'hierarchical' => true, 'label' => 'smoke channel' ] );
+  register_taxonomy( 'gmcp_smoke_shared', [ 'gmcp_smoke_sub', 'post' ], [ 'public' => true, 'hierarchical' => true, 'label' => 'smoke shared' ] );
 }, 99 );
+add_filter( 'gmcp_commerce_post_types', function ( $types ) {
+  $types[] = 'gmcp_smoke_ord';
+  return $types;
+} );
 // Lets the suite make a page type look like a form-submission type, to prove that a REST route
 // belonging to a guarded type is not turned into tools.
 add_filter( 'gmcp_personal_data_post_types', function ( $types ) {
+  $types[] = 'gmcp_smoke_sub';
+  $types[] = 'gmcp_smoke_con';
   if ( get_option( 'gmcp_smoke_guard_pages' ) ) {
     $types[] = 'page';
   }
@@ -272,12 +275,12 @@ add_filter( 'gmcp_plugin_config_post_types', function ( $types ) {
 } );
 function gmcp_smoke_seed( $m ) {
   $out = [];
-  foreach ( [ 'sub' => 'flamingo_inbound', 'ctl' => 'post', 'ord' => 'shop_order' ] as $k => $type ) {
+  foreach ( [ 'sub' => 'gmcp_smoke_sub', 'ctl' => 'post', 'ord' => 'gmcp_smoke_ord' ] as $k => $type ) {
     $tag = $m . '-' . $k;
     $id = wp_insert_post( [ 'post_type' => $type, 'post_status' => 'publish', 'post_title' => $tag . '-title', 'post_content' => $tag . '-content [elementor-template id="7771"]', 'post_excerpt' => $tag . '-excerpt', 'comment_status' => 'open' ] );
     update_post_meta( $id, '_field_message', $tag . '-meta' );
     $cid = wp_insert_comment( [ 'comment_post_ID' => $id, 'comment_content' => $tag . '-comment', 'comment_author' => 'a', 'comment_approved' => 1 ] );
-    $tax = $type === 'flamingo_inbound' ? 'gmcp_smoke_channel' : 'category';
+    $tax = $type === 'gmcp_smoke_sub' ? 'gmcp_smoke_channel' : 'category';
     $term = wp_insert_term( $tag . '-term', $tax );
     wp_set_object_terms( $id, [ (int) $term['term_id'] ], $tax );
     wp_update_post( [ 'ID' => $id, 'post_content' => $tag . '-content-v2 [elementor-template id="7771"]' ] );
@@ -295,7 +298,7 @@ add_action( 'profile_update', function ( $user_id ) {
   }
   $id = (int) get_option( 'gmcp_smoke_contact' );
   if ( !$id || !get_post( $id ) ) {
-    $id = wp_insert_post( [ 'post_type' => 'flamingo_contact', 'post_status' => 'publish', 'post_title' => 'contact-created' ] );
+    $id = wp_insert_post( [ 'post_type' => 'gmcp_smoke_con', 'post_status' => 'publish', 'post_title' => 'contact-created' ] );
     update_option( 'gmcp_smoke_contact', $id, false );
   }
   wp_update_post( [ 'ID' => $id, 'post_title' => 'contact-updated-' . $user_id ] );
@@ -386,7 +389,7 @@ allow() { # allow <label> <key> <tool> <args> <marker>: answers and the marker I
 check "CONTROL: the seed stored a marker on the submission, its revision, its upload and its comment" \
   "$(wpe 'echo get_post_meta('"$SUB"',"_field_message",true),"|",get_post('"$SUBREV"')->post_parent==='"$SUB"'?"rev":"norev","|",get_post('"$SUBATT"')->post_parent==='"$SUB"'?"att":"noatt","|",get_comment('"$SUBCOM"')->comment_post_ID=='"$SUB"'?"com":"nocom";')" "$M2-sub-meta|rev|att|com"
 check "CONTROL: the order type has the same rows" \
-  "$(wpe 'echo get_post_type('"$ORD"'),"|",get_post('"$ORDATT"')->post_parent==='"$ORD"'?"att":"noatt";')" "shop_order|att"
+  "$(wpe 'echo get_post_type('"$ORD"'),"|",get_post('"$ORDATT"')->post_parent==='"$ORD"'?"att":"noatt";')" "gmcp_smoke_ord|att"
 
 echo "-- a revision, an upload or a comment of a submission is the submission --"
 deny "wp_get_post on a revision of a submission" "$RO" wp_get_post "{\"ID\":$SUBREV}" "$M2-sub"
@@ -442,7 +445,7 @@ check "CONTROL: and STORED: the term is on the ordinary post" "$(wpe 'echo in_ar
 wpe 'wp_delete_term('"$EXTRA"',"category");' >/dev/null
 
 echo "-- counts are an existence oracle and are kept --"
-callas "$RO" d3 "$(tc wp_count_posts '{"post_type":"flamingo_inbound"}')"
+callas "$RO" d3 "$(tc wp_count_posts '{"post_type":"gmcp_smoke_sub"}')"
 check "wp_count_posts for a submission type answers (a number, never a row)" "$(verdict d3)" "ok"
 check "and it carries no marker" "$(has d3 "$M2")" "no"
 
@@ -730,7 +733,7 @@ callas "$TOK" se1 "$(tc wp_update_user "{\"ID\":$SEU,\"fields\":{\"display_name\
 check "wp_update_user succeeds although a plugin hook creates and writes a submission-type post during the call" "$(verdict se1)" "ok"
 check "STORED: the user's display name changed" "$(wpe 'echo get_userdata('"$SEU"')->display_name;')" "$M2-seu-name"
 check "STORED: and the hook's own writes to its contact row went through (title and meta)" \
-  "$(wpe '$c=(int) get_option("gmcp_smoke_contact");echo get_post_type($c),"|",get_post($c)->post_title,"|",get_post_meta($c,"_gmcp_smoke_side",true);')" "flamingo_contact|contact-updated-$SEU|meta-$SEU"
+  "$(wpe '$c=(int) get_option("gmcp_smoke_contact");echo get_post_type($c),"|",get_post($c)->post_title,"|",get_post_meta($c,"_gmcp_smoke_side",true);')" "gmcp_smoke_con|contact-updated-$SEU|meta-$SEU"
 callas "$TOK" se2 "$(tc wp_update_user "{\"ID\":$SEU,\"fields\":{\"display_name\":\"$M2-seu-name-2\"}}")"
 check "and a second call, which UPDATES the row the first created, succeeds as well" "$(verdict se2)" "ok"
 wpe 'wp_delete_post((int) get_option("gmcp_smoke_contact"),true);delete_option("gmcp_smoke_contact");delete_option("gmcp_smoke_sideeffect");wp_delete_user('"$SEU"');' >/dev/null
@@ -800,7 +803,7 @@ echo "-- a menu item is a read of what it points at --"
 MENU=$(wpe 'echo wp_create_nav_menu("'"$M2"'-menu");')
 MI_OK=$(wpe 'echo wp_update_nav_menu_item('"$MENU"',0,["menu-item-type"=>"post_type","menu-item-object"=>"post","menu-item-object-id"=>'"$CTL"',"menu-item-status"=>"publish"]);')
 MI_AIM=$(wpe 'echo wp_update_nav_menu_item('"$MENU"',0,["menu-item-type"=>"post_type","menu-item-object"=>"post","menu-item-object-id"=>'"$CTL"',"menu-item-status"=>"publish"]);')
-MI_OLD=$(wpe 'echo wp_update_nav_menu_item('"$MENU"',0,["menu-item-type"=>"post_type","menu-item-object"=>"flamingo_inbound","menu-item-object-id"=>'"$SUB"',"menu-item-status"=>"publish"]);')
+MI_OLD=$(wpe 'echo wp_update_nav_menu_item('"$MENU"',0,["menu-item-type"=>"post_type","menu-item-object"=>"gmcp_smoke_sub","menu-item-object-id"=>'"$SUB"',"menu-item-status"=>"publish"]);')
 CLEAN="$CLEAN $MI_OK $MI_AIM $MI_OLD"
 check "CONTROL: the menu holds an item that points at the submission (made outside any tool)" "$(wpe 'echo (int) get_post_meta('"$MI_OLD"',"_menu_item_object_id",true);')" "$SUB"
 callas "$RO" mi0 "$(tc wp_get_menu_items "{\"menu\":\"$MENU\"}")"
@@ -808,7 +811,7 @@ check "wp_get_menu_items answers" "$(verdict mi0)" "ok"
 check "CONTROL: it lists the item that points at an ordinary post, with that post's title" "$(has mi0 "$M2-ctl-title")" "yes"
 check "it does not list the item that points at a submission" "$(has mi0 "$M2-sub-title")" "no"
 check "nor give its id" "$(has mi0 "\"item_id\": $MI_OLD")" "no"
-callas "$RW" mi1 "$(tc wp_update_post_meta "{\"ID\":$MI_AIM,\"meta\":{\"_menu_item_object_id\":\"$SUB\",\"_menu_item_object\":\"flamingo_inbound\"}}")"
+callas "$RW" mi1 "$(tc wp_update_post_meta "{\"ID\":$MI_AIM,\"meta\":{\"_menu_item_object_id\":\"$SUB\",\"_menu_item_object\":\"gmcp_smoke_sub\"}}")"
 check "re-pointing a menu item at a submission through its meta is refused" "$(verdict mi1)" "error"
 check "STORED: the item still points at the ordinary post" "$(wpe 'echo (int) get_post_meta('"$MI_AIM"',"_menu_item_object_id",true),"|",get_post_meta('"$MI_AIM"',"_menu_item_object",true);')" "$CTL|post"
 callas "$RW" mi1b "$(tc wp_update_post_meta "{\"ID\":$MI_AIM,\"meta\":{\"_menu_item_object_id\":\"$SUBATT\"}}")"
@@ -1011,7 +1014,7 @@ check "CONTROL: an ordinary post is answered differently from a missing one (the
   "$([ "$(norm u3 "$CTL")" != "$(norm u4 "$MISSING")" ] && echo differs || echo same)" "differs"
 callas "$TOK" u5 "$(tc wp_get_post "{\"ID\":$SUB}")"
 check "an ADMIN key is still told why" "$(has u5 "form submission")" "yes"
-callas "$RO" u6 "$(tc wp_get_posts '{"post_type":"flamingo_inbound"}')"
+callas "$RO" u6 "$(tc wp_get_posts '{"post_type":"gmcp_smoke_sub"}')"
 check "a listing that names the submission type is refused with the reason (it names a type, not a post)" "$(has u6 "form submission")" "yes"
 if [ "$REST_WAS" = unset ]; then
   wpe '$o=get_option("gmcp_options",[]);unset($o["mcp_tools_rest"]);update_option("gmcp_options",$o,false);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null
