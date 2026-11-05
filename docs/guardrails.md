@@ -304,7 +304,12 @@ something that looks harmless and is not, so each says what it cannot promise.
   address (an empty user name and a password containing `@` included; a password
   containing a literal `/` is not a valid URL and is not covered); the same
   credential-named values inside JSON that is itself inside a log line, where the
-  quotes arrive escaped; keys with a fixed vendor prefix (Stripe, GitHub, Slack,
+  quotes arrive escaped, or the whole object is percent-encoded inside a URL
+  (`%22access_token%22%3A%22...%22`); an element named like a secret, including one whose
+  content is a CDATA section; values in curly quotes, an escaped quote inside a quoted value,
+  and the fullwidth `＝` and `：` as separators (not covered: a value split across two lines
+  or arguments, base64 of a credential, and a secret that is written with no name in front
+  of it); keys with a fixed vendor prefix (Stripe, GitHub, Slack,
   SendGrid, Google API, GitLab, Mailgun); a private key block, one line of which is
   withheld along with every line up to its end marker (a missing end marker ends at
   the next log record or after 100 lines; a line that closes one block and opens a
@@ -449,15 +454,28 @@ something that looks harmless and is not, so each says what it cannot promise.
   type, an exception message, the reason an authorize request was refused) goes through
   `GMCP_Core::log_text()`, and a session id is written as its first eight characters.
   `log_text()` is the widest scrub in the plugin because a log is the channel nobody is
-  told about before reading it: it turns control characters into visible escapes (a
-  newline in a request value used to be written as a second line, so a client could forge
-  `[Guarded MCP]` lines), runs the line through the same scrubber the error-log reader
-  uses (vendor key prefixes, PEM blocks, URL user information, JWTs, escaped JSON,
-  `define()` lines, `pw=`), and takes the whole value after a secret-named key: an
-  unquoted one up to `&` or the end of the line, a quoted one up to its closing quote,
-  so `smtp_pwd=correct horse battery` no longer leaves `horse battery`. It reads at most
-  2,500 bytes of a value, and when PCRE gives up the line says it was withheld rather than
-  coming out empty. `GMCP_Logging` writes every line through the same function. Without it the tool that hands the link out would
+  told about before reading it. First it turns every kind of whitespace (tab, newline,
+  carriage return, vertical tab, form feed, U+0085, U+2028, U+2029, the no-break space and
+  the other fixed-width spaces) into one plain space, before any scrub reads the line:
+  a newline in a request value used to be written as a second line, so a client could forge
+  `[Guarded MCP]` lines, and escaping it to the two characters backslash and "n" first meant
+  that `smtp_pass<TAB>=<TAB>x` and `Bearer<TAB>x` slipped past the separator rule and the
+  Bearer rule, which is the defect this order fixes (it reached the 30-character query and
+  message previews, the redirect URI, the scope, the client name and version, and exception
+  messages). Any other control character is shown as a visible escape. Then it runs the line
+  through the same scrubber the error-log reader uses (vendor key prefixes, PEM blocks, URL
+  user information, JWTs, escaped JSON, `define()` lines, `pw=`), and takes the whole value
+  after a secret-named key: an unquoted one up to `&` or the end of the line, a quoted one up
+  to its closing quote, so `smtp_pwd=correct horse battery` no longer leaves `horse battery`.
+  A backslash and the character after it count as one inside a quoted value, so an escaped
+  quote (`'ab\'cdef'`) does not end the value and leave its tail (measured for the debug log,
+  the error-log reader and the scanner). It reads at
+  most 2,500 bytes of a value, and a call's arguments only up to a byte budget of four times
+  that, whatever number of leaves they come in (the redaction walk used to cost about as much
+  per leaf as per byte: a million one-character strings took 2.5 s, a million assignments 17
+  s with the JIT off; now 0.1 to 0.4 s, measured in `.dev/test-redact-timing.php`). When PCRE gives up the
+  line says it was withheld rather than coming out empty. It is one line of text: a secret
+  that is split across two log lines, or across two arguments, is not joined. `GMCP_Logging` writes every line through the same function. Without it the tool that hands the link out would
   have written it into the audit log in the clear in the same call, which the
   first test of it showed. The fetch tool refuses a URL carrying the parameter
   for the same reason: it would be recorded as an argument, and a preview
@@ -1538,6 +1556,23 @@ Authorization header, a private key block, user information in a URL, a JWT, and
 published prefixes of the common key formats. It is a heuristic and not a promise: a
 secret that is a bare word with nothing around it is not recognisable as one.
 
+Exactly what it reads, because each of these was once a miss and is now asserted
+(`.dev/journal-pure.php`, offsets included): the name may be of any length (a bound of 63
+characters let a secret hide behind a long name) and may be a PHP array index
+(`$cfg['db_password'] = '...'`); `=>`, `=` and `:` separate; inside a quoted value a
+backslash and the character after it count as one, so `\'` and `\"`, Gutenberg's `\u0026`
+and a Windows path (`C:\\vault\\...`) do not end the value, and a `define()` value with an
+escaped quote is taken whole; text that was escaped for embedding is read as well, as
+`&quot;`, `&#039;`, `\"`, `\\"` (escaped twice), `\u0022` and the HTML-escaped arrow `=&gt;` of a
+code block, and the spans are mapped back to the original text. `Basic` is a credential when the
+token is the base64 of `user:password` (decoded, printable, with a colon), `Bearer` when it is eight
+characters or more with a digit (or twenty or more letters) and not words joined by hyphens or
+slashes, and an `Authorization:` header is read whole. What it does not find: a value split across
+several arguments or lines, a credential that is base64 or encrypted and has no name or prefix
+around it, a bare token, a `Basic` credential that is not standard base64 of `user:password`, a
+secret under a name that does not end in a secret word, and an unquoted value under `token`, `secret` or `key`
+that is nothing but short words and numbers joined by hyphens or slashes.
+
 It is built to avoid the opposite failure as carefully, because a false positive
 costs an undo and the journal exists so that an ordinary edit can be put back. The
 last word of the name decides, so `passwordLabel` and `placeholder_text` are labels,
@@ -1547,6 +1582,26 @@ undone byte for byte, and a block attribute such as `{"authorId":3}` is not touc
 both are asserted. On a half-megabyte body it takes about 15 to 60 milliseconds,
 measured, and a failure of the regular-expression engine itself answers "yes, a
 credential", never "no".
+
+Measured false positives. Ordinary prose that was flagged and is not now: `Course 1: Basic
+HTML/CSS for beginners`, `Basic 2024/2025 membership`, `Season Pass: 2024-2025`, `Day pass:
+10am-6pm daily`, `Token: 1st-come-first-served`, `The ring Bearer 4-year-old nephew`, `Hall
+pass=2nd-floor`, a reCAPTCHA `data-sitekey`, and a Stripe publishable key (`pk_live_`, `pk_test_`;
+the secret `sk_` keys are still flagged). The causes were a Basic or Bearer rule that wanted one
+digit or slash in an eight-character word, and `pass`, `token` and `secret` standing alone as names
+in the unquoted `name: value` rule. A bare `pass` is no longer a name there (`db_pass`, `smtp_pass`
+and `DB_PASS` still are), a `::` is not a separator, and for the unquoted `token`/`secret`/`key`
+names a value that reads as words and numbers (a version, a range, hyphen- or slash-joined words and
+short ordinals) is not one. A password name has no such exemption: a passphrase is often just words
+joined by hyphens. Run over 1,423 documentation and readme files from this machine (30 MB, 730,252
+lines: the WordPress readme and licence, the bundled plugin's readme, and the system's package
+docs) the scanner flagged 6 lines before and none after; the six were C++ scope names such as
+`strlen_pass::count_nonzero_bytes_addr`. That corpus is technical text and says little about
+marketing prose, so the seven lines above, not the corpus, are what the tests assert. What is still
+flagged and cannot be removed without losing real secrets: a Maps `?key=AIza...` URL (a Maps key
+is restricted by referrer, but the same prefix is a server secret on other Google services), a
+placeholder that is not on the list (`$Db_pass9`, `${db_pass}`), and any prose that really looks like
+`name=value` with a secret-ended name and a token-shaped value (`password=abc123`, said in a sentence).
 
 What a post entry does about it is per field. A field that holds one is left out of
 `previous` and named in `redacted_fields`; the other fields of the same edit stay
@@ -2018,9 +2073,18 @@ the second half.
   can read, if it carries an argument the tool's schema does not declare, if it is a list of
   unnamed values, if it nests more than 12 levels, or if its arguments written out exceed
   16000 bytes: an approval covers every byte, so it is not asked for what cannot be read.
-  A credential-shaped field, a string that holds one, and a preview-link token show as
-  `[redacted]`, and the screen says how many values are hidden and names their paths, so a
-  person knows a value they cannot see is part of what they approve. Bidirectional and
+  A credential-shaped field, and a JSON or serialized string with one inside, show as
+  `[redacted]` whole. In any other string only the stretch the scanner matched, or a
+  preview-link token, is replaced by `[redacted]`: the rest of the string stays readable,
+  `[hidden values present: N]` is appended to it, and the screen names its path, so a person
+  knows a value they cannot see is part of what they approve and can still read what
+  surrounds it. This screen used to replace the whole string when the scanner matched
+  anywhere in it, so a decoy that merely looked like a credential in a post body made the
+  script tag beside it unreadable to the person deciding, and an agent that knew that could
+  make any argument unreadable. Each string is judged on its own: a secret split across two
+  arguments is not recognised by the view. The approval stays bound to the real arguments:
+  building the view does not touch them and the keyed hash is computed from them (asserted).
+  Bidirectional and
   zero-width characters are shown as escapes. Rows stored before this existed are labelled
   as possibly incomplete.
 - **A held call is not a success.** The reply is a normal result, not `isError`, so a

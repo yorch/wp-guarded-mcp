@@ -73,8 +73,13 @@ key blocks and the common key prefixes, and it does not find a secret that is a 
 or an unquoted lowercase word under a secret-named key with no digit in it. The debug log
 does take that last one; see `docs/guardrails.md`. A value that is plainly what a template
 writes where a secret goes (`password_here`, `YOUR_TOKEN_HERE`, `********`, `<token>`,
-`${DB_PASS}`, `user:pass@host`) is not a credential, so WordPress's own sample config line
-does not cost a post its undo. Ordinary prose that mentions a password is recorded as
+`${DB_PASS}` or `$DB_PASS` in capitals only, `user:pass@host`) is not a credential, so WordPress's
+own sample config line does not cost a post its undo; `'$uperS3cret99'` is a password that starts
+with a dollar sign and is flagged. The scanner also reads PHP array-index assignments
+(`$cfg['db_password'] = '...'`), names of any length, and quoted values that hold escapes (an
+escaped quote, Gutenberg's `&`, a backslash path, text escaped twice, `=&gt;` in a code block);
+what it does not find (a value split across arguments, base64, a bare token) and the prose it
+still flags are listed in `docs/guardrails.md`. Ordinary prose that mentions a password is recorded as
 written, and so is a caller named by a key id: the approval events' `caller` is an
 identity, not a secret, and is never blanked.
 
@@ -100,10 +105,19 @@ into the log.
 The scrubs run after the tool has run, over every string of the call, so they have to
 be fast on text an agent controls and honest when they cannot finish. No string is
 read past 64,000 bytes plus a margin, because no more than that can be stored, and a
-call cut that way records the size it really had (`__gmcp_truncated`). The expressions
-are linear in the length of the text, measured with the regular-expression JIT on and
-off (`.dev/test-redact-timing.php`): an earlier form was quadratic, and a 560 KB
-argument made the tool's effect land with no row written at all. When the engine does
+call cut that way records the size it really had (`__gmcp_truncated`). That bounds each
+leaf and not their number, and the scrubs cost about as much per leaf as per byte, so the
+walk also has a byte budget of 65,024 bytes for the whole call: each leaf is read until the
+budget is spent, the rest of that array is dropped unread, and an `__gmcp_omitted` entry says
+how many entries and bytes went unexamined (so a call of a million one-character strings
+records a truncation and its real size, in about 0.3 s instead of 2.5 s, and a million
+secret-looking assignments in 0.3 s instead of 17 s, with the JIT off). The change journal
+applies a node and byte budget to a value before it walks it (100,000 nodes, 8 MiB of strings),
+and treats a value over it as NOT safe to keep, never as clean: that entry has no undo copy.
+The expressions are linear in the length of the text, a private key block is searched for its end
+once, not once per line (17,500 unterminated lines took 3.4 s, now 0.1 s), all measured with the
+regular-expression JIT on and off (`.dev/test-redact-timing.php`): an earlier form was quadratic,
+and a 560 KB argument made the tool's effect land with no row written at all. When the engine does
 give up on a string, the record says `[unscrubbable text withheld]`; it never records
 an empty string in place of text it could not read.
 

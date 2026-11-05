@@ -522,11 +522,13 @@ repeats the identical call and it runs once.
 - The screen shows the call in one canonical order (sorted, the tool's declared arguments
   first) and never shortens it: a call with an argument its tool does not declare, nested
   more than 12 levels, or longer than 16000 bytes written out is refused with an error
-  instead of queued, because an approval covers every byte. A credential is hidden, whether it
-  sits under a field named like one or is written into free text (a `define( 'DB_PASSWORD', ... )`
-  line inside a tagline), and the
+  instead of queued, because an approval covers every byte. A field named like a credential, or a JSON
+  string with one inside, is hidden whole. In any other text only the part that looks like a credential
+  is hidden (a `define( 'DB_PASSWORD', ... )` line inside a tagline), the rest of the text stays
+  readable with `[hidden values present: N]` after it, and the
   screen says how many values are hidden and which fields, so you know a value you cannot
-  see is part of what you approve (the hash covers the real value). Requests,
+  see is part of what you approve (the hash covers the real value). Each text is judged on its own: a
+  secret split across two arguments is not recognised by the screen. Requests,
   approvals, declines, lapses, uses and refused replays are written to the audit log.
   There are no bulk actions and nothing to delete: a request leaves the list by being
   answered or by lapsing.

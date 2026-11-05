@@ -155,12 +155,17 @@ can reach, and a channel with no redaction is a leak waiting for the first calle
 that passes a secret. So every debug line that prints something a client sent goes
 through `GMCP_Core::log_text()` (`log_line()` for a string), and so does every line
 `GMCP_Logging` writes, so a line added later without the helper is still covered. In a log
-over-redacting is fine and under-redacting is not, so it is the widest of the channels: control
-characters become visible escapes (a newline in a request value was a forged second log line),
+over-redacting is fine and under-redacting is not, so it is the widest of the channels: whitespace of
+every kind (tab, newline, carriage return, vertical tab, form feed, the Unicode line and paragraph
+separators, the no-break and other fixed-width spaces) becomes one plain space BEFORE any scrub reads
+the line, so a separator with a tab in it is still a separator and a newline in a request value cannot
+start a forged second log line; any other control character is shown as a visible escape,
 `GMCP_Diag_Util::scrub_log_line()` removes the vendor key shapes, PEM blocks, URL user
 information, JWTs, escaped JSON, `define()` lines and `pw=`, and the whole value after a
 secret-named key goes, an unquoted one to `&` or the end of the line and a quoted one to its
-closing quote. Every `error_log()` in `includes/` is checked by a tripwire in
+closing quote, where a backslash and the character after it count as one (an escaped quote does not end
+a value). It reads one line of at most 2,500 bytes of a value, and a call's arguments only up to a
+byte budget (see the audit log doc), so the cost does not grow with how many leaves a client sends. Every `error_log()` in `includes/` is checked by a tripwire in
 `.dev/test-credential-channels.php`: one that prints `$reason`, an exception message or a request
 parameter without `log_text()` fails it. A bare token with no key in front of it and no known
 prefix is not recognised by any of this, and nothing in the docs claims it is.
@@ -172,11 +177,20 @@ test, and the journal (`unsafe_to_keep()`, `post_previous()`, `label()`), `GMCP_
 the audit log's arguments, target and reply, `redact_reversible()` and the approval queue's stored and
 printed view of a call (`GMCP_Approvals::view_value()`, per string value) all ask it. It also says
 WHERE (`spans()`), and the audit log's arguments blank only those spans, so a decoy cannot wipe a
-whole value from the log; the journal keeps its whole-field drop, because a partly blanked value
+whole value from the log; the approval screen does the same, because it is the one place a person
+decides on what they read: only the matched stretch is replaced, the string's path is listed and
+`[hidden values present: N]` is appended (a JSON or serialized blob with a secret-named field inside
+is still replaced whole, and each string is judged alone, so a secret split across two arguments is
+not recognised by the view). The journal keeps its whole-field drop, because a partly blanked value
 cannot be restored. The aggressive assignment scrub (any value after a secret-named key) belongs to
 the debug log only: in a record of what a call said it blanked ordinary prose. A value that is a
-documented placeholder (`password_here`, `YOUR_TOKEN_HERE`, `********`, `${VAR}`, `user:pass@`) is not
-a credential, with a counterpart test for each that a real-looking value under the same name still is.
+documented placeholder (`password_here`, `YOUR_TOKEN_HERE`, `********`, `<token>`, `${UPPER_SNAKE}` or
+`$UPPER_SNAKE` in capitals only, `user:pass@`) is not a credential, with a counterpart test for each that a
+real-looking value under the same name still is: `'$uperS3cret99'` and `${db_pass}` are not placeholders.
+What the scanner reads through is listed in `docs/guardrails.md`: quote escapes, a backslash and the
+character after it counting as one inside a quoted value, array-index and `define()` assignments, names of
+any length. What it does not find is listed there too (a value split over several arguments, base64, a bare
+token). Its false positives are measured on a prose corpus, and the classes that remain are named.
 The short one-line columns (the journal's `what` and `label()`, the audit log's change summary, target and
 reply) ask the wider `GMCP_Core::looks_credentialed()` (the scanner plus the assignment rule), because
 `password: hunter2` and `smtp_pwd=hunter` passed the scanner and were recorded in the clear in a column read
