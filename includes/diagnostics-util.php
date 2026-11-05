@@ -177,6 +177,75 @@ final class GMCP_Diag_Util {
   ];
 
   /**
+  * The path a server would route, and a refusal when the path is not a plain one.
+  *
+  * Decoded until it stops changing (capped), then refused if it was ever encoded in a way no
+  * browser produces: an encoded unreserved character (letter, digit, "-", "_", "~"), an
+  * encoded dot, slash, backslash or NUL, a path that is still encoded after one decode (a
+  * double encoding is only ever sent to confuse a second decoder), or one that decodes to a
+  * control character. Legitimate encoding (%20, a UTF-8 sequence) is untouched.
+  *
+  * @return array{path:string,error:string}
+  */
+  public static function normalise_path( string $path ): array {
+    $bad = static function ( string $why ): array {
+      return [ 'path' => '', 'error' => $why ];
+    };
+    if ( preg_match( '/%(2e|2f|5c|00)/i', $path ) ) {
+      return $bad( 'A path containing an encoded dot, slash, backslash or NUL is refused.' );
+    }
+    if ( preg_match_all( '/%([0-9a-f]{2})/i', $path, $m ) ) {
+      foreach ( $m[1] as $hex ) {
+        $c = hexdec( $hex );
+        if ( ( $c >= 0x30 && $c <= 0x39 ) || ( $c >= 0x41 && $c <= 0x5a ) || ( $c >= 0x61 && $c <= 0x7a ) || $c === 0x2d || $c === 0x5f || $c === 0x7e ) {
+          return $bad( 'A path with an encoded letter, digit, hyphen, underscore or tilde is refused: nothing that visits a page writes it that way.' );
+        }
+      }
+    }
+    $once = rawurldecode( $path );
+    if ( preg_match( '/%[0-9a-f]{2}/i', $once ) ) {
+      return $bad( 'A path that is still percent-encoded after decoding (double encoding) is refused.' );
+    }
+    if ( preg_match( '/[\x00-\x1f\x7f\\\\]/', $once ) ) {
+      return $bad( 'A path that decodes to a control character or a backslash is refused.' );
+    }
+    foreach ( explode( '/', $once ) as $segment ) {
+      if ( $segment === '.' || $segment === '..' ) {
+        return $bad( 'A path with dot segments is refused.' );
+      }
+    }
+    return [ 'path' => $once, 'error' => '' ];
+  }
+
+  /**
+  * Every name a query key can arrive in PHP as, lowercased.
+  *
+  * PHP does not keep the key it was sent. It decodes it ("+" is a space), drops leading
+  * spaces, turns "." and " " into "_" and, in a key with "[", either takes what is before it
+  * as the name (an array key) or turns the "[" into "_" (no closing bracket). So
+  * "rest.route", "rest+route" and "rest[route" are all $_GET['rest_route'], which WordPress
+  * serves as the REST API. Returned: the key decoded, the key as PHP stores it, and the
+  * array-key base, so a blocked name is matched whichever spelling reached it.
+  *
+  * @return string[]
+  */
+  public static function query_key_variants( string $raw ): array {
+    $key = urldecode( $raw );
+    $nul = strpos( $key, "\0" );
+    if ( $nul !== false ) {
+      $key = substr( $key, 0, $nul );
+    }
+    $key = ltrim( $key, ' ' );
+    $out = [ strtolower( rawurldecode( $raw ) ), strtolower( $key ) ];
+    $out[] = strtolower( strtr( $key, [ '.' => '_', ' ' => '_', '[' => '_' ] ) );
+    $br = strpos( $key, '[' );
+    if ( $br !== false && strpos( $key, ']', $br ) !== false ) {
+      $out[] = strtolower( strtr( substr( $key, 0, $br ), [ '.' => '_', ' ' => '_' ] ) );
+    }
+    return array_values( array_unique( $out ) );
+  }
+
+  /**
   * May the server fetch this URL, and if so what exactly should it request.
   *
   * The one rule is that the URL must be a page of THIS site: same scheme, same host, same
@@ -243,32 +312,44 @@ final class GMCP_Diag_Util {
     if ( $path === '' ) {
       $path = '/';
     }
-    if ( preg_match( '/%(2e|2f|5c|00)/i', $path ) ) {
-      return $fail( 'A path containing an encoded dot, slash, backslash or NUL is refused.' );
+    $norm = self::normalise_path( $path );
+    if ( $norm['error'] !== '' ) {
+      return $fail( $norm['error'] );
     }
-    foreach ( explode( '/', $path ) as $segment ) {
-      if ( $segment === '.' || $segment === '..' ) {
-        return $fail( 'A path with dot segments is refused.' );
-      }
-    }
+    // Every comparison below is made on the DECODED path: a server decodes before it routes,
+    // so "/wp%2Djson/", "/wp-login.ph%70" and "/index.php/wp-json/" are the same request as
+    // the plain spellings, and a list compared against the text that was sent is a list the
+    // sender gets to spell around.
+    $decoded = $norm['path'];
     $base = rtrim( $h['path'] ?? '', '/' );
-    if ( $base !== '' && $path !== $base && strpos( $path, $base . '/' ) !== 0 ) {
+    if ( $base !== '' && $decoded !== $base && strpos( $decoded, $base . '/' ) !== 0 ) {
       return $fail( 'The path is outside the site (' . $base . '/).' );
     }
-    $relative = ltrim( substr( $path, strlen( $base ) ), '/' );
-    $first = strtolower( explode( '/', $relative )[0] );
+    $segments = explode( '/', ltrim( substr( $decoded, strlen( $base ) ), '/' ) );
+    $first = strtolower( $segments[0] );
     if ( in_array( $first, self::BLOCKED_SEGMENTS, true ) ) {
       return $fail( '"' . $first . '" is not a page a visitor sees, and is not fetched.' );
     }
-    if ( substr( strtolower( $path ), -4 ) === '.php' && strtolower( basename( $path ) ) !== 'index.php' ) {
-      return $fail( 'A request for a PHP file other than index.php is not a request for a page, and is not made.' );
+    $last = count( $segments ) - 1;
+    foreach ( $segments as $i => $segment ) {
+      $seg = strtolower( $segment );
+      if ( substr( $seg, -4 ) !== '.php' ) {
+        continue;
+      }
+      // "/index.php/wp-json/..." is how WordPress is reached without rewrite rules: PATH_INFO
+      // carries the route, so index.php may only ever be the last thing in the path. Any other
+      // PHP file, and a PHP file with a path after it, is not a request for a page.
+      if ( $i !== $last || $seg !== 'index.php' ) {
+        return $fail( 'A request for a PHP file other than a bare index.php is not a request for a page, and is not made.' );
+      }
     }
     $query = $u['query'] ?? '';
     if ( $query !== '' ) {
       foreach ( explode( '&', $query ) as $pair ) {
-        $key = strtolower( rawurldecode( explode( '=', $pair, 2 )[0] ) );
-        if ( in_array( $key, self::BLOCKED_QUERY_KEYS, true ) ) {
-          return $fail( 'The query parameter "' . $key . '" is not fetched: it either changes state on common plugins or carries a preview credential.' );
+        foreach ( self::query_key_variants( explode( '=', $pair, 2 )[0] ) as $key ) {
+          if ( in_array( $key, self::BLOCKED_QUERY_KEYS, true ) ) {
+            return $fail( 'The query parameter "' . $key . '" is not fetched: it either changes state on common plugins or carries a preview credential.' );
+          }
         }
       }
     }
@@ -489,6 +570,41 @@ final class GMCP_Diag_Util {
     return $r;
   }
 
+  /* ----------------------------------------------------------------- preview tokens */
+
+  /**
+  * A preview link's token cut out of a string, whichever way the parameter name was spelled.
+  *
+  * PHP turns "gmcp.preview", "gmcp preview" and "gmcp[preview" into $_GET['gmcp_preview'],
+  * and a client may percent-encode any character of the name or the "=", so a scrubber that
+  * looks for the literal "gmcp_preview=" misses a link that works. Each letter of the name
+  * is therefore matched as itself or as its %XX form, the separator as any character PHP
+  * maps to "_" (or its encoding), and the value as the run of token characters after the
+  * "=" (or %3D). The value is replaced even when it is not 40 hex characters: a shorter
+  * string after that key is still something somebody meant as a credential.
+  *
+  * Used for anything that is written down: the audit log, the debug log, the error-log
+  * reader. Not for what a tool returns to its caller about the site's own data.
+  */
+  public static function scrub_preview_tokens( string $text ): string {
+    if ( stripos( $text, 'preview' ) === false && stripos( $text, '%' ) === false ) {
+      return $text;
+    }
+    static $re = null;
+    if ( $re === null ) {
+      $lit = static function ( string $word ): string {
+        $out = '';
+        foreach ( str_split( $word ) as $ch ) {
+          $out .= '(?:' . $ch . '|%' . strtoupper( bin2hex( $ch ) ) . '|%' . strtoupper( bin2hex( strtoupper( $ch ) ) ) . ')';
+        }
+        return $out;
+      };
+      $sep = '(?:[._ +\\[]|%5[Ff]|%2[Ee]|%20|%2[Bb]|%5[Bb])';
+      $re = '/(' . $lit( 'gmcp' ) . $sep . $lit( 'preview' ) . '(?:\\]|%5[Dd])?(?:=|%3[Dd]))[A-Za-z0-9_%.-]+/i';
+    }
+    return (string) preg_replace( $re, '$1[redacted]', $text );
+  }
+
   /* ------------------------------------------------------------------- log scrubbing */
 
   /**
@@ -555,6 +671,7 @@ final class GMCP_Diag_Util {
     // is also what clears ?token=... in a logged URL.
     $patterns = array_values( array_filter( array_map( 'strval', $ctx['patterns'] ?? [ 'pass', 'pwd', 'secret', 'token', 'key', 'auth', 'salt', 'nonce', 'credential', 'bearer', 'signature', 'licence', 'license', 'private' ] ), 'strlen' ) );
     $patterns[] = 'gmcp_preview';
+    $line = self::scrub_preview_tokens( $line );
     if ( $patterns ) {
       $alt = implode( '|', array_map( static function ( $p ) {
         return preg_quote( $p, '#' );

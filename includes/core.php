@@ -1381,10 +1381,7 @@ class GMCP_Core {
   * and by the audit log for the reply text it keeps.
   */
   public static function scrub_preview_tokens( string $text ): string {
-    if ( strpos( $text, 'gmcp_preview' ) === false ) {
-      return $text;
-    }
-    return (string) preg_replace( '/(gmcp_preview(?:=|%3D))[A-Za-z0-9_-]+/i', '$1[redacted]', $text );
+    return GMCP_Diag_Util::scrub_preview_tokens( $text );
   }
 
   /**

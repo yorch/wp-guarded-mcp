@@ -53,7 +53,8 @@ the thing being changed.
 
 One credential has no field name to give it away: a draft preview link, whose
 token rides in a URL. `redact()` therefore also scrubs the `gmcp_preview`
-parameter out of any string it is handed, and the reply text the entry keeps is
+parameter (whichever spelling of its name PHP maps to it) out of any string it is
+handed, and the reply text the entry keeps is
 scrubbed the same way, so the tool that hands a link out does not also write it
 into the log.
 

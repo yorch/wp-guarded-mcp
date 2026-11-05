@@ -277,5 +277,80 @@ check( 'and says so', $has( $long, 'line truncated' ), true );
 check( 'invalid UTF-8 does not survive', preg_match( '//u', $s( "bad \xC3\x28 bytes" ) ), 1 );
 check( 'control characters removed', $s( "a\x00b\x1bc" ), 'abc' );
 
+echo "-- check_fetch_url: spellings of a blocked target --\n";
+// Each of these reached a 200 from wp-json / wp-login / the draft preview before the path
+// and the query keys were compared in their decoded, PHP-normalised form.
+$tok = str_repeat( 'a1', 20 );
+foreach ( [
+  'index.php before the REST route' => '/index.php/wp-json/wp/v2/users',
+  'index.php PATH_INFO page' => '/index.php/about/',
+  'php file with a path after it' => '/wp-content/plugins/x/do.php/more',
+  'encoded hyphen in wp-json' => '/wp%2Djson/wp/v2/users',
+  'encoded p in wp-login.php' => '/wp-login.ph%70',
+  'encoded p in wp-cron.php' => '/wp-cron.ph%70',
+  'encoded p in wp-mail.php' => '/wp-mail.ph%70',
+  'encoded p in xmlrpc.php' => '/xmlrpc.ph%70',
+  'encoded letter in wp-admin' => '/%77p-admin/',
+  'double encoding' => '/wp%252Djson/',
+  'double encoded slash' => '/a%252fb',
+  'encoded control character' => '/a%0Ab',
+  'rest.route' => '/?rest.route=/wp/v2/users',
+  'rest+route' => '/?rest+route=/wp/v2/users',
+  'rest[route' => '/?rest[route=/wp/v2/users',
+  'encoded dot in key' => '/?rest%2Eroute=/wp/v2/users',
+  'leading space in key' => '/?%20rest_route=/wp/v2/users',
+  'gmcp.preview' => "/?p=3&gmcp.preview=$tok",
+  'gmcp+preview' => "/?p=3&gmcp+preview=$tok",
+  'gmcp[preview' => "/?p=3&gmcp[preview=$tok",
+  'doing.wp.cron' => '/?doing.wp.cron=1',
+  'remove.item' => '/?remove.item=abc',
+  'undo.item' => '/?undo.item=abc',
+  '.wpnonce' => '/?.wpnonce=abc',
+  'array-valued action' => '/?action[]=x',
+  'encoded action letter' => '/?%61ction=x',
+] as $label => $tail ) {
+  $r = $fetch( 'https://example.com' . $tail );
+  check( "refused: $label", $r['ok'], false );
+}
+check( 'control: an ordinary page', $fetch( 'https://example.com/about/' )['ok'], true );
+check( 'control: an encoded space is fine', $fetch( 'https://example.com/a%20b/' )['ok'], true );
+check( 'control: an encoded UTF-8 letter is fine', $fetch( 'https://example.com/caf%C3%A9/' )['ok'], true );
+check( 'control: index.php with a query', $fetch( 'https://example.com/index.php?p=3' )['ok'], true );
+check( 'control: a key that merely contains a blocked word', $fetch( 'https://example.com/?actions=1&rest=2' )['ok'], true );
+check( 'control: a dotted key that is not blocked', $fetch( 'https://example.com/?a.b=1' )['ok'], true );
+check( 'control: a path that merely contains "wp-json" later', $fetch( 'https://example.com/blog/wp-json-guide/' )['ok'], true );
+
+echo "-- query_key_variants (what PHP calls the key) --\n";
+foreach ( [ 'rest.route', 'rest route', 'rest+route', 'rest[route', 'rest%2Eroute', ' rest_route' ] as $k ) {
+  check( "variants of '$k' include rest_route", in_array( 'rest_route', GMCP_Diag_Util::query_key_variants( $k ), true ), true );
+}
+check( 'array base', in_array( 'action', GMCP_Diag_Util::query_key_variants( 'action[]' ), true ), true );
+check( 'control: an unrelated key', in_array( 'rest_route', GMCP_Diag_Util::query_key_variants( 'resting' ), true ), false );
+
+echo "-- scrub_preview_tokens --\n";
+$sp = static function ( string $t ): string {
+  return GMCP_Diag_Util::scrub_preview_tokens( $t );
+};
+foreach ( [
+  'literal' => "https://x/?p=3&gmcp_preview=$tok",
+  'dot' => "https://x/?p=3&gmcp.preview=$tok",
+  'plus' => "https://x/?p=3&gmcp+preview=$tok",
+  'space' => "https://x/?p=3&gmcp preview=$tok",
+  'bracket' => "https://x/?p=3&gmcp[preview]=$tok",
+  'encoded underscore' => "https://x/?p=3&gmcp%5Fpreview=$tok",
+  'encoded dot' => "https://x/?p=3&gmcp%2Epreview=$tok",
+  'encoded space' => "https://x/?p=3&gmcp%20preview=$tok",
+  'encoded equals' => "https://x/?p=3&gmcp_preview%3D$tok",
+  'encoded letter in the name' => "https://x/?p=3&gmcp_%70review=$tok",
+  'upper case' => "https://x/?p=3&GMCP_PREVIEW=$tok",
+] as $label => $text ) {
+  $out = $sp( $text );
+  check( "scrubbed: $label (token gone)", strpos( $out, $tok ) === false, true );
+  check( "  ...and marked ($label)", strpos( $out, '[redacted]' ) !== false, true );
+}
+check( 'control: text with no preview key is untouched', $sp( "see https://x/?p=3&other=$tok" ), "see https://x/?p=3&other=$tok" );
+check( 'control: the word preview alone is untouched', $sp( 'a preview of the page' ), 'a preview of the page' );
+check( 'scrub_log_line applies it too', strpos( GMCP_Diag_Util::scrub_log_line( "404 /?gmcp.preview=$tok", [] ), $tok ) === false, true );
+
 printf( "\n  %d passed, %d failed\n", $pass, $fail );
 exit( $fail === 0 ? 0 : 1 );

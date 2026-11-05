@@ -268,9 +268,16 @@ something that looks harmless and is not, so each says what it cannot promise.
 - Why `admin` and not `read`: the request originates from the server, so it
   arrives from the one address a site's own IP allowlists and loopback-only
   handlers trust. `wp-admin`, `wp-json`, `wp-login.php`, `wp-cron.php`,
-  `xmlrpc.php`, any other `.php` file and a short list of query parameters that
-  change state on common plugins (`add-to-cart`, `wc-ajax`, `action` and others)
-  are refused. That list is a list. A front-end route on this site whose GET has
+  `xmlrpc.php`, any other `.php` file (and `index.php` with anything after it,
+  which is how WordPress is reached as `/index.php/wp-json/...`) and a short
+  list of query parameters that change state on common plugins (`add-to-cart`,
+  `wc-ajax`, `action` and others) are refused. The comparison is made on what a
+  server would route, not on the text that was sent: the path is decoded and
+  refused if it carries an encoded letter, digit, hyphen, underscore or tilde, an
+  encoded dot, slash, backslash or NUL, or a second layer of encoding (so
+  `/wp%2Djson/` and `/wp-login.ph%70` are the plain request), and a query key is
+  compared as PHP will name it (`rest.route`, `rest+route` and `rest[route` are
+  all `rest_route`; `gmcp.preview` is the preview parameter). That list is a list. A front-end route on this site whose GET has
   a side effect and an unfamiliar name is still reachable, and the tool says so
   in its description rather than implying otherwise.
 - Page text is somebody else's words. Everything under `page_content_untrusted`
@@ -304,7 +311,9 @@ something that looks harmless and is not, so each says what it cannot promise.
   Feeds, embeds, trackbacks and the REST API never honour a token.
 - The link is a bearer credential and it travels in a URL, where no field name
   marks it secret. `GMCP_Core::redact()` therefore scrubs the `gmcp_preview`
-  parameter out of every string it is handed, which is what the audit log's
+  parameter (in any spelling PHP maps to it: `gmcp.preview`, `gmcp+preview`,
+  `gmcp[preview]`, percent-encoded characters in the name or the `=`) out of every
+  string it is handed on the logging paths, which is what the audit log's
   arguments and the debug trace both use, and the audit log applies the same
   scrub to the reply it keeps. Without it the tool that hands the link out would
   have written it into the audit log in the clear in the same call, which the
