@@ -1068,9 +1068,14 @@ be put back on a post that has since been rewritten. The undo of an undo has no
 such excuse, because it restores a whole recorded value taken before whatever
 happened next, so it is refused when the target is no longer in the state the undo
 left it in. That state is stored as a hash measured from the stored value after the
-write, never as a second copy of it. Where the value the undo is about to overwrite
-holds a credential, the undo is recorded as not reversible instead of being copied,
-for the reason the original is not.
+write, never as a second copy of it. For a custom field it covers every row of the
+key, not the first, and an undo that would write one recorded value is refused when
+the key now holds several rows, because that write rewrites every row. Where the
+value the undo is about to overwrite holds a credential, the undo is recorded as
+not reversible instead of being copied, for the reason the original is not; that
+test runs for options, custom fields, theme settings and terms. A post's own fields
+(title, content, excerpt) are not tested for credential shapes, here or when the
+original edit is recorded. That is a gap, not a decision this document defends.
 
 Previous meta values live in a table of their own rather than in the journal's
 option row, because `_elementor_data` runs past 100KB and the option's per-value

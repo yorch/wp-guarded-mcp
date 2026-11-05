@@ -3065,6 +3065,97 @@ else
 fi
 docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
 
+echo "-- journal: an undo records no credential, and meta staleness sees every row --"
+# Run on its own through the docker stand-in against a local WordPress; see the note on the
+# diagnostics block below. Two defects, each asserted on stored state:
+#  1. Undoing a term edit wrote the value it overwrote into the journal entry that reverses the
+#     undo, with no credential test, while recording the edit itself did have one.
+#  2. The staleness hash of a meta entry read the FIRST row only, and a single-value restore
+#     ran update_post_meta() with no previous value, which rewrites every row of the key.
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+jx_find() { # jx_find <file> <python predicate on x> -> id of the newest matching entry, or MISSING
+  py "import json,sys
+rows = json.loads(json.load(sys.stdin)['result']['content'][0]['text'])
+hit = [x for x in rows if $2]
+print(hit[0]['id'] if hit else 'MISSING')" "$1"
+}
+jx_list() { call "$1" '{"jsonrpc":"2.0","id":500,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":40}}}'; }
+jx_undo() { call "$1" "{\"jsonrpc\":\"2.0\",\"id\":501,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$2\"}}}"; }
+jx_journal() { docker compose exec -T cli wp eval 'echo serialize( get_option( "gmcp_journal", [] ) );' 2>/dev/null; }
+
+# --- 1. the term description that becomes a credential, then is undone ---
+JX_T=$(docker compose exec -T cli wp eval 'echo wp_insert_term( "JX term", "category", [ "slug" => "jx-term", "description" => "plain" ] )["term_id"];' 2>/dev/null | tr -d '\r\n')
+check "control: the fixture term holds the plain description" "$(docker compose exec -T cli wp eval "echo get_term($JX_T,'category')->description;" 2>/dev/null | tr -d '\r\n')" "plain"
+call jx_t1 "{\"jsonrpc\":\"2.0\",\"id\":502,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_term\",\"arguments\":{\"term_id\":$JX_T,\"taxonomy\":\"category\",\"description\":\"{\\\"api_key\\\":\\\"sk_live_SECRETVALUE123\\\"}\"}}}"
+check "control: the secret is now the stored description (so the probe below has something to find)" \
+  "$(docker compose exec -T cli wp eval "echo strpos(get_term($JX_T,'category')->description,'SECRETVALUE123')!==false?'present':'absent';" 2>/dev/null | tr -d '\r\n')" "present"
+jx_list jx_l1
+JX_E1=$(jx_find jx_l1 "x['tool']=='wp_update_term' and 'JX term' in x['what']")
+check "control: the edit is journalled" "$([ "$JX_E1" != MISSING ] && echo yes || echo no)" "yes"
+check "stored state: the journal holds no copy of the secret after the edit" "$(jx_journal | grep -c SECRETVALUE123)" "0"
+check "control: that probe does find a value that IS in the journal (the earlier description)" "$([ "$(jx_journal | grep -c plain)" -ge 1 ] && echo yes || echo no)" "yes"
+jx_undo jx_u1 "$JX_E1"
+check "the undo put the plain description back" "$(docker compose exec -T cli wp eval "echo get_term($JX_T,'category')->description;" 2>/dev/null | tr -d '\r\n')" "plain"
+check "stored state: the entry that reverses the undo carries no copy of the secret" "$(jx_journal | grep -c SECRETVALUE123)" "0"
+jx_list jx_l2
+JX_U1=$(jx_find jx_l2 "x.get('undoes')=='$JX_E1'")
+check "the undo is on record" "$([ "$JX_U1" != MISSING ] && echo yes || echo no)" "yes"
+jx_undo jx_u2 "$JX_U1"
+check "reverting it is refused" "$(verdict jx_u2)" "error"
+check "stored state: the description is still the plain one" "$(docker compose exec -T cli wp eval "echo get_term($JX_T,'category')->description;" 2>/dev/null | tr -d '\r\n')" "plain"
+# The other direction is the control: a credential going OUT of a term is not copied either.
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+docker compose exec -T cli wp eval "wp_update_term($JX_T,'category',['description'=>'{\"api_key\":\"sk_live_SECRETVALUE123\"}']);" >/dev/null 2>&1
+call jx_t2 "{\"jsonrpc\":\"2.0\",\"id\":503,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_term\",\"arguments\":{\"term_id\":$JX_T,\"taxonomy\":\"category\",\"description\":\"plain again\"}}}"
+check "control: secret to plain is journalled with nothing stored" "$(jx_journal | grep -c SECRETVALUE123)" "0"
+check "control: and the entry exists" "$([ "$(jx_journal | grep -c 'JX term')" -ge 1 ] && echo yes || echo no)" "yes"
+docker compose exec -T cli wp term delete category "$JX_T" >/dev/null 2>&1
+
+# --- 2. post meta: the staleness check and the single-value restore see every row ---
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+JX_P=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"JX meta","post_type"=>"page","post_status"=>"draft"]);' 2>/dev/null | tr -d '\r\n')
+jx_rows() { docker compose exec -T cli wp eval "echo wp_json_encode( get_post_meta($JX_P,'$1',false) );" 2>/dev/null | tr -d '\r\n'; }
+jx_set() { call "$1" "{\"jsonrpc\":\"2.0\",\"id\":504,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post_meta\",\"arguments\":{\"ID\":$JX_P,\"key\":\"$2\",\"value\":\"$3\"}}}"; }
+# (a) The reported case: an undo, then somebody else adds a row, then the undo is reverted.
+docker compose exec -T cli wp eval "update_post_meta($JX_P,'jx_mrk','A');" >/dev/null 2>&1
+jx_set jx_s1 jx_mrk B
+jx_list jx_l3
+JX_M1=$(jx_find jx_l3 "x['tool']=='wp_update_post_meta' and 'jx_mrk' in x['what']")
+check "control: the tool's edit is journalled and stored" "$(jx_rows jx_mrk)|$([ "$JX_M1" != MISSING ] && echo yes || echo no)" '["B"]|yes'
+jx_undo jx_u3 "$JX_M1"
+check "the undo put A back" "$(jx_rows jx_mrk)" '["A"]'
+jx_list jx_l4
+JX_MU1=$(jx_find jx_l4 "x.get('undoes')=='$JX_M1'")
+check "control: the undo is itself on record" "$([ "$JX_MU1" != MISSING ] && echo yes || echo no)" "yes"
+docker compose exec -T cli wp eval "add_post_meta($JX_P,'jx_mrk','C-newer');" >/dev/null 2>&1
+check "control: a person added a second row" "$(jx_rows jx_mrk)" '["A","C-newer"]'
+jx_undo jx_u4 "$JX_MU1"
+check "reverting the undo is refused now that the key changed" "$(verdict jx_u4)" "error"
+check "stored state: both rows are exactly as the person left them" "$(jx_rows jx_mrk)" '["A","C-newer"]'
+# Control for the probe: with no row added, the same revert of an undo goes through.
+docker compose exec -T cli wp eval "update_post_meta($JX_P,'jx_ok','A');" >/dev/null 2>&1
+jx_set jx_s2 jx_ok B
+jx_list jx_l5
+JX_M2=$(jx_find jx_l5 "x['tool']=='wp_update_post_meta' and 'jx_ok' in x['what']")
+jx_undo jx_u5 "$JX_M2"
+jx_list jx_l6
+JX_MU2=$(jx_find jx_l6 "x.get('undoes')=='$JX_M2'")
+jx_undo jx_u6 "$JX_MU2"
+check "control: reverting an undo whose key did not change works" "$(jx_rows jx_ok)" '["B"]'
+# (b) A sibling row added after the tool's edit, then the edit is undone: the one recorded value
+# must not be written over every row.
+docker compose exec -T cli wp eval "update_post_meta($JX_P,'jx_sib','A');" >/dev/null 2>&1
+jx_set jx_s3 jx_sib B
+jx_list jx_l7
+JX_M3=$(jx_find jx_l7 "x['tool']=='wp_update_post_meta' and 'jx_sib' in x['what']")
+docker compose exec -T cli wp eval "add_post_meta($JX_P,'jx_sib','C-sibling');" >/dev/null 2>&1
+check "control: the key holds two rows" "$(jx_rows jx_sib)" '["B","C-sibling"]'
+jx_undo jx_u7 "$JX_M3"
+check "undoing a single-value edit of a key that now has several rows is refused" "$(verdict jx_u7)" "error"
+check "stored state: neither row was overwritten" "$(jx_rows jx_sib)" '["B","C-sibling"]'
+docker compose exec -T cli wp post delete "$JX_P" --force >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+
 echo "-- diagnostics: error log, page fetch, preview links --"
 # Written without a Docker daemon. This block was run, on its own, through a stand-in for the
 # docker CLI against a local WordPress with no daemon; the rest of this file was not run.
