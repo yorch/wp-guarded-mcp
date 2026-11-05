@@ -849,14 +849,30 @@ their source, on a machine where neither could be installed, and is marked UNVER
   it can already do more to its search presence than any field here. The honest remainder is
   All in One SEO: its table is reachable only through this group, so a `write` key gains a
   capability it did not have. That is accepted, not denied. What narrows it: `robots` is a
-  three-way enum (`index`, `noindex`, `default`) with no free-text directives, other robots
-  directives on the post are left exactly as found, and a canonical must be on this site
+  three-way enum (`index`, `noindex`, `default`) with no free-text directives, `index` and
+  `noindex` leave the other robots directives on the post as found (Rank Math) or switch the
+  row's other flags on from a clean slate (All in One SEO, below), and a canonical must be on this site
   unless the site names another host through `gmcp_seo_canonical_hosts`. A canonical on
   another host hands the page's ranking to that host, which is the one field in the group
   with an attacker-shaped use.
-- **The commerce post guard applies**, and is asked before the "is this a public post type"
+- **`default` means different things, and the reply says so.** Rank Math falls back to the
+  post type's setting only when the stored robots array is EMPTY (checked in its
+  `Paper::get_robots()`), and its `validate_robots()` adds `index` to any non-empty array that
+  lacks one, so a stray `nofollow` left behind would pin the page to `index` instead of handing
+  the decision back. `robots: default` therefore removes every robots directive on the post and
+  the reply names what it removed, and the reader reports `index` for a stored set with no
+  `noindex`. In All in One SEO an explicit `index` or `noindex` sets `robots_default` to 0, which
+  makes the plugin read the row's other robots flags (`robots_nofollow`, `robots_noarchive`,
+  `robots_nosnippet` ...), so a flag that did nothing while the row followed the site-wide
+  setting would start to apply; going from default to an explicit decision resets them to off and
+  says which were set. A row that already made an explicit decision keeps its flags.
+- **The commerce post guard and the drafts-only guard apply** (`GMCP_Core::post_write_guard()`),
+  and are asked before the "is this a public post type"
   check, so on a site where a filter has made an order type viewable the policy about the
-  object is still what answers. No tool here writes an option, so the option write policy is
+  object is still what answers. The drafts-only half is the only thing holding a drafts-only key
+  on All in One SEO: it writes its own table through its own database layer, which no hook of
+  the net under WordPress sees. A refusal thrown by that net is reported as the policy's sentence,
+  not as "the SEO plugin threw an error". No tool here writes an option, so the option write policy is
   not bypassed because it is never reached; site-wide SEO settings are options and stay
   behind it.
 - **No nofollow, noarchive, snippet-length, schema or redirect controls, and the All in One

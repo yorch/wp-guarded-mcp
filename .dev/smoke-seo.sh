@@ -1,10 +1,13 @@
 #!/bin/bash
 # Smoke test for the Rank Math and All in One SEO tools.
 #
-# STATUS: UNRUN. This suite was written on a machine with no Docker daemon and neither plugin
-# installed, from memory of how each plugin stores its data. Every plugin-specific assumption
-# is marked UNVERIFIED in includes/tools-seo.php, and a failure here is as likely to be one of
-# those assumptions as a defect in the tools. Run it, read each failure, and decide which.
+# STATUS: written blind, then run against the real Rank Math 1.0.281 and All in One SEO 5.0.5
+# (no Docker: SQLite and php -S). The storage assumptions it checks held: Rank Math's robots
+# array and AIOSEO's robots_* columns are as seeded below. On that SQLite stack the two checks
+# under "a missing table is reported as missing" fail for an environmental reason: the suite
+# simulates the missing table with RENAME TABLE, which the SQLite drop-in does not perform, so
+# the table is never missing (its "the table is back" control passes vacuously). They need a
+# MySQL or MariaDB stack.
 #
 # Its own file because it needs one of the two plugins installed and the group switched on.
 # Each plugin's block skips itself, with a message, when that plugin is not active, so a site
@@ -40,7 +43,15 @@ gmcp_make_key() { # gmcp_make_key <label> <level>
 TOK=$(gmcp_make_key "smoke seo" admin)
 RO=$(gmcp_make_key "smoke seo readonly" readonly)
 RW=$(gmcp_make_key "smoke seo readwrite" readwrite)
-for k in "$TOK" "$RO" "$RW"; do
+# A readwrite key that is also drafts-only (the sixth argument to GMCP_Tokens::create).
+DO=$(docker compose exec -T cli wp eval '
+    foreach ( GMCP_Tokens::all() as $k ) {
+      if ( ( $k["label"] ?? "" ) === "smoke seo drafts-only" ) { GMCP_Tokens::revoke( $k["id"] ); }
+    }
+    $admins = get_users( [ "role" => "administrator", "number" => 1, "orderby" => "ID", "order" => "ASC" ] );
+    $a = GMCP_Tokens::create( "smoke seo drafts-only", "readwrite", 0, [], $admins ? $admins[0]->ID : 0, true );
+    echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+for k in "$TOK" "$RO" "$RW" "$DO"; do
   case "$k" in
     gmcp_*) ;;
     *) echo "Could not create an API key for the suite. Is the plugin active?" >&2; exit 1 ;;
@@ -60,6 +71,11 @@ ctext() { py 'import json,sys
 d=json.load(sys.stdin)
 c=d.get("result",{}).get("content",[])
 print(c[0]["text"] if c else json.dumps(d.get("error","")))' "$1"; }
+has() { python3 -c 'import json,sys
+d=json.load(sys.stdin)
+c=d.get("result",{}).get("content",[])
+t=(c[0]["text"] if c else "")+json.dumps(d.get("error",""))
+print("yes" if sys.argv[1] in t else "no")' "$2" < "$OUT/$1"; }
 jget() { py 'import json,sys
 t=json.load(sys.stdin).get("result",{}).get("content",[{}])[0].get("text","{}")
 try: cur=json.loads(t)
@@ -114,8 +130,24 @@ else
   check "index replaced noindex and kept nofollow and noarchive" \
     "$(wpe '$r=(array)get_post_meta('"$P"',"rank_math_robots",true);sort($r);echo implode(",",$r);')" "index,noarchive,nofollow"
   call rm_def "$(tc rankmath_set_post_seo "{\"post_id\":$P,\"robots\":\"default\"}")"
-  check "robots default removes the decision and keeps the rest" \
-    "$(wpe '$r=(array)get_post_meta('"$P"',"rank_math_robots",true);sort($r);echo implode(",",$r);')" "noarchive,nofollow"
+  # Rank Math falls back to the post type's setting only when the stored array is EMPTY, and
+  # Paper::validate_robots() adds "index" to anything else, so "default" has to clear them all.
+  # Seeded from the form the plugin stores (verified against Rank Math 1.0.281's
+  # Paper::robots_combine, which keys a list of directive names).
+  wpe 'update_post_meta('"$P"',"rank_math_robots",["nofollow"]);' >/dev/null
+  call rm_eff "$(tc rankmath_get_post_seo "{\"post_id\":$P}")"
+  check "a stored set with no index/noindex is reported as index (Rank Math adds it), not as default" "$(jget rm_eff robots)" "index"
+  call rm_def "$(tc rankmath_set_post_seo "{\"post_id\":$P,\"robots\":\"default\"}")"
+  check "robots default clears EVERY directive, so the post type's setting applies again" \
+    "$(wpe 'echo metadata_exists("post",'"$P"',"rank_math_robots")?"present":"gone";')" "gone"
+  check "and the reply says what it removed" \
+    "$(py 'import json,sys;print("nofollow" in " ".join(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])["notes"]))' rm_def)" "True"
+  call rm_def2 "$(tc rankmath_get_post_seo "{\"post_id\":$P}")"
+  check "get now reports default" "$(jget rm_def2 robots)" "default"
+  wpe 'update_post_meta('"$P"',"rank_math_robots",["index","nofollow"]);' >/dev/null
+  call rm_ix "$(tc rankmath_set_post_seo "{\"post_id\":$P,\"robots\":\"noindex\"}")"
+  check "CONTROL: noindex keeps the other directives (only default clears them)" \
+    "$(wpe '$r=(array)get_post_meta('"$P"',"rank_math_robots",true);sort($r);echo implode(",",$r);')" "nofollow,noindex"
 
   echo "-- clearing --"
   call rm_clr "$(tc rankmath_set_post_seo "{\"post_id\":$P,\"description\":\"\"}")"
@@ -141,13 +173,25 @@ else
   check "and by the commerce guard, which says who owns it" "$(py 'import json,sys;print("owns it" in json.load(sys.stdin)["result"]["content"][0]["text"])' rm_order)" "True"
   check "and nothing was written to it" "$(wpe 'echo metadata_exists("post",'"$ORDER"',"rank_math_title")?"written":"clean";')" "clean"
   wpe 'wp_delete_post('"$ORDER"',true);' >/dev/null
+  # A drafts-only key may not change a live page, and this tool is one of the writers it must
+  # be held at: asked explicitly through GMCP_Core::post_write_guard().
+  call rm_title0 "$(tc rankmath_set_post_seo "{\"post_id\":$P,\"title\":\"before drafts-only\"}")"
+  DRAFT=$(wpe 'echo wp_insert_post(["post_title"=>"SEO draft","post_status"=>"draft","post_content"=>"x"]);'); POSTS="$POSTS $DRAFT"
+  callas "$DO" rm_do1 "$(tc rankmath_set_post_seo "{\"post_id\":$P,\"title\":\"drafts-only wrote this\",\"robots\":\"noindex\"}")"
+  check "a drafts-only key is refused on a live post" "$(verdict rm_do1)" "error"
+  check "and the refusal is the drafts-only policy" "$(has rm_do1 "drafts-only")" "yes"
+  check "and it is not reported as 'the SEO plugin threw an error'" "$(has rm_do1 "threw an error")" "no"
+  check "STORED: the live post's title is unchanged" "$(wpe 'echo get_post_meta('"$P"',"rank_math_title",true);')" "before drafts-only"
+  callas "$DO" rm_do2 "$(tc rankmath_set_post_seo "{\"post_id\":$DRAFT,\"title\":\"on a draft\"}")"
+  check "CONTROL: the same key may write the same fields on a draft" "$(verdict rm_do2)" "ok"
+  check "CONTROL: and STORED: the draft holds it" "$(wpe 'echo get_post_meta('"$DRAFT"',"rank_math_title",true);')" "on a draft"
 
   echo "-- access levels --"
   callas "$RO" rm_ro_get "$(tc rankmath_get_post_seo "{\"post_id\":$P}")"
   check "a readonly key can read" "$(verdict rm_ro_get)" "ok"
   callas "$RO" rm_ro_set "$(tc rankmath_set_post_seo "{\"post_id\":$P,\"title\":\"RO\"}")"
   check "a readonly key cannot write" "$(verdict rm_ro_set)" "error"
-  check "and the title is unchanged" "$(wpe 'echo get_post_meta('"$P"',"rank_math_title",true);')" 'Smoke %title% %sep%'
+  check "and the title is unchanged" "$(wpe 'echo get_post_meta('"$P"',"rank_math_title",true);')" 'before drafts-only'
   callas "$RW" rm_rw_set "$(tc rankmath_set_post_seo "{\"post_id\":$P,\"title\":\"RW title\"}")"
   check "a readwrite key can write (the write level is intended)" "$(verdict rm_rw_set)" "ok"
 
@@ -210,6 +254,32 @@ else
   check "an order is refused" "$(verdict ao_order)" "error"
   check "and no row was created for it" "$(aio post_id "$ORDER")" ""
   wpe 'wp_delete_post('"$ORDER"',true);' >/dev/null
+  # AIOSEO writes its own table through its own database layer, which no WordPress hook sees,
+  # so the explicit guard is the only thing holding a drafts-only key here.
+  call ao_t0 "$(tc aioseo_set_post_seo "{\"post_id\":$P,\"title\":\"before drafts-only\"}")"
+  DRAFT=$(wpe 'echo wp_insert_post(["post_title"=>"AIO draft","post_status"=>"draft","post_content"=>"x"]);'); POSTS="$POSTS $DRAFT"
+  callas "$DO" ao_do1 "$(tc aioseo_set_post_seo "{\"post_id\":$P,\"title\":\"drafts-only wrote this\",\"robots\":\"noindex\"}")"
+  check "a drafts-only key is refused on a live post" "$(verdict ao_do1)" "error"
+  check "STORED: the live post's title in AIOSEO's table is unchanged" "$(aio title "$P")" "before drafts-only"
+  check "STORED: and its robots decision is unchanged" "$(aio robots_noindex "$P")" "0"
+  callas "$DO" ao_do2 "$(tc aioseo_set_post_seo "{\"post_id\":$DRAFT,\"title\":\"on a draft\"}")"
+  check "CONTROL: the same key may write a draft" "$(verdict ao_do2)" "ok"
+  check "CONTROL: and STORED: the draft's row holds it" "$(aio title "$DRAFT")" "on a draft"
+
+  echo "-- an explicit robots decision does not wake stale flags --"
+  # A row that follows the site-wide setting (robots_default 1) with leftover flags that do
+  # nothing yet: robots_nofollow and robots_noarchive from an old edit or an import.
+  wpe 'global $wpdb;$wpdb->update("'"${PFX}"'aioseo_posts",["robots_default"=>1,"robots_noindex"=>0,"robots_nofollow"=>1,"robots_noarchive"=>1],["post_id"=>'"$P"']);' >/dev/null
+  check "CONTROL: the stale flags are stored (the probe sees them)" "$(aio robots_nofollow "$P")$(aio robots_noarchive "$P")" "11"
+  call ao_rb "$(tc aioseo_set_post_seo "{\"post_id\":$P,\"robots\":\"index\"}")"
+  check "setting robots index succeeds" "$(verdict ao_rb)" "ok"
+  check "STORED: robots_default is 0 now" "$(aio robots_default "$P")" "0"
+  check "STORED: the stale nofollow flag was reset, not left to start applying" "$(aio robots_nofollow "$P")" "0"
+  check "STORED: the stale noarchive flag was reset" "$(aio robots_noarchive "$P")" "0"
+  check "and the reply says it did" "$(py 'import json,sys;print("robots_nofollow" in " ".join(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])["notes"]))' ao_rb)" "True"
+  wpe 'global $wpdb;$wpdb->update("'"${PFX}"'aioseo_posts",["robots_nofollow"=>1],["post_id"=>'"$P"']);' >/dev/null
+  call ao_rb2 "$(tc aioseo_set_post_seo "{\"post_id\":$P,\"robots\":\"noindex\"}")"
+  check "CONTROL: from a row that already made an explicit decision, a deliberate flag is kept" "$(aio robots_nofollow "$P")" "1"
 
   echo "-- a missing table is reported as missing --"
   # Renamed for the length of one call and put back before anything is compared.

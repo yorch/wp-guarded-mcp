@@ -167,7 +167,9 @@ and the reply carries the previous values instead. Every write is read back from
 fails if it differs; the rendered page, page caches and sitemaps are not checked. `noindex`
 and a canonical URL change how a page appears in search, so a canonical must be on this site
 (another host needs the `gmcp_seo_canonical_hosts` filter), `robots` accepts only the three
-values, and orders are refused. The write level is a judgement, argued in
+values (`default` clears every robots directive on the post, because Rank Math only falls back
+to the site-wide setting when none is stored), a drafts-only key cannot write to a live page,
+and orders are refused. The write level is a judgement, argued in
 [docs/guardrails.md](docs/guardrails.md#rank-math-and-all-in-one-seo), and it is weaker for
 All in One SEO because no generic tool reaches its table. The All in One SEO focus keyphrase
 is readable and not writable. How each plugin stores its data was written without an installed

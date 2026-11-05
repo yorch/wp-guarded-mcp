@@ -103,6 +103,14 @@ class GMCP_Tools_Seo {
     'robots_default', 'robots_noindex', 'og_title', 'og_description',
   ];
 
+  /**
+  * AIOSEO's other per-post robots flags. Inert while robots_default is 1, live the moment it is 0.
+  * Robots::post() returns the post-type setting for a row with robots_default = 1 and reads
+  * these columns for one with 0, so a stale value left by an import or an old edit starts
+  * to apply when an explicit index/noindex is stored.
+  */
+  const AIO_ROBOTS_FLAGS = [ 'robots_noarchive', 'robots_nosnippet', 'robots_nofollow', 'robots_noimageindex', 'robots_noodp', 'robots_notranslate' ];
+
   public function __construct() {
     add_action( 'rest_api_init', [ $this, 'rest_api_init' ] );
   }
@@ -229,6 +237,10 @@ class GMCP_Tools_Seo {
         default:
           return $this->error( $r, 'Unknown tool', -32601 );
       }
+    } catch ( GMCP_Drafts_Only_Refusal $e ) {
+      // A policy refusal from the net under WordPress, not a fault in the SEO plugin. Say
+      // what the policy said; "the plugin threw an error" would send a reader to debug it.
+      return $this->error( $r, $e->getMessage(), -32600 );
     } catch ( \Throwable $e ) {
       return $this->error( $r, 'The SEO plugin threw an error while running ' . $tool . ': ' . $e->getMessage() . ' Nothing should be assumed about what was written; read the post back.', -32603 );
     }
@@ -247,7 +259,7 @@ class GMCP_Tools_Seo {
   * Reads and writes both require a post that exists and whose type can have a public URL:
   * an SEO title on a revision or a menu item is a row nothing renders, and a tool that said
   * "updated" over it would be the silent success this repo exists to refuse. Writes also go
-  * through the commerce post guard, as every generic post and meta writer does.
+  * through the commerce and drafts-only post guards, as every generic post and meta writer does.
   *
   * @return \WP_Post|string
   */
@@ -262,10 +274,16 @@ class GMCP_Tools_Seo {
     }
     // Asked first, so that on a site where a filter has made an order type viewable the policy
     // about the object is still the thing that answers.
+    //
+    // post_write_guard() is the commerce policy and the drafts-only policy together, as every
+    // generic post and meta writer asks. The drafts-only half matters most for All in One SEO:
+    // it writes its own table through its own database layer, which no WordPress hook the
+    // drafts-only net listens to ever sees, so this explicit question is the only thing that
+    // stops a drafts-only key setting the title and robots of a live page.
     if ( $for_write ) {
-      $commerce = GMCP_Core::commerce_post_guard( $post_id, 'Setting SEO fields on' );
-      if ( $commerce !== true ) {
-        return $commerce;
+      $guard = GMCP_Core::post_write_guard( $post_id, 'Setting SEO fields on' );
+      if ( $guard !== true ) {
+        return $guard;
       }
     }
     if ( in_array( $post->post_status, [ 'auto-draft', 'inherit' ], true ) || wp_is_post_revision( $post ) ) {
@@ -403,18 +421,22 @@ class GMCP_Tools_Seo {
     return [ true, maybe_unserialize( $row['meta_value'] ) ];
   }
 
-  /** The robots decision in a Rank Math robots array. */
+  /**
+  * The robots decision a Rank Math robots array amounts to.
+  *
+  * Rank Math falls back to the post type's setting only when the stored array is EMPTY.
+  * A non-empty array with no index/noindex in it (say ["nofollow"]) is used as it is, and
+  * Paper::validate_robots() then adds "index" and "follow" itself. So that case is not
+  * "default": the page is indexed, whatever the post type's setting says.
+  */
   private function rm_robots_summary( $stored_exists, $directives ): string {
-    if ( !$stored_exists || !is_array( $directives ) ) {
+    if ( !$stored_exists || !is_array( $directives ) || !$directives ) {
       return 'default';
     }
     if ( in_array( 'noindex', $directives, true ) ) {
       return 'noindex';
     }
-    if ( in_array( 'index', $directives, true ) ) {
-      return 'index';
-    }
-    return 'default';
+    return 'index';
   }
 
   private function get_rankmath( array $args, array $r ): array {
@@ -433,7 +455,7 @@ class GMCP_Tools_Seo {
     $data['seo_state'] = [
       'plugin_loaded' => true,
       'source' => 'post meta (rank_math_*)',
-      'note' => 'A null field has no per-post value, so the plugin falls back to its template for this post type. "robots": "default" means no per-post index or noindex decision is stored, so the site-wide setting for the post type applies; that setting is not resolved here.',
+      'note' => 'A null field has no per-post value, so the plugin falls back to its template for this post type. "robots": "default" means no robots directive at all is stored, which is the only case in which Rank Math applies the site-wide setting for the post type (that setting is not resolved here). Any stored directive, even one that is not index or noindex, switches that fallback off: "index" is reported when the stored set has no noindex, because Rank Math adds "index" itself.',
     ];
     return $this->json( $r, $data );
   }
@@ -458,6 +480,7 @@ class GMCP_Tools_Seo {
 
     $previous = [];
     $expected = [];
+    $notes = [];
 
     foreach ( $wanted as $field => $value ) {
       if ( $field === 'robots' ) {
@@ -481,20 +504,24 @@ class GMCP_Tools_Seo {
       [ $had, $old ] = $this->stored_meta( $post->ID, self::RM_ROBOTS );
       $previous['robots'] = $this->rm_robots_summary( $had, $old );
       $previous['robots_directives'] = ( $had && is_array( $old ) ) ? array_values( $old ) : [];
-      // Every directive other than the index/noindex decision is carried over untouched.
+      // "default" clears EVERY robots directive on the post. Rank Math falls back to the post
+      // type's setting only when the stored array is empty, and Paper::validate_robots() adds
+      // "index" to anything else, so leaving a stray "nofollow" behind would not hand the
+      // decision back, it would pin the page to index. "index" and "noindex" keep the
+      // other directives (nofollow, noarchive...) that were already on the post.
       $kept = array_values( array_filter( ( $had && is_array( $old ) ) ? $old : [], function ( $d ) {
         return is_string( $d ) && $d !== 'index' && $d !== 'noindex';
       } ) );
-      $new = $kept;
-      if ( $wanted['robots'] !== 'default' ) {
-        array_unshift( $new, $wanted['robots'] );
-      }
+      $new = $wanted['robots'] === 'default' ? [] : array_merge( [ $wanted['robots'] ], $kept );
       if ( $new ) {
         update_post_meta( $post->ID, self::RM_ROBOTS, wp_slash( $new ) );
       } else {
         delete_post_meta( $post->ID, self::RM_ROBOTS );
       }
       $expected['robots'] = [ self::RM_ROBOTS, $new ?: null ];
+      if ( $wanted['robots'] === 'default' && $kept ) {
+        $notes[] = 'robots "default" removed every robots directive on this post, including ' . implode( ', ', $kept ) . ', because Rank Math only falls back to the post type\'s setting when none is stored. Put them back with the Rank Math editor if they were wanted.';
+      }
     }
 
     // Read every touched row back from the database. A mismatch is an error and not a note:
@@ -518,6 +545,7 @@ class GMCP_Tools_Seo {
       'changed' => array_keys( $expected ),
       'previous' => $previous,
       'stored' => $stored,
+      'notes' => $notes,
       'verified' => 'Each field was read back from wp_postmeta and matches. The rendered page, a page cache and the sitemap were not checked.',
     ] );
   }
@@ -558,6 +586,25 @@ class GMCP_Tools_Seo {
       $post_id
     ), ARRAY_A );
     return is_array( $row ) ? $row : null;
+  }
+
+  /** The robots flags that are set to 1 on a post's row, for the flags that exist in this version. */
+  private function aio_stale_robots_flags( int $post_id ): array {
+    global $wpdb;
+    $table = $this->aio_table();
+    $have = $wpdb->get_col( "SHOW COLUMNS FROM `{$table}`", 0 );
+    $cols = array_values( array_intersect( self::AIO_ROBOTS_FLAGS, is_array( $have ) ? $have : [] ) );
+    if ( !$cols ) {
+      return [];
+    }
+    $row = $wpdb->get_row( $wpdb->prepare( 'SELECT `' . implode( '`, `', $cols ) . "` FROM `{$table}` WHERE post_id = %d LIMIT 1", $post_id ), ARRAY_A );
+    $set = [];
+    foreach ( is_array( $row ) ? $row : [] as $col => $val ) {
+      if ( (int) $val === 1 ) {
+        $set[] = $col;
+      }
+    }
+    return $set;
   }
 
   private function aio_robots( ?array $row ): string {
@@ -671,13 +718,27 @@ class GMCP_Tools_Seo {
     }
 
     $expect = [];
+    $notes = [];
     foreach ( $wanted as $field => $value ) {
       if ( $field === 'robots' ) {
         // robots_default = 1 makes the plugin ignore every per-post robots column, so an
         // explicit decision has to clear it, and "default" has to set it.
+        $was_default = $this->aio_robots( $before ) === 'default';
         $model->robots_default = $value === 'default' ? 1 : 0;
         $model->robots_noindex = $value === 'noindex' ? 1 : 0;
         $expect['robots'] = $value;
+        // Going from default to an explicit decision switches the plugin from the post-type
+        // setting to THIS ROW, and every other robots flag on it starts to apply with it,
+        // including stale ones the person never chose here. Start from none.
+        if ( $value !== 'default' && $was_default ) {
+          $stale = $this->aio_stale_robots_flags( $post->ID );
+          foreach ( self::AIO_ROBOTS_FLAGS as $flag ) {
+            $model->{$flag} = 0;
+          }
+          if ( $stale ) {
+            $notes[] = 'The row held robots flags (' . implode( ', ', $stale ) . ') that did nothing while the post followed the site-wide setting; they would have started to apply, so they were reset to off together with this decision.';
+          }
+        }
         continue;
       }
       $column = self::AIO_COLUMNS[ $field ];
@@ -718,6 +779,7 @@ class GMCP_Tools_Seo {
       'changed' => array_keys( $expect ),
       'previous' => $previous,
       'stored' => $stored,
+      'notes' => $notes,
       'journal' => 'Not recorded. The change journal does not watch All in One SEO\'s table, so wp_undo_change cannot put this back; "previous" is the only copy.',
       'verified' => 'Each field was read back from the plugin\'s own table and matches. The rendered page, a page cache and the sitemap were not checked.',
     ] );
