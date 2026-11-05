@@ -49,7 +49,8 @@ well as deletes, because a live page may be showing it and nothing can find whic
 **A deletion is not always a delete tool.** WordPress deletes on markers it reads from
 ordinary rows: `wp_scheduled_delete()` removes every post with an old `_wp_trash_meta_time`
 and `wp_delete_auto_drafts()` every old auto-draft. So `GMCP_Core::status_write_refusal()`
-refuses a status of `trash` or `auto-draft` in the write tools, `protected_meta_refusal()`
+refuses a status of `trash` or `auto-draft` in the write tools (and `spam` on a comment, which
+Akismet deletes after fifteen days), `protected_meta_refusal()`
 refuses the `_wp_trash_meta_` keys in every meta writer (with a net under the WordPress
 meta functions for writers that are not ours), and `GMCP_Approvals::classify_call()` reads
 the arguments as well as the tool's name. A write-level key that can reach any of them has a

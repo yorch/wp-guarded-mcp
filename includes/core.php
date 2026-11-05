@@ -1174,6 +1174,16 @@ class GMCP_Core {
     if ( $status === 'auto-draft' ) {
       return 'Setting a status of "auto-draft" is refused here: WordPress deletes old auto-drafts for good in its daily clean-up, so this is a deletion by another name. Use wp_delete_' . $noun . '.';
     }
+    // A comment marked spam is permanently deleted once it is old enough by any anti-spam
+    // plugin that purges its spam queue: Akismet, which ships with WordPress, deletes every
+    // 'spam' comment older than fifteen days from a daily event it registers unconditionally.
+    // Measured: an old comment moved to spam was gone the next run, while the same comment left
+    // approved, and a recent one moved to spam, both survived. So 'spam' on a comment is the
+    // comment's version of 'trash'. Marking spam is a moderation decision for a person in
+    // wp-admin; wp_delete_comment is the tool that says it is a deletion.
+    if ( $noun === 'comment' && $status === 'spam' ) {
+      return 'Setting a comment to "spam" is refused here: anti-spam plugins permanently delete old spam in their daily clean-up (Akismet does, after fifteen days), so this is a deletion by another name and the write level does not delete. A person can mark spam in wp-admin; wp_delete_comment is the tool that says what it does and is held for approval where that is switched on.';
+    }
     return null;
   }
 

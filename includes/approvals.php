@@ -356,7 +356,10 @@ class GMCP_Approvals {
     }
     foreach ( $scopes as $scope ) {
       foreach ( [ 'post_status', 'status', 'comment_approved' ] as $key ) {
-        if ( array_key_exists( $key, $scope ) && GMCP_Core::status_write_refusal( $scope[ $key ] ) !== null ) {
+        // The key says which kind of object the status belongs to: 'spam' is a deletion for a
+        // comment and an ordinary word for nothing else.
+        $noun = $key === 'comment_approved' ? 'comment' : 'post';
+        if ( array_key_exists( $key, $scope ) && GMCP_Core::status_write_refusal( $scope[ $key ], $noun ) !== null ) {
           return true;
         }
       }

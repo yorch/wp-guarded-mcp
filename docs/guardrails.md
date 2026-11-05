@@ -1494,8 +1494,17 @@ approval and no second call, from the level that has no delete tool. Confirmed b
 it, not by reading it.
 
 - **A status that is a deletion is refused.** `wp_update_post` and `wp_update_comment`
-  refuse a status of `trash`, and `wp_update_post` refuses `auto-draft`, with a sentence
-  pointing at `wp_delete_post` / `wp_delete_comment`. Refused rather than rerouted or held
+  refuse a status of `trash`, `wp_update_post` refuses `auto-draft`, and `wp_update_comment`
+  refuses `spam`, with a sentence pointing at `wp_delete_post` / `wp_delete_comment`. Spam
+  is the comment's trash: Akismet, which ships with WordPress, permanently deletes every
+  comment marked spam once it is fifteen days old, from a daily event it registers whether
+  or not an Akismet key is set. Measured with Akismet active: an old comment moved to spam
+  was gone after the next run, while the same comment left approved and a recent one moved to
+  spam both survived. The cost is real and is accepted: an agent cannot mark spam at any
+  level, so a comment-triage run recommends and a person marks it in wp-admin. Other
+  anti-spam plugins that purge their queue behave the same way, and this refuses all of
+  them without naming them. Creating a comment with a spam status is not refused, because
+  the new comment is the agent's own and carries today's date. Refused rather than rerouted or held
   by argument, because the honest tool already exists, is held by its name, and a second
   door that merely behaves like it would have to be found and held again by every tool
   that ever takes a status. `wp_alter_post` and `wp_update_media` write no status, and the

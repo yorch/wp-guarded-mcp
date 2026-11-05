@@ -1299,7 +1299,7 @@ class GMCP_Tools_Core {
       ],
       'wp_update_comment' => [
         'name' => 'wp_update_comment',
-        'description' => 'Update a comment – pass comment_ID plus fields (comment_content, comment_approved).',
+        'description' => 'Update a comment – pass comment_ID plus fields (comment_content, comment_approved). A comment_approved of "trash" or "spam" is refused, because both end in permanent deletion; use wp_delete_comment, and a person marks spam in wp-admin.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [

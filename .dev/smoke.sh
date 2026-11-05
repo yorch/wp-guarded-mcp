@@ -1396,6 +1396,19 @@ callk dx "$K_PW" "$(tool_json 14 wp_update_comment "{\"comment_ID\":$DX_C,\"fiel
 check "wp_update_comment cannot trash a comment" "$(verdict dx)/$(wpe "wp_cache_flush(); echo get_comment($DX_C)->comment_approved;")" "error/1"
 callk dx "$K_PW" "$(tool_json 15 wp_update_comment "{\"comment_ID\":$DX_C,\"fields\":{\"comment_approved\":\"0\"}}")"
 check "CONTROL: it still changes a comment's approval" "$(verdict dx)/$(wpe "wp_cache_flush(); echo get_comment($DX_C)->comment_approved;")" "ok/0"
+# Spam is the comment's trash: Akismet (bundled with WordPress) permanently deletes spam older
+# than fifteen days. Stored state is asserted, not the reply, and the neighbouring statuses are
+# the controls: "0" (held) was just written above, so it is the value that must survive.
+callk dx "$K_PW" "$(tool_json 16 wp_update_comment "{\"comment_ID\":$DX_C,\"fields\":{\"comment_approved\":\"spam\"}}")"
+check "wp_update_comment cannot mark a comment spam, and the stored status is unchanged" "$(verdict dx)/$(wpe "wp_cache_flush(); echo get_comment($DX_C)->comment_approved;")" "error/0"
+callk dx "$K_PW" "$(tool_json 17 wp_update_comment "{\"comment_ID\":$DX_C,\"fields\":{\"comment_approved\":\" SPAM \"}}")"
+check "  and case and whitespace do not get round it" "$(verdict dx)/$(wpe "wp_cache_flush(); echo get_comment($DX_C)->comment_approved;")" "error/0"
+callk dx "$K_PW" "$(tool_json 18 wp_update_comment "{\"comment_ID\":$DX_C,\"fields\":{\"comment_approved\":\"1\"}}")"
+check "CONTROL: approving it still works, so the refusal is about spam and not about the field" "$(verdict dx)/$(wpe "wp_cache_flush(); echo get_comment($DX_C)->comment_approved;")" "ok/1"
+check "classify_call: spam on a comment widens a write to destructive" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_update_thing","accessLevel"=>"write"],["fields"=>["comment_approved"=>"spam"]]);')" "destructive"
+check "CONTROL: the word spam as a post status is not a deletion, so it stays content" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_update_thing","accessLevel"=>"write"],["fields"=>["post_status"=>"spam"]]);')" "content"
 
 echo "  -- the approval gate sees the same thing --"
 # Pure: what the classifier answers for definitions and arguments, with controls for each
