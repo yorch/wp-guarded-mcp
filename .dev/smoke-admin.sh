@@ -3534,6 +3534,25 @@ if grep -q wordpress_logged_in "$AP_JAR"; then
   check "CONTROL: the page shows the request" \
     "$([ "$(printf '%s' "$AP_PAGE" | grep -c 'apuser')" -ge 1 ] && echo yes || echo no)" "yes"
   check "the page does not show the password" "$(printf '%s' "$AP_PAGE" | grep -c 'APPLAINTEXTMUSTNOTAPPEAR')" "0"
+  check "the page says a value is hidden yet part of the approval, and names it" \
+    "$(printf '%s' "$AP_PAGE" | grep -c 'is still part of what you approve:</strong> &quot;user_pass&quot;')" "1"
+  check "the stored view is in canonical order, not the order the client sent (role, email, login, password)" \
+    "$(ap_eval 'global $wpdb; $t=(string)$wpdb->get_var("SELECT args_view FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R7"'"); $p=array_map(function($k) use ($t){return strpos($t,"\"".$k."\"");},["role","user_email","user_login","user_pass"]); $s=$p; sort($s); echo $p===$s && !in_array(false,$p,true) ? "ordered" : "UNORDERED";')" "ordered"
+  echo "   -- a call that cannot be shown in full is not queued --"
+  AP_BEFORE=$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')
+  AP_BIG=$(python3 -c 'print("x"*20000)')
+  ap_call ap_big wp_update_option '{"key":"smoke_probe_big","value":"'"$AP_BIG"'"}'
+  check "an oversized call is refused, as an error" "$(verdict ap_big)" "error"
+  check "  that says why" "$(ap_text ap_big | grep -c 'not queued for approval')" "1"
+  check "  and queued nothing" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "$AP_BEFORE"
+  check "  and ran nothing" "$(ap_eval 'echo get_option("smoke_probe_big","unset") === "unset" ? "unset" : "WRITTEN";')" "unset"
+  ap_call ap_unk wp_update_option '{"key":"smoke_probe_unk","value":"v","sneaky":"hidden from the person"}'
+  check "an argument the tool does not declare is refused too, and nothing is queued" \
+    "$(verdict ap_unk)/$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "error/$AP_BEFORE"
+  ap_call ap_okq wp_update_option '{"key":"smoke_probe_unk","value":"v"}'
+  check "CONTROL: the same call without it is queued (so the refusals above were about the argument and the size)" \
+    "$(ap_state ap_okq)/$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "awaiting_human_approval/$((AP_BEFORE + 1))"
+  ap_decide decline "$(ap_rid ap_okq)"
   check "the audit log does not hold it" "$(leaked_audit APPLAINTEXTMUSTNOTAPPEAR)" "0"
   check "CONTROL: the audit scan does see a harmless argument of the same call" "$(leaked_audit ap@example.test)" "1"
   ap_decide decline "$AP_R7"

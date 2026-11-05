@@ -313,7 +313,7 @@ class GMCP_Settings {
       .gmcp-verdict-broken { border-left-color: #d63638; }
       /* A refusal is worth spotting from across the table, not by reading it. */
       tr.gmcp-row-refused td { box-shadow: inset 3px 0 0 #d63638; }
-      .gmcp-args { white-space: pre-wrap; font-size: 11px; margin: 4px 0 0; }
+      .gmcp-args { white-space: pre-wrap; font-size: 11px; margin: 4px 0 0; max-height: 28em; overflow: auto; }
       .gmcp-summary { cursor: pointer; color: #2271b1; font-size: 12px; }
       .gmcp-limits { font-size: 11px; }
       .gmcp-intro { max-width: 800px; }
@@ -1687,7 +1687,7 @@ class GMCP_Settings {
               <span class="gmcp-detail"><?php echo esc_html( $row['identity'] ); ?></span></td>
             <td><code><?php echo esc_html( $row['tool'] ); ?></code>
               <span class="gmcp-detail">(<?php echo esc_html( $row['tool_class'] ); ?>)</span>
-              <?php echo self::approval_args_html( (string) $row['args_view'] ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- every piece is escaped inside. ?></td>
+              <?php echo self::approval_args_html( (string) $row['args_view'], $row['args_redacted'] ?? null ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- every piece is escaped inside. ?></td>
             <td class="gmcp-nowrap"><?php echo esc_html( human_time_diff( time(), (int) $row['expires'] ) ); ?></td>
             <td class="gmcp-nowrap">
               <?php foreach ( [ 'approve' => __( 'Approve', 'guarded-mcp' ), 'decline' => __( 'Decline', 'guarded-mcp' ) ] as $verdict => $label ) : ?>
@@ -1738,28 +1738,33 @@ class GMCP_Settings {
   }
 
   /**
-  * The stored, redacted arguments as a collapsible block, shortened for display only.
+  * The arguments exactly as stored, in the one canonical order, with what is hidden named.
   *
-  * Shortened rather than refused: a person who cannot see the end of a long argument is
-  * told so, and that the approval covers all of it by hash.
+  * Not shortened and not reordered here: GMCP_Approvals::build_view() refuses to queue a call
+  * that does not fit, so the text this prints is every byte the approval covers, except the
+  * values it says it hides. A row from before that (no redaction list, or a stored preview)
+  * is labelled as possibly incomplete instead of being passed off as whole.
+  *
+  * @param string|null $redacted JSON list of the paths hidden, or null for an older row.
   */
-  private static function approval_args_html( string $json ): string {
-    $decoded = json_decode( $json, true );
-    $text = json_last_error() === JSON_ERROR_NONE
-      ? wp_json_encode( $decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE )
-      : $json;
-    $text = (string) $text;
+  private static function approval_args_html( string $text, $redacted ): string {
+    $names = is_string( $redacted ) ? json_decode( $redacted, true ) : null;
     $note = '';
-    if ( strlen( $text ) > 4000 ) {
-      $note = '<p class="gmcp-detail">' . esc_html( sprintf(
-        /* translators: %d: total size in bytes. */
-        __( 'Shortened here; the full arguments (%d bytes) are what an approval covers. Credential-shaped values are hidden and covered too.', 'guarded-mcp' ),
-        strlen( $text )
-      ) ) . '</p>';
-      $text = mb_substr( $text, 0, 4000 );
+    if ( is_array( $names ) && $names ) {
+      $shown = array_map( function ( $n ) {
+        return '"' . mb_substr( (string) $n, 0, 60 ) . '"';
+      }, array_slice( $names, 0, 20 ) );
+      $note = '<p class="gmcp-detail gmcp-warn"><strong>' . esc_html( sprintf(
+        /* translators: %d: number of hidden values. */
+        _n( '%d value is hidden from this screen and is still part of what you approve:', '%d values are hidden from this screen and are still part of what you approve:', count( $names ), 'guarded-mcp' ),
+        count( $names )
+      ) ) . '</strong> ' . esc_html( implode( ', ', $shown ) . ( count( $names ) > 20 ? sprintf( /* translators: %d: how many more. */ __( ' and %d more', 'guarded-mcp' ), count( $names ) - 20 ) : '' ) ) . '</p>';
     }
-    return '<details><summary class="gmcp-summary">' . esc_html__( 'Arguments', 'guarded-mcp' ) . '</summary><pre class="gmcp-args">'
-      . esc_html( $text ) . '</pre>' . $note . '</details>';
+    elseif ( !is_array( $names ) || strpos( $text, '__gmcp_truncated' ) !== false ) {
+      $note = '<p class="gmcp-detail gmcp-warn">' . esc_html__( 'This request was stored by an earlier version. What is shown may be shortened and may hide values you cannot see here; decline it unless you are sure.', 'guarded-mcp' ) . '</p>';
+    }
+    return $note . '<details open><summary class="gmcp-summary">' . esc_html__( 'Arguments', 'guarded-mcp' ) . '</summary><pre class="gmcp-args">'
+      . esc_html( $text ) . '</pre></details>';
   }
 
   #endregion

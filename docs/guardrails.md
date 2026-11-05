@@ -1416,9 +1416,20 @@ the second half.
   the plugin cannot make an agent that was told to create an administrator in that mode
   stop; it can only keep that administrator from approving anything. Not covered: a tool
   that changes an account in some way the user tools' names do not say.
-- **What a person sees.** The tool, the key, and the arguments as the audit log would
-  record them. A credential-shaped value is hidden, so it is approved unseen and covered
-  by the hash. Long arguments are shortened on screen only.
+- **What a person sees.** Exactly what the hash covers, or the call is not queued. The
+  screen once printed the arguments in the order the client sent them, cut at 4000
+  characters, with credential-shaped values hidden: three ways to show a different call
+  from the one approved. `GMCP_Approvals::build_view()` now makes the one view, at queue
+  time, and the screen prints it unchanged. Arguments are sorted (the tool's declared ones
+  first, objects sorted all the way down). A call is refused, with a normal error the agent
+  can read, if it carries an argument the tool's schema does not declare, if it is a list of
+  unnamed values, if it nests more than 12 levels, or if its arguments written out exceed
+  16000 bytes: an approval covers every byte, so it is not asked for what cannot be read.
+  A credential-shaped field, a string that holds one, and a preview-link token show as
+  `[redacted]`, and the screen says how many values are hidden and names their paths, so a
+  person knows a value they cannot see is part of what they approve. Bidirectional and
+  zero-width characters are shown as escapes. Rows stored before this existed are labelled
+  as possibly incomplete.
 - **A held call is not a success.** The reply is a normal result, not `isError`, so a
   client does not send the agent looking for a workaround; the audit log records the call
   as refused, because nothing ran. Requests, approvals, declines, lapses, uses and refused

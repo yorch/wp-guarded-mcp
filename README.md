@@ -408,8 +408,12 @@ repeats the identical call and it runs once.
   lists, approves, declines or edits the queue, at any access level.
 - The two-step confirmation still applies inside an approved call, and one approval covers
   both legs: a call that only issued a confirmation token has not spent it.
-- Arguments are redacted by the same test the audit log uses before they are stored or
-  shown, so a credential is approved unseen (the hash covers the real value). Requests,
+- The screen shows the call in one canonical order (sorted, the tool's declared arguments
+  first) and never shortens it: a call with an argument its tool does not declare, nested
+  more than 12 levels, or longer than 16000 bytes written out is refused with an error
+  instead of queued, because an approval covers every byte. A credential is hidden, and the
+  screen says how many values are hidden and which fields, so you know a value you cannot
+  see is part of what you approve (the hash covers the real value). Requests,
   approvals, declines, lapses, uses and refused replays are written to the audit log.
   There are no bulk actions and nothing to delete: a request leaves the list by being
   answered or by lapsing.

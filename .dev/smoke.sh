@@ -1489,6 +1489,45 @@ for want in person_password=clean tool_display_name=clean tool_password=marked t
 done
 wpe 'foreach ( [ "ac_subscriber" ] as $l ) { $u = get_user_by( "login", $l ); if ( $u ) { wp_delete_user( $u->ID ); } }' >/dev/null
 
+echo "-- what an approver is shown is what the hash covers --"
+# The Approvals screen printed the arguments in the order the client sent them, cut at 4000
+# characters, with credential-shaped values hidden: a page that could show a different call
+# from the one approved. build_view() is now the one place the view is made, and it either
+# shows the whole call or refuses to queue it. Pure checks here; the page itself is in
+# smoke-admin.sh.
+BV_DEF='["name"=>"x_delete_thing","accessLevel"=>"admin","inputSchema"=>["type"=>"object","properties"=>["ID"=>["type"=>"integer"],"force"=>["type"=>"boolean"],"note"=>["type"=>"string"],"fields"=>["type"=>"object"],"key"=>["type"=>"string"],"value"=>["type"=>"string"],"confirm"=>["type"=>"string"]]]]'
+bv() { wpe '$d='"$BV_DEF"'; $a=json_decode(base64_decode("'"$(printf '%s' "$1" | base64 | tr -d '\n')"'"),true); '"$2"; }
+check "the same call in another key order is shown in one order" \
+  "$(bv '{}' 'echo GMCP_Approvals::build_view(["force"=>true,"ID"=>3,"fields"=>["b"=>1,"a"=>2]],$d)["text"]===GMCP_Approvals::build_view(["fields"=>["a"=>2,"b"=>1],"ID"=>3,"force"=>true],$d)["text"]?"same":"DIFFERENT";')" "same"
+check "  and it is sorted, not in the order sent" \
+  "$(bv '{}' '$t=GMCP_Approvals::build_view(["note"=>"n","ID"=>3,"force"=>true],$d)["text"]; echo strpos($t,"\"ID\"")<strpos($t,"\"force\"") && strpos($t,"\"force\"")<strpos($t,"\"note\"") ? "sorted":"UNSORTED";')" "sorted"
+check "the view is faithful: reading it back gives the call that is hashed" \
+  "$(bv '{}' '$a=["ID"=>3,"note"=>"ünï \"quoted\" <b>","fields"=>["z"=>[3,1,2],"a"=>["x"=>null,"y"=>false]]]; $v=GMCP_Approvals::build_view($a,$d); echo GMCP_Approvals::canonical_json(json_decode($v["text"],true))===GMCP_Approvals::canonical_json($a)?"faithful":"DIFFERS";')" "faithful"
+check "the two-step token is not part of the view, as it is not part of the hash" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["ID"=>3,"confirm"=>"abcdef"],$d); echo strpos($v["text"],"abcdef")===false?"absent":"SHOWN";')" "absent"
+check "an argument the tool does not declare refuses the call" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["ID"=>3,"sneaky"=>"x"],$d); echo isset($v["refusal"]) && strpos($v["refusal"],"sneaky")!==false ? "refused":"QUEUED";')" "refused"
+check "CONTROL: the same call without it is shown" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["ID"=>3],$d); echo isset($v["text"]) ? "shown":"REFUSED";')" "shown"
+check "a call that would be cut off is refused, not queued" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["note"=>str_repeat("a",GMCP_Approvals::VIEW_MAX)],$d); echo isset($v["refusal"]) ? "refused":"QUEUED";')" "refused"
+check "CONTROL: one that fits, and is longer than the old 4000-character cut, is shown whole" \
+  "$(bv '{}' '$n=str_repeat("a",9000)."END"; $v=GMCP_Approvals::build_view(["note"=>$n],$d); echo isset($v["text"]) && strpos($v["text"],"aEND")!==false ? "whole":"CUT";')" "whole"
+check "arguments nested past the depth limit are refused" \
+  "$(bv '{}' '$n="x"; for($i=0;$i<20;$i++){$n=["k"=>$n];} $v=GMCP_Approvals::build_view(["fields"=>$n],$d); echo isset($v["refusal"]) ? "refused":"QUEUED";')" "refused"
+check "a list of unnamed arguments is refused" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view([1,2],$d); echo isset($v["refusal"]) ? "refused":"QUEUED";')" "refused"
+check "credential-shaped fields are hidden, counted and named" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["ID"=>3,"fields"=>["user_pass"=>"SECRETPW123","display_name"=>"d","api_token"=>"SECRETTOK"]],$d); echo strpos($v["text"],"SECRET")===false ? implode(",",$v["redacted"]) : "LEAKED";')" "fields.user_pass,fields.api_token"
+check "CONTROL: a call with nothing hidden lists nothing hidden" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["ID"=>3,"fields"=>["display_name"=>"d"]],$d); echo count($v["redacted"]);')" "0"
+check "the value stored under a credential-shaped option name is hidden, the name is not" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["key"=>"smtp_pwd","value"=>"SECRETSMTP"],$d); echo strpos($v["text"],"SECRETSMTP")===false && strpos($v["text"],"smtp_pwd")!==false ? implode(",",$v["redacted"]) : "WRONG";')" "value"
+check "a string that holds a credential inside it is hidden whole" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["note"=>"{\"password\":\"SECRETJSON\"}"],$d); echo strpos($v["text"],"SECRETJSON")===false ? implode(",",$v["redacted"]) : "LEAKED";')" "note"
+check "a text-reordering character is shown as an escape, not applied" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["note"=>"safe\u{202E}evil"],$d); echo strpos($v["text"],"\u{202E}")===false && strpos($v["text"],"\\u202e")!==false ? "escaped":"RAW";')" "escaped"
+
 echo "-- OAuth: the consent screen offers full or read-only, and the grant carries it --"
 JAR="$OUT/oauth.jar"
 curl -sS -c "$JAR" -b "$JAR" -d 'log=admin&pwd=admin&rememberme=forever&testcookie=1' "$BASE/wp-login.php" -o /dev/null 2>/dev/null

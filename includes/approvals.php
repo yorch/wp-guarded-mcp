@@ -35,12 +35,14 @@ if ( !defined( 'ABSPATH' ) ) {
 *
 * WHAT IT DOES NOT DO. It does not replace the two-step; an approved call still goes
 * through confirm_gate() if the tool has one. It does not make a gated tool safe, only
-* attended. And what the person sees is the redacted arguments (GMCP_Audit::storable_args),
-* so a credential inside them is approved unseen; the hash covers the real value.
+* attended. And what the person sees is the whole call in one canonical order, with
+* credential-shaped values hidden and counted (build_view()), so a credential inside it is
+* approved unseen and the screen says so; the hash covers the real value. A call that cannot
+* be shown in full is not queued.
 */
 class GMCP_Approvals {
 
-  const DB_VERSION = '1';
+  const DB_VERSION = '2';
   const DB_VERSION_OPTION = 'gmcp_approvals_db_version';
 
   /** never: nothing waits. deletes: deletions and anything unclassified. site: and site-wide changes. */
@@ -66,6 +68,14 @@ class GMCP_Approvals {
   */
   const TOUCHED_WINDOW = DAY_IN_SECONDS;
   const TOUCHED_META = 'gmcp_changed_by_mcp';
+  /**
+  * The most a person is shown of one call's arguments, in bytes of the text on screen. A call
+  * whose arguments do not fit is not queued, because an approval covers ALL of the arguments
+  * by hash and a person who can see only the start of them is approving the rest unseen.
+  */
+  const VIEW_MAX = 16000;
+  /** How deep the arguments may nest and still be shown. */
+  const VIEW_DEPTH = 12;
 
   /**
   * Verbs that destroy something. Matched against the name's segments, and only ever
@@ -117,6 +127,7 @@ class GMCP_Approvals {
       tool_class varchar(16) NOT NULL DEFAULT '',
       args_mac char(64) NOT NULL DEFAULT '',
       args_view longtext NULL,
+      args_redacted text NULL,
       decided_by bigint(20) unsigned NOT NULL DEFAULT 0,
       decided_at int(10) unsigned NOT NULL DEFAULT 0,
       approved_until int(10) unsigned NOT NULL DEFAULT 0,
@@ -385,6 +396,145 @@ class GMCP_Approvals {
     return hash_hmac( 'sha256', $tool . "\x1f" . $json, $secret );
   }
 
+  /**
+  * What a person is shown for a call, or why it cannot be shown.
+  *
+  * The screen once printed the stored arguments in the order the client sent them, shortened
+  * at 4000 characters, with credential-shaped values hidden: three ways for the page to show
+  * a different call from the one the hash covers. So the view is built once, here, to be
+  * complete or absent:
+  *
+  *   - Arguments the tool's schema does not name are refused. The hash covers them, the
+  *     person would not be told what they were for, and a tool that reads an undeclared
+  *     argument is one the registration did not describe.
+  *   - Every key in one canonical order (the schema's own arguments first, then by name,
+  *     objects sorted all the way down), so the same call always reads the same way.
+  *   - Nothing is cut: a view past VIEW_MAX, or nested past VIEW_DEPTH, refuses the call.
+  *   - What is hidden is counted and named. A credential-shaped field, a string holding one,
+  *     or a preview-link token shows as "[redacted]" and its path is listed, so the person
+  *     knows a value they cannot see is part of what they approve.
+  *   - Characters that reorder or hide text (bidirectional controls, zero-width marks) are
+  *     shown as escapes, so a string cannot read as something it is not.
+  *
+  * @return array{text:string,redacted:string[]}|array{refusal:string}
+  */
+  public static function build_view( array $args, ?array $definition ): array {
+    $declares_confirm = self::declares_confirm( $definition );
+    if ( $declares_confirm && isset( $args['confirm'] ) && is_string( $args['confirm'] ) ) {
+      unset( $args['confirm'] );
+    }
+    $known = [];
+    $props = is_array( $definition ) ? ( $definition['inputSchema']['properties'] ?? null ) : null;
+    if ( is_object( $props ) ) {
+      $props = get_object_vars( $props );
+    }
+    if ( is_array( $props ) ) {
+      $known = array_map( 'strval', array_keys( $props ) );
+    }
+    foreach ( array_keys( $args ) as $name ) {
+      if ( !is_string( $name ) ) {
+        return [ 'refusal' => 'This call was not queued for approval and did not run: its arguments are a list, not named values, so there is nothing a person could read them by.' ];
+      }
+      // A tool with no definition at all is held as unknown, and has no schema to check against.
+      if ( is_array( $definition ) && !in_array( $name, $known, true ) ) {
+        return [ 'refusal' => 'This call was not queued for approval and did not run: it carries an argument the tool does not declare ("' . mb_substr( $name, 0, 60 ) . '"). A person approving it could not be told what that argument is for. Repeat the call with only the arguments the tool lists.' ];
+      }
+    }
+    $redacted = [];
+    $too_deep = false;
+    $walk = self::view_value( $args, '', 0, $redacted, $too_deep );
+    if ( $too_deep ) {
+      return [ 'refusal' => 'This call was not queued for approval and did not run: its arguments nest more than ' . self::VIEW_DEPTH . ' levels deep, which is more than a person can be shown. Send a flatter call.' ];
+    }
+    // Schema-declared arguments first, in name order, then anything else in name order.
+    $ordered = [];
+    $names = array_keys( $walk );
+    sort( $names, SORT_STRING );
+    foreach ( [ true, false ] as $want_known ) {
+      foreach ( $names as $name ) {
+        if ( in_array( (string) $name, $known, true ) === $want_known ) {
+          $ordered[ $name ] = $walk[ $name ];
+        }
+      }
+    }
+    // phpcs:ignore WordPress.WP.AlternativeFunctions.json_encode_json_encode -- same reason as canonical_json(): no silent repair of bytes.
+    $text = json_encode( $ordered === [] ? new stdClass() : $ordered, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION );
+    if ( $text === false ) {
+      return [ 'refusal' => 'This call was not queued for approval and did not run: its arguments could not be written out for a person to read.' ];
+    }
+    $text = (string) preg_replace_callback(
+      '/[\x{0080}-\x{009F}\x{200B}-\x{200F}\x{2028}-\x{202E}\x{2060}-\x{206F}\x{FEFF}]/u',
+      function ( $m ) {
+        return sprintf( '\\u%04x', mb_ord( $m[0], 'UTF-8' ) );
+      },
+      $text
+    );
+    if ( strlen( $text ) > self::VIEW_MAX ) {
+      return [ 'refusal' => 'This call was not queued for approval and did not run: its arguments are ' . strlen( $text ) . ' bytes when written out, and a person can be shown at most ' . self::VIEW_MAX . '. An approval covers every byte, so it will not be asked for what cannot be read. Split the work into smaller calls.' ];
+    }
+    return [ 'text' => $text, 'redacted' => array_values( array_unique( $redacted ) ) ];
+  }
+
+  /**
+  * One value as it is shown, objects sorted by key, secrets replaced and their paths noted.
+  * $too_deep is set when it nests past VIEW_DEPTH (a null leaf is a value, so null cannot
+  * be the signal).
+  *
+  * @param string[] $redacted Collected paths, by reference.
+  */
+  private static function view_value( $value, string $path, int $depth, array &$redacted, bool &$too_deep ) {
+    if ( $depth > self::VIEW_DEPTH ) {
+      $too_deep = true;
+      return null;
+    }
+    if ( is_object( $value ) ) {
+      $value = get_object_vars( $value );
+    }
+    if ( is_string( $value ) ) {
+      if ( GMCP_Core::scrub_preview_tokens( $value ) !== $value || GMCP_Core::holds_credential( $value, 0, 12 ) ) {
+        $redacted[] = $path === '' ? '(value)' : $path;
+        return GMCP_Core::REDACTION_MARKER;
+      }
+      return $value;
+    }
+    if ( !is_array( $value ) ) {
+      return $value;
+    }
+    // The name of a row and the secret stored under it: hide the companion when the name is.
+    $hide_companions = false;
+    if ( $depth === 0 ) {
+      foreach ( GMCP_Core::IDENTIFIER_ARGS as $field ) {
+        if ( isset( $value[ $field ] ) && is_scalar( $value[ $field ] ) && GMCP_Core::field_looks_secret( (string) $value[ $field ] ) ) {
+          $hide_companions = true;
+        }
+      }
+    }
+    $is_list = $value === array_values( $value );
+    $out = [];
+    foreach ( $value as $key => $inner ) {
+      $inner_path = $path === '' ? (string) $key : $path . '.' . $key;
+      // The name of the row a call names ("key": "blogname") is not a credential even though
+      // "key" matches the pattern; what is stored under it may be, which is $hide_companions.
+      $names_a_row = $depth === 0 && in_array( $key, GMCP_Core::IDENTIFIER_ARGS, true ) && is_scalar( $inner );
+      $secret = ( !$names_a_row && is_string( $key ) && GMCP_Core::field_looks_secret( $key ) )
+        || ( $hide_companions && in_array( $key, [ 'value', 'meta_value', 'option_value', 'data' ], true ) );
+      if ( $secret ) {
+        $redacted[] = mb_substr( $inner_path, 0, 80 );
+        $out[ $key ] = GMCP_Core::REDACTION_MARKER;
+        continue;
+      }
+      $shown = self::view_value( $inner, $inner_path, $depth + 1, $redacted, $too_deep );
+      if ( $too_deep ) {
+        return null;
+      }
+      $out[ $key ] = $shown;
+    }
+    if ( !$is_list ) {
+      ksort( $out, SORT_STRING );
+    }
+    return $out;
+  }
+
   /** Whether the tool's schema declares `confirm` as a string, i.e. as the two-step token. */
   private static function declares_confirm( ?array $tool ): bool {
     $props = $tool['inputSchema']['properties']['confirm'] ?? null;
@@ -437,6 +587,12 @@ class GMCP_Approvals {
     $mac = self::args_mac( $tool, $args, self::declares_confirm( $definition ) );
     if ( $mac === false ) {
       return self::refusal( 'This call could not be queued for approval because its arguments could not be encoded as JSON, so nothing ran.' );
+    }
+    // Before anything is looked up, so a call a person could not read in full can neither be
+    // queued nor spend an approval: what is approved is exactly what was shown.
+    $view = self::build_view( $args, $definition );
+    if ( isset( $view['refusal'] ) ) {
+      return self::refusal( $view['refusal'] );
     }
 
     self::expire_stale();
@@ -519,9 +675,11 @@ class GMCP_Approvals {
       'tool' => mb_substr( $tool, 0, 64 ),
       'tool_class' => $class,
       'args_mac' => $mac,
-      // Redacted by the one function the audit log uses, so what a person reads here and
-      // what the log keeps cannot disagree about what a credential is.
-      'args_view' => GMCP_Audit::storable_args( $args ),
+      // Exactly the text the screen prints, and the names of what it hides. Built by
+      // build_view() from the same credential test the audit log uses, so what a person
+      // reads here and what the log keeps cannot disagree about what a credential is.
+      'args_view' => $view['text'],
+      'args_redacted' => wp_json_encode( $view['redacted'] ),
     ] );
     if ( !$inserted ) {
       return self::refusal( 'The approval queue could not be written, so the call was not run.' );
