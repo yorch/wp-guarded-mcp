@@ -87,6 +87,23 @@ check "a second request with the same token is refused" "$CODE" "403"
 CODE2=$(curl -sS -o /dev/null -w '%{http_code}' "${DL%/*}/deadbeefdeadbeefdeadbeefdeadbeef" 2>/dev/null)
 check "an unknown token is refused" "$CODE2" "403"
 
+echo "-- an expired token is refused --"
+# Minted, then the timeout row is moved into the past: the row itself stays, which is the case
+# the direct SELECT would otherwise miss.
+call "$TOK" mint3 "$(tc wp_download_request '{"ID":'"$ATT"'}')"
+DL3=$(py 'import json,sys
+t=json.load(sys.stdin).get("result",{}).get("content",[{}])[0].get("text","{}")
+print(json.loads(t).get("download_url",""))' "" mint3)
+TOK3=${DL3##*/}
+wpc eval 'update_option( "_transient_timeout_gmcp_download_'"$TOK3"'", time() - 60 );' >/dev/null 2>&1
+# Read through get_option rather than a hand-built SQL string: the nested quoting in the
+# version above produced an empty result, which read as "the control failed" when the fixture
+# was fine.
+check "CONTROL: the row still exists after its timeout" \
+  "$(wpc eval 'echo get_option( "_transient_gmcp_download_'"$TOK3"'", "__ABSENT__" ) !== "__ABSENT__" ? "yes" : "no";')" "yes"
+CODE4=$(curl -sS -o /dev/null -w '%{http_code}' "$DL3" 2>/dev/null)
+check "an expired token is refused even though its row is still there" "$CODE4" "403"
+
 echo "-- the bytes never reach the audit log --"
 # Positive control first: the tool call itself IS in the log, so an empty table is not the
 # explanation for a missing payload.
