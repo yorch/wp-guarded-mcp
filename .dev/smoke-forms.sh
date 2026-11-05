@@ -860,7 +860,7 @@ check "STORED: the submission, its revision and its upload are all still there, 
   "$(wpe 'echo get_post('"$SUB"')?"sub":"nosub","|",get_post('"$SUBREV"')?"rev":"norev","|",(int) get_post('"$SUBATT"')->post_parent==='"$SUB"'?"att":"orphan";')" "sub|rev|att"
 callas "$TOK" x5 "$(tc wp_delete_media "{\"ID\":$SUBATT,\"force\":true}")"
 check "deleting a submission's upload through wp_delete_media is refused" "$(verdict x5)" "error"
-check "and the refusal says \"an attachment\", not \"a attachment\"" "$(has x5 "it is an attachment that hangs from a flamingo_inbound")/$(has x5 "a attachment")" "yes/no"
+check "and the refusal says \"an attachment\", not \"a attachment\"" "$(has x5 "it is an attachment that hangs from a gmcp_smoke_sub")/$(has x5 "a attachment")" "yes/no"
 check "STORED: the upload is still there" "$(wpe 'echo get_post('"$SUBATT"')?"there":"gone";')" "there"
 callas "$TOK" x6 "$(tc gmcp_smoke_rawwrite "{\"op\":\"title\",\"id\":$SUBATT,\"value\":\"x\"}")"
 check "the net refuses a raw edit of the upload" "$(verdict x6)" "error"
