@@ -356,6 +356,7 @@ class GMCP_Settings {
       'mcp_tools_forms' => 'bool',
       'mcp_tools_wordfence' => 'bool',
       'mcp_tools_stream' => 'bool',
+      'mcp_tools_beaver' => 'bool',
       'mcp_approval_mode' => 'approval_mode',
       'mcp_debug_mode' => 'bool',
       'mcp_activity_log' => 'bool',
@@ -1298,6 +1299,9 @@ class GMCP_Settings {
     // Stream defines no version constant in 4.4.0, so presence is the namespaced plugin
     // class plus the global accessor a reader here would call.
     $stream = class_exists( '\WP_Stream\Plugin' ) && function_exists( 'wp_stream_get_instance' );
+    // Beaver Builder: the version constant plus the model class its tools call, the same
+    // per-call signal the group itself uses.
+    $beaver = defined( 'FL_BUILDER_VERSION' ) && class_exists( 'FLBuilderModel' );
 
     // Only the groups actually rendered are declared to the save. A checkbox that was
     // never on screen must keep its stored value rather than read as unticked, which is
@@ -1353,6 +1357,9 @@ class GMCP_Settings {
     }
     if ( $stream ) {
       $keys[] = 'mcp_tools_stream';
+    }
+    if ( $beaver ) {
+      $keys[] = 'mcp_tools_beaver';
     }
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'Which groups of tools an agent is offered. A group that is off is not merely hidden: its tools are refused if asked for by name.', 'guarded-mcp' ); ?></p>
@@ -1473,6 +1480,12 @@ class GMCP_Settings {
                   <?php esc_html_e( 'Stream (read the site\'s activity log: event counts, and the records themselves at admin level)', 'guarded-mcp' ); ?>
                 </label>
               <?php endif; ?>
+              <?php if ( $beaver ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_beaver" value="1" <?php checked( !empty( $options['mcp_tools_beaver'] ) ); ?>>
+                  <?php esc_html_e( 'Beaver Builder (layout structure and node types, templates, and clearing generated CSS)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
               <label>
                 <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>
                 <?php esc_html_e( 'Generate create, read, update and delete tools for posts, pages and media from the REST API', 'guarded-mcp' ); ?>
@@ -1549,6 +1562,11 @@ class GMCP_Settings {
             <?php if ( $wordfence ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The Wordfence tools only read, and they answer a different question from the activity log: is anything watching, and is the watching working. There is deliberately no tool that dismisses an issue, whitelists an address, changes a firewall mode or starts a scan, because each is a way to make the watcher quieter and an agent that can quiet it and read it back can confirm its own silence. A count of zero findings is always reported next to whether a scan has ever run, since on a fresh install it means nothing has looked rather than that the site is clean.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $beaver ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The Beaver Builder tools read a page\'s layout STRUCTURE and never its settings, because a node\'s settings is the content and the html module makes it executable. They report whether the builder is enabled on a post, how many nodes the published and draft copies hold, and whether the layout carries custom CSS or JS. There is no tool that writes layout data: the layout lives in post meta rather than post content, so a generic body edit appears to work and changes nothing, and writing the meta would be persistent script injection with no restore tool behind it. The one write is clearing the builder\'s generated CSS/JS, which it regenerates.', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
             <?php if ( $stream ) : ?>

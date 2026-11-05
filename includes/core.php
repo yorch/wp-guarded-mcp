@@ -98,6 +98,11 @@ class GMCP_Core {
     // an agent can shorten the retention of is not an audit log, so wp_stream is refused by
     // option_write_policy() (see audit_log_option_prefixes()).
     'mcp_tools_stream' => false,
+    // Beaver Builder: the layout lives in post meta, not in post content, so a generic write
+    // to the body appears to work and leaves the page rendering as before. Read only apart
+    // from clearing the generated CSS/JS, and no tool writes layout data: the html module
+    // makes that persistent script injection with no restore behind it.
+    'mcp_tools_beaver' => false,
     // Out-of-band human approval. 'never' | 'deletes' | 'site': which tool calls are held
     // until a logged-in administrator approves them on the Approvals screen. Global rather
     // than per key, so that a key, an OAuth grant and a key minted next week are all
@@ -1311,6 +1316,50 @@ class GMCP_Core {
   *
   * @return string|null The refusal, or null when the key is fine.
   */
+  /**
+  * Meta keys that hold a page builder's LAYOUT, which no generic tool may read or write.
+  *
+  * A policy about a key belongs to the key, not to the tool that writes it: the Beaver Builder
+  * group withholds node settings and layout css/js, and that withholding would be decoration if
+  * wp_get_post_meta returned `_fl_builder_data` and wp_update_post_meta could rewrite it. This
+  * is the same rule the WPForms post type got, one level down — a post-type rule cannot help
+  * here, because a layout hangs off an ordinary page.
+  *
+  * Measured on Beaver Builder 2.11.1.2: `_fl_builder_data` is a serialised array of nodes whose
+  * settings hold the content and, for the html module, arbitrary markup including script;
+  * `_fl_builder_data_settings` holds layout-level css and js that run on every page using the
+  * layout. So a read hands over a script payload and a write installs one.
+  *
+  * Filterable, because the category is "a builder's layout", not one plugin.
+  *
+  * @return string[] Lowercased meta keys.
+  */
+  public static function layout_meta_keys(): array {
+    return array_map( 'strtolower', array_map( 'strval', (array) apply_filters( 'gmcp_layout_meta_keys', [
+      '_fl_builder_data',
+      '_fl_builder_draft',
+      '_fl_builder_data_settings',
+      '_fl_builder_draft_settings',
+      '_fl_builder_enabled',
+    ] ) ) );
+  }
+
+  /**
+  * The refusal for a layout meta key, or null when the key is fine.
+  *
+  * Asked by the generic meta readers and writers, and by protected_meta_refusal() so the
+  * WordPress-level net covers writers that do not come through those tools.
+  */
+  public static function layout_meta_refusal( $key ): ?string {
+    if ( !is_string( $key ) || $key === '' ) {
+      return null;
+    }
+    if ( !in_array( strtolower( rtrim( $key ) ), self::layout_meta_keys(), true ) ) {
+      return null;
+    }
+    return 'The meta key "' . $key . '" holds a page builder layout, and the generic meta tools neither read nor write it: a node\'s settings is the content and the html module makes it executable, and the layout settings hold css and js that run on every page using it. Reading it would hand over a script payload and writing it would install one, with no restore tool behind it. Use the builder\'s own tools to read the structure (node types, counts, whether it carries custom code), or its editor in wp-admin to change it. A site can extend the list with the gmcp_layout_meta_keys filter.';
+  }
+
   public static function protected_meta_refusal( $key ): ?string {
     if ( !is_string( $key ) ) {
       return null;
@@ -1318,6 +1367,13 @@ class GMCP_Core {
     $needle = strtolower( rtrim( $key ) );
     if ( strncmp( $needle, '_wp_trash_meta_', 15 ) === 0 ) {
       return 'The meta key "' . $key . '" is refused: WordPress deletes posts and comments for good on the schedule these keys hold, so writing one is a deletion by another name. Use wp_delete_post.';
+    }
+    // A page builder's layout, for the same reason and through the same door: the WordPress
+    // filters installed by install_trash_meta_net() ask this function, so a writer that never
+    // calls the tools is covered too.
+    $layout = self::layout_meta_refusal( $key );
+    if ( $layout !== null ) {
+      return $layout;
     }
     return null;
   }
@@ -2046,6 +2102,13 @@ class GMCP_Core {
     // different answer from "the log is empty".
     if ( $this->get_option( 'mcp_tools_stream' ) ) {
       new GMCP_Tools_Stream();
+    }
+
+    // Beaver Builder: the layout is post meta and the front end renders from it. Registered
+    // unconditionally within its switch, like the other optional groups, so the status tool
+    // can answer "the builder is not loaded" rather than the tool being absent.
+    if ( $this->get_option( 'mcp_tools_beaver' ) ) {
+      new GMCP_Tools_Beaver();
     }
   }
 

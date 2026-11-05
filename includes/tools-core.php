@@ -512,6 +512,14 @@ class GMCP_Tools_Core {
       if ( $protected !== null ) {
         return $protected;
       }
+    } else {
+      // Reads too, for this one family: a builder layout is not a trash timestamp. Reading it
+      // hands over the content and, for the html module, script; the builder group reports the
+      // structure instead and never the settings.
+      $layout = GMCP_Core::layout_meta_refusal( $key );
+      if ( $layout !== null ) {
+        return $layout;
+      }
     }
     return true;
   }
