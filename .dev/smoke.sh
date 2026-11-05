@@ -889,7 +889,7 @@ echo "-- the dynamic REST tools --"
 # every later run of every other suite is testing.
 REST_WAS=$(docker compose exec -T cli wp eval 'echo !empty(get_option("gmcp_options",[])["mcp_tools_rest"]) ? "1" : "0";' 2>/dev/null | tr -d '\r\n')
 docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]); $o["mcp_tools_rest"]=true; update_option("gmcp_options",$o,false);' >/dev/null 2>&1
-docker compose exec -T cli wp transient delete gmcp_tools_cache_v5 >/dev/null 2>&1
+docker compose exec -T cli wp eval 'delete_transient( GMCP_Tools_Rest::CACHE_KEY );' >/dev/null 2>&1
 call rlist '{"jsonrpc":"2.0","id":90,"method":"tools/list"}'
 check "the REST group appears when switched on" \
   "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"list_pages","get_pages","create_pages","update_pages","delete_pages"}-n) or True)' rlist)" "True"
@@ -1016,7 +1016,7 @@ docker compose exec -T cli wp eval '
 call up_again '{"jsonrpc":"2.0","id":100,"method":"tools/list"}'
 check "and it does not fire again on the next request" \
   "$(py 'import json,sys;print("zz_sentinel2" in {t["name"] for t in json.load(sys.stdin)["result"]["tools"]})' up_again)" "True"
-docker compose exec -T cli wp transient delete gmcp_tools_cache_v5 >/dev/null 2>&1
+docker compose exec -T cli wp eval 'delete_transient( GMCP_Tools_Rest::CACHE_KEY );' >/dev/null 2>&1
 docker compose exec -T cli wp post delete "$RF_ID" --force >/dev/null 2>&1
 # Quoted, and it was not: the shell substitutes REST_WAS bare, so (1==='1') compares an
 # int against a string under PHP's strict operator and is always false. The restore then
