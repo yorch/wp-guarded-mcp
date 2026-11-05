@@ -388,8 +388,9 @@ class GMCP_Audit {
   * a multisite network's blogs have no reason to queue behind one another. If the lock
   * cannot be had in five seconds the row is written anyway, because an entry that might sit
   * on a fork is a better outcome than an entry that does not exist; the timeout is logged.
-  * A server with no GET_LOCK (some SQLite drop-ins) answers null and is treated as having
-  * no lock to take, silently.
+  * A server with no GET_LOCK answers something that is neither '1' nor '0' and is treated as
+  * having no lock to take, silently: null from a server that errors on the call, and the
+  * string '1=1' from the SQLite drop-in (measured), which reads the call as a comparison.
   *
   * @param array $row the columns, without prev_hash and hash.
   */
