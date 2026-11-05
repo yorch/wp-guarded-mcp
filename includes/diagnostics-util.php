@@ -18,6 +18,9 @@ if ( !defined( 'ABSPATH' ) ) {
 * single list in GMCP_Core::credential_field_patterns() stays the only one.
 */
 final class GMCP_Diag_Util {
+  /** The substrings that make a field name secret in a log line, when the caller supplies none. */
+  const DEFAULT_SECRET_PATTERNS = [ 'pass', 'pwd', 'secret', 'token', 'key', 'auth', 'salt', 'nonce', 'credential', 'bearer', 'signature', 'licence', 'license', 'private' ];
+
 
   /* ------------------------------------------------------------------ IP addresses */
 
@@ -571,7 +574,7 @@ final class GMCP_Diag_Util {
       return [ 'ok' => false, 'error' => $why, 'expected' => '', 'dirs' => [], 'below_root' => false ];
     };
     if ( $configured === '' || $configured[0] !== '/' || strpos( $configured, "\0" ) !== false ) {
-      return $fail( 'The configured log path is not an absolute path.' );
+      return $fail( 'The configured log path is not an absolute path (a relative error_log is not read: the directory PHP resolves it against depends on how PHP is run, so this tool will not guess which file that is). Set error_log to an absolute path, or use WP_DEBUG_LOG.' );
     }
     $best = null;
     clearstatcache( true ); // including the realpath cache, which is not re-validated for minutes
@@ -997,7 +1000,7 @@ final class GMCP_Diag_Util {
 
     // key=value, key: value, "key":"value", key => value, where the key looks secret. This
     // is also what clears ?token=... in a logged URL.
-    $patterns = array_values( array_filter( array_map( 'strval', $ctx['patterns'] ?? [ 'pass', 'pwd', 'secret', 'token', 'key', 'auth', 'salt', 'nonce', 'credential', 'bearer', 'signature', 'licence', 'license', 'private' ] ), 'strlen' ) );
+    $patterns = array_values( array_filter( array_map( 'strval', $ctx['patterns'] ?? self::DEFAULT_SECRET_PATTERNS ), 'strlen' ) );
     $patterns[] = 'gmcp_preview';
     $line = self::scrub_preview_tokens( $line );
     if ( $patterns ) {
@@ -1022,6 +1025,40 @@ final class GMCP_Diag_Util {
         '$1[redacted]',
         $line
       );
+      // PHP serialized data: s:9:"user_pass";s:7:"hunter2"; (an options dump, a session, a
+      // user meta row). The name and the value are separate strings, so no separator sits
+      // between them for the rule above. The value is read up to its closing quote, which is
+      // as far as a value without a quote in it goes; one with a quote in it is cut short, and
+      // the rest stays. The name is bounded so a long line cannot make this quadratic.
+      $line = (string) preg_replace(
+        '#(\bs:\d{1,5}:"[^"]{0,100}?(?:' . $alt . ')[^"]{0,100}";\s*)(?:s:\d{1,7}:"(?:[^"\\\\]|\\\\.)*";|[idb]:[^;]{0,60};)#i',
+        '$1s:10:"[redacted]";',
+        $line
+      );
+      // An element named like a secret: <Password>value</Password>, <api_key id="1">value</api_key>.
+      // Closed on the same line and by the same name; an element left open (a value cut off by
+      // the log line's end, or one printed over several lines) is not recognised.
+      $line = (string) preg_replace(
+        '#(<([A-Za-z0-9_.:\-]{0,60}?(?:' . $alt . ')[A-Za-z0-9_.:\-]{0,60})(?:\s[^<>]{0,300})?>)[^<]{1,2000}(</\2\s*>)#i',
+        '$1[redacted]$3',
+        $line
+      );
+      // The same assignment URL-encoded, which is how it sits in a logged query string or in a
+      // form body that was encoded twice: token%3Dabc, %26password%3Dabc, password%253Dabc. The
+      // value ends at an encoded "&", ";", "," or space, which are what separate the next field.
+      $line = (string) preg_replace(
+        '#(?<![A-Za-z0-9_.\-\[\]])(["\']?[A-Za-z0-9_.\-\[\]]*(?:' . $alt . ')[A-Za-z0-9_.\-\[\]]*["\']?)((?:%253[Dd]|%3[Dd]))((?:[^\s&,;)\]}"\'%]|%(?!26|3[Bb]|2[Cc]|20|25(?:26|3[Bb])))+)#i',
+        '$1$2[redacted]',
+        $line
+      );
+      // A command line: --password hunter2, --api-key hunter2 (the "=" form is the name rule's).
+      // Only for option names that are a secret by themselves, because the next word of
+      // "--key-file x" or "--no-token-check yes" is not one.
+      $line = (string) preg_replace(
+        '#(?<![A-Za-z0-9_\-])(--(?:[A-Za-z0-9]+-)?(?:password|passwd|passphrase|pass|pwd|secret|token|api-?key|auth-?token|access-?key|client-?secret)\s+)("[^"]{1,300}"|\'[^\']{1,300}\'|[^\s"\'-][^\s"\']{0,300})#i',
+        '$1[redacted]',
+        $line
+      );
     }
 
     // Shapes the name-based rule above cannot see.
@@ -1036,6 +1073,22 @@ final class GMCP_Diag_Util {
     );
     $line = (string) preg_replace(
       '/(?<![A-Za-z0-9_])(pw)(\s*(?:=>|[:=])\s*)("[^"]*"|\'[^\']*\'|[^\s&,;)\]}]+)/i',
+      '$1$2[redacted]',
+      $line
+    );
+    // A database client's -pPASSWORD, written with no space (with a space, "-p" is a prompt and
+    // has no password after it). Only after a command that is one of those clients: -p is a
+    // port, a path or a pattern in most other programs. Case matters: -P is the port.
+    $line = (string) preg_replace(
+      '~((?i:\b(?:mysql[a-z]*|mariadb[a-z-]*))\b[^\r\n]{0,400}?\s-p)(?=[^\s-])("[^"]*"|\'[^\']*\'|\S+)~',
+      '$1[redacted]',
+      $line
+    );
+    // Azure shared access signatures: sig=<base64, percent-encoded> in a connection string or a
+    // URL. "sig" is too short to be one of the substring patterns without matching "signal" and
+    // "design", so it is a whole word, like "pw".
+    $line = (string) preg_replace(
+      '/(?<![A-Za-z0-9_])(sig)(%253[Dd]|%3[Dd]|\s*(?:=>|[:=])\s*)("[^"]*"|\'[^\']*\'|(?:[^\s&,;)\]}"\'%]|%(?!26|3[Bb]|2[Cc]|20))+)/i',
       '$1$2[redacted]',
       $line
     );
@@ -1084,15 +1137,22 @@ final class GMCP_Diag_Util {
   }
 
   /**
-  * Several lines of a log, scrubbed one by one, plus the one thing a single line cannot know:
-  * that it is inside a private key that began on an earlier line.
+  * Several lines of a log, scrubbed one by one, plus the two things a single line cannot know:
+  * that it is inside a private key that began on an earlier line, and that it is the value of
+  * a field whose name was on the line before.
   *
   * From a line holding "-----BEGIN ... PRIVATE KEY-----" with no end marker, every following
-  * line is withheld up to the line with the end marker. A missing end marker cannot swallow the
-  * log: the block also ends at a line that starts a new log record (a timestamp in brackets or
-  * "PHP "), which no line of a key does, and after 100 lines. A window that starts in the middle
-  * of a key has no beginning to see; its base64 lines are caught by the whole-line rule in
-  * scrub_log_line().
+  * line is withheld up to the line with the end marker. "No end marker" means the last BEGIN on
+  * the line comes after its last END: a line that closes one block and opens a second is still
+  * inside a key. A missing end marker cannot swallow the log: the block also ends at a line
+  * that starts a new log record (a timestamp in brackets or "PHP "), which no line of a key
+  * does, and after 100 lines. A window that starts in the middle of a key has no beginning to
+  * see; its base64 lines are caught by the whole-line rule in scrub_log_line().
+  *
+  * var_dump(), var_export() and print_r() of a nested value put the name and the value on two
+  * lines (`["password"]=>` then `string(7) "hunter2"`). When a line ends in "=>" and its name
+  * looks secret, the next line is withheld, unless it opens an array or an object, whose own
+  * members are judged by their own names.
   *
   * @param string[] $lines
   * @return string[] the same number of lines.
@@ -1100,26 +1160,59 @@ final class GMCP_Diag_Util {
   public static function scrub_log_lines( array $lines, array $ctx = [] ): array {
     $out = [];
     $in_key = 0;
+    $value_next = false;
+    $alt = self::secret_name_alternation( $ctx );
+    $record_start = '/^\[\d{1,2}-[A-Za-z]{3}-\d{4}[ \]]|^\[\d{4}-\d\d-\d\d|^PHP /';
     foreach ( $lines as $line ) {
       $line = (string) $line;
+      $was_value_next = $value_next;
+      $value_next = false;
       if ( $in_key > 0 ) {
         if ( preg_match( '/-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----/', $line ) ) {
           $in_key = 0;
           $out[] = '[private-key-block ends]';
           continue;
         }
-        if ( $in_key < 100 && !preg_match( '/^\[\d{1,2}-[A-Za-z]{3}-\d{4}[ \]]|^\[\d{4}-\d\d-\d\d|^PHP /', $line ) ) {
+        if ( $in_key < 100 && !preg_match( $record_start, $line ) ) {
           $in_key++;
           $out[] = '[private-key-block line]';
           continue;
         }
         $in_key = 0; // a new record, or too long: stop withholding and scrub this line normally
       }
-      if ( preg_match( '/-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----/', $line ) && !preg_match( '/-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----/', $line ) ) {
+      if ( $was_value_next && !preg_match( $record_start, $line ) && !preg_match( '/^\s*(?:array|object|stdClass|\(|\{|\)|\})/i', $line ) && trim( $line ) !== '' ) {
+        $out[] = '[redacted]';
+        continue;
+      }
+      $begin = self::last_offset( $line, '/-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----/' );
+      if ( $begin !== -1 && $begin > self::last_offset( $line, '/-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----/' ) ) {
         $in_key = 1;
+      }
+      if ( $alt !== '' && preg_match( '/^(.{0,300}?)=>\s*$/', $line, $m ) && preg_match( '#(?:' . $alt . ')#i', $m[1] ) ) {
+        $value_next = true;
       }
       $out[] = self::scrub_log_line( $line, $ctx );
     }
     return $out;
+  }
+
+  /** The offset where the last match of $pattern begins in $text, or -1 for none. */
+  private static function last_offset( string $text, string $pattern ): int {
+    $last = -1;
+    if ( preg_match_all( $pattern, $text, $m, PREG_OFFSET_CAPTURE ) ) {
+      foreach ( $m[0] as $hit ) {
+        $last = max( $last, (int) $hit[1] );
+      }
+    }
+    return $last;
+  }
+
+  /** The words that make a field name secret, as a regex alternation. */
+  private static function secret_name_alternation( array $ctx ): string {
+    $patterns = array_values( array_filter( array_map( 'strval', $ctx['patterns'] ?? self::DEFAULT_SECRET_PATTERNS ), 'strlen' ) );
+    $patterns[] = 'gmcp_preview';
+    return implode( '|', array_map( static function ( $p ) {
+      return preg_quote( $p, '#' );
+    }, $patterns ) );
   }
 }

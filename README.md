@@ -79,7 +79,7 @@ The settings screen shows the endpoint URL. There are two ways in.
 }
 ```
 
-If your host strips the `Authorization` header before PHP sees it, the plugin also registers `/wp-json/mcp/v1/<token>` as an alternative path. Prefer the header when it works.
+If your host strips the `Authorization` header before PHP sees it, there is no alternative path: re-save your permalink structure to regenerate the `.htaccess` rule that forwards it, and use the connection check on the settings screen to see whether it worked.
 
 ## Access levels
 

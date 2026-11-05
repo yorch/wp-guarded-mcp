@@ -273,6 +273,8 @@ check( 'resolve_log: the longest root wins (content directory, not the install r
 check( 'resolve_log: ".." is refused', GMCP_Diag_Util::resolve_log( "$dir/site/wp-content/../wp-content/logs/debug.log", $roots )['ok'], false );
 check( 'resolve_log: "." is refused', GMCP_Diag_Util::resolve_log( "$dir/site/wp-content/./logs/debug.log", $roots )['ok'], false );
 check( 'resolve_log: a relative path is refused', GMCP_Diag_Util::resolve_log( 'logs/debug.log', $roots )['ok'], false );
+check( 'resolve_log: ...and the refusal says it is a relative path and what to do', [ strpos( GMCP_Diag_Util::resolve_log( 'error_log', $roots )['error'], 'relative' ) !== false, strpos( GMCP_Diag_Util::resolve_log( 'error_log', $roots )['error'], 'absolute path' ) !== false ], [ true, true ] );
+check( 'resolve_log: control: the same file as an absolute path under the content directory is accepted', GMCP_Diag_Util::resolve_log( "$dir/site/wp-content/error_log", $roots )['ok'], true );
 check( 'resolve_log: a NUL byte is refused', GMCP_Diag_Util::resolve_log( "$dir/site/wp-content/logs/debug.log\0.txt", $roots )['ok'], false );
 $out = GMCP_Diag_Util::resolve_log( "$dir/elsewhere/other.log", $roots );
 check( 'resolve_log: a path outside both roots is canonicalised once, not anchored', $out['ok'] && !$out['below_root'], true );
@@ -417,6 +419,82 @@ $o = GMCP_Diag_Util::scrub_log_lines( array_merge( [ '-----BEGIN PRIVATE KEY----
 check( 'a key with no end marker and no new record cannot swallow more than 100 lines', end( $o ), 'plain after' );
 check( 'control: a certificate (public) is not withheld', GMCP_Diag_Util::scrub_log_lines( [ '-----BEGIN CERTIFICATE-----', 'short', '-----END CERTIFICATE-----' ], $ctx )[1], 'short' );
 
+echo "-- scrub_log_line: shapes a log can print a secret in that carry no 'name=value' --\n";
+// Each secret below came back unchanged before its rule existed. Each has a harmless line next to it
+// that the same rule must leave alone, and a control that the probe sees the secret in the input.
+$shapes = [
+  'PHP serialized string' => [ 's:9:"user_pass";s:7:"hunter2xq";', 'hunter2xq' ],
+  'serialized inside an array' => [ 'a:2:{s:5:"login";s:5:"admin";s:8:"password";s:9:"hunter2xq";}', 'hunter2xq' ],
+  'serialized with an escaped quote in the value' => [ 's:8:"password";s:9:"hun\\"ter2xq";', 'ter2xq' ],
+  'element named like a secret' => [ '<Password>hunter2xq</Password>', 'hunter2xq' ],
+  'element with an attribute' => [ '<db_password type="string">hunter2xq</db_password>', 'hunter2xq' ],
+  'mysqldump -pPASSWORD' => [ 'mysqldump -u root -phunter2xq wordpress > /tmp/x.sql', 'hunter2xq' ],
+  'mysql -pPASSWORD quoted' => [ "mysql -h db -u wp -p'hunter2xq' wordpress", 'hunter2xq' ],
+  '--password VALUE' => [ 'mysqldump --user=root --password hunter2xq db', 'hunter2xq' ],
+  '--password=VALUE' => [ 'mysqldump --user=root --password=hunter2xq db', 'hunter2xq' ],
+  '--api-key VALUE' => [ 'tool --api-key hunter2xq --verbose', 'hunter2xq' ],
+  'URL-encoded token' => [ 'token%3Dhunter2xq', 'hunter2xq' ],
+  'URL-encoded password after an encoded ampersand' => [ 'a=1%26password%3Dhunter2xq%26b=2', 'hunter2xq' ],
+  'double-encoded password' => [ 'password%253Dhunter2xq', 'hunter2xq' ],
+  'Azure sig, percent-encoded value' => [ 'SharedAccessSignature=sv=2020-08-04&sig=Hunter2xQ%2Bef&se=2030', 'Hunter2xQ' ],
+  'Azure sig, in a URL' => [ 'GET https://acct.blob.core.windows.net/c/b?sv=2020&sig=Hunter2xQ%2Fef%3D&sp=r', 'Hunter2xQ' ],
+];
+foreach ( $shapes as $label => [ $line, $secret ] ) {
+  check( "control: the probe sees the secret in the input ($label)", $has( $line, $secret ), true );
+  $out = GMCP_Diag_Util::scrub_log_line( $line, $ctx );
+  check( "removed: $label", $has( $out, $secret ), false );
+  check( "  ...and not by emptying the line ($label)", $out !== '' && preg_last_error() === PREG_NO_ERROR, true );
+}
+check( 'the fields around a serialized secret survive', GMCP_Diag_Util::scrub_log_line( 'a:2:{s:5:"login";s:5:"admin";s:8:"password";s:9:"hunter2xq";}', $ctx ), 'a:2:{s:5:"login";s:5:"admin";s:8:"password";s:10:"[redacted]";}' );
+check( 'the next URL-encoded field survives', GMCP_Diag_Util::scrub_log_line( 'a=1%26password%3Dhunter2xq%26b=2', $ctx ), 'a=1%26password%3D[redacted]%26b=2' );
+check( 'the Azure fields around the signature survive', GMCP_Diag_Util::scrub_log_line( 'x?sv=2020&sig=Hunter2xQ%2Bef&se=2030', $ctx ), 'x?sv=2020&sig=[redacted]&se=2030' );
+foreach ( [
+  '<Passwords count="3"/>',
+  '<Passwords>',
+  '<Password/>',
+  '<Pass>',
+  '<note>the password field is empty</note>',
+  '<div class="x">plain text</div>',
+  's:5:"login";s:5:"admin";',
+  's:4:"city";s:4:"Oslo";',
+  'mysqldump -u root -p wordpress',
+  'mysqldump -P3306 -h db wordpress',
+  'ls -plan and tar -pxf a.tar',
+  'rsync -p --password-file /etc/rsync.pass src dst',
+  'tool --keyfile /tmp/k --no-token-check yes',
+  'tokenizer%20extension%20ok',
+  'sig_handler installed',
+  'signal 11 and design%3Dfinal',
+  'a%3Db and 100%25 done and %26amp',
+] as $line ) {
+  check( 'unchanged: ' . $line, GMCP_Diag_Util::scrub_log_line( $line, $ctx ), $line );
+}
+
+echo "-- scrub_log_lines: a value printed on the line after its name --\n";
+$dump = [ 'array(2) {', '  ["login"]=>', '  string(5) "admin"', '  ["password"]=>', '  string(9) "hunter2xq"', '}' ];
+$o = GMCP_Diag_Util::scrub_log_lines( $dump, $ctx );
+check( 'control: the probe sees the secret in the input', $has( implode( "\n", $dump ), 'hunter2xq' ), true );
+check( 'var_dump: the value after a secret name is withheld', $has( implode( "\n", $o ), 'hunter2xq' ), false );
+check( 'var_dump: the name line, the other field and the structure stay', [ $o[0], $o[1], $o[2], $o[3], $o[5] ], [ 'array(2) {', '  ["login"]=>', '  string(5) "admin"', '  ["password"]=>', '}' ] );
+check( 'var_dump: the same number of lines', count( $o ), count( $dump ) );
+$o = GMCP_Diag_Util::scrub_log_lines( [ "  'db_password' =>", "  'hunter2xq',", "  'login' =>", "  'admin'," ], $ctx );
+check( 'var_export: the value after a secret name is withheld, the other field is not', [ $has( implode( "\n", $o ), 'hunter2xq' ), $o[3] ], [ false, "  'admin'," ] );
+$o = GMCP_Diag_Util::scrub_log_lines( [ '  [secret_options] =>', '  Array', '  (', '      [login] => admin', '  )' ], $ctx );
+check( 'a secret name followed by an array: the structure is kept and its members judged by their own names', array_slice( $o, 1 ), [ '  Array', '  (', '      [login] => admin', '  )' ] );
+$o = GMCP_Diag_Util::scrub_log_lines( [ '  ["password"]=>', '[04-Nov-2026 22:36:32 UTC] PHP Warning:  next record' ], $ctx );
+check( 'a name at the end of the window does not swallow the next record', $o[1], '[04-Nov-2026 22:36:32 UTC] PHP Warning:  next record' );
+$o = GMCP_Diag_Util::scrub_log_lines( [ 'ordinary line =>', 'following line' ], $ctx );
+check( 'control: a line ending in => whose name is not secret withholds nothing', $o[1], 'following line' );
+
+echo "-- scrub_log_lines: a key block that closes and opens on one line --\n";
+$two = [ 'x -----BEGIN PRIVATE KEY-----AAAA-----END PRIVATE KEY----- y -----BEGIN PRIVATE KEY-----', 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw', 'short/body+line', '-----END PRIVATE KEY-----', 'after' ];
+$o = GMCP_Diag_Util::scrub_log_lines( $two, $ctx );
+check( 'control: the probe sees the body in the input', $has( implode( "\n", $two ), 'short/body' ), true );
+check( 'the lines of the second block are withheld', $has( implode( "\n", $o ), 'short/body' ) || $has( implode( "\n", $o ), 'MIIEvQ' ), false );
+check( 'the line after the end marker is kept', end( $o ), 'after' );
+$one = [ '-----BEGIN PRIVATE KEY-----AAAA-----END PRIVATE KEY----- then more', 'ordinary next line' ];
+check( 'control: a block that closes on its own line does not withhold the next line', GMCP_Diag_Util::scrub_log_lines( $one, $ctx )[1], 'ordinary next line' );
+
 echo "-- scrub_log_line: pathological 5000-character lines (a pattern that backtracks shows here) --\n";
 $bad = [
   'letters' => str_repeat( 'a', 5000 ),
@@ -441,6 +519,23 @@ $bad = [
   'base64 almost' => str_repeat( 'A', 4999 ) . '!',
   'Authorization repeats' => str_repeat( 'Authorization:', 350 ),
   'brackets' => str_repeat( '[a]', 1600 ),
+  'serialized prefixes' => str_repeat( 's:5:"pass', 500 ),
+  'serialized names, no value' => str_repeat( 's:9:"user_pass";', 300 ),
+  'serialized, open string' => 's:9:"password";s:7:"' . str_repeat( 'a', 4970 ),
+  'elements open' => str_repeat( '<password>', 500 ),
+  'elements, a long name' => '<' . str_repeat( 'pass', 1250 ) . '>x</a>',
+  'elements, no close' => '<password>' . str_repeat( 'x', 4980 ),
+  'elements, many tags' => str_repeat( '<a>', 1600 ),
+  'encoded names' => str_repeat( 'token%3D', 600 ),
+  'encoded percent signs' => str_repeat( '%25', 1600 ),
+  'encoded name, long value' => 'password%3D' . str_repeat( 'a%2B', 1600 ),
+  'option repeats' => str_repeat( '--password ', 450 ),
+  'option, long value' => '--password ' . str_repeat( 'x', 4980 ),
+  'mysql repeats' => str_repeat( 'mysql -', 700 ),
+  'mysql, long tail' => 'mysql ' . str_repeat( 'x ', 2490 ),
+  'mysql words, no -p' => str_repeat( 'mysql ', 800 ),
+  'sig repeats' => str_repeat( 'sig=', 1250 ),
+  'sig, long encoded value' => 'sig=' . str_repeat( 'a%2B', 1200 ),
 ];
 $worst = 0.0;
 foreach ( $bad as $label => $line ) {
@@ -459,17 +554,29 @@ printf( "        slowest of %d pathological lines: %.1f ms\n", count( $bad ), $w
 // pattern already compiled with the JIT stays compiled with it, so ini_set() here would change
 // nothing). Before the name-based rule was anchored to the start of a run of name characters,
 // each of these took about 0.3 s.
-$child_code = 'define( "ABSPATH", "/" ); require $argv[1]; $worst = 0; $empty = 0;'
-  . ' foreach ( [ str_repeat( "a_", 2500 ), str_repeat( "[a]", 1600 ), str_repeat( "wordpress_logged_in_", 250 ), str_repeat( "a", 5000 ), "a://" . str_repeat( "x", 4990 ) ] as $l ) {'
+$jit_lines = [ str_repeat( 'a_', 2500 ), str_repeat( '[a]', 1600 ), str_repeat( 'wordpress_logged_in_', 250 ), str_repeat( 'a', 5000 ), 'a://' . str_repeat( 'x', 4990 ) ];
+foreach ( $bad as $label => $line ) {
+  // The new rules, at the length they see (the scrubber cuts at 2000) and at 5000.
+  if ( preg_match( '/serialized|element|encoded|option|mysql|sig/', $label ) ) {
+    $jit_lines[] = substr( $line, 0, 2000 );
+    $jit_lines[] = $line;
+  }
+}
+$child_code = 'define( "ABSPATH", "/" ); require $argv[1]; $worst = 0; $empty = 0; $n = 0;'
+  . ' foreach ( json_decode( (string) file_get_contents( $argv[2] ), true ) as $l ) { $n++;'
   . ' $t0 = microtime( true ); $r = GMCP_Diag_Util::scrub_log_line( $l, [ "patterns" => [ "pass", "pwd", "secret", "token", "key", "auth", "salt", "nonce", "credential", "bearer", "signature", "licence", "license", "private" ] ] );'
-  . ' $worst = max( $worst, microtime( true ) - $t0 ); if ( $r === "" ) { $empty++; } }'
-  . ' echo json_encode( [ ini_get( "pcre.jit" ), $worst, $empty ] );';
+  . ' $worst = max( $worst, microtime( true ) - $t0 ); if ( $r === "" || preg_last_error() !== PREG_NO_ERROR ) { $empty++; } }'
+  . ' echo json_encode( [ ini_get( "pcre.jit" ), $worst, $empty, $n ] );';
 $util_path = getenv( 'GMCP_UTIL' ) ?: __DIR__ . '/../includes/diagnostics-util.php';
-$child_out = (string) shell_exec( escapeshellarg( PHP_BINARY ) . ' -d pcre.jit=0 -r ' . escapeshellarg( $child_code ) . ' ' . escapeshellarg( $util_path ) . ' 2>&1' );
+$jit_file = tempnam( sys_get_temp_dir(), 'gmcp-jit' );
+file_put_contents( $jit_file, (string) json_encode( $jit_lines ) );
+$child_out = (string) shell_exec( escapeshellarg( PHP_BINARY ) . ' -d pcre.jit=0 -r ' . escapeshellarg( $child_code ) . ' ' . escapeshellarg( $util_path ) . ' ' . escapeshellarg( $jit_file ) . ' 2>&1' );
+unlink( $jit_file );
 $child = json_decode( $child_out, true );
 check( 'JIT-off child ran with the JIT off', is_array( $child ) ? (string) $child[0] : $child_out, '0' );
-check( 'JIT off: five pathological lines each scrub in under 0.1 s (the slowest of them)', is_array( $child ) && $child[1] < 0.1, true );
-check( 'JIT off: and none was emptied by a regular expression giving up', is_array( $child ) ? $child[2] : -1, 0 );
+check( 'JIT off: the child scrubbed every line it was given (' . count( $jit_lines ) . ')', is_array( $child ) ? $child[3] : -1, count( $jit_lines ) );
+check( 'JIT off: every pathological line, the new rules at 2000 and 5000 characters included, scrubs in under 0.1 s (the slowest of them)', is_array( $child ) && $child[1] < 0.1, true );
+check( 'JIT off: and none was emptied, or hit a PCRE error, by a regular expression giving up', is_array( $child ) ? $child[2] : -1, 0 );
 printf( "        slowest with the JIT off: %.1f ms\n", is_array( $child ) ? $child[1] * 1000 : -1 );
 // scrub_log_line() cuts a line at 2000 characters before any rule runs, so the time above is the
 // time for 2000 characters. Time the rules with the cut taken away from their input as well: the

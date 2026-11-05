@@ -237,6 +237,14 @@ something that looks harmless and is not, so each says what it cannot promise.
   path. A configured file is still refused if its name is not log-shaped, if it
   is a script or a configuration file, or if it is a symbolic link, so a
   misconfigured or swapped value cannot turn it into a general file reader.
+  A relative `error_log` (a bare `error_log`, which some hosting panels set) is refused
+  with a message saying so, and was read before the anchoring existed: PHP opens a
+  relative path against a directory that depends on how PHP is run (the script's, the
+  server's, `/`), so resolving it against the WordPress root or the content directory
+  would show the caller a file other than the one PHP writes, and resolving it against
+  the process's working directory would make the answer depend on where the request
+  happened to start. The site owner makes it readable by setting an absolute path or
+  `WP_DEBUG_LOG`.
   The file is read through one handle that was checked after it was opened, and the
   path is never consulted again:
   the path is looked at without following a link (`lstat`); it is opened non-blocking
@@ -299,8 +307,22 @@ something that looks harmless and is not, so each says what it cannot promise.
   quotes arrive escaped; keys with a fixed vendor prefix (Stripe, GitHub, Slack,
   SendGrid, Google API, GitLab, Mailgun); a private key block, one line of which is
   withheld along with every line up to its end marker (a missing end marker ends at
-  the next log record or after 100 lines), and any line that is nothing but 40 or more
+  the next log record or after 100 lines; a line that closes one block and opens a
+  second is still inside a key), and any line that is nothing but 40 or more
   base64 characters, which is what remains when the window starts inside a key.
+  Also, because a dump does not print `name=value`: PHP serialized strings
+  (`s:9:"user_pass";s:7:"...";`; a value with a quote inside it is cut at the quote and
+  the rest stays), an element named like a secret and closed on the same line
+  (`<Password>...</Password>`; one left open or spread over lines is not recognised), the
+  value on the line after a name that ends in `=>` (what `var_dump`, `var_export` and
+  `print_r` print for a nested value, unless the next line opens an array or object), a
+  database client's `-pPASSWORD` (only after `mysql*` and `mariadb*` commands; `-p` alone
+  is a prompt and is left), `--password VALUE` and the like for option names that are a
+  secret by themselves (`--password`, `--token`, `--api-key`, and so on; the `=` form is
+  the name rule's), URL-encoded assignments (`token%3D...`, `%26password%3D...`, double
+  encoded too), and an Azure shared access signature's `sig=` value. A name that merely
+  contains a credential word is already redacted when it is followed by a separator
+  (`tokenizer: ok` reads `tokenizer: [redacted]`), which is deliberate and over-redacts.
   Public certificates are not withheld. Paths are shown as `[content]/` and
   `[abspath]/`. This recognises shapes. A secret written into an ordinary
   sentence survives it, and so does personal data in a message PHP assembled from
