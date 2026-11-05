@@ -1419,6 +1419,23 @@ check "...and the posts were left standing" "$(docker compose exec -T cli wp eva
 docker compose exec -T cli wp eval 'foreach ( get_posts( [ "post_type" => "post", "post_status" => "any", "numberposts" => -1, "s" => "BMX batch" ] ) as $p ) { wp_delete_post( $p->ID, true ); }' >/dev/null 2>&1
 docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
 
+echo "-- wp_write_blocks keeps backslashes, on the blocks path as on the markdown path --"
+# The blocks path unslashed text that was never slashed and then slashed it once for the
+# writer, so a Windows path in a code block lost its separators and "a\b" became "ab", while
+# the markdown path stored the same text intact. Asserted on the stored post_content, with the
+# markdown path as the control that the probe can see an intact backslash.
+WB_P=$(docker compose exec -T cli wp eval 'echo wp_insert_post( [ "post_title" => "WBX backslash", "post_status" => "draft" ] );' 2>/dev/null | tr -d '\r\n')
+wb_stored() { docker compose exec -T cli wp eval "\$c = get_post($WB_P)->post_content; \$bs = chr(92); echo ( strpos( \$c, '<code>C:' . \$bs . 'Users' . \$bs . 'x</code>' ) !== false ? 'code-intact' : 'code-mangled' ) . ',' . ( strpos( \$c, '<p>a' . \$bs . 'b</p>' ) !== false ? 'para-intact' : 'para-mangled' );" 2>/dev/null | tr -d '\r\n'; }
+WB_JSON_BLOCKS=$(python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":9201,"method":"tools/call","params":{"name":"wp_write_blocks","arguments":{"ID":int(sys.argv[1]),"blocks":[{"type":"paragraph","content":"a\\b"},{"type":"code","content":"C:\\Users\\x"}]}}}))' "$WB_P")
+WB_JSON_MD=$(python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":9202,"method":"tools/call","params":{"name":"wp_write_blocks","arguments":{"ID":int(sys.argv[1]),"markdown":"a\\b\n\n```\nC:\\Users\\x\n```"}}}))' "$WB_P")
+call wb_md "$WB_JSON_MD"
+check "control: the markdown path reports success" "$(verdict wb_md)" "ok"
+check "control: the markdown path stored the backslashes (code block)" "$(docker compose exec -T cli wp eval "\$c = get_post($WB_P)->post_content; \$bs = chr(92); echo strpos( \$c, 'C:' . \$bs . 'Users' . \$bs . 'x' ) !== false ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
+call wb_bl "$WB_JSON_BLOCKS"
+check "the blocks path reports success" "$(verdict wb_bl)" "ok"
+check "stored state: the blocks path kept both backslashes" "$(wb_stored)" "code-intact,para-intact"
+docker compose exec -T cli wp post delete "$WB_P" --force >/dev/null 2>&1
+
 # Put the site back: the fixtures, the keys, the grants. A guard test must not leave them.
 wpe 'foreach(get_posts(["post_status"=>"any","post_type"=>["post","page","attachment"],"numberposts"=>-1,"s"=>"DO "]) as $p){ if(strpos($p->post_title,"DO ")===0){wp_delete_post($p->ID,true);} } foreach(wp_get_nav_menus() as $m){ if($m->name==="DO net menu"){wp_delete_nav_menu($m->term_id);} } foreach(GMCP_Tokens::all() as $t){ if(in_array($t["label"],["drafts only writer","plain writer","drafts only admin","pre-flag writer","do admin"],true)){GMCP_Tokens::revoke($t["id"]);} } global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_tokens WHERE client_id IN (SELECT client_id FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\")"); $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\"");' >/dev/null
 

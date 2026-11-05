@@ -127,6 +127,12 @@ and carry their own guards:
   `store_html()` path as block markup written directly, so the rules above apply to
   it too. Neither layer is trusted alone: the converter is the one that knows what the
   source meant, and the filter is the one that knows what the editor will render.
+  Block specs given to the same tool are filtered leaf by leaf with `wp_kses_post()`
+  as each block is rendered, without unslashing (the text arrives from JSON, not from
+  `$_POST`, so a backslash in it is the author's), and that filtering is unconditional:
+  it does not honour `gmcp_allow_unfiltered_post_html`, which `store_html()` does, so a
+  site that opted into raw HTML still gets filtered text from block specs. That is the
+  stricter of the two and was left that way on purpose.
 - Tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
   `openWorldHint`) are advisory and are not a guard. Clients may use them to decide
   whether to ask first, so a wrong hint costs a prompt or skips one; it does not
