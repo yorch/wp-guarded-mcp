@@ -94,7 +94,7 @@ An access level belongs to a named key, or to an OAuth grant. A key carries the 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
 nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO,
 ACF, Gravity Forms, LearnDash, Elementor Pro, WP Activity Log, Redirection, Polylang, Rank Math and All in One SEO,
-Wordfence, Stream and the form-submission tools are not counted: their tools
+Wordfence, Stream, Beaver Builder and the form-submission tools are not counted: their tools
 are optional groups that come and go with a plugin, so folding them in would make the table
 depend on what
 happens to be installed.
@@ -332,6 +332,25 @@ from a read key because it is an exception message and those carry paths. Measur
 building this: the option writer cannot reach any of it, because Wordfence 9.0.2 keeps its
 configuration in its own `wp_wfconfig` table and rewrites its version option on load, so the
 protection here is that the group has no writers rather than a prefix rule.
+
+**Beaver Builder**, off by default, and the switch only appears when Beaver Builder is
+installed. The trap this group exists for is that **the layout is not `post_content`**: a page
+keeps its layout in `_fl_builder_data` and the front end renders from that, so a generic write
+to the body appears to work and leaves the page exactly as it was. A page can also hold
+unpublished builder changes in `_fl_builder_draft`, so a reader that reports only the published
+copy can describe a layout no visitor sees — every reply says whether drafted changes exist and
+reports both copies' node counts. The tools report the SHAPE and never the settings: a node's
+`settings` is the content and, for the `html` module, arbitrary markup including script, and
+`_fl_builder_data_settings` holds layout-level `css` and `js` that run on every page using the
+layout. So node types, counts and depth are returned, layout setting *names* are returned,
+whether custom code is present is returned, and no value of either is. There is no tool that
+writes layout data at any level: it would be persistent script injection with no restore tool
+behind it, the same reasoning that keeps a Custom Code writer out of the Elementor Pro group.
+The one write is `beaver_clear_cache`, which deletes the generated CSS/JS so the builder
+regenerates them — derived files, admin level, and it says so when the site enqueues the
+builder's CSS inline and there is nothing to delete. There is no tool that applies or imports a
+template: applying a saved one is reversible, importing one rewrites the design system from an
+archive built elsewhere in a single call.
 
 **Redirection**, off by default, and the switch only appears when the Redirection plugin is
 installed. Five tools: list and get at `write`, and create, update and switch on/off at
@@ -615,7 +634,7 @@ tools; `smoke-woo-subscriptions.sh` for the Subscriptions tools; `smoke-wsal.sh`
 WP Activity Log tools; `smoke-redirection.sh` for the Redirection tools; `smoke-polylang.sh`
 for the Polylang tools; `smoke-seo.sh` for the Rank Math and All in One SEO tools;
 `smoke-forms.sh` for the form-submission tools; `smoke-wordfence.sh` for the Wordfence tools;
-and `smoke-stream.sh` for the Stream tools. `smoke-seo.sh`, `smoke-forms.sh`,
+`smoke-stream.sh` for the Stream tools; and `smoke-beaver.sh` for the Beaver Builder tools. `smoke-seo.sh`, `smoke-forms.sh`,
 `smoke-polylang.sh` and `smoke-redirection.sh` were written without a running stack and have
 not been run. All but the first two need their plugin installed.
 

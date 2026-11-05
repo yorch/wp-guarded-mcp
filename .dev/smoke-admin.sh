@@ -2681,7 +2681,7 @@ try:
     t = json.load(sys.stdin)['result']['tools']
 except Exception:
     print('unreadable'); raise SystemExit
-print(len([x for x in t if not x['name'].startswith('elementor_') and not x['name'].startswith('kirki_') and not x['name'].startswith('yoast_') and not x['name'].startswith('acf_') and not x['name'].startswith('wsal_') and not x['name'].startswith('gf_') and not x['name'].startswith('ld_') and not x['name'].startswith('rankmath_') and not x['name'].startswith('aioseo_') and not x['name'].startswith('cf7_') and not x['name'].startswith('fluentform_') and not x['name'].startswith('ninjaform_') and not x['name'].startswith('redirection_') and not x['name'].startswith('pll_') and not x['name'].startswith('wpforms_') and not x['name'].startswith('wf_') and not x['name'].startswith('stream_')]))"
+print(len([x for x in t if not x['name'].startswith('elementor_') and not x['name'].startswith('kirki_') and not x['name'].startswith('yoast_') and not x['name'].startswith('acf_') and not x['name'].startswith('wsal_') and not x['name'].startswith('gf_') and not x['name'].startswith('ld_') and not x['name'].startswith('rankmath_') and not x['name'].startswith('aioseo_') and not x['name'].startswith('cf7_') and not x['name'].startswith('fluentform_') and not x['name'].startswith('ninjaform_') and not x['name'].startswith('redirection_') and not x['name'].startswith('pll_') and not x['name'].startswith('wpforms_') and not x['name'].startswith('wf_') and not x['name'].startswith('stream_') and not x['name'].startswith('beaver_')]))"
 }
 # The expected numbers come from the table itself, so the check fails whichever side moved.
 tc_doc() { # tc_doc <level> <column index, 1-3>
