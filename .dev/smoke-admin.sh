@@ -3407,12 +3407,14 @@ DBG_LOG="${GMCP_TEST_ERROR_LOG:-$PV_LOGFILE}"
 if [ -n "$DBG_LOG" ] && docker compose exec -T cli test -w "$DBG_LOG" >/dev/null 2>&1; then
   DBG_WAS=$(docker compose exec -T cli wp eval 'echo empty( get_option( "gmcp_options", [] )["mcp_debug_mode"] ) ? "off" : "on";' 2>/dev/null | tr -d '\r\n')
   docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_debug_mode"]=true;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
-  call dbg_1 '{"jsonrpc":"2.0","id":450,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"fixc_vendor_pwd","value":"HUNTER2-LOGLEAK"}}}'
-  call dbg_2 '{"jsonrpc":"2.0","id":451,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"fixc_plain_opt","value":"PLAINVALUE-LOGGED"}}}'
-  check "control: the secret-named option really was written" "$(docker compose exec -T cli wp option get fixc_vendor_pwd 2>/dev/null | tr -d '\r\n')" "HUNTER2-LOGLEAK"
+  # A value no earlier run can have left in the log file.
+  DBG_N="${RANDOM}${RANDOM}"
+  call dbg_1 "{\"jsonrpc\":\"2.0\",\"id\":450,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_option\",\"arguments\":{\"key\":\"fixc_vendor_pwd\",\"value\":\"HUNTER2-LOGLEAK-$DBG_N\"}}}"
+  call dbg_2 "{\"jsonrpc\":\"2.0\",\"id\":451,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_option\",\"arguments\":{\"key\":\"fixc_plain_opt\",\"value\":\"PLAINVALUE-LOGGED-$DBG_N\"}}}"
+  check "control: the secret-named option really was written" "$(docker compose exec -T cli wp option get fixc_vendor_pwd 2>/dev/null | tr -d '\r\n')" "HUNTER2-LOGLEAK-$DBG_N"
   check "control: the debug log has this call's lines" "$([ "$(docker compose exec -T cli sh -c "grep -c 'tools/call - Tool: wp_update_option' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" -ge 2 ] && echo yes || echo no)" "yes"
-  check "control: an ordinary value IS printed in the arguments, so the probe can see one" "$([ "$(docker compose exec -T cli sh -c "grep -c 'PLAINVALUE-LOGGED' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" -ge 1 ] && echo yes || echo no)" "yes"
-  check "the value stored under a secret-named option is not in the debug log" "$(docker compose exec -T cli sh -c "grep -c 'HUNTER2-LOGLEAK' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" "0"
+  check "control: an ordinary value IS printed in the arguments, so the probe can see one" "$([ "$(docker compose exec -T cli sh -c "grep -c 'PLAINVALUE-LOGGED-$DBG_N' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "the value stored under a secret-named option is not in the debug log" "$(docker compose exec -T cli sh -c "grep -c 'HUNTER2-LOGLEAK-$DBG_N' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" "0"
   check "...but the option's name is, so the line still says what changed" "$([ "$(docker compose exec -T cli sh -c "grep -c 'fixc_vendor_pwd' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" -ge 1 ] && echo yes || echo no)" "yes"
   docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_debug_mode"]='"$([ "$DBG_WAS" = on ] && echo true || echo false)"';update_option("gmcp_options",$o,false);' >/dev/null 2>&1
   docker compose exec -T cli wp option delete fixc_vendor_pwd fixc_plain_opt >/dev/null 2>&1
