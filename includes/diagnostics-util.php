@@ -18,6 +18,21 @@ if ( !defined( 'ABSPATH' ) ) {
 * single list in GMCP_Core::credential_field_patterns() stays the only one.
 */
 final class GMCP_Diag_Util {
+  /**
+  * A quoted value for the scrubs below, as a regular expression fragment: "..." or '...' in which
+  * a backslash and the character after it count as one (so an escaped quote does not end the
+  * value), or a curly-quoted one. Possessive, so a long unterminated value is read once.
+  */
+  const QUOTED_VALUE = '"(?:[^"\\\\]++|\\\\.)*+"|\'(?:[^\'\\\\]++|\\\\.)*+\'|“[^”]*+”|‘[^’]*+’';
+
+  /**
+  * The markers this scrubber writes in place of what it removed, as a regular expression
+  * fragment. A later rule must not read one as the value after a secret-named name: given
+  * "key: [private-key-block]" the name rule ended the value at the "]" and wrote a second marker
+  * over it, leaving a stray "]" behind and making a second pass change the line.
+  */
+  const OWN_MARKER = '\[(?:redacted|private-key-block|jwt|token|hash|email|ip|api key|gmcp key|aws key id|aws secret|base64 line redacted)\]';
+
   /** The substrings that make a field name secret in a log line, when the caller supplies none. */
   const DEFAULT_SECRET_PATTERNS = [ 'pass', 'pwd', 'secret', 'token', 'key', 'auth', 'salt', 'nonce', 'credential', 'bearer', 'signature', 'licence', 'license', 'private' ];
 
@@ -1013,8 +1028,20 @@ final class GMCP_Diag_Util {
         // and backtracks over all of it each time, which is quadratic: measured at about 0.3 s for
         // one 2000-character line with the PCRE JIT off (0.4 ms with it). The match that matters
         // starts at the beginning of the run anyway, so what is redacted does not change.
-        '#(?<![A-Za-z0-9_.\-\[\]])(["\']?[A-Za-z0-9_.\-\[\]]*(?:' . $alt . ')[A-Za-z0-9_.\-\[\]]*["\']?)(\s*(?:=>|[:=])\s*)("[^"]*"|\'[^\']*\'|[^\s&,;)\]}]+)#i',
+        //
+        // A quote around the name or the value may be a curly one (a value copied out of a document
+        // keeps its typographic quotes), the separator may be a fullwidth "＝" or "：", and a quoted
+        // value may hold an escaped quote of its own ('ab\'cd'): a rule that ended the value at the
+        // first quote it met left the rest of the secret behind.
+        '#(?<![A-Za-z0-9_.\-\[\]])((?:["\']|“|”|‘|’)?[A-Za-z0-9_.\-\[\]]*(?:' . $alt . ')[A-Za-z0-9_.\-\[\]]*(?:["\']|“|”|‘|’)?)(\s*(?:=>|[:=]|＝|：)\s*)(?!' . self::OWN_MARKER . ')(' . self::QUOTED_VALUE . '|[^\s&,;)\]}]+)#i',
         '$1$2[redacted]',
+        $line
+      );
+      // The same in a URL, where a JSON object is encoded whole: %22access_token%22%3A%22value%22.
+      // The value ends at an encoded quote, comma or closing brace, or at the next parameter.
+      $line = (string) preg_replace(
+        '#(%22[A-Za-z0-9_.\-]{0,60}?(?:' . $alt . ')[A-Za-z0-9_.\-]{0,60}%22(?:%253[Aa]|%3[Aa])(?:%22)?)(?!' . self::OWN_MARKER . ')((?:[^\s&,;)\]}"\'%]|%(?!22|2[Cc]|7[Dd]))+)#i',
+        '$1[redacted]',
         $line
       );
       // The same thing inside a JSON string that is itself inside a log line, where the
@@ -1037,9 +1064,10 @@ final class GMCP_Diag_Util {
       );
       // An element named like a secret: <Password>value</Password>, <api_key id="1">value</api_key>.
       // Closed on the same line and by the same name; an element left open (a value cut off by
-      // the log line's end, or one printed over several lines) is not recognised.
+      // the log line's end, or one printed over several lines) is not recognised. The value may be
+      // a CDATA section, whose content can hold "<" and ">": <password><![CDATA[x]]></password>.
       $line = (string) preg_replace(
-        '#(<([A-Za-z0-9_.:\-]{0,60}?(?:' . $alt . ')[A-Za-z0-9_.:\-]{0,60})(?:\s[^<>]{0,300})?>)[^<]{1,2000}(</\2\s*>)#i',
+        '#(<([A-Za-z0-9_.:\-]{0,60}?(?:' . $alt . ')[A-Za-z0-9_.:\-]{0,60})(?:\s[^<>]{0,300})?>)(?:<!\[CDATA\[(?:(?!\]\]>).){0,2000}\]\]>|[^<]{1,2000})(</\2\s*>)#i',
         '$1[redacted]$3',
         $line
       );
@@ -1047,7 +1075,7 @@ final class GMCP_Diag_Util {
       // form body that was encoded twice: token%3Dabc, %26password%3Dabc, password%253Dabc. The
       // value ends at an encoded "&", ";", "," or space, which are what separate the next field.
       $line = (string) preg_replace(
-        '#(?<![A-Za-z0-9_.\-\[\]])(["\']?[A-Za-z0-9_.\-\[\]]*(?:' . $alt . ')[A-Za-z0-9_.\-\[\]]*["\']?)((?:%253[Dd]|%3[Dd]))((?:[^\s&,;)\]}"\'%]|%(?!26|3[Bb]|2[Cc]|20|25(?:26|3[Bb])))+)#i',
+        '#(?<![A-Za-z0-9_.\-\[\]])(["\']?[A-Za-z0-9_.\-\[\]]*(?:' . $alt . ')[A-Za-z0-9_.\-\[\]]*["\']?)((?:%253[Dd]|%3[Dd]))(?!' . self::OWN_MARKER . ')((?:[^\s&,;)\]}"\'%]|%(?!26|3[Bb]|2[Cc]|20|25(?:26|3[Bb])))+)#i',
         '$1$2[redacted]',
         $line
       );
@@ -1067,12 +1095,12 @@ final class GMCP_Diag_Util {
     //  - pw=value: "pw" is too short to be one of the substring patterns without matching
     //    "power" and "pwa", so it is matched as a whole word.
     $line = (string) preg_replace(
-      '/(\bdefine\s*\(\s*([\'"])[A-Za-z0-9_]*(?:PASS|PWD|PW|SECRET|KEY|SALT|TOKEN|AUTH|CREDENTIAL)[A-Za-z0-9_]*\2\s*,\s*)(?:"[^"]*"|\'[^\']*\'|[^\s,)]+)/i',
+      '/(\bdefine\s*\(\s*([\'"])[A-Za-z0-9_]*(?:PASS|PWD|PW|SECRET|KEY|SALT|TOKEN|AUTH|CREDENTIAL)[A-Za-z0-9_]*\2\s*,\s*)(?:' . self::QUOTED_VALUE . '|[^\s,)]+)/i',
       '$1[redacted]',
       $line
     );
     $line = (string) preg_replace(
-      '/(?<![A-Za-z0-9_])(pw)(\s*(?:=>|[:=])\s*)("[^"]*"|\'[^\']*\'|[^\s&,;)\]}]+)/i',
+      '/(?<![A-Za-z0-9_])(pw)(\s*(?:=>|[:=]|＝|：)\s*)(?!' . self::OWN_MARKER . ')(' . self::QUOTED_VALUE . '|[^\s&,;)\]}]+)/i',
       '$1$2[redacted]',
       $line
     );
@@ -1088,7 +1116,7 @@ final class GMCP_Diag_Util {
     // URL. "sig" is too short to be one of the substring patterns without matching "signal" and
     // "design", so it is a whole word, like "pw".
     $line = (string) preg_replace(
-      '/(?<![A-Za-z0-9_])(sig)(%253[Dd]|%3[Dd]|\s*(?:=>|[:=])\s*)("[^"]*"|\'[^\']*\'|(?:[^\s&,;)\]}"\'%]|%(?!26|3[Bb]|2[Cc]|20))+)/i',
+      '/(?<![A-Za-z0-9_])(sig)(%253[Dd]|%3[Dd]|\s*(?:=>|[:=])\s*)(?!' . self::OWN_MARKER . ')("[^"]*"|\'[^\']*\'|(?:[^\s&,;)\]}"\'%]|%(?!26|3[Bb]|2[Cc]|20))+)/i',
       '$1$2[redacted]',
       $line
     );

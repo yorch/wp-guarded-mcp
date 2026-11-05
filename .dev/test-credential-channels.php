@@ -85,9 +85,10 @@ $forged = "tok\n[Guarded MCP OAuth] ❌ Authorize refused: forged by a client\r\
 $line = GMCP_Core::log_text( $forged );
 check( 'CONTROL: the probe really holds line breaks', [ has( $forged, "\n" ), has( $forged, "\r" ) ], [ true, true ] );
 check( 'a newline or carriage return in a request value is not written as one', [ has( $line, "\n" ), has( $line, "\r" ) ], [ false, false ] );
-check( 'it is shown as an escape, so the reader can see what was sent', has( $line, '\\n[Guarded MCP' ), true );
+check( 'a line break becomes one space, so what follows it is still on the same line and is plainly text', has( $line, 'tok [Guarded MCP OAuth]' ) && has( $line, '  [Guarded MCP] WARNING' ), true );
 check( 'no control character of any kind survives', preg_match( '/[\x00-\x1F\x7F]/', GMCP_Core::log_text( "a\x00b\x07c\x1bd\te\x7ff" ) ), 0 );
-check( 'CONTROL: the Unicode line separators are shown too', [ has( GMCP_Core::log_text( "a\u{2028}b\u{2029}c\u{0085}d" ), "\u{2028}" ), has( GMCP_Core::log_text( "a\u{2028}b" ), 'u2028' ) ], [ false, true ] );
+check( 'CONTROL: a control character that is not whitespace is still shown as a visible escape', [ has( GMCP_Core::log_text( "a\x00b\x07c" ), 'a\\x00b\\x07c' ), has( GMCP_Core::log_text( "a\x7fb" ), 'a\\x7fb' ) ], [ true, true ] );
+check( 'the Unicode line separators and next-line are not written either', [ has( GMCP_Core::log_text( "a\u{2028}b\u{2029}c\u{0085}d" ), "\u{2028}" ), has( GMCP_Core::log_text( "a\u{2028}b\u{2029}c\u{0085}d" ), "\u{2029}" ), has( GMCP_Core::log_text( "a\u{2028}b\u{2029}c\u{0085}d" ), "\u{0085}" ) ], [ false, false, false ] );
 
 $errlog = sys_get_temp_dir() . '/gmcp-channels-' . getmypid() . '.log';
 @unlink( $errlog );
@@ -333,6 +334,116 @@ check( 'a post title of "smtp_pwd=hunter" is recorded as redacted in the label',
 check( 'a reply that says "password: hunter2" is withheld whole, with the reason', GMCP_Audit::scrub_text( 'Saved. password: hunter2', '[redacted: the reply held something credential-shaped]' ), '[redacted: the reply held something credential-shaped]' );
 check( 'CONTROL: the scanner alone passes a six-letter lowercase value (so the wider test is what covers a label like that)',
   [ GMCP_Credential_Scan::text_holds( 'smtp_pwd=hunter' ), GMCP_Credential_Scan::text_holds( 'Our password: required' ) ], [ false, false ] );
+
+echo "-- the debug log: whitespace of every kind is a separator, and an escaped quote does not end a value --\n";
+$ws_kinds = [ 'tab' => "\t", 'vertical tab' => "\x0B", 'form feed' => "\x0C", 'carriage return' => "\r", 'newline' => "\n",
+  'U+0085' => "\u{0085}", 'U+2028' => "\u{2028}", 'U+2029' => "\u{2029}", 'no-break space' => "\u{00A0}", 'ideographic space' => "\u{3000}", 'en space' => "\u{2002}" ];
+foreach ( $ws_kinds as $name => $w ) {
+  $assign = "smtp_pass{$w}={$w}Zx9Qw3Lp7Rt2";
+  $bearer = "Bearer{$w}Zx9Qw3Lp7Rt2abcdef";
+  check( "CONTROL: the $name probes hold the secret and the whitespace", has( $assign, 'Zx9Qw3Lp7Rt2' ) && has( $assign, $w ) && has( $bearer, 'Zx9Qw3Lp7Rt2abcdef' ), true );
+  check( "log_text: an assignment with a $name around the separator is scrubbed", has( GMCP_Core::log_text( $assign ), 'Zx9Qw3Lp7Rt2' ), false );
+  check( "log_text: a Bearer token after a $name is scrubbed", has( GMCP_Core::log_text( $bearer ), 'Zx9Qw3Lp7Rt2abcdef' ), false );
+}
+check( 'CONTROL: the same probe with plain spaces is scrubbed (so the whitespace is what differed)', has( GMCP_Core::log_text( 'smtp_pass = Zx9Qw3Lp7Rt2' ), 'Zx9Qw3Lp7Rt2' ), false );
+check( 'CONTROL: a harmless value with a tab in it is kept, as a space', GMCP_Core::log_text( "note\tkeepme" ), 'note keepme' );
+check( 'whitespace_to_spaces: a table, the same for any run', GMCP_Core::whitespace_to_spaces( "a\t\r\n\x0B\x0Cb" ), 'a     b' );
+$escaped_define = "define('DB_PASSWORD', 'ab\\'cdef12345');";
+check( 'CONTROL: the escaped-quote define() probe holds the tail that used to leak', has( $escaped_define, "cdef12345" ), true );
+check( 'log_text: an escaped quote inside a define() value does not end it and leave the tail', GMCP_Core::log_text( $escaped_define ), "define('DB_PASSWORD', [redacted]);" );
+check( 'log_text: an escaped quote inside a quoted assignment does not end it', GMCP_Core::log_text( "secret = 'two \\' words' tail" ), 'secret = [redacted] tail' );
+check( 'log_text: an escaped quote inside a double-quoted assignment does not end it', GMCP_Core::log_text( 'smtp_pass = "ab\\"cdef12345" tail' ), 'smtp_pass = [redacted] tail' );
+check( 'scrub_log_line, directly: the same define() line', GMCP_Diag_Util::scrub_log_line( $escaped_define ), "define('DB_PASSWORD', [redacted]);" );
+
+echo "-- the two-pass marker: no stray bracket, and a second pass changes nothing --\n";
+$marker_rows = [
+  'an Authorization: Token header' => 'Authorization: Token Zx9Qw3Lp7Rt2abc',
+  'a key whose value is a private key on one line' => 'key: -----BEGIN OPENSSH PRIVATE KEY----- abc -----END OPENSSH PRIVATE KEY-----',
+  'a key whose value is a JWT' => 'x token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk',
+  'a plain assignment' => 'smtp_pass=Zx9Qw3Lp7Rt2 next=1',
+];
+foreach ( $marker_rows as $label => $text ) {
+  $once = GMCP_Core::log_text( $text );
+  $raw = GMCP_Diag_Util::scrub_log_line( $text );
+  check( "$label: log_text leaves no doubled bracket", has( $once, ']]' ), false );
+  check( "$label: scrub_log_line leaves no doubled bracket", has( $raw, ']]' ), false );
+  check( "$label: scrubbing the log_text result again changes nothing", GMCP_Core::log_text( $once ), $once );
+  check( "$label: scrubbing the scrub_log_line result again changes nothing", GMCP_Diag_Util::scrub_log_line( $raw ), $raw );
+}
+check( 'CONTROL: the Authorization row is really scrubbed (a probe that returned the text would pass the checks above)', has( GMCP_Core::log_text( $marker_rows['an Authorization: Token header'] ), 'Zx9Qw3Lp7Rt2abc' ), false );
+
+// The real field-name rule is loaded here (journal-pure.php stands in for it), so the public-key
+// exemption is asserted where "key" really does make a name look secret.
+$recaptcha = '<div class="g-recaptcha" data-sitekey="6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI"></div>';
+check( 'CONTROL: with the real rule, a weakly secret name holding a long mixed token is flagged', GMCP_Credential_Scan::text_holds( '<div data-secretkey="6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI"></div>' ), true );
+check( 'a reCAPTCHA data-sitekey attribute is public by design and is not flagged', GMCP_Credential_Scan::text_holds( $recaptcha ), false );
+check( 'CONTROL: the same attribute under a name that is a secret outright is flagged', GMCP_Credential_Scan::text_holds( str_replace( 'data-sitekey', 'data-secret', $recaptcha ) ), true );
+check( 'a Stripe publishable key under an api_key name is not flagged, a secret key is',
+  [ GMCP_Credential_Scan::text_holds( "api_key = 'pk_" . "live_abcdefghijklmnop12345'" ), GMCP_Credential_Scan::text_holds( "api_key = 'sk_" . "live_abcdefghijklmnop12345'" ) ], [ false, true ] );
+
+echo "-- the approval screen: only the matched stretch is hidden, and the approval still covers the real call --\n";
+require_once __DIR__ . '/../includes/approvals.php';
+$def = [ 'name' => 'wp_update_post', 'inputSchema' => [ 'properties' => [ 'ID' => [ 'type' => 'integer' ], 'post_content' => [ 'type' => 'string' ] ] ] ];
+$decoy_body = '<script src="https://evil.example/x.js"></script><p>Welcome</p><!-- see Basic HTML/CSS 101 -->';
+$decoy_args = [ 'ID' => 5, 'post_content' => $decoy_body ];
+$mac_before = GMCP_Approvals::args_mac( 'wp_update_post', $decoy_args );
+$view = GMCP_Approvals::build_view( $decoy_args, $def );
+$mac_after = GMCP_Approvals::args_mac( 'wp_update_post', $decoy_args );
+check( 'a decoy that merely looks like a credential no longer hides the script the approver must see', has( $view['text'], 'https://evil.example/x.js' ), true );
+check( 'and nothing is hidden or listed for it', [ has( $view['text'], '[redacted]' ), $view['redacted'] ], [ false, [] ] );
+check( 'the MAC the approval is bound to is the real arguments\' (unchanged by building the view)', [ $mac_before === $mac_after, is_string( $mac_before ) && strlen( $mac_before ) === 64 ], [ true, true ] );
+// A decoy the scanner does flag (a short define() comment at the end): it hides itself, not the script before it.
+$decoy2 = GMCP_Approvals::build_view( [ 'ID' => 5, 'post_content' => '<script src="https://evil.example/x.js"></script><p>Welcome</p><!-- define("DB_PASSWORD","abcd") -->' ], $def );
+check( 'a flagged decoy at the end of a body hides only itself: the script tag stays readable',
+  [ has( $decoy2['text'], 'https://evil.example/x.js' ), has( $decoy2['text'], 'abcd' ), has( $decoy2['text'], '[hidden values present: 1]' ) ], [ true, false, true ] );
+// A real secret inside prose: the secret is hidden, the rest is readable, the count and the path are shown.
+$real_secret = 'sk_' . 'live_abcdefgh12345678';
+$mixed_args = [ 'ID' => 5, 'post_content' => '<script src="https://evil.example/x.js"></script><p>Welcome</p> key ' . $real_secret . ' and more <!-- see Basic HTML/CSS 101 -->' ];
+$mixed = GMCP_Approvals::build_view( $mixed_args, $def );
+check( 'CONTROL: the mixed probe holds the secret', has( $mixed_args['post_content'], $real_secret ), true );
+check( 'a real secret inside prose is not shown', has( $mixed['text'], 'abcdefgh12345678' ), false );
+check( 'the script tag and the words around the secret are still shown', [ has( $mixed['text'], 'evil.example/x.js' ), has( $mixed['text'], 'Welcome' ), has( $mixed['text'], 'and more' ), has( $mixed['text'], 'Basic HTML/CSS 101' ) ], [ true, true, true, true ] );
+check( 'the hidden stretch is marked and counted in the text, and its path is listed', [ has( $mixed['text'], '[redacted]' ), has( $mixed['text'], '[hidden values present: 1]' ), $mixed['redacted'] ], [ true, true, [ 'post_content' ] ] );
+check( 'the MAC of the mixed call is bound to the real text, not to what is shown',
+  GMCP_Approvals::args_mac( 'wp_update_post', $mixed_args ) !== GMCP_Approvals::args_mac( 'wp_update_post', [ 'ID' => 5, 'post_content' => str_replace( $real_secret, '[redacted]', $mixed_args['post_content'] ) ] ), true );
+$two = GMCP_Approvals::build_view( [ 'ID' => 5, 'post_content' => 'a ' . $real_secret . ' b define(\'DB_PASSWORD\', \'Zx9Qw3Lp7Rt2\') c' ], $def );
+check( 'two secrets in one string are both hidden and counted', [ has( $two['text'], 'Zx9Qw3Lp7Rt2' ), has( $two['text'], 'abcdefgh12345678' ), has( $two['text'], '[hidden values present: 2]' ) ], [ false, false, true ] );
+$blob = GMCP_Approvals::build_view( [ 'ID' => 5, 'post_content' => '{"api_key":"Zx9Qw3Lp7Rt2","note":"hello"}' ], $def );
+check( 'a JSON blob with a secret-named field is still replaced whole, and listed', [ has( $blob['text'], 'hello' ), has( $blob['text'], '[redacted]' ), $blob['redacted'] ], [ false, true, [ 'post_content' ] ] );
+$def_wide = [ 'name' => 'x', 'inputSchema' => [ 'properties' => [ 'ID' => [], 'post_content' => [], 'excerpt' => [], 'smtp_password' => [] ] ] ];
+$fieldname = GMCP_Approvals::build_view( [ 'ID' => 5, 'post_content' => 'x', 'smtp_password' => 'Zx9Qw3Lp7Rt2' ], $def_wide );
+check( 'a secret-named argument is still replaced whole', [ has( $fieldname['text'], 'Zx9Qw3Lp7Rt2' ), in_array( 'smtp_password', $fieldname['redacted'], true ) ], [ false, true ] );
+$split = GMCP_Approvals::build_view( [ 'ID' => 5, 'post_content' => 'sk_' . 'live_abcd', 'excerpt' => 'efgh12345678' ], $def_wide );
+check( 'KNOWN GAP, documented: a secret split across two arguments is not recognised by the view', [ has( $split['text'], 'sk_' . 'live_abcd' ), has( $split['text'], 'efgh12345678' ) ], [ true, true ] );
+
+echo "-- a call is not read past a byte budget, and what is dropped is said --\n";
+$many = array_fill( 0, 200000, 'a' );
+$stored = GMCP_Audit::storable_args( [ 'key' => 'blogdescription', 'value' => 'x', 'items' => $many ] );
+$stored_row = json_decode( $stored, true );
+check( 'CONTROL: the probe is over what can be stored', strlen( json_encode( $many ) ) > GMCP_Audit::MAX_ARGS, true );
+check( 'storable_args of 200,000 leaves is a truncation record that names the original size', [ isset( $stored_row['__gmcp_truncated'] ), ( $stored_row['__gmcp_truncated'] ?? 0 ) > 200000 ], [ true, true ] );
+check( 'and what it kept of the call still shows the harmless leaves it read', has( (string) ( $stored_row['preview'] ?? '' ), 'blogdescription' ), true );
+$ev = GMCP_Audit::event_args( [ 'items' => $many, 'caller' => 'key:3' ] );
+check( 'event_args keeps the caller and records that entries were not examined', [ $ev['caller'], isset( $ev['items']['__gmcp_omitted'] ), count( $ev['items'] ) < 100000 ], [ 'key:3', true, true ] );
+check( 'CONTROL: a small list is recorded whole, with no omission entry', GMCP_Audit::event_args( [ 'items' => [ 'a', 'b', 'c' ] ] )['items'], [ 'a', 'b', 'c' ] );
+$line = GMCP_Core::log_text( $many );
+check( 'log_text of 200,000 leaves is a line, and a short one', [ $line !== '', strlen( $line ) <= GMCP_Core::LOG_READ_BYTES + 200 ], [ true, true ] );
+$cut = 0;
+$budget = 1000;
+$cut_arr = GMCP_Core::cut_leaves( [ 'a' => str_repeat( 'x', 600 ), 'b' => str_repeat( 'y', 600 ), 'c' => str_repeat( 'z', 600 ), 'd' => [ 'e' => 'f' ] ], 4096, $cut, 0, $budget );
+check( 'cut_leaves with a budget keeps what fits, drops the rest and counts the bytes it did not read', [ array_keys( $cut_arr ), $cut > 600 ], [ [ 'a', 'b', '__gmcp_omitted' ], true ] );
+check( 'CONTROL: cut_leaves without a budget changes nothing about the same input', array_keys( GMCP_Core::cut_leaves( [ 'a' => 'x', 'b' => 'y', 'c' => 'z', 'd' => [ 'e' => 'f' ] ], 4096, $cut ) ), [ 'a', 'b', 'c', 'd' ] );
+check( 'redact_reversible refuses a value over the node budget instead of walking it', GMCP_Core::redact_reversible( array_fill( 0, 150000, 'a' ) ), [ false, null ] );
+check( 'CONTROL: redact_reversible takes a small one', GMCP_Core::redact_reversible( array_fill( 0, 10, 'a' ) )[0], true );
+if ( !function_exists( 'size_format' ) ) {
+  function size_format( $bytes ) {
+    return $bytes . ' B';
+  }
+}
+$described = new ReflectionMethod( 'GMCP_Changes', 'describe' );
+$described->setAccessible( true );
+check( 'the changes column describes a value of 150,000 leaves by size, unread', has( (string) $described->invoke( null, 'items', array_fill( 0, 150000, 'a' ) ), 'too large to read' ), true );
+check( 'CONTROL: and a short list by its content', $described->invoke( null, 'items', [ 'a', 'b' ] ), '["a","b"]' );
 
 echo "\n$total checks, $fails failed\n";
 exit( min( 255, $fails ) );

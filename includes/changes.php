@@ -1129,6 +1129,11 @@ class GMCP_Changes {
     // "value", so testing the field name alone asked whether "value" looks like a secret,
     // which it never does, while the option was called mailchimp_key and said so plainly.
     // Both names are tested, and either one is enough to redact.
+    // A value with more nodes than can be read is described by its size and nothing of it is read:
+    // the walks below cost per node, and a client can send a million.
+    if ( ( is_array( $value ) || is_object( $value ) ) && !GMCP_Credential_Scan::within_budget( $value ) ) {
+      return '[' . size_format( GMCP_Core::weigh( $value ) ) . ' of structured data, too large to read]';
+    }
     if ( GMCP_Core::field_looks_secret( $field )
       || ( $context !== '' && GMCP_Core::field_looks_secret( $context ) )
       || GMCP_Core::holds_credential( $value ) ) {

@@ -2317,6 +2317,11 @@ class GMCP_Core {
     if ( $depth > 8 || is_object( $value ) ) {
       return [ false, null ];
     }
+    // A value too large to be read within the budget is refused, as one nested too deep is: the
+    // walk below judges every leaf, and the answer for a value it cannot finish is "not kept".
+    if ( $depth === 0 && !GMCP_Credential_Scan::within_budget( $value ) ) {
+      return [ false, null ];
+    }
     if ( is_string( $value ) ) {
       // Free text too: a string leaf with a pasted wp-config line in it names nothing, so the
       // structural test passes it. @see GMCP_Credential_Scan.
@@ -2479,7 +2484,11 @@ class GMCP_Core {
   */
   public static function log_text( $value ): string {
     if ( is_array( $value ) || is_object( $value ) ) {
-      $json = wp_json_encode( self::redact( $value ) );
+      // A line holds LOG_READ_BYTES of this, so no more than a small multiple of that is read:
+      // the redaction walk costs per leaf, and a million of them is an argument a client may send.
+      $unused = 0;
+      $budget = self::LOG_READ_BYTES * 4;
+      $json = wp_json_encode( self::redact( self::cut_leaves( $value, self::LOG_READ_BYTES, $unused, 0, $budget ) ) );
       return self::log_line( is_string( $json ) ? $json : '' );
     }
     return self::log_line( (string) $value );
@@ -2501,9 +2510,12 @@ class GMCP_Core {
   *
   *  1. Cut to what a line can hold (read no more than that), so a megabyte argument is not
   *     processed to print two thousand characters.
-  *  2. Control characters become visible escapes. A request value with a newline in it was
-  *     written as a second line, so any client could forge "[Guarded MCP] ..." lines in the log
-  *     an operator reads; one line in, one line out.
+  *  2. Whitespace of every kind (tab, newline, carriage return, vertical tab, form feed, the
+  *     Unicode line and paragraph separators and the no-break spaces) becomes one plain space,
+  *     before any scrub reads the text, so a separator written with a tab in it is still a
+  *     separator. A request value with a newline in it was written as a second line, so any
+  *     client could forge "[Guarded MCP] ..." lines in the log an operator reads; one line in,
+  *     one line out. Other control characters are escaped to a visible form after the scrubs.
   *  3. A value after a secret-named key is taken whole: an unquoted one up to "&" or the end of
   *     the line, a quoted one up to its closing quote. "smtp_pwd=correct horse battery" was left
   *     as "smtp_pwd=[redacted] horse battery" by a scrub that ended a value at the first space.
@@ -2520,7 +2532,9 @@ class GMCP_Core {
   * Never returns "" for text: a scrub that gives up yields UNSCRUBBABLE.
   */
   public static function log_line( string $text ): string {
-    $text = self::escape_control_characters( self::cut_bytes( $text, self::LOG_READ_BYTES ) );
+    // Whitespace first, so the scrubs read it as the separator it was; then every other control
+    // character as a visible escape, because the scrubber would otherwise delete it unseen.
+    $text = self::escape_control_characters( self::whitespace_to_spaces( self::cut_bytes( $text, self::LOG_READ_BYTES ) ) );
     if ( $text === '' ) {
       return '';
     }
@@ -2535,6 +2549,32 @@ class GMCP_Core {
       $text = ( $left === '' && trim( $text ) !== '' && trim( $text ) !== self::LOG_SENTINEL ) ? self::UNSCRUBBABLE : $scrubbed;
     }
     return self::escape_control_characters( str_replace( self::LOG_SENTINEL, self::REDACTION_MARKER, $text ) );
+  }
+
+  /**
+  * Every kind of whitespace that is not a plain space or that a pattern's \s would not read as one,
+  * as a single plain space: tab, vertical tab, form feed, carriage return, newline, the Unicode
+  * next-line and line and paragraph separators, the no-break and other fixed-width spaces. Not a
+  * regular expression: a table, which cannot give up.
+  *
+  * This runs BEFORE the scrubs. Escaping a tab first turned "smtp_pass<TAB>=<TAB>x" into the
+  * characters backslash and "t", which neither the separator rule nor "Bearer\s++" matches, so a
+  * value the client had put a tab in front of reached the log. A line still has one line's worth of
+  * characters afterwards (a newline cannot start a forged record), and any other control character
+  * is escaped to a visible form at the end of log_line().
+  */
+  public static function whitespace_to_spaces( string $text ): string {
+    static $table = null;
+    if ( $table === null ) {
+      $table = [ "\t" => ' ', "\x0B" => ' ', "\x0C" => ' ', "\r" => ' ', "\n" => ' ',
+        "\xC2\x85" => ' ', "\xC2\xA0" => ' ', "\xE1\x9A\x80" => ' ', "\xE2\x80\xA8" => ' ', "\xE2\x80\xA9" => ' ',
+        "\xE2\x80\xAF" => ' ', "\xE2\x81\x9F" => ' ', "\xE3\x80\x80" => ' ' ];
+      // U+2000 to U+200A: the en and em spaces, the thin and hair spaces and their neighbours.
+      for ( $i = 0x80; $i <= 0x8A; $i++ ) {
+        $table[ "\xE2\x80" . chr( $i ) ] = ' ';
+      }
+    }
+    return strtr( $text, $table );
   }
 
   /**
@@ -2574,7 +2614,7 @@ class GMCP_Core {
     }
     $re = '/(?<![A-Za-z0-9_.\-\[\]])(?=[A-Za-z0-9_.\-\[\]]*?(?:' . implode( '|', $names ) . '))'
       . '([A-Za-z0-9_.\-\[\]]++)((?:\\\\*+["\'])?+\s*+(?:=>|=|:|%3[Dd]|%3[Aa])\s*+)'
-      . '(["\']?+' . self::LOG_SENTINEL . '["\']?+|"[^"\r\n]*+"?+|\'[^\'\r\n]*+\'?+|[^&\r\n]++)/i';
+      . '(["\']?+' . self::LOG_SENTINEL . '["\']?+|"(?:[^"\\\\\r\n]++|\\\\.)*+"?+|\'(?:[^\'\\\\\r\n]++|\\\\.)*+\'?+|[^&\r\n]++)/i';
     $out = preg_replace_callback( $re, static function ( $m ) {
       if ( strpos( $m[3], self::LOG_SENTINEL ) !== false && strlen( $m[3] ) <= strlen( self::LOG_SENTINEL ) + 2 ) {
         return $m[0];
@@ -2658,7 +2698,8 @@ class GMCP_Core {
   public static function redact_call_args( array $args ): array {
     // The debug line prints a few hundred characters of this; nothing is gained by reading more.
     $unused = 0;
-    $args = self::cut_leaves( $args, 4096, $unused );
+    $budget = 16384;
+    $args = self::cut_leaves( $args, 4096, $unused, 0, $budget );
     foreach ( self::NEVER_RECORD_ARGS as $field ) {
       if ( array_key_exists( $field, $args ) ) {
         $args[ $field ] = self::REDACTION_MARKER;
@@ -2716,27 +2757,84 @@ class GMCP_Core {
   * done after the tool has run, for text that cannot be stored. The count lets the caller say how
   * large the original was instead of reporting the size of the copy.
   *
-  * @param int $removed running total, by reference
+  * Bounding each leaf does not bound how many there are, and the scrubs that run afterwards cost
+  * about as much per leaf as per byte: a million one-character strings (4 MB) took 2.5 s to
+  * record, a million secret-looking assignments (40 MB) 17 s, and both are well inside the size a
+  * request may be. So $budget, when given, is how many bytes of the call may be kept at all. What
+  * a node costs is never more than it takes in JSON (a string its length and two quotes, a string
+  * key its length and three bytes, a number or a boolean one byte), so the encoded copy is at least
+  * as large as what was spent, and a caller whose budget is its storage cap and whose budget ran out
+  * would have been over that cap anyway. Once it is spent the rest of that array is dropped without
+  * being read, and one entry named "__gmcp_omitted" says how many entries and bytes went unexamined.
+  *
+  * @param int      $removed running total of bytes not kept, by reference
+  * @param int|null $budget  bytes still to be spent, by reference; null for no budget
   */
-  public static function cut_leaves( $value, int $max, int &$removed, int $depth = 0 ) {
+  public static function cut_leaves( $value, int $max, int &$removed, int $depth = 0, ?int &$budget = null ) {
     if ( is_string( $value ) ) {
-      if ( strlen( $value ) <= $max ) {
-        return $value;
+      if ( strlen( $value ) > $max ) {
+        $cut = self::cut_bytes( $value, $max );
+        $removed += strlen( $value ) - strlen( $cut );
+        $value = $cut;
       }
-      $cut = self::cut_bytes( $value, $max );
-      $removed += strlen( $value ) - strlen( $cut );
-      return $cut;
+      if ( $budget !== null ) {
+        $budget -= strlen( $value ) + 2;
+      }
+      return $value;
     }
     if ( is_object( $value ) ) {
       $value = get_object_vars( $value );
     }
     if ( !is_array( $value ) || $depth > 8 ) {
+      if ( $budget !== null ) {
+        $budget -= 1;
+      }
       return $value;
     }
+    $dropped = 0;
+    $dropped_bytes = 0;
     foreach ( $value as $k => $inner ) {
-      $value[ $k ] = self::cut_leaves( $inner, $max, $removed, $depth + 1 );
+      if ( $budget !== null && $budget <= 0 ) {
+        $dropped++;
+        $dropped_bytes += self::weigh( $inner ) + strlen( (string) $k );
+        unset( $value[ $k ] );
+        continue;
+      }
+      if ( $budget !== null && is_string( $k ) ) {
+        $budget -= strlen( $k ) + 3;
+      }
+      $value[ $k ] = self::cut_leaves( $inner, $max, $removed, $depth + 1, $budget );
+    }
+    if ( $dropped ) {
+      $removed += $dropped_bytes;
+      $value['__gmcp_omitted'] = $dropped . ' more entries (' . $dropped_bytes . ' bytes) were not examined or recorded';
     }
     return $value;
+  }
+
+  /**
+  * The bytes a value holds, strings by length and anything else by a few bytes, without reading
+  * the strings. For the size a caller reports about what it chose not to look at. Bounded in
+  * depth; a deeper structure counts as the depth limit's worth.
+  */
+  public static function weigh( $value, int $depth = 0 ): int {
+    if ( is_string( $value ) ) {
+      return strlen( $value );
+    }
+    if ( is_object( $value ) ) {
+      $value = get_object_vars( $value );
+    }
+    if ( !is_array( $value ) ) {
+      return 8;
+    }
+    if ( $depth > 64 ) {
+      return 64;
+    }
+    $sum = 8;
+    foreach ( $value as $k => $inner ) {
+      $sum += strlen( (string) $k ) + self::weigh( $inner, $depth + 1 );
+    }
+    return $sum;
   }
 
   /**

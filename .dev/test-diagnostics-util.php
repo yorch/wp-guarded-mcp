@@ -728,5 +728,32 @@ foreach ( [ 'upload', 'download', 'export' ] as $route ) {
   check( "  ...and the escaped route is kept ($route)", strpos( $out, '\\/' . $route . '\\/[redacted]' ) !== false, true );
 }
 
+echo "-- scrub_log_line: shapes found missing in review --\n";
+$sec = 'Zx9Qw3Lp7Rt2';
+$rev = [
+  'an escaped quote inside a define() value'  => [ "define('DB_PASSWORD', 'ab\\'cdef12345');", 'cdef12345', "define('DB_PASSWORD', [redacted]);" ],
+  'an escaped quote inside a quoted value'    => [ "smtp_pass = 'ab\\'cdef12345' tail", 'cdef12345', 'smtp_pass = [redacted] tail' ],
+  'a double-quoted value with an escaped quote' => [ 'smtp_pass = "ab\\"cdef12345" tail', 'cdef12345', 'smtp_pass = [redacted] tail' ],
+  'a CDATA element'                           => [ "<password><![CDATA[Zx9<Qw3>Lp7]]></password>", 'Lp7', '<password>[redacted]</password>' ],
+  'a CDATA element with attributes'           => [ "<api_key id=\"1\"><![CDATA[$sec]]></api_key>", $sec, '<api_key id="1">[redacted]</api_key>' ],
+  'JSON in a URL, percent-encoded'            => [ "GET /x?data=%7B%22access_token%22%3A%22$sec%22%2C%22b%22%3A1%7D", $sec, 'GET /x?data=%7B%22access_token%22%3A%22[redacted]%22%2C%22b%22%3A1%7D' ],
+  'curly double quotes around a value'        => [ "password: “Zx9 Qw3 Lp7” tail", 'Qw3', 'password: [redacted] tail' ],
+  'curly single quotes around a value'        => [ "password = ‘Zx9 Qw3 Lp7’ tail", 'Qw3', 'password = [redacted] tail' ],
+  'curly quotes around the name too'          => [ "“password”: “Zx9 Qw3”", 'Qw3', '“password”: [redacted]' ],
+  'a fullwidth equals sign'                   => [ "password＝{$sec} next", $sec, 'password＝[redacted] next' ],
+  'a fullwidth colon'                         => [ "password：{$sec} next", $sec, 'password：[redacted] next' ],
+  'pw with a fullwidth colon'                 => [ "pw：{$sec} next", $sec, 'pw：[redacted] next' ],
+  'Authorization: Token'                      => [ "Authorization: Token {$sec}abc", $sec, 'Authorization: [redacted]' ],
+  'a key whose value is a one-line private key' => [ 'key: -----BEGIN OPENSSH PRIVATE KEY----- abc -----END OPENSSH PRIVATE KEY-----', 'abc', 'key: [private-key-block]' ],
+];
+foreach ( $rev as $label => [ $text, $leak, $want ] ) {
+  check( "control: the $label probe holds what must go", strpos( $text, $leak ) !== false, true );
+  $out = GMCP_Diag_Util::scrub_log_line( $text, [] );
+  check( "scrubbed: $label", $out, $want );
+  check( "stable: $label is unchanged by a second pass", GMCP_Diag_Util::scrub_log_line( $out, [] ), $out );
+}
+check( 'control: curly quotes round a harmless value are kept', GMCP_Diag_Util::scrub_log_line( 'title: “Hello there” and more', [] ), 'title: “Hello there” and more' );
+check( 'control: an element not named like a secret keeps its CDATA', GMCP_Diag_Util::scrub_log_line( '<title><![CDATA[Hello]]></title>', [] ), '<title><![CDATA[Hello]]></title>' );
+
 printf( "\n  %d passed, %d failed\n", $pass, $fail );
 exit( $fail === 0 ? 0 : 1 );

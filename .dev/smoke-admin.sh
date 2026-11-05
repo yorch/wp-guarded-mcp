@@ -4019,8 +4019,13 @@ if grep -q wordpress_logged_in "$AP_JAR"; then
   check "CONTROL: ...and it lists nothing as hidden" "$(ap_q 'SELECT args_redacted FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R9")" "[]"
   check "the stored view of the credential-bearing tagline does not hold the secret" \
     "$(ap_q 'SELECT args_view LIKE \"%Hunter2-rv3-secret%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8")" "0"
-  check "  nor the password constant's name and value" \
-    "$(ap_q 'SELECT args_view LIKE \"%DB_PASSWORD%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8")" "0"
+  # Only the secret itself is hidden now. The whole string used to be replaced, which let a decoy that
+  # merely looked like a credential make any argument unreadable to the person approving it, so the
+  # words around the secret stay readable and the view says that something is hidden and how many.
+  check "  the words around it stay readable (the tagline and the constant's NAME)" \
+    "$(ap_q 'SELECT args_view LIKE \"%Our tagline.%\" AND args_view LIKE \"%DB_PASSWORD%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8")" "1"
+  check "  and the view says one value is hidden in it" \
+    "$(ap_q 'SELECT args_view LIKE \"%[hidden values present: 1]%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8")" "1"
   check "  and lists the value as hidden" "$(ap_q 'SELECT args_redacted FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8")" '["value"]'
   check "the approval is still bound to the real arguments (the keyed hash covers the secret)" \
     "$(ap_eval 'global $wpdb; $m=(string)$wpdb->get_var("SELECT args_mac FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8"'");

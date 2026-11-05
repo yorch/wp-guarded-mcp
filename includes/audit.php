@@ -280,7 +280,8 @@ class GMCP_Audit {
     // cannot be stored is time the row can fail to be written in. $cut_off keeps the recorded
     // size honest: it is the size of the call the agent sent, not of the copy examined here.
     $cut_off = 0;
-    $args = GMCP_Core::cut_leaves( $args, self::MAX_ARGS + 1024, $cut_off );
+    $budget = self::MAX_ARGS + 1024;
+    $args = GMCP_Core::cut_leaves( $args, self::MAX_ARGS + 1024, $cut_off, 0, $budget );
     foreach ( self::NEVER_RECORD as $field ) {
       if ( array_key_exists( $field, $args ) ) {
         $args[ $field ] = '[redacted]';
@@ -515,7 +516,8 @@ class GMCP_Audit {
     $caller = isset( $given['caller'] ) && is_scalar( $given['caller'] ) ? mb_substr( (string) $given['caller'], 0, 191 ) : null;
     unset( $given['caller'] );
     $unused = 0;
-    $args = GMCP_Core::redact_credential_spans( GMCP_Core::redact( GMCP_Core::cut_leaves( $given, self::MAX_ARGS + 1024, $unused ) ) );
+    $budget = self::MAX_ARGS + 1024;
+    $args = GMCP_Core::redact_credential_spans( GMCP_Core::redact( GMCP_Core::cut_leaves( $given, self::MAX_ARGS + 1024, $unused, 0, $budget ) ) );
     if ( $caller !== null ) {
       $args['caller'] = $caller;
     }

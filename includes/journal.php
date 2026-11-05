@@ -310,7 +310,9 @@ class GMCP_Journal {
       'tool' => (string) ( $change['tool'] ?? '' ),
       'call' => (string) ( $change['call'] ?? '' ),
     ];
-    if ( GMCP_Core::holds_credential( $old ) || GMCP_Credential_Scan::holds( $old ) ) {
+    // The budget is asked first: holds_credential() walks the whole value, and a value too large to
+    // be read is one that is not kept, whatever the walk would have said.
+    if ( !GMCP_Credential_Scan::within_budget( $old ) || GMCP_Core::holds_credential( $old ) || GMCP_Credential_Scan::holds( $old ) ) {
       // Keep the shape with the secret-looking leaves blanked, rather than dropping the
       // value whole. Dropping was costing every option that merely contains a field named
       // key, author or password-something its undo, which on an Elementor build is most of
@@ -1578,7 +1580,7 @@ class GMCP_Journal {
         $redo['previous'] = null;
         $redo['absent'] = true;
       }
-      elseif ( GMCP_Core::holds_credential( $current ) || GMCP_Credential_Scan::holds( $current ) ) {
+      elseif ( !GMCP_Credential_Scan::within_budget( $current ) || GMCP_Core::holds_credential( $current ) || GMCP_Credential_Scan::holds( $current ) ) {
         // What the undo is about to overwrite holds a credential. It is not copied, for the
         // reason an ordinary entry does not copy one, so this undo cannot itself be undone.
         $redo['previous'] = null;

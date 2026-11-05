@@ -46,7 +46,7 @@ function check( string $label, $got, $want ): void {
 * A scrub that never finishes must read as a failure with a name, not as a hung test run.
 */
 function run_child( string $php, string $self, int $jit, int $limit ): array {
-  $cmd = escapeshellarg( $php ) . ' -d pcre.jit=' . $jit . ' -d pcre.backtrack_limit=1000000 -d max_execution_time=0 ' . escapeshellarg( $self ) . ' --child';
+  $cmd = escapeshellarg( $php ) . ' -d pcre.jit=' . $jit . ' -d pcre.backtrack_limit=1000000 -d max_execution_time=0 -d memory_limit=3G ' . escapeshellarg( $self ) . ' --child';
   $proc = proc_open( $cmd, [ 1 => [ 'pipe', 'w' ], 2 => [ 'pipe', 'w' ] ], $pipes );
   stream_set_blocking( $pipes[1], false );
   stream_set_blocking( $pipes[2], false );
@@ -146,6 +146,32 @@ function child(): void {
     'distinct names x=1 64 KB' => implode( ' ', array_map( function ( $i ) { return "n$i=1"; }, range( 1, 9000 ) ) ),
     'distinct quoted names 64 KB' => implode( ' ', array_map( function ( $i ) { return "q$i=\"v\""; }, range( 1, 7000 ) ) ),
     'define( chain 32 KB' => str_repeat( 'define("a","b") ', 2000 ),
+    // Second review: every new rule has an input that would make it quadratic if it were.
+    'backslashes x 512 KB' => str_repeat( '\\', 524288 ),
+    'escaped quotes \\" x 128 KB' => str_repeat( '\\"', 65536 ),
+    'double-escaped quotes \\\\" x 96 KB' => str_repeat( '\\\\"', 32768 ),
+    'a name of 512 KB then a secret' => str_repeat( 'a', 524288 ) . '_password="Zx9Qw3Lp7Rt2"',
+    'a dotted name a. x 512 KB' => str_repeat( 'a.', 262144 ) . '=1',
+    'a hyphenated name a- x 512 KB' => str_repeat( 'a-', 262144 ) . '=1',
+    'name chars then no separator, 512 KB' => str_repeat( 'a_', 262144 ),
+    'unterminated BEGIN lines x 17500 (560 KB)' => str_repeat( "-----BEGIN RSA PRIVATE KEY-----\n", 17500 ),
+    'BEGIN END BEGIN END x 8000' => str_repeat( "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n", 8000 ),
+    '&gt; x 100 KB' => str_repeat( '&gt;', 25000 ),
+    "k&gt;'x' x 64 KB" => str_repeat( "k&gt;'x' ", 8000 ),
+    'escaped define chain 48 KB' => str_repeat( "define('PASSWORD','b\\'c') ", 2000 ),
+    'escaped assignment chain 64 KB' => str_repeat( "smtp_pass='b\\'c' ", 4000 ),
+    'quote then no end, escapes x 64 KB' => "smtp_pass='" . str_repeat( 'b\\\'', 20000 ),
+    'CDATA open x 32 KB' => str_repeat( '<password><![CDATA[', 1700 ),
+    'CDATA closed chain 64 KB' => str_repeat( '<password><![CDATA[x]]></password>', 1800 ),
+    'curly quotes open x 64 KB' => str_repeat( 'password: “', 5000 ),
+    'fullwidth separators x 64 KB' => str_repeat( 'password＝', 8000 ),
+    'tabs between names x 64 KB' => str_repeat( "pass\t", 13000 ),
+    'every whitespace control x 64 KB' => str_repeat( "Bearer\t\x0B\x0C\r\n\u{0085}\u{2028} ", 5000 ),
+    'Basic words x 64 KB' => str_repeat( 'Basic information ', 3600 ),
+    'Bearer tokens x 128 KB' => str_repeat( 'Bearer abc12345 ', 8000 ),
+    'base64 words after Basic x 128 KB' => str_repeat( 'Basic dXNlcjpwYXNzMQ== ', 5600 ),
+    'URL-encoded JSON open x 80 KB' => str_repeat( '%22token%22%3A%22', 5000 ),
+    '[array][index] names x 64 KB' => str_repeat( "\$a['password']['x'] ", 3000 ),
   ];
 
   foreach ( $inputs as $label => $text ) {
@@ -175,6 +201,48 @@ function child(): void {
     $line = GMCP_Core::log_text( $text );
     $emit( "log_text of $label", microtime( true ) - $t, 2.0, $line !== '' );
   }
+
+  // Cost that grows with the NUMBER of leaves, not their size: a million one-character strings is
+  // 4 MB and a million secret-looking assignments 40 MB, both well inside what a request may carry.
+  // Each walk used to take 2 to 18 s with the JIT off. The probe of the walk that records must also
+  // say what it did not read, so "nonempty" here is a real property: the record exists and names the
+  // omission, or the answer is "not safe". It is not the absence of an error.
+  $leafy = [
+    '1M leaves of "a"' => array_fill( 0, 1000000, 'a' ),
+  ];
+  $assign = [];
+  for ( $i = 0; $i < 1000000; $i++ ) {
+    $assign[ "f$i" ] = "p{$i}_password=\"Zx9Qw3Lp7Rt2\"";
+  }
+  $leafy['1M distinct secret-looking assignments'] = $assign;
+  unset( $assign );
+  foreach ( $leafy as $label => $tree ) {
+    $begin( "leafy storable_args of $label" );
+    $t = microtime( true );
+    $json = GMCP_Audit::storable_args( [ 'key' => 'blogdescription', 'value' => 'x', 'zz' => $tree ] );
+    $emit( "leafy storable_args of $label", microtime( true ) - $t, 2.0, $json !== '' && ( strpos( $json, '__gmcp_truncated' ) !== false || strpos( $json, '__gmcp_omitted' ) !== false ) );
+
+    $begin( "leafy event_args of $label" );
+    $t = microtime( true );
+    $ev = GMCP_Audit::event_args( [ 'zz' => $tree, 'caller' => 'key:1' ] );
+    $emit( "leafy event_args of $label", microtime( true ) - $t, 2.0, isset( $ev['zz']['__gmcp_omitted'] ) && ( $ev['caller'] ?? '' ) === 'key:1' );
+
+    $begin( "leafy log_text of $label" );
+    $t = microtime( true );
+    $line = GMCP_Core::log_text( $tree );
+    $emit( "leafy log_text of $label", microtime( true ) - $t, 2.0, $line !== '' && $line !== GMCP_Core::UNSCRUBBABLE );
+
+    $begin( "leafy holds of $label" );
+    $t = microtime( true );
+    $held = GMCP_Credential_Scan::holds( $tree );
+    $emit( "leafy holds of $label", microtime( true ) - $t, 2.0, $held === true );
+
+    $begin( "leafy redact_reversible of $label" );
+    $t = microtime( true );
+    $rev = GMCP_Core::redact_reversible( $tree );
+    $emit( "leafy redact_reversible of $label", microtime( true ) - $t, 2.0, $rev === [ false, null ] );
+  }
+  unset( $leafy, $tree );
 
   // The old output, on the probe cases where the old expression finished: same text out.
   // Reference = the expression this change replaced, run on inputs small enough for it.
