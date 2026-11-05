@@ -1419,7 +1419,11 @@ be put back on a post that has since been rewritten. The undo of an undo has no
 such excuse, because it restores a whole recorded value taken before whatever
 happened next, so it is refused when the target is no longer in the state the undo
 left it in. That state is stored as a hash measured from the stored value after the
-write, never as a second copy of it. For a custom field it covers every row of the
+write, never as a second copy of it. The hash is an HMAC under the site's salt: it used to
+be an unsalted md5, which is a fingerprint of the live value that anyone able to read the
+journal could test guesses against offline. An entry recorded before the change still holds
+the md5 and is compared in that form until the journal rolls past it (at most forty
+entries); nothing writes that form any more. For a custom field it covers every row of the
 key, not the first, and an undo that would write one recorded value is refused when
 the key now holds several rows, because that write rewrites every row. Where the
 value the undo is about to overwrite holds a credential, the undo is recorded as

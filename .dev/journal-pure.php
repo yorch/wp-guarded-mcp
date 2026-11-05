@@ -93,6 +93,10 @@ function delete_option( $key ) {
   unset( $GLOBALS['gmcp_t_options'][ $key ] );
   return true;
 }
+$GLOBALS['gmcp_t_salt'] = 'test-salt-one';
+function wp_salt( $scheme = 'auth' ) {
+  return $GLOBALS['gmcp_t_salt'] . '-' . $scheme;
+}
 function maybe_serialize( $v ) {
   return is_array( $v ) || is_object( $v ) ? serialize( $v ) : $v;
 }
@@ -242,6 +246,14 @@ check( 'CONTROL: an empty set differs from a populated one', GMCP_Changes::term_
 check( 'absent differs from null', GMCP_Journal::state_hash( false, null ) !== GMCP_Journal::state_hash( true, null ), true );
 check( 'the same value hashes the same', GMCP_Journal::state_hash( true, [ 'x' => 1 ] ), GMCP_Journal::state_hash( true, [ 'x' => 1 ] ) );
 check( 'a different value hashes differently', GMCP_Journal::state_hash( true, 'a' ) !== GMCP_Journal::state_hash( true, 'b' ), true );
+check( 'the fingerprint is keyed: it is not the md5 of the serialized value any more', [ strpos( GMCP_Journal::state_hash( true, 'guess' ), 'h:' ), GMCP_Journal::state_hash( true, 'guess' ) === 'v:' . md5( serialize( 'guess' ) ) ], [ 0, false ] );
+check( 'CONTROL: the legacy form is still the unsalted md5, for entries already on record', GMCP_Journal::state_hash( true, 'guess', true ), 'v:' . md5( serialize( 'guess' ) ) );
+$keyed_one = GMCP_Journal::state_hash( true, 'guess' );
+$GLOBALS['gmcp_t_salt'] = 'test-salt-two';
+check( 'the same value fingerprints differently under another site salt', GMCP_Journal::state_hash( true, 'guess' ) !== $keyed_one, true );
+$GLOBALS['gmcp_t_salt'] = 'test-salt-one';
+check( 'CONTROL: and identically under the same one', GMCP_Journal::state_hash( true, 'guess' ), $keyed_one );
+check( 'absent is still a plain word in both forms', [ GMCP_Journal::state_hash( false, null ), GMCP_Journal::state_hash( false, null, true ) ], [ 'absent', 'absent' ] );
 $log = [ [ 'id' => 'a1' ], [ 'id' => 'b2' ] ];
 $marked = GMCP_Journal::mark_in_log( $log, 'a1', 100, 'z9' );
 check( 'mark_in_log marks the entry and links its undo', [ $marked[0]['undone'], $marked[0]['undone_by'] ], [ 100, 'z9' ] );
@@ -358,6 +370,45 @@ $bd3 = entry_by( $bd2 )['undone_by'];
 check( 'and that can be undone again', GMCP_Journal::revert( $bd3 )['ok'], true );
 check( 'back to the original', get_option( 'blogdescription' ), 'before' );
 check( 'the chain shows one label, not a nest of prefixes', substr_count( entry_by( $bd3 )['what'], 'Undo of: ' ), 1 );
+
+echo "-- an undo's recorded state: keyed now, and an entry with the old md5 still compares --\n";
+update_option( 'fp_opt', 'one' );
+$observer->observe( [ 'kind' => 'option', 'op' => 'updated', 'id' => 'fp_opt',
+  'fields' => [ 'value' => [ 'from' => 'one', 'to' => 'two' ] ], 'tool' => 'wp_update_option', 'call' => 'fp1' ] );
+update_option( 'fp_opt', 'two' );
+$fp = end( $GLOBALS['gmcp_t_options'][ GMCP_Journal::OPTION ] );
+check( 'CONTROL: the first undo goes through', GMCP_Journal::revert( $fp['id'] )['ok'], true );
+$fp_undo = entry_by( $fp['id'] )['undone_by'];
+$reversible_now = function ( string $id ): array {
+  foreach ( GMCP_Journal::recent( 60 ) as $row ) {
+    if ( $row['id'] === $id ) {
+      return [ $row['reversible'], $row['not_reversible_because'] ?? '' ];
+    }
+  }
+  return [ null, 'not listed' ];
+};
+check( 'the undo records its state keyed', strpos( (string) entry_by( $fp_undo )['after_state'], 'h:' ), 0 );
+check( 'CONTROL: and it can itself be undone while the value is where the undo left it', $reversible_now( $fp_undo )[0], true );
+$set_after_state = function ( string $id, string $state ) {
+  $log = journal();
+  foreach ( $log as $i => $e ) {
+    if ( $e['id'] === $id ) {
+      $log[ $i ]['after_state'] = $state;
+    }
+  }
+  update_option( GMCP_Journal::OPTION, $log, false );
+};
+$set_after_state( $fp_undo, GMCP_Journal::state_hash( true, 'one', true ) );
+check( 'an entry that carries the old md5 still compares equal, so upgrading does not strand it', $reversible_now( $fp_undo )[0], true );
+update_option( 'fp_opt', 'changed by someone else' );
+check( 'and the old form still refuses once the value has moved', [ $reversible_now( $fp_undo )[0], strpos( $reversible_now( $fp_undo )[1], 'changed since' ) !== false ], [ false, true ] );
+$set_after_state( $fp_undo, GMCP_Journal::state_hash( true, 'one' ) );
+check( 'the keyed form refuses once the value has moved too', [ $reversible_now( $fp_undo )[0], strpos( $reversible_now( $fp_undo )[1], 'changed since' ) !== false ], [ false, true ] );
+$GLOBALS['gmcp_t_salt'] = 'test-salt-two';
+update_option( 'fp_opt', 'one' );
+check( 'a keyed state does not match under a different salt (the stored string is useless off this site)', $reversible_now( $fp_undo )[0], false );
+$GLOBALS['gmcp_t_salt'] = 'test-salt-one';
+check( 'CONTROL: it matches again under the right one, with the value back where the undo left it', $reversible_now( $fp_undo )[0], true );
 
 echo "-- an absent option --\n";
 $observer->observe( [ 'kind' => 'option', 'op' => 'created', 'id' => 'fresh_opt', 'fields' => [], 'tool' => 'wp_update_option', 'call' => 'c6' ] );

@@ -910,7 +910,7 @@ class GMCP_Journal {
     if ( $why !== true ) {
       return $why;
     }
-    if ( isset( $entry['after_state'] ) && self::state_of( $entry ) !== $entry['after_state'] ) {
+    if ( isset( $entry['after_state'] ) && !self::state_matches( $entry ) ) {
       return 'It has changed since that undo was made, so putting the earlier copy back would discard the newer change. Read the current value and make the edit again if it is still wanted.';
     }
     return true;
@@ -1340,17 +1340,20 @@ class GMCP_Journal {
   * Not a copy of anything: a hash, so it can be stored for every kind without a size
   * budget and without a second place for a value to leak from. 'absent' is its own state.
   */
-  private static function state_of( array $entry ): string {
+  private static function state_of( array $entry, bool $legacy = false ): string {
+    $h = static function ( bool $exists, $value ) use ( $legacy ): string {
+      return self::state_hash( $exists, $value, $legacy );
+    };
     $kind = (string) ( $entry['kind'] ?? '' );
     if ( $kind === 'option' ) {
       $none = '__gmcp_absent__' . bin2hex( random_bytes( 4 ) );
       $value = get_option( (string) $entry['key'], $none );
-      return self::state_hash( $value !== $none, $value );
+      return $h( $value !== $none, $value );
     }
     if ( $kind === 'meta' ) {
       $exists = metadata_exists( 'post', (int) $entry['ID'], (string) $entry['key'] );
       if ( !$exists ) {
-        return self::state_hash( false, null );
+        return $h( false, null );
       }
       // Every row, not the first. get_post_meta( ..., true ) is one row, so a row added by
       // somebody else after an undo was invisible to the staleness check, and reverting the
@@ -1358,7 +1361,7 @@ class GMCP_Journal {
       // (entries already on record carry that hash), and several rows hash as a list under a
       // wrapper key so one row holding an array can never collide with several rows.
       $rows = (array) get_post_meta( (int) $entry['ID'], (string) $entry['key'], false );
-      return self::state_hash( true, count( $rows ) > 1 ? [ self::META_ROWS => array_values( $rows ) ] : ( $rows ? reset( $rows ) : null ) );
+      return $h( true, count( $rows ) > 1 ? [ self::META_ROWS => array_values( $rows ) ] : ( $rows ? reset( $rows ) : null ) );
     }
     if ( $kind === 'post' ) {
       $values = [];
@@ -1366,13 +1369,13 @@ class GMCP_Journal {
         $value = get_post_field( (string) $field, (int) $entry['ID'], 'raw' );
         $values[ $field ] = is_scalar( $value ) ? (string) $value : $value;
       }
-      return self::state_hash( true, $values );
+      return $h( true, $values );
     }
     if ( $kind === 'themod' ) {
       $row = get_option( (string) $entry['row'], [] );
       $row = is_array( $row ) ? $row : [];
       $key = (string) $entry['key'];
-      return self::state_hash( array_key_exists( $key, $row ), $row[ $key ] ?? null );
+      return $h( array_key_exists( $key, $row ), $row[ $key ] ?? null );
     }
     if ( $kind === 'term' ) {
       $term = get_term( (int) $entry['ID'], (string) $entry['taxonomy'] );
@@ -1383,17 +1386,53 @@ class GMCP_Journal {
       foreach ( (array) ( $entry['fields'] ?? [] ) as $field ) {
         $values[ $field ] = is_scalar( $term->$field ) ? (string) $term->$field : $term->$field;
       }
-      return self::state_hash( true, $values );
+      return $h( true, $values );
     }
     if ( $kind === 'termrel' ) {
-      return self::state_hash( true, GMCP_Changes::term_ids_of( (int) $entry['ID'], (string) $entry['taxonomy'] ) );
+      return $h( true, GMCP_Changes::term_ids_of( (int) $entry['ID'], (string) $entry['taxonomy'] ) );
     }
     return 'unknown';
   }
 
-  /** The fingerprint itself. Pure. */
-  public static function state_hash( bool $exists, $value ): string {
-    return $exists ? 'v:' . md5( serialize( $value ) ) : 'absent';
+  /**
+  * The fingerprint itself. Pure, given the site's salt.
+  *
+  * Keyed: an HMAC under wp_salt(). It used to be md5( serialize( $value ) ), unsalted, stored as
+  * after_state for an undone entry. That is a fingerprint of the live value (a stored option, a
+  * post field, a meta row) kept in a second place that anyone able to read the journal could
+  * test guesses against offline: a low-entropy value, such as a short password-like string, is
+  * confirmed by hashing candidates. The key makes the stored string useless away from this site.
+  * Truncated to 128 bits, which is ample for "did it change since" and keeps the row small.
+  *
+  * $legacy computes the old unsalted form, 'v:' and an md5, for one purpose only: an entry already
+  * on record carries that string, and state_matches() accepts it until the journal rolls past it
+  * (forty entries at most). Nothing writes it any more.
+  */
+  public static function state_hash( bool $exists, $value, bool $legacy = false ): string {
+    if ( !$exists ) {
+      return 'absent';
+    }
+    $blob = serialize( $value );
+    if ( $legacy ) {
+      return 'v:' . md5( $blob );
+    }
+    return 'h:' . substr( hash_hmac( 'sha256', $blob, wp_salt( 'auth' ) . 'gmcp-journal-state' ), 0, 32 );
+  }
+
+  /**
+  * Whether an undo entry's target is still in the state the undo left it in.
+  *
+  * Compares the keyed fingerprint. An entry recorded before the key existed holds the old md5
+  * form, and is compared in that form, so upgrading does not make every undone entry read as
+  * "changed since" and refuse to be undone again. 'absent', 'gone' and 'unknown' are plain words
+  * in both forms.
+  */
+  private static function state_matches( array $entry ): bool {
+    $stored = (string) ( $entry['after_state'] ?? '' );
+    if ( hash_equals( self::state_of( $entry ), $stored ) ) {
+      return true;
+    }
+    return strpos( $stored, 'v:' ) === 0 && hash_equals( self::state_of( $entry, true ), $stored );
   }
 
   /**
