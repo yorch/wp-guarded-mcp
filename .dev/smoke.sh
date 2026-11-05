@@ -1690,6 +1690,97 @@ check "  and still cannot write" "$(verdict o_c)/$(ptitle $DO_LIVE)" "error/DO o
 check "the grants are stored with the marker only where read-only was chosen" \
   "$(wpe 'global $wpdb; $n=["ro"=>0,"full"=>0]; foreach($wpdb->get_col("SELECT t.scope FROM {$wpdb->prefix}gmcp_oauth_tokens t JOIN {$wpdb->prefix}gmcp_oauth_clients c ON c.client_id=t.client_id WHERE c.client_name=\"drafts test\" AND t.revoked=0") as $sc){ $n[GMCP_OAuth::scope_is_readonly($sc)?"ro":"full"]++; } echo $n["ro"],"/",$n["full"];')" "1/2"
 
+echo "-- OAuth: the level comes from the person's choice and its nonce, from nothing else --"
+# More than the three grants above. A consent POST that omits the choice means "full" (that is
+# how a grant made before the choice existed behaves), so the only thing keeping a forged POST
+# from minting a full grant is the nonce; a scope the client names, on the way in or on a
+# refresh, must neither lower a grant nor raise one. Each refusal has a control that makes the
+# same flow succeed, so a broken helper cannot read as a refusal.
+oauth_flow() { # oauth_flow <prefix> <client scope> <choice: full|readonly|omit> <nonce: ok|bad|none>
+  python3 - "$BASE" "$JAR" "$OUT" "$1" "$2" "$3" "$4" <<'PY'
+import sys, json, re, html, hashlib, base64, os, urllib.request, urllib.parse, urllib.error, http.cookiejar
+base, jar, out, prefix, scope, choice, nonce = sys.argv[1:8]
+cj = http.cookiejar.MozillaCookieJar(jar); cj.load(ignore_discard=True, ignore_expires=True)
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k): return None
+op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj), NoRedirect)
+reg = json.load(urllib.request.urlopen(urllib.request.Request(base + "/wp-json/mcp/v1/oauth/register",
+    json.dumps({"redirect_uris": ["http://localhost:9/cb"], "client_name": "drafts test", "token_endpoint_auth_method": "none"}).encode(),
+    {"Content-Type": "application/json"})))
+cid = reg["client_id"]
+verifier = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+chal = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+q = urllib.parse.urlencode({"response_type": "code", "client_id": cid, "redirect_uri": "http://localhost:9/cb", "state": "s",
+    "scope": scope, "code_challenge": chal, "code_challenge_method": "S256"})
+page = op.open(base + "/wp-json/mcp/v1/oauth/authorize?" + q).read().decode()
+fields = {m.group(1): html.unescape(m.group(2)) for m in re.finditer(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', page)}
+fields["action"] = "approve"
+if choice != "omit":
+    fields["gmcp_access"] = choice
+else:
+    fields.pop("gmcp_access", None)
+if nonce == "none":
+    fields.pop("_gmcp_nonce", None)
+elif nonce == "bad":
+    fields["_gmcp_nonce"] = "0000000000"
+loc = ""
+try:
+    op.open(urllib.request.Request(base + "/wp-json/mcp/v1/oauth/authorize", urllib.parse.urlencode(fields).encode()))
+except urllib.error.HTTPError as e:
+    loc = e.headers.get("Location", "")
+codes = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query).get("code")
+open(out + "/" + prefix + ".issued", "w").write("yes" if codes else "no")
+if not codes:
+    sys.exit(0)
+data = urllib.parse.urlencode({"grant_type": "authorization_code", "code": codes[0], "redirect_uri": "http://localhost:9/cb",
+    "code_verifier": verifier, "client_id": cid}).encode()
+tok = json.load(urllib.request.urlopen(urllib.request.Request(base + "/wp-json/mcp/v1/oauth/token", data)))
+for ext, val in (("tok", tok["access_token"]), ("ref", tok["refresh_token"]), ("cid", cid), ("scope", tok.get("scope", ""))):
+    open(out + "/" + prefix + "." + ext, "w").write(val)
+PY
+}
+oauth_refresh_scope() { # oauth_refresh_scope <prefix> <scope the client asks for on refresh>
+  curl -sS -X POST "$BASE/wp-json/mcp/v1/oauth/token" --data-urlencode grant_type=refresh_token --data-urlencode "scope=$2" \
+    --data-urlencode "refresh_token=$(cat "$OUT/$1.ref")" --data-urlencode "client_id=$(cat "$OUT/$1.cid")" -o "$OUT/$1.refreshed"
+  python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));open(sys.argv[2]+".tok","w").write(d["access_token"]);open(sys.argv[2]+".ref","w").write(d["refresh_token"])' "$OUT/$1.refreshed" "$OUT/$1"
+}
+rm -f "$OUT"/oq_*.issued
+oauth_flow oq_good "mcp" full ok
+check "CONTROL: a consent POST with a valid nonce issues a code, and the grant is full" "$(cat "$OUT/oq_good.issued")/$(oauth_tools oq_good)" "yes/True True"
+oauth_flow oq_omit_ok "mcp" omit ok
+check "an omitted choice with a valid nonce is full (the pre-choice behaviour, kept)" "$(cat "$OUT/oq_omit_ok.issued")/$(oauth_tools oq_omit_ok)" "yes/True True"
+oauth_flow oq_omit_bad "mcp" omit bad
+check "an omitted choice with a forged nonce issues nothing" "$(cat "$OUT/oq_omit_bad.issued")" "no"
+oauth_flow oq_omit_none "mcp" omit none
+check "  nor does one with no nonce at all" "$(cat "$OUT/oq_omit_none.issued")" "no"
+oauth_flow oq_full_bad "mcp" full bad
+check "  nor does an explicit full with a forged nonce" "$(cat "$OUT/oq_full_bad.issued")" "no"
+check "and no token was minted by any of the refused flows" \
+  "$(for p in oq_omit_bad oq_omit_none oq_full_bad; do [ -e "$OUT/$p.tok" ] && printf y || printf n; done)" "nnn"
+check "CONTROL: the probe does see a token where a flow succeeded" \
+  "$(for p in oq_good oq_omit_ok; do [ -s "$OUT/$p.tok" ] && printf y || printf n; done)" "yy"
+
+oauth_flow oq_claim_ro "mcp mcp:readonly" full ok
+check "a client that NAMES the read-only scope cannot lower a grant the person made full" \
+  "$(cat "$OUT/oq_claim_ro.issued")/$(oauth_tools oq_claim_ro)/$(wpe 'echo GMCP_OAuth::scope_is_readonly("'"$(cat "$OUT/oq_claim_ro.scope")"'") ? "ro" : "full";')" "yes/True True/full"
+oauth_flow oq_claim_omit "mcp:readonly" omit ok
+check "  nor with the choice omitted: the scope string is not the choice" \
+  "$(cat "$OUT/oq_claim_omit.issued")/$(oauth_tools oq_claim_omit)" "yes/True True"
+oauth_flow oq_ro "mcp" readonly ok
+check "CONTROL: the person's read-only choice does lower it, whatever scope the client named" "$(cat "$OUT/oq_ro.issued")/$(oauth_tools oq_ro)" "yes/False False"
+
+oauth_refresh_scope oq_ro "mcp"
+check "a refresh that asks for plain mcp cannot raise a read-only grant" "$(oauth_tools oq_ro)" "False False"
+oauth_refresh_scope oq_ro "mcp admin write"
+check "  nor can one that asks for more scopes than were granted" "$(oauth_tools oq_ro)" "False False"
+oauth_refresh_scope oq_ro ""
+check "  nor one that names none, and the stored scope still carries the marker" \
+  "$(oauth_tools oq_ro)/$(wpe 'global $wpdb; echo GMCP_OAuth::scope_is_readonly((string)$wpdb->get_var("SELECT t.scope FROM {$wpdb->prefix}gmcp_oauth_tokens t WHERE t.client_id=\"'"$(cat "$OUT/oq_ro.cid")"'\" AND t.revoked=0 ORDER BY t.id DESC LIMIT 1")) ? "marked" : "UNMARKED";')" "False False/marked"
+oauth_refresh_scope oq_good "mcp:readonly"
+check "a refresh that names the read-only scope does not lower a full grant either" "$(oauth_tools oq_good)" "True True"
+callk o_c "$(cat "$OUT/oq_ro.tok")" "$(tool_json 57 wp_update_post "{\"ID\":$DO_LIVE,\"fields\":{\"post_title\":\"DO oauth write 3\"}}")"
+check "and after all those refreshes the read-only grant still cannot write" "$(verdict o_c)/$(ptitle $DO_LIVE)" "error/DO oauth write"
+
 # Put the site back: the fixtures, the keys, the grants. A guard test must not leave them.
 wpe 'foreach(get_posts(["post_status"=>"any","post_type"=>["post","page","attachment"],"numberposts"=>-1,"s"=>"DO "]) as $p){ if(strpos($p->post_title,"DO ")===0){wp_delete_post($p->ID,true);} } foreach(wp_get_nav_menus() as $m){ if($m->name==="DO net menu"){wp_delete_nav_menu($m->term_id);} } foreach(GMCP_Tokens::all() as $t){ if(in_array($t["label"],["drafts only writer","plain writer","drafts only admin","pre-flag writer","do admin"],true)){GMCP_Tokens::revoke($t["id"]);} } global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_tokens WHERE client_id IN (SELECT client_id FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\")"); $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\"");' >/dev/null
 

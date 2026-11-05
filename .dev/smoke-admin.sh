@@ -3464,6 +3464,48 @@ if grep -q wordpress_logged_in "$AP_JAR"; then
   check "exactly one approval has been used" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals WHERE status=\"used\" AND tool=\"wp_delete_post\"')" "1"
   check "the refused replay is in the audit log" "$([ "$(ap_events replay_refused)" -ge 1 ] && echo yes || echo no)" "yes"
 
+  echo "   -- eight retries of one approved call at once: exactly one runs --"
+  # The claim is a single UPDATE ... WHERE status = 'approved', so two retries racing cannot
+  # both win. Asserted by counting what actually happened, not what was replied: the audit
+  # log's successful writes of this option, the approval row's state, and the option itself.
+  # The write is a scratch option under the wider mode, where wp_update_option is held.
+  ap_mode site
+  AP_RACE_KEY=smoke_probe_race
+  ap_eval 'delete_option("'"$AP_RACE_KEY"'");' >/dev/null
+  ap_race_ok() { ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_update_option\" AND outcome=\"ok\" AND args LIKE \"%'"$AP_RACE_KEY"'%\"'; }
+  AP_RACE_BEFORE=$(ap_race_ok)
+  ap_call ap_rc0 wp_update_option '{"key":"'"$AP_RACE_KEY"'","value":"raced"}'
+  AP_RR=$(ap_rid ap_rc0)
+  check "CONTROL: the scratch write is held first, and did nothing" \
+    "$(ap_state ap_rc0)/$(ap_eval 'echo get_option("'"$AP_RACE_KEY"'","unset");')" "awaiting_human_approval/unset"
+  ap_decide approve "$AP_RR"
+  check "CONTROL: a person approved it" "$(ap_status "$AP_RR")" "approved"
+  for i in 1 2 3 4 5 6 7 8; do
+    ap_call ap_rc$i wp_update_option '{"key":"'"$AP_RACE_KEY"'","value":"raced"}' &
+  done
+  wait
+  AP_RAN=0; AP_HELD=0
+  for i in 1 2 3 4 5 6 7 8; do
+    case "$(ap_state ap_rc$i)" in
+      -) AP_RAN=$((AP_RAN + 1)) ;;
+      awaiting_human_approval) AP_HELD=$((AP_HELD + 1)) ;;
+    esac
+  done
+  check "exactly one of the eight parallel retries ran, and the other seven were held" "$AP_RAN/$AP_HELD" "1/7"
+  check "the audit log holds exactly one successful write of it" "$(( $(ap_race_ok) - AP_RACE_BEFORE ))" "1"
+  check "the approval was spent exactly once" "$(ap_status "$AP_RR")" "used"
+  check "and the write happened" "$(ap_eval 'echo get_option("'"$AP_RACE_KEY"'","unset");')" "raced"
+  ap_eval 'delete_option("'"$AP_RACE_KEY"'");' >/dev/null
+  # Eight requests at once write eight audit rows at once. The chain is serialised with a named
+  # lock (GMCP_Audit, GET_LOCK), which a SQLite drop-in does not have: it answers null or a
+  # mangled "1=1" (measured), never "1", the rows fork the chain, and the verification further down reports a break that is the
+  # stack's and not the plugin's. Said out loud and cleared there; on MariaDB nothing is cleared.
+  if [ "$(ap_eval 'global $wpdb; $g=$wpdb->get_var("SELECT GET_LOCK(\"gmcp_probe\",1)"); if($g==="1"){$wpdb->get_var("SELECT RELEASE_LOCK(\"gmcp_probe\")");} echo $g===null?"none":$g;')" != "1" ]; then
+    echo "  ....  this stack has no GET_LOCK, so parallel audit writes fork the hash chain; clearing the log after the race"
+    ap_eval 'GMCP_Audit::clear();' >/dev/null
+  fi
+  ap_mode deletes
+
   echo "   -- declining, and the lapse of requests and approvals --"
   AP_C=$(ap_post "AP victim C")
   ap_call ap_d1 wp_delete_post "{\"ID\":$AP_C,\"force\":true}"
