@@ -1466,7 +1466,8 @@ class GMCP_Core {
   * status_write_refusal()). Only core's own wp_trash_post() and wp_untrash_post() may touch
   * it, and trash_meta_net() lets exactly those through. Matched case-insensitively and
   * ignoring trailing spaces, because the meta_key column compares that way: "_WP_TRASH_META_TIME "
-  * is the same row to every query WordPress runs.
+  * is the same row to every query WordPress runs. And accents, ignorable characters and expansions
+  * too, on the collations that have them (see GMCP_Meta_Key, which measured what they equal).
   *
   * Not on the list, and why: _edit_lock only says who is editing, _wp_desired_post_slug only
   * names the slug an untrash restores and _wp_old_slug only adds a redirect from a slug the
@@ -1559,8 +1560,9 @@ class GMCP_Core {
     if ( !is_string( $key ) ) {
       return null;
     }
-    $needle = strtolower( rtrim( $key ) );
-    if ( strncmp( $needle, '_wp_trash_meta_', 15 ) === 0 ) {
+    // The key as the database will compare it, not as it was typed: "_wp_trash_meta_tíme" is the
+    // "_wp_trash_meta_time" row to every query on a collation that ignores accents. @see GMCP_Meta_Key.
+    if ( GMCP_Meta_Key::starts_with( $key, '_wp_trash_meta_' ) ) {
       return 'The meta key "' . $key . '" is refused: WordPress deletes posts and comments for good on the schedule these keys hold, so writing one is a deletion by another name. Use wp_delete_post.';
     }
     // A page builder's layout, for the same reason and through the same door: the WordPress
@@ -1972,7 +1974,25 @@ class GMCP_Core {
     if ( !is_string( $key ) ) {
       return null;
     }
-    $needle = strtolower( rtrim( $key ) );
+    // Judged as the database will compare it, not as typed. On a collation that ignores accents
+    // "_thumbnaíl_id" updates the "_thumbnail_id" row (or, with none, files a row every later
+    // query for "_thumbnail_id" matches), so a rule keyed on the typed spelling was a rule for
+    // the people who spell it right. One verdict per spelling the collations disagree on. @see GMCP_Meta_Key.
+    foreach ( GMCP_Meta_Key::folds( $key ) as $needle ) {
+      $why = self::pointer_meta_refusal_for( $needle, $value, $object_id );
+      if ( $why !== null ) {
+        return $why;
+      }
+    }
+    return null;
+  }
+
+  /** The folded spelling of a meta key, the one every key policy judges. @see GMCP_Meta_Key::folds() */
+  public static function meta_key_fold( $key ): string {
+    return GMCP_Meta_Key::fold( $key );
+  }
+
+  private static function pointer_meta_refusal_for( string $needle, $value, int $object_id ): ?string {
     $target = 0;
     $what = '';
     if ( $needle === '_thumbnail_id' ) {

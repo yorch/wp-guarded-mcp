@@ -2197,6 +2197,118 @@ check "post_type, author, password and date were not written by the undo" "$(wpe
 wpe 'foreach ( [ '"$JC_POST"', '"$JC_TR"', '"$JC_AD"', '"$JC_AD_CTRL"', '"$JC_FORGE_ID"' ] as $i ) { wp_delete_post( $i, true ); } foreach ( GMCP_Tokens::all() as $t ) { if ( $t["label"] === "jc admin" ) { GMCP_Tokens::revoke( $t["id"] ); } } delete_option( "gmcp_journal" ); $o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=('"$JC_J_WAS"'===1);$o["mcp_activity_log"]=('"$JC_A_WAS"'===1);update_option("gmcp_options",$o,false);' >/dev/null
 check "put back: the fixtures are gone" "$(wpe 'echo count( get_posts( [ "post_type" => "any", "post_status" => "any", "numberposts" => -1, "s" => "JC " ] ) );')" "0"
 
+echo "-- a meta key is judged as the database compares it: accents, case, spaces and invisible characters --"
+# wp_postmeta.meta_key is compared by its column's collation, utf8mb4_unicode_520_ci on a stock WordPress:
+# accent-insensitive, case-insensitive, blind to combining marks and zero-width characters, and it
+# ignores trailing spaces. So update_metadata() filed a write for "_thumbnaíl_id" under the existing
+# "_thumbnail_id" row, and a policy that compared the typed spelling refused the right one and stored the
+# other. SQLite compares exactly, so none of this exists there: the block says so and skips, rather than
+# passing checks that could not have failed. Every claim is asserted on the STORED row, the public page,
+# or the post's survival of the trash purge, never on the reply.
+MK_FOLDS=$(wpe 'global $wpdb; $wpdb->suppress_errors( true ); echo $wpdb->get_var( "SELECT CONVERT(0xc3ad USING utf8mb4) COLLATE utf8mb4_unicode_520_ci = CHAR( 105 )" ) === "1" ? "folds" : "exact";')
+if [ "$MK_FOLDS" != "folds" ]; then
+  echo "  SKIP  this database compares meta keys exactly (SQLite, or a binary collation): the accent and case fold does not exist here, so nothing below could fail. Run this suite against MariaDB or MySQL."
+else
+K_MK=$(wpe '$a=GMCP_Tokens::create("mk writer","readwrite",0,[]);echo $a["secret"];')
+check "CONTROL: the suite minted a readwrite key for the block" "$([ -n "$K_MK" ] && echo yes || echo no)" "yes"
+MK_IDS=$(wpe '
+  $sub = wp_insert_post( [ "post_type" => "flamingo_inbound", "post_status" => "publish", "post_title" => "MK submission" ] );
+  $att = wp_insert_post( [ "post_type" => "attachment", "post_status" => "inherit", "post_parent" => $sub, "post_title" => "MK submission upload", "post_mime_type" => "image/png", "guid" => home_url( "/mk-att.png" ) ] );
+  update_post_meta( $att, "_wp_attached_file", "mk-att.png" );
+  $ok = wp_insert_post( [ "post_type" => "attachment", "post_status" => "inherit", "post_title" => "MK ordinary upload", "post_mime_type" => "image/png", "guid" => home_url( "/mk-ok.png" ) ] );
+  update_post_meta( $ok, "_wp_attached_file", "mk-ok.png" );
+  $pg = wp_insert_post( [ "post_type" => "post", "post_status" => "publish", "post_title" => "MK page", "post_content" => "MK body" ] );
+  $pg2 = wp_insert_post( [ "post_type" => "post", "post_status" => "publish", "post_title" => "MK page two", "post_content" => "MK body two" ] );
+  echo "$sub $att $ok $pg $pg2";')
+read -r MK_SUB MK_ATT MK_OK MK_PG MK_PG2 <<< "$MK_IDS"
+check "CONTROL: the fixtures exist (a submission, its upload, an ordinary upload, two public posts)" "$([ -n "$MK_PG2" ] && echo yes || echo no)" "yes"
+mk_thumb() { wpe 'wp_cache_flush(); global $wpdb; $v = $wpdb->get_var( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s ORDER BY meta_id LIMIT 1", '"$1"', "_thumbnail_id" ) ); echo $v === null ? "none" : $v;'; }
+mk_rows() { wpe 'wp_cache_flush(); global $wpdb; echo (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s", '"$1"', "'"$2"'" ) );'; }
+mk_page_has() { curl -sSL "$BASE/?p=$1" | grep -c "$2"; }
+
+# A. A featured image. The real one first, so there is an existing "_thumbnail_id" row to hit.
+callk mk0 "$K_MK" "$(tool_json 1 wp_set_featured_image "{\"post_id\":$MK_PG,\"media_id\":$MK_OK}")"
+check "CONTROL: the ordinary upload became the page's featured image" "$(verdict mk0)/$(mk_thumb $MK_PG)" "ok/$MK_OK"
+check "CONTROL: the public page renders that image (so the probe below can see a rendered file)" "$([ "$(mk_page_has $MK_PG mk-ok.png)" -ge 1 ] && echo yes || echo no)" "yes"
+callk mk1 "$K_MK" "$(tool_json 2 wp_update_post_meta "{\"ID\":$MK_PG,\"key\":\"_thumbnail_id\",\"value\":\"$MK_ATT\"}")"
+check "CONTROL: the exact spelling pointed at a submission's upload is refused" "$(verdict mk1)/$(mk_thumb $MK_PG)" "error/$MK_OK"
+MK_THUMB_VARIANTS='_thumbna\u00edl_id|_THUMBNA\u00cdL_ID|_thumbnail_id  |_thumbnai\u0301l_id|_thumb\u200bnail_id|_thumbnail_\u0131d|\uff3fthumbnail_id|_thumbnail_\uff49d|_thumb\u00adnail_id'
+IFS='|' read -r -a MK_VARS <<< "$MK_THUMB_VARIANTS"
+MK_N=10
+for MK_V in "${MK_VARS[@]}"; do
+  MK_N=$((MK_N+1))
+  callk mkv "$K_MK" "$(tool_json $MK_N wp_update_post_meta "{\"ID\":$MK_PG,\"key\":\"$MK_V\",\"value\":\"$MK_ATT\"}")"
+  check "STORED: the page's featured image is still the ordinary upload after a write under the spelling [$MK_V]" "$(mk_thumb $MK_PG)" "$MK_OK"
+  # Put it back through core, outside any tool call, so one variant's result cannot decide the next one's.
+  wpe 'delete_post_meta( '"$MK_PG"', "_thumbnail_id" ); update_post_meta( '"$MK_PG"', "_thumbnail_id", '"$MK_OK"' ); global $wpdb; $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key <> %s AND meta_key LIKE %s", '"$MK_PG"', "_thumbnail_id", "\\_thumb%" ) );' >/dev/null
+done
+check "STORED: still exactly one row the database reads as _thumbnail_id on the page" "$(mk_rows $MK_PG _thumbnail_id)" "1"
+check "the public page still shows the ordinary image" "$([ "$(mk_page_has $MK_PG mk-ok.png)" -ge 1 ] && echo yes || echo no)" "yes"
+check "and does not render the submission's upload" "$(mk_page_has $MK_PG mk-att.png)" "0"
+# The same value through meta_input, the batch tool and the featured-image tool with an accent-free key is covered
+# by smoke-forms.sh; here the accent goes in through the other generic route that takes a key.
+callk mkb "$K_MK" "$(tool_json 40 wp_update_post "{\"ID\":$MK_PG,\"meta_input\":{\"_thumbnaíl_id\":\"$MK_ATT\"}}")"
+check "STORED: meta_input under an accented spelling did not repoint the image either" "$(mk_thumb $MK_PG)" "$MK_OK"
+# The journal's undo replays through the same WordPress meta functions. An entry naming the accented key (forged
+# here, because the guarded writers can no longer record one) must not repoint the image when undone.
+MK_JOURNAL_WAS=$(wpe 'echo get_option( "gmcp_options", [] )["mcp_change_journal"] ?? 0 ? 1 : 0;')
+wpe '$o = get_option( "gmcp_options", [] ); $o["mcp_change_journal"] = true; update_option( "gmcp_options", $o, false );' >/dev/null
+wpe '$m = new ReflectionMethod( "GMCP_Journal", "meta_body" ); $m->setAccessible( true ); $e = $m->invoke( null, [ "kind" => "meta", "ID" => '"$MK_PG"', "key" => "_thumbna\u{00ED}l_id", "what" => "MK forged", "absent" => false, "id" => "mkforged01", "tool" => "wp_update_post_meta", "call" => "mkforgedcall", "t" => time() ], "'"$MK_ATT"'" ); update_option( "gmcp_journal", [ $e ], false );' >/dev/null
+check "CONTROL: the forged entry has a snapshot to replay" "$(wpe 'echo get_option( "gmcp_journal", [] )[0]["snapshot"] ?? 0 ? "yes" : "no";')" "yes"
+callk mku "$K_MK" "$(tool_json 39 wp_undo_change '{"id":"mkforged01"}')"
+check "STORED: undoing an entry for the accented key did not repoint the image" "$(mk_thumb $MK_PG)" "$MK_OK"
+wpe 'delete_option( "gmcp_journal" ); $o = get_option( "gmcp_options", [] ); $o["mcp_change_journal"] = ( '"$MK_JOURNAL_WAS"' === 1 ); update_option( "gmcp_options", $o, false );' >/dev/null
+# No existing row: a refused write must not leave a row under the accented spelling, because every query that asks
+# for "_thumbnail_id" matches it through the same collation.
+callk mkn "$K_MK" "$(tool_json 41 wp_update_post_meta "{\"ID\":$MK_PG2,\"key\":\"_thumbnaíl_id\",\"value\":\"$MK_ATT\"}")"
+check "STORED: with no featured image yet, the accented write left no row the database reads as _thumbnail_id" "$(verdict mkn)/$(mk_rows $MK_PG2 _thumbnail_id)" "error/0"
+check "the second page renders no submission file" "$(mk_page_has $MK_PG2 mk-att.png)" "0"
+# Controls on the other side of the fold: an unrelated accented key is an ordinary key.
+callk mkc "$K_MK" "$(tool_json 42 wp_update_post_meta "{\"ID\":$MK_PG2,\"key\":\"café_note\",\"value\":\"kept\"}")"
+check "CONTROL: an unrelated accented key (café_note) is still writable and stored under its own spelling" "$(verdict mkc)/$(wpe 'echo get_post_meta('"$MK_PG2"', "café_note", true);')/$(mk_rows $MK_PG2 'café_note')" "ok/kept/1"
+callk mkc2 "$K_MK" "$(tool_json 43 wp_update_post_meta "{\"ID\":$MK_PG2,\"key\":\"_thumbnail_ie\",\"value\":\"$MK_ATT\"}")"
+check "CONTROL: a key one letter off _thumbnail_id is an ordinary key" "$(verdict mkc2)" "ok"
+
+# B. A menu item's target: the same fold over the _menu_item_* family.
+MK_ITEM=$(wpe '
+  $m = wp_create_nav_menu( "MK menu" );
+  echo wp_update_nav_menu_item( $m, 0, [ "menu-item-object-id" => '"$MK_PG2"', "menu-item-object" => "post", "menu-item-type" => "post_type", "menu-item-status" => "publish" ] );')
+check "CONTROL: a menu item pointing at the ordinary page exists" "$(wpe 'echo (int) get_post_meta('"$MK_ITEM"', "_menu_item_object_id", true);')" "$MK_PG2"
+callk mm0 "$K_MK" "$(tool_json 50 wp_update_post_meta "{\"ID\":$MK_ITEM,\"key\":\"_menu_item_object_id\",\"value\":\"$MK_ATT\"}")"
+check "CONTROL: the exact spelling, pointed at a submission's upload, is refused" "$(verdict mm0)/$(wpe 'wp_cache_flush(); echo (int) get_post_meta('"$MK_ITEM"', "_menu_item_object_id", true);')" "error/$MK_PG2"
+MK_N=50
+for MK_V in '_menu_item_obj\u00e9ct_id' '_MENU_ITEM_OBJECT_ID' '_menu_item_object_id ' '_menu_item_object\u200b_id' '_menu_item_object_\u0131d'; do
+  MK_N=$((MK_N+1))
+  callk mmv "$K_MK" "$(tool_json $MK_N wp_update_post_meta "{\"ID\":$MK_ITEM,\"key\":\"$MK_V\",\"value\":\"$MK_ATT\"}")"
+  check "STORED: the menu item still points at the ordinary page after a write under [$MK_V]" "$(wpe 'wp_cache_flush(); echo (int) get_post_meta('"$MK_ITEM"', "_menu_item_object_id", true);')" "$MK_PG2"
+  wpe 'update_post_meta( '"$MK_ITEM"', "_menu_item_object_id", '"$MK_PG2"' );' >/dev/null
+done
+check "the public navigation names no submission upload" "$(wpe 'wp_cache_flush(); $i = wp_setup_nav_menu_item( get_post( '"$MK_ITEM"' ) ); echo strpos( (string) $i->title . (string) $i->url, "submission upload" ) === false ? "clean" : "LEAKS";')" "clean"
+
+# C. The deletion schedule. A trashed post is purged when its _wp_trash_meta_time is old enough, so a key the
+# database reads as that name, written with an accent INSIDE the part a byte comparison of the prefix looked at,
+# was a way to bring a person's trashed post forward to the next cron run.
+MK_TR=$(wpe '$id = wp_insert_post( [ "post_type" => "post", "post_status" => "publish", "post_title" => "MK trashed by a person" ] ); wp_trash_post( $id ); echo $id;')
+MK_TR2=$(wpe '$id = wp_insert_post( [ "post_type" => "post", "post_status" => "publish", "post_title" => "MK trashed control" ] ); wp_trash_post( $id ); echo $id;')
+check "CONTROL: both posts are in the trash with a trash stamp" "$(pstatus $MK_TR)/$(pstatus $MK_TR2)/$(mk_rows $MK_TR _wp_trash_meta_time)" "trash/trash/1"
+MK_N=60
+for MK_V in '_wp_tr\u00e1sh_meta_time' '_wp_trash\u0301_meta_time' '_WP_TRASH_META_TIME' '_wp_trash_meta_time ' '_wp_trash\u200b_meta_time' '_wp\uff3ftrash_meta_time' '_wp_tra\u00dfh_meta_time'; do
+  MK_N=$((MK_N+1))
+  callk mkt "$K_MK" "$(tool_json $MK_N wp_update_post_meta "{\"ID\":$MK_TR,\"key\":\"$MK_V\",\"value\":\"1\"}")"
+  check "STORED: after a write under [$MK_V] the post has one row the database reads as _wp_trash_meta_time, holding a current time and not 1" "$(mk_rows $MK_TR _wp_trash_meta_time)/$(wpe 'wp_cache_flush(); global $wpdb; echo (int) $wpdb->get_var( $wpdb->prepare( "SELECT MIN( CAST( meta_value AS UNSIGNED ) ) FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s", '"$MK_TR"', "_wp_trash_meta_time" ) ) > 1000000000 ? "current" : "TAMPERED";')" "1/current"
+  # Back to what core wrote, whatever the variant did, so the next one starts from the same place.
+  wpe 'global $wpdb; $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key LIKE %s", '"$MK_TR"', "\\_wp%trash%meta%" ) ); $wpdb->insert( $wpdb->postmeta, [ "post_id" => '"$MK_TR"', "meta_key" => "_wp_trash_meta_time", "meta_value" => time() ] ); $wpdb->insert( $wpdb->postmeta, [ "post_id" => '"$MK_TR"', "meta_key" => "_wp_trash_meta_status", "meta_value" => "publish" ] ); wp_cache_flush();' >/dev/null
+done
+# The control that makes the purge a probe: a stamp written by core's own API IS purged, by the same call.
+wpe 'global $wpdb; $wpdb->update( $wpdb->postmeta, [ "meta_value" => 1 ], [ "post_id" => '"$MK_TR2"', "meta_key" => "_wp_trash_meta_time" ] ); wp_cache_flush(); wp_scheduled_delete();' >/dev/null
+check "CONTROL: the daily purge deletes a trashed post whose stamp is old (the probe can find a purge)" "$(wpe 'echo get_post('"$MK_TR2"') ? "present" : "purged";')" "purged"
+check "the daily purge left the person's trashed post alone" "$(wpe 'echo get_post('"$MK_TR"') ? "present" : "purged";')" "present"
+
+# Put the site back.
+wpe 'foreach ( [ '"$MK_SUB"', '"$MK_ATT"', '"$MK_OK"', '"$MK_PG"', '"$MK_PG2"', '"$MK_TR"', '"$MK_TR2"', '"$MK_ITEM"' ] as $i ) { if ( get_post( $i ) ) { wp_delete_post( $i, true ); } } foreach ( wp_get_nav_menus() as $m ) { if ( $m->name === "MK menu" ) { wp_delete_nav_menu( $m->term_id ); } } foreach ( GMCP_Tokens::all() as $t ) { if ( $t["label"] === "mk writer" ) { GMCP_Tokens::revoke( $t["id"] ); } }' >/dev/null
+check "put back: the fixtures are gone" "$(wpe 'echo count( get_posts( [ "post_type" => "any", "post_status" => "any", "numberposts" => -1, "s" => "MK " ] ) );')" "0"
+fi
+
 # Put the site back: the fixtures, the keys, the grants. A guard test must not leave them.
 wpe 'foreach(get_posts(["post_status"=>"any","post_type"=>["post","page","attachment"],"numberposts"=>-1,"s"=>"DO "]) as $p){ if(strpos($p->post_title,"DO ")===0){wp_delete_post($p->ID,true);} } foreach(wp_get_nav_menus() as $m){ if($m->name==="DO net menu"){wp_delete_nav_menu($m->term_id);} } foreach(GMCP_Tokens::all() as $t){ if(in_array($t["label"],["drafts only writer","plain writer","drafts only admin","pre-flag writer","do admin"],true)){GMCP_Tokens::revoke($t["id"]);} } global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_tokens WHERE client_id IN (SELECT client_id FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\")"); $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\"");' >/dev/null
 

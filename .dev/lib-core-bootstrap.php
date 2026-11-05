@@ -44,4 +44,5 @@ if ( !function_exists( 'get_option' ) ) {
 
 require_once __DIR__ . '/../includes/diagnostics-util.php';
 require_once __DIR__ . '/../includes/credential-scan.php';
+require_once __DIR__ . '/../includes/meta-key.php';
 require_once __DIR__ . '/../includes/core.php';

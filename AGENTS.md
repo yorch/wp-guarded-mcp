@@ -87,7 +87,7 @@ refuses every generic write to a submission and to anything in its tree, at ever
 `tree_move_guard()` and `comment_write_guard()` refuse a write that moves a post or comment into
 or out of a submission's or an order's tree, which also stops a key hiding its own page under
 one; `pointer_meta_refusal()` refuses `_thumbnail_id` and the `_menu_item_*` keys pointing into
-one; and `install_personal_data_net()` asks the same of every writer that goes through
+one (judged on the key as the database compares it, see the next invariant); and `install_personal_data_net()` asks the same of every writer that goes through
 WordPress while a tool call is in flight (insert and attachment data, post meta by key and by
 id, term assignment, deletion, comment update, creation and removal), for what hangs FROM a
 submission and not for the submission's own row, because a form plugin writes that itself from
@@ -98,12 +98,30 @@ post, its meta, its terms or a comment asks the guard; the net is the backstop, 
 a test-only tool registered by its mu-plugin writes through WordPress with the net taken out to
 show that the change records hold when a writer asks nothing.
 
+**A policy about a meta key is about the key as the database compares it.** `wp_postmeta.meta_key`
+is compared by its collation, `utf8mb4_unicode_520_ci` on a stock WordPress, which ignores accents,
+case, combining marks, soft hyphens, zero-width and control characters and trailing spaces and
+expands `ß` to `ss`. So `update_post_meta( $id, '_thumbnaíl_id', 9 )` writes the existing
+`_thumbnail_id` row, and a rule that compared `strtolower( rtrim( $key ) )` refused one spelling and
+stored the other (measured on MariaDB with a read-write key: a form submission's upload became a
+page's featured image, and an accent inside `_wp_trash_meta_` rewrote a trashed post's purge stamp
+so the daily purge deleted it). SQLite compares exactly, so no suite run there can see it.
+`GMCP_Meta_Key::folds()` (`GMCP_Core::meta_key_fold()`) is the one answer, and
+`pointer_meta_refusal()` and `protected_meta_refusal()` ask it; a new policy keyed on a meta key
+asks it too. Resolving the key through the database is not enough (with no row yet the write files
+a new one under the accented spelling that every later query for the real name matches). The
+table is measured from the database by `.dev/build-meta-key-fold.php`, not written from Unicode
+tables; rebuild `includes/meta-key-fold-map.php` with it, and run `.dev/test-meta-key-fold.php`
+(with `GMCP_FOLD_DSN` to check the fold against a live server in both directions) and the
+MariaDB-only block in `smoke.sh`, which says it skipped on SQLite.
+
 **A deletion is not always a delete tool.** WordPress deletes on markers it reads from
 ordinary rows: `wp_scheduled_delete()` removes every post with an old `_wp_trash_meta_time`
 and `wp_delete_auto_drafts()` every old auto-draft. So `GMCP_Core::status_write_refusal()`
 refuses a status of `trash` or `auto-draft` in the write tools (and `spam` on a comment, which
 Akismet deletes after fifteen days), `protected_meta_refusal()`
-refuses the `_wp_trash_meta_` keys in every meta writer (with a net under the WordPress
+refuses the `_wp_trash_meta_` keys in every meta writer, in any spelling the database reads as the
+same key (with a net under the WordPress
 meta functions for writers that are not ours), and `GMCP_Approvals::classify_call()` reads
 the arguments as well as the tool's name. A write-level key that can reach any of them has a
 delete tool, whatever the README calls the level.

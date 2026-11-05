@@ -1262,7 +1262,35 @@ re-read.
   `wp_set_featured_image`, the meta tools or any writer) and a menu item's target
   (`_menu_item_object_id`, `_menu_item_object`, `_menu_item_type`, judged in both orders so a
   taxonomy item switched back to a post item does not carry the id through), refused when the
-  target is, or hangs from, a submission or an order. `wp_get_menu_items`, `wp_menu_health` and
+  target is, or hangs from, a submission or an order. **The key is judged as the database
+  compares it, not as it was typed** (`GMCP_Meta_Key`). `wp_postmeta.meta_key` is compared by its
+  column's collation, `utf8mb4_unicode_520_ci` on a stock WordPress, which ignores accents and
+  case, ignores combining marks, soft hyphens, zero-width and control characters, expands `ß`
+  to `ss` and ignores trailing spaces, so `_thumbnaíl_id` updates the `_thumbnail_id` row. A
+  rule on the typed spelling refused the right one and stored the other. Measured on MariaDB
+  10.11 with a read-write key: `wp_update_post_meta` on `_thumbnail_id` pointing at a submission's
+  upload was refused, on `_thumbnaíl_id` it was stored, and the public page then printed the
+  file; the same fold, with the accent inside the prefix (`_wp_trásh_meta_time`), rewrote a
+  trashed post's purge stamp to 1 and the next daily purge deleted a post a person had only
+  trashed, which is the "deletion by another name" refusal below reopened, and it repointed a
+  menu item. Resolving the key through the database is not enough, because with no existing row
+  the write files a new one under the accented spelling and every later query for
+  `_thumbnail_id` matches it through the same collation, so the policy asks the **folded**
+  spelling whether or not a row exists, in `pointer_meta_refusal()`, in
+  `protected_meta_refusal()` (and so in `trash_meta_net()`, the personal-data net and every meta
+  writer, `meta_input` included) and, because the journal's undo writes through the WordPress meta
+  functions, in the undo too. The fold's table was **measured, not written from the Unicode
+  tables**: `.dev/build-meta-key-fold.php` loads every code point into a scratch table and asks the
+  server which compare equal to a letter, digit, underscore or hyphen, to nothing, or to a space,
+  for `utf8mb4_unicode_520_ci`, `utf8mb4_unicode_ci`, `utf8mb4_general_ci` and `uca1400_ai_ci`, and
+  `includes/meta-key-fold-map.php` is its output (rebuild with that script). It is the union of
+  the four, which over-folds for any one of them (never under-folds); the one disagreement, `ß`
+  (`ss` in the Unicode collations, `s` in `utf8mb4_general_ci`), is asked both ways. A character
+  outside the table takes a generic fold (compatibility decomposition, accent removal, lower
+  case). A refusal of an odd key the database would have kept apart is the price; an admission
+  of one it would not is the failure, so every step errs toward folding. SQLite and binary
+  collations compare exactly and the fold changes nothing for them (an ordinary accented key such
+  as `café_note` is still writable everywhere). `wp_get_menu_items`, `wp_menu_health` and
   `wp_update_menu_item` leave out an item whose target the caller may not read, because
   WordPress fills an empty item title from the object, and the snapshot omits such a
   thumbnail. **The net.** `GMCP_Core::install_personal_data_net()` asks the same questions under
@@ -1361,7 +1389,13 @@ re-read.
     and seven parents) in the guards and in every SQL filter. A row related to a submission by a
     meta value holding its id is not, except the two pointers that print what they name, a
     featured image and a menu item's target, which are refused when written and left out when
-    read. An id inside any other value (an ACF relationship field, an Elementor widget naming a
+    read, and which are recognised by key on case- and accent-insensitive collations only
+    because of the fold above (measured on the four collations listed there, plus a generic
+    decomposition for the rest). A collation that equates a character neither the measured table
+    nor Unicode decomposition equates (a locale-tailored one, or `utf8mb4_0900_ai_ci` on a
+    character its Unicode version equates and decomposition does not) would not be recognised;
+    asking the live column collation instead is not done, because LIKE and prefix comparison
+    under expansions are not reliable and SQLite cannot answer. An id inside any other value (an ACF relationship field, an Elementor widget naming a
     post, a plugin's own table) is neither refused when written nor filtered when read.
   - A writer that is not one of the generic tools can still write a submission's own row (its
     title, body, meta and terms) while a tool call is in flight, because the net covers what
@@ -1958,8 +1992,10 @@ it, not by reading it.
   trashed post back to `draft` still works.
 - **The schedule itself is not writable.** Every meta key beginning `_wp_trash_meta_` is
   refused by every tool that writes post meta (update, delete, copy, chunk, `meta_input`
-  on create and update). Matching ignores case and trailing spaces because the column
-  compares that way. Reading one is allowed. Because other plugins write meta through the
+  on create and update). Matching is on the key as the database compares it, so case, trailing
+  spaces, accents, fullwidth forms, `ß` and invisible or combining characters inside the prefix
+  are all the same key (`GMCP_Meta_Key`, see the pointer rules above for how the fold was built
+  and measured: `_wp_trásh_meta_time` is the schedule row on MariaDB). Reading one is allowed. Because other plugins write meta through the
   same three WordPress functions, the same refusal also sits under them while a tool call
   is in flight (`GMCP_Core::trash_meta_net()`), letting through only core's own
   `wp_trash_post`, `wp_untrash_post` and `wp_delete_post`, which write and clear the key
