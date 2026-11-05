@@ -3173,6 +3173,20 @@ fetch_verdict() { # fetch_verdict <url> -> "refused" when the POLICY refused, "a
   py 'import json,sys;d=json.load(sys.stdin);t=d["result"]["content"][0]["text"] if "result" in d else "";print("refused" if t.startswith("Refused:") else "admitted")' pv_f
 }
 check "control: the site's own front page is admitted by the policy" "$(fetch_verdict "$BASE/")" "admitted"
+# The ways of spelling a blocked target. Each of these returned a real response (a 200 JSON
+# list of users, for the first) before the policy compared the DECODED path and the keys as
+# PHP names them. Every one is checked against the policy's refusal, with the controls above
+# and below showing the probe can see an admitted URL.
+check "index.php in front of the REST route is refused" "$(fetch_verdict "$BASE/index.php/wp-json/wp/v2/users")" "refused"
+check "an encoded hyphen in wp-json is refused" "$(fetch_verdict "$BASE/wp%2Djson/wp/v2/users")" "refused"
+check "rest.route (PHP reads it as rest_route) is refused" "$(fetch_verdict "$BASE/?rest.route=/wp/v2/users")" "refused"
+check "rest+route is refused" "$(fetch_verdict "$BASE/?rest+route=/wp/v2/users")" "refused"
+check "an encoded p in wp-login.php is refused" "$(fetch_verdict "$BASE/wp-login.ph%70")" "refused"
+check "an encoded p in wp-cron.php is refused" "$(fetch_verdict "$BASE/wp-cron.ph%70")" "refused"
+check "gmcp.preview (PHP reads it as the preview parameter) is refused" "$(fetch_verdict "$BASE/?p=$PV_A&gmcp.preview=$PV_LAST")" "refused"
+check "doing.wp.cron is refused" "$(fetch_verdict "$BASE/?doing.wp.cron=1")" "refused"
+check "control: an ordinary page with a query and an encoded space is admitted" "$(fetch_verdict "$BASE/?s=a%20b")" "admitted"
+check "stored state: the dotted-key preview URL did not put the token in any audit row" "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE args LIKE '%$PV_LAST%'")" "0"
 check "another host is refused" "$(fetch_verdict 'http://example.com/')" "refused"
 # example.com is also refused by a host that cannot be resolved, so that check can pass for
 # the wrong reason on a stack with no DNS. A loopback literal resolves by definition, and on a
@@ -3190,6 +3204,40 @@ check "a file URL is refused" "$(fetch_verdict 'file:///etc/passwd')" "refused"
 check "the refused fetch above, which carried a token in its url, did not record it" "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE args LIKE '%$PV_LAST%'")" "0"
 check "control: that call was recorded, with its url argument and the mark" \
   "$([ "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE tool='wp_fetch_page' AND args LIKE '%gmcp_preview=[redacted]%'")" -ge 1 ] && echo yes || echo no)" "yes"
+
+# The pin and an environment proxy. libcurl honours http_proxy from the process environment, a
+# proxy resolves the host name itself, and so a fetch could be answered by the proxy while the
+# reply said the connection was pinned. The proxy here is a closed port: if it is used, the
+# request fails; if it is bypassed, the page comes back. Run in the CLI so the variable is in the
+# process that makes the request. The first fetch is the control: where the site cannot reach its
+# own advertised address (the compose stack, see above) nothing below can be read and it says so.
+pv_cli_fetch() { # pv_cli_fetch <proxy-env-or-empty> -> "<status>|<connection>"
+  docker compose exec -T cli wp eval '
+    if ( "'"$1"'" !== "" ) { putenv( "http_proxy='"$1"'" ); putenv( "HTTP_PROXY='"$1"'" ); putenv( "https_proxy='"$1"'" ); putenv( "ALL_PROXY='"$1"'" ); putenv( "no_proxy" ); putenv( "NO_PROXY" ); }
+    global $gmcp_core;
+    $t = new GMCP_Tools_Diagnostics( $gmcp_core );
+    $r = $t->handle_call( null, "wp_fetch_page", [ "url" => home_url( "/" ) ], 1 );
+    $j = json_decode( $r["result"]["content"][0]["text"] ?? "", true );
+    echo is_array( $j ) ? ( $j["status"] ?? "?" ) . "|" . ( $j["connection"] ?? "-" ) : "error|" . substr( (string) ( $r["result"]["content"][0]["text"] ?? "" ), 0, 120 );' 2>/dev/null | tr -d '\r\n'
+}
+PV_DIRECT=$(pv_cli_fetch "")
+if [ "${PV_DIRECT%%|*}" = "200" ]; then
+  check "control: the site fetches its own front page" "${PV_DIRECT%%|*}" "200"
+  PV_PROXIED=$(pv_cli_fetch "http://127.0.0.1:9")
+  check "with a dead http_proxy in the environment the page still comes back (the proxy is bypassed)" "${PV_PROXIED%%|*}" "200"
+  check "...and the reply says the connection was direct" "${PV_PROXIED#*|}" "direct (no proxy), pinned to the address that was checked"
+  # WordPress's own proxy setting applies to this host: refused, nothing requested.
+  PV_WPPROXY=$(docker compose exec -T cli wp eval '
+    define( "WP_PROXY_HOST", "127.0.0.1" ); define( "WP_PROXY_PORT", "9" );
+    add_filter( "pre_http_send_through_proxy", "__return_true" ); // WordPress exempts the site host itself unless a filter says otherwise
+    global $gmcp_core;
+    $t = new GMCP_Tools_Diagnostics( $gmcp_core );
+    $r = $t->handle_call( null, "wp_fetch_page", [ "url" => home_url( "/" ) ], 1 );
+    echo strpos( (string) ( $r["result"]["content"][0]["text"] ?? "" ), "WP_PROXY_HOST" ) !== false ? "refused" : "went through";' 2>/dev/null | tr -d '\r\n')
+  check "a site configured to proxy its own host (WP_PROXY_HOST) is refused, not routed around" "$PV_WPPROXY" "refused"
+else
+  echo "  ....  proxy bypass not checked: the site could not fetch its own front page here (${PV_DIRECT})"
+fi
 
 # The error log tool.
 call pv_log '{"jsonrpc":"2.0","id":430,"method":"tools/call","params":{"name":"wp_get_php_error_log","arguments":{"lines":5}}}'

@@ -317,6 +317,18 @@ class GMCP_Tools_Diagnostics {
   * @return array{ok:bool,error?:string,code?:int,headers?:array,body?:string}
   */
   private function request( array $check ): array {
+    // WordPress's own proxy settings (WP_PROXY_HOST) apply to a request whose host they do not
+    // exempt, and a proxy resolves the host name itself, so it connects to whatever IT resolves
+    // and the address that was checked here is never used. The callback below switches the
+    // proxy off for this one request, but a site configured to REQUIRE the proxy for its own
+    // name is a site where a direct connection is not what the operator set up, so it is
+    // refused rather than quietly routed around.
+    if ( class_exists( 'WP_HTTP_Proxy' ) ) {
+      $wp_proxy = new WP_HTTP_Proxy();
+      if ( $wp_proxy->is_enabled() && $wp_proxy->send_through_proxy( $check['url'] ) ) {
+        return [ 'ok' => false, 'error' => 'WordPress is configured to send requests to this site\'s own host through a proxy (WP_PROXY_HOST), and a proxy makes its own connection, so the address that was checked cannot be enforced. Nothing was requested. Add this host to WP_PROXY_BYPASS_HOSTS, or remove the proxy, to use this tool.' ];
+      }
+    }
     $pinned = false;
     $callback = static function ( $handle, $args, $url ) use ( $check, &$pinned ) {
       if ( $url !== $check['url'] ) {
@@ -324,8 +336,14 @@ class GMCP_Tools_Diagnostics {
       }
       $ip = $check['pin'];
       $entry = $check['host'] . ':' . $check['port'] . ':' . ( strpos( $ip, ':' ) !== false ? '[' . $ip . ']' : $ip );
+      // No proxy, whatever the environment says. libcurl honours http_proxy / HTTPS_PROXY /
+      // ALL_PROXY from the process environment when nothing is set on the handle, and a proxy
+      // resolves the host name itself: CURLOPT_RESOLVE then pins nothing and the response is
+      // the proxy's. An explicit empty CURLOPT_PROXY and a catch-all CURLOPT_NOPROXY turn that
+      // off. Both must be accepted for the connection to count as pinned.
+      $direct = curl_setopt( $handle, CURLOPT_PROXY, '' ) && curl_setopt( $handle, CURLOPT_NOPROXY, '*' );
       // Pin first: whatever else this does, the connection must go where the check looked.
-      if ( curl_setopt( $handle, CURLOPT_RESOLVE, [ $entry ] ) ) {
+      if ( $direct && curl_setopt( $handle, CURLOPT_RESOLVE, [ $entry ] ) ) {
         $pinned = true;
       }
       if ( defined( 'CURLOPT_PROTOCOLS' ) ) {
@@ -439,6 +457,9 @@ class GMCP_Tools_Diagnostics {
       'body_cut_at_1MB' => $truncated,
       'x_robots_tag' => $resp['headers']['x-robots-tag'] !== '' ? $resp['headers']['x-robots-tag'] : null,
       'sent_cookies_or_credentials' => false,
+      // Reported only because request() discards the response unless the proxy was switched
+      // off and the address pin was applied, so a reply that exists is a reply for which this holds.
+      'connection' => 'direct (no proxy), pinned to the address that was checked',
     ];
     if ( $blocked ) {
       $out['redirect_not_followed'] = $blocked;

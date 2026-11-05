@@ -325,9 +325,14 @@ something that looks harmless and is not, so each says what it cannot promise.
   revoking are); anyone who is given the link can forward it; a link pasted into a
   post body or a message is outside what the audit log's scrub can see; the
   window between the address check and the connect is closed by pinning only
-  where the HTTP transport is cURL; and a site that is behind a proxy configured
-  through `WP_PROXY_HOST` has its connection made by the proxy, which pins
-  nothing.
+  where the HTTP transport is cURL. A proxy is never used for the fetch: libcurl
+  honours `http_proxy` and `HTTPS_PROXY` from the environment, and a proxy
+  resolves the host itself so the pin would hold nothing, so the request sets an
+  empty proxy and `NO_PROXY=*` on its own handle, and the response is discarded
+  unless both were accepted. A site whose WordPress proxy settings
+  (`WP_PROXY_HOST`, or the `pre_http_send_through_proxy` filter) apply to its
+  own host is refused outright rather than routed around. The reply's
+  `connection` field says so only for a response that passed that test.
 
 ## WooCommerce
 
