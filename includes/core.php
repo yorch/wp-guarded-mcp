@@ -891,6 +891,14 @@ class GMCP_Core {
   * @return true|string True when the write is allowed, otherwise the refusal.
   */
   public static function commerce_post_guard( int $post_id, string $verb = 'Changing', ?string $target_type = null ) {
+    // The same question for the other policy that refuses every generic write: a form
+    // submission, and what hangs from one. Asked here because this is the function every
+    // generic writer already asks, so one definition covers all of them. The name is the
+    // older of the two policies. @see personal_data_write_guard().
+    $held = self::personal_data_write_guard( $post_id, $verb );
+    if ( $held !== true ) {
+      return $held;
+    }
     $type = $post_id > 0 ? get_post_type( $post_id ) : false;
     // Another plugin's configuration row first, because the sentence differs and so does the
     // reason. Asked for the target type as well as the existing one: creating or retyping into
@@ -1704,6 +1712,339 @@ class GMCP_Core {
       . 'Retyping a submission would make it an ordinary post those tools read, and a submission made by hand is not one a visitor sent. The form tools read submissions; nothing here writes one.';
   }
 
+  #region What hangs from a submission: writes, moves and pointers
+
+  /** The form-submission post types, lowercased. @see personal_data_post_types() */
+  private static function held_personal_types(): array {
+    return array_map( 'strtolower', array_map( 'strval', self::personal_data_post_types() ) );
+  }
+
+  /**
+  * The nearest post type in a post's chain (itself, then every parent above it) that is a
+  * form-submission type, or null. Commerce types too when $commerce is set, for the questions
+  * where an order's tree must be as closed as a submission's (moving a row into or out of it).
+  *
+  * @param int|WP_Post $post
+  */
+  public static function guarded_tree_hit( $post, bool $commerce = false ): ?string {
+    $held = self::held_personal_types();
+    if ( $commerce ) {
+      $held = array_merge( $held, self::commerce_post_types() );
+    }
+    foreach ( self::post_chain_types( $post ) as $type ) {
+      if ( $type !== '' && in_array( $type, $held, true ) ) {
+        return $type;
+      }
+    }
+    return null;
+  }
+
+  /** The nearest form-submission type in a post's chain, or null. @see guarded_tree_hit() */
+  public static function personal_data_chain_hit( $post ): ?string {
+    return self::guarded_tree_hit( $post, false );
+  }
+
+  /**
+  * Whether a generic WRITE may touch this post, as far as the form-submission policy goes.
+  *
+  * The read guards keep a submission, and everything that hangs from it through post_parent,
+  * away from the generic readers. That is only true while the tree stays as it is, and every
+  * generic writer could change it: re-parent a revision of a submission and it was an ordinary
+  * post whose body any key read, re-parent a visitor's upload under a page and it was readable
+  * media, comment_post_ID did the same for a comment. So the policy is symmetric with the
+  * commerce one, which has always refused every generic write to an order: no generic write
+  * touches a submission or anything in its tree, at any access level. Nothing legitimate is
+  * lost, because nobody edits a visitor's submission through an administration agent and the
+  * form tools only read.
+  *
+  * Called from commerce_post_guard(), which every generic writer already asks, and by the
+  * writers that never asked it. The net below asks it again for the writers that ask neither.
+  *
+  * @param bool $descendants_only Refuse only a post that hangs FROM a submission, and let the
+  *                               submission's own row through. The net uses it: Flamingo records
+  *                               a contact (a post of a guarded type, with meta and terms) every
+  *                               time a user profile is saved, so refusing every write to such a
+  *                               row while a tool call is in flight broke wp_update_user and
+  *                               wp_create_user on a site that has it. The generic tools ask the
+  *                               strict question.
+  * @return true|string
+  */
+  public static function personal_data_write_guard( int $post_id, string $verb = 'Changing', bool $descendants_only = false ) {
+    if ( $post_id <= 0 ) {
+      return true;
+    }
+    $hit = self::personal_data_chain_hit( $post_id );
+    if ( $hit === null ) {
+      return true;
+    }
+    $own = strtolower( (string) get_post_type( $post_id ) );
+    if ( $descendants_only && $own === $hit ) {
+      return true;
+    }
+    return $verb . ' post #' . $post_id . ' is refused: '
+      . ( $own === $hit ? 'it is a ' . $hit : 'it is a ' . $own . ' that hangs from a ' . $hit ) . ', a form submission. '
+      . 'Nothing here edits, moves, annotates or deletes a visitor\'s submission or anything in its tree (its revisions, uploads and comments), at any access level: '
+      . 'the form tools only read, and a write through the generic tools would change what the readers return, move a row out of the tree they keep from the readers, or destroy the only record of what the visitor sent. '
+      . 'Handle submissions in wp-admin or with the form plugin.';
+  }
+
+  /**
+  * Whether a post may be given this parent, when that changes what it hangs from.
+  *
+  * Which readers may see a post is decided by the chain above it, so changing the parent is
+  * changing who may read it: moving a row OUT of a guarded tree makes it readable, moving one
+  * INTO it hides it from every generic reader (a key could bury one of its own published pages
+  * under a submission). Both are refused, and for the commerce trees as well as the
+  * submission ones, because the commerce read policy follows the same chain.
+  *
+  * @param int $post_id    The post being written, or 0 for a creation.
+  * @param int $new_parent The parent the write leaves it with.
+  * @return true|string
+  */
+  public static function tree_move_guard( int $post_id, int $new_parent, string $verb = 'Changing the parent of' ) {
+    $current = $post_id > 0 ? (int) get_post_field( 'post_parent', $post_id ) : 0;
+    if ( $new_parent === $current ) {
+      return true;
+    }
+    $from = $post_id > 0 ? self::guarded_tree_hit( $post_id, true ) : null;
+    // A creation is judged against submission trees only. Commerce plugins make child rows of
+    // an order themselves (a refund hangs from its order), so refusing every new child of a
+    // commerce post would break their own tools, and a new row cannot be hidden by it: the
+    // generic create tools take no parent. An EXISTING post is moved into or out of either.
+    $to = $new_parent > 0 ? self::guarded_tree_hit( $new_parent, $post_id > 0 ) : null;
+    if ( $from === null && $to === null ) {
+      return true;
+    }
+    return $verb . ( $post_id > 0 ? ' post #' . $post_id : ' a new post' ) . ' is refused: '
+      . ( $from !== null ? 'it is in the tree of a ' . $from : 'the new parent (#' . $new_parent . ') is in the tree of a ' . $to ) . '. '
+      . 'Which readers may see a post is decided by what it hangs from, so moving a row out of such a tree would make personal data readable and moving one into it would hide it from every generic reader. '
+      . 'Neither is done through these tools.';
+  }
+
+  /**
+  * Whether a comment may be written, as far as the post it is on (or would be moved to) goes.
+  *
+  * @param int      $comment_id  The comment, or 0 for a creation.
+  * @param int|null $new_post_id The post a creation names, or the one an update moves it to.
+  * @return true|string
+  */
+  public static function comment_write_guard( int $comment_id, ?int $new_post_id = null, string $verb = 'Changing' ) {
+    $current = 0;
+    if ( $comment_id > 0 ) {
+      $comment = get_comment( $comment_id );
+      $current = $comment ? (int) $comment->comment_post_ID : 0;
+    }
+    $moving = $comment_id > 0 && $new_post_id !== null && $new_post_id !== $current;
+    $targets = [ $current ];
+    if ( $new_post_id !== null && $new_post_id !== $current ) {
+      $targets[] = (int) $new_post_id;
+    }
+    foreach ( $targets as $post_id ) {
+      $hit = $post_id > 0 ? self::guarded_tree_hit( $post_id, $moving ) : null;
+      if ( $hit !== null ) {
+        return $verb . ( $comment_id > 0 ? ' comment #' . $comment_id : ' a comment' ) . ' is refused: '
+          . ( $moving ? 'it would be moved into or out of the tree of a ' . $hit : 'it is on a post in the tree of a ' . $hit . ', a form submission' ) . '. '
+          . 'A comment is read as the post it is on, so writing, moving or deleting one on a submission or anything hanging from it is refused at every access level, '
+          . 'for the reason post writes to one are: nothing here changes what the readers keep from a key that can only read.';
+      }
+    }
+    return true;
+  }
+
+  /**
+  * Meta keys whose VALUE is another post's id that something renders or reads from, and the
+  * refusal when that id is in a guarded tree.
+  *
+  * A featured image is displayed on the page that holds it and returned by the snapshot; a
+  * menu item copies its title and its URL from the object it points at, into the public
+  * navigation and into wp_get_menu_items. Pointing either at a visitor's submission or an
+  * upload of one is a read of it by another name, and a write that "touches only an
+  * ordinary post".
+  *
+  * @param mixed $value The value being written.
+  * @return string|null
+  */
+  public static function pointer_meta_refusal( $key, $value, int $object_id = 0 ): ?string {
+    if ( !is_string( $key ) ) {
+      return null;
+    }
+    $needle = strtolower( rtrim( $key ) );
+    $target = 0;
+    $what = '';
+    if ( $needle === '_thumbnail_id' ) {
+      $target = is_scalar( $value ) ? (int) $value : 0;
+      $what = 'a featured image';
+    }
+    elseif ( $needle === '_menu_item_object_id' ) {
+      $kind = $object_id > 0 ? (string) get_post_meta( $object_id, '_menu_item_type', true ) : '';
+      if ( !in_array( $kind, [ 'taxonomy', 'custom', 'post_type_archive' ], true ) ) {
+        $target = is_scalar( $value ) ? (int) $value : 0;
+        $what = 'a menu item';
+      }
+    }
+    elseif ( $needle === '_menu_item_type' ) {
+      // Judged in the other order too: an item made a taxonomy item, pointed at a number and
+      // then switched back to a post item would otherwise carry the id through.
+      if ( is_scalar( $value ) && (string) $value === 'post_type' && $object_id > 0 ) {
+        $target = (int) get_post_meta( $object_id, '_menu_item_object_id', true );
+        $what = 'a menu item';
+      }
+    }
+    elseif ( $needle === '_menu_item_object' ) {
+      $named = is_scalar( $value ) ? strtolower( trim( (string) $value ) ) : '';
+      if ( $named !== '' && in_array( $named, array_merge( self::held_personal_types(), self::commerce_post_types() ), true ) ) {
+        return 'Pointing a menu item at the ' . $named . ' type is refused: its rows are personal data and the public navigation would print them.';
+      }
+    }
+    if ( $target <= 0 ) {
+      return null;
+    }
+    $hit = self::guarded_tree_hit( $target, true );
+    if ( $hit === null ) {
+      return null;
+    }
+    return 'Using post #' . $target . ' as ' . $what . ' is refused: it is, or hangs from, a ' . $hit . '. '
+      . 'A featured image is shown on the public page that holds it and a menu item prints the title and URL of what it points at, so this would publish, and let every reader see, something the generic readers keep from them.';
+  }
+
+  /**
+  * The refusal for one post-meta write, from every route: the policy about the post it is on,
+  * and the policy about a value that points at another post.
+  */
+  public static function meta_write_refusal( int $object_id, $key, $value = null ): ?string {
+    if ( $object_id > 0 ) {
+      $held = self::personal_data_write_guard( $object_id, 'Writing meta on', true );
+      if ( $held !== true ) {
+        return $held;
+      }
+    }
+    return self::pointer_meta_refusal( $key, $value, $object_id );
+  }
+
+  private static $personal_net_installed = false;
+
+  /**
+  * The same refusals under WordPress, for writers that never ask the guards above: every
+  * route to a post, its meta, its terms, its comments or its deletion that goes through
+  * WordPress passes one of these hooks. Active only while a tool call is in flight, so
+  * wp-admin, cron and wp-cli (and the form plugins' own saves) are untouched. It throws, for
+  * the reason restrict_caller_to_drafts() does: a filter that answered false would let a
+  * writer report success over a write that did not happen.
+  *
+  * It refuses what hangs FROM a submission (a revision, an upload) being written, deleted or
+  * given other terms, a post or comment moving into or out of such a tree, and a pointer into
+  * one. It does NOT refuse a write to the submission's own row, because a form plugin keeps
+  * such rows itself and does so from hooks a tool call can fire (Flamingo records a contact when
+  * a profile is saved); the generic tools refuse that write themselves, through
+  * commerce_post_guard().
+  *
+  * What it cannot see: a plugin writing the posts or comments table with $wpdb directly,
+  * wp_set_comment_status() (no hook in front of it) and wp_insert_comment() (none either; the
+  * comment tool asks the guard itself, and wp_new_comment() is covered).
+  */
+  public static function install_personal_data_net(): void {
+    if ( self::$personal_net_installed ) {
+      return;
+    }
+    self::$personal_net_installed = true;
+    add_filter( 'wp_insert_post_data', [ __CLASS__, 'pd_net_insert' ], PHP_INT_MAX - 1, 4 );
+    add_filter( 'wp_insert_attachment_data', [ __CLASS__, 'pd_net_insert' ], PHP_INT_MAX - 1, 4 );
+    foreach ( [ 'add', 'update', 'delete' ] as $op ) {
+      add_filter( $op . '_post_metadata', [ __CLASS__, 'pd_net_meta' ], PHP_INT_MIN + 1, 4 );
+    }
+    add_filter( 'update_post_metadata_by_mid', [ __CLASS__, 'pd_net_meta_by_mid' ], PHP_INT_MIN + 1, 4 );
+    add_filter( 'delete_post_metadata_by_mid', [ __CLASS__, 'pd_net_meta_by_mid' ], PHP_INT_MIN + 1, 2 );
+    foreach ( [ 'pre_delete_post', 'pre_delete_attachment', 'pre_trash_post', 'pre_untrash_post' ] as $hook ) {
+      add_filter( $hook, [ __CLASS__, 'pd_net_remove' ], PHP_INT_MIN + 1, 2 );
+    }
+    add_action( 'add_term_relationship', [ __CLASS__, 'pd_net_terms' ], PHP_INT_MIN + 1, 3 );
+    add_action( 'delete_term_relationships', [ __CLASS__, 'pd_net_terms' ], PHP_INT_MIN + 1, 3 );
+    add_filter( 'wp_update_comment_data', [ __CLASS__, 'pd_net_comment_update' ], PHP_INT_MAX - 1, 3 );
+    add_filter( 'preprocess_comment', [ __CLASS__, 'pd_net_comment_new' ], PHP_INT_MIN + 1 );
+    foreach ( [ 'delete_comment', 'trash_comment' ] as $hook ) {
+      add_action( $hook, [ __CLASS__, 'pd_net_comment_remove' ], PHP_INT_MIN + 1, 1 );
+    }
+  }
+
+  private static function pd_refuse( $why ): void {
+    if ( $why !== true && $why !== null ) {
+      throw new GMCP_Policy_Refusal( (string) $why );
+    }
+  }
+
+  public static function pd_net_insert( $data, $postarr = [], $unsanitized = [], $update = false ) {
+    if ( !self::tool_in_flight() || !is_array( $data ) ) {
+      return $data;
+    }
+    $id = (int) ( $postarr['ID'] ?? 0 );
+    if ( $update && $id > 0 ) {
+      self::pd_refuse( self::personal_data_write_guard( $id, 'Updating', true ) );
+    }
+    $parent = (int) ( $data['post_parent'] ?? 0 );
+    self::pd_refuse( self::tree_move_guard( $update ? $id : 0, $parent, $update ? 'Changing the parent of' : 'Creating' ) );
+    return $data;
+  }
+
+  public static function pd_net_meta( $check, $object_id = 0, $meta_key = '', $meta_value = null ) {
+    if ( self::tool_in_flight() ) {
+      self::pd_refuse( self::meta_write_refusal( (int) $object_id, $meta_key, $meta_value ) );
+    }
+    return $check;
+  }
+
+  public static function pd_net_meta_by_mid( $check, $meta_id = 0, $meta_value = null, $meta_key = false ) {
+    if ( self::tool_in_flight() ) {
+      $row = function_exists( 'get_metadata_by_mid' ) ? get_metadata_by_mid( 'post', (int) $meta_id ) : null;
+      if ( $row ) {
+        self::pd_refuse( self::meta_write_refusal( (int) $row->post_id, $meta_key !== false ? $meta_key : $row->meta_key, $meta_value ) );
+      }
+    }
+    return $check;
+  }
+
+  public static function pd_net_remove( $check, $post = null ) {
+    if ( self::tool_in_flight() && $post instanceof WP_Post ) {
+      self::pd_refuse( self::personal_data_write_guard( (int) $post->ID, 'Removing', true ) );
+    }
+    return $check;
+  }
+
+  public static function pd_net_terms( $object_id = 0, $unused = null, $taxonomy = '' ) {
+    if ( !self::tool_in_flight() ) {
+      return;
+    }
+    // Only a taxonomy that belongs to the post's own type is a post write: the action also
+    // fires for users and links, whose ids can equal a post's.
+    $post = get_post( (int) $object_id );
+    $tax = $post ? get_taxonomy( (string) $taxonomy ) : null;
+    if ( $post && $tax && in_array( $post->post_type, (array) $tax->object_type, true ) ) {
+      self::pd_refuse( self::personal_data_write_guard( (int) $post->ID, 'Changing the terms of', true ) );
+    }
+  }
+
+  public static function pd_net_comment_update( $data, $comment = [], $commentarr = [] ) {
+    if ( self::tool_in_flight() && is_array( $data ) ) {
+      $cid = (int) ( $data['comment_ID'] ?? $commentarr['comment_ID'] ?? 0 );
+      self::pd_refuse( self::comment_write_guard( $cid, isset( $data['comment_post_ID'] ) ? (int) $data['comment_post_ID'] : null, 'Updating' ) );
+    }
+    return $data;
+  }
+
+  public static function pd_net_comment_new( $commentdata ) {
+    if ( self::tool_in_flight() && is_array( $commentdata ) ) {
+      self::pd_refuse( self::comment_write_guard( 0, (int) ( $commentdata['comment_post_ID'] ?? 0 ), 'Creating' ) );
+    }
+    return $commentdata;
+  }
+
+  public static function pd_net_comment_remove( $comment_id = 0 ) {
+    if ( self::tool_in_flight() ) {
+      self::pd_refuse( self::comment_write_guard( (int) $comment_id, null, 'Removing' ) );
+    }
+  }
+
+  #endregion
+
   /**
   * Whether a post is an Elementor library template something still renders, and the
   * sentence to refuse with.
@@ -2428,6 +2769,7 @@ class GMCP_Core {
     // archive minted before somebody switched it off is still removed when it lapses.
     GMCP_Tools_Export::boot();
     GMCP_Core::install_trash_meta_net();
+    GMCP_Core::install_personal_data_net();
 
     // How to put back what changed.
     if ( $this->get_option( 'mcp_change_journal' ) ) {

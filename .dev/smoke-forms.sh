@@ -97,6 +97,8 @@ wpe 'update_post_meta('"$NF"',"_field_1","'"$MARK"'-meta");update_post_meta('"$F
 check "CONTROL: the marker really is stored on the submission-type posts" \
   "$(wpe 'echo get_post_meta('"$NF"',"_field_1",true);')" "$MARK-meta"
 
+# Below admin a submission is answered exactly as a post that does not exist; an admin key is
+# told why, because it reads submissions through the form tools anyway.
 for tool_json in \
   "wp_get_post_meta|{\"ID\":$NF,\"key\":\"_field_1\"}" \
   "wp_get_post_meta|{\"ID\":$NF}" \
@@ -236,6 +238,14 @@ add_action( 'init', function () {
     register_post_type( 'flamingo_inbound', [ 'public' => true, 'show_in_rest' => false, 'label' => 'smoke submission',
       'supports' => [ 'title', 'editor', 'excerpt', 'comments', 'revisions', 'custom-fields' ] ] );
   }
+  // With the real form plugin active the type already exists, non-public and without revisions or
+  // comments. The seed below needs a submission with a revision and a comment that "any" can find.
+  foreach ( [ 'revisions', 'comments', 'title', 'editor', 'excerpt', 'custom-fields' ] as $feature ) {
+    add_post_type_support( 'flamingo_inbound', $feature );
+  }
+  if ( isset( $GLOBALS['wp_post_types']['flamingo_inbound'] ) ) {
+    $GLOBALS['wp_post_types']['flamingo_inbound']->exclude_from_search = false;
+  }
   register_taxonomy( 'gmcp_smoke_channel', [ 'flamingo_inbound' ], [ 'public' => true, 'hierarchical' => true, 'label' => 'smoke channel' ] );
   register_taxonomy( 'gmcp_smoke_shared', [ 'flamingo_inbound', 'post' ], [ 'public' => true, 'hierarchical' => true, 'label' => 'smoke shared' ] );
   if ( !post_type_exists( 'shop_order' ) ) {
@@ -267,6 +277,67 @@ function gmcp_smoke_seed( $m ) {
   }
   return $out;
 }
+// Stands in for a form plugin's own bookkeeping from a hook a tool call can fire: Flamingo saves a
+// contact (a post of a guarded type, with meta) every time a user profile is saved.
+add_action( 'profile_update', function ( $user_id ) {
+  if ( !get_option( 'gmcp_smoke_sideeffect' ) ) {
+    return;
+  }
+  $id = (int) get_option( 'gmcp_smoke_contact' );
+  if ( !$id || !get_post( $id ) ) {
+    $id = wp_insert_post( [ 'post_type' => 'flamingo_contact', 'post_status' => 'publish', 'post_title' => 'contact-created' ] );
+    update_option( 'gmcp_smoke_contact', $id, false );
+  }
+  wp_update_post( [ 'ID' => $id, 'post_title' => 'contact-updated-' . $user_id ] );
+  update_post_meta( $id, '_gmcp_smoke_side', 'meta-' . $user_id );
+} );
+// A tool that exists only for this suite. It writes through WordPress directly, and with
+// net=off with the net the plugin installs under its tools taken out first, which is how the
+// change records are shown to hold when a writer asks none of the guards.
+add_filter( 'gmcp_tools', function ( $tools ) {
+  $tools[] = [ 'name' => 'gmcp_smoke_rawwrite', 'description' => 'Test only.', 'category' => 'smoke', 'accessLevel' => 'write',
+    'inputSchema' => [ 'type' => 'object', 'properties' => [ 'op' => [ 'type' => 'string' ], 'id' => [ 'type' => 'integer' ],
+      'parent' => [ 'type' => 'integer' ], 'key' => [ 'type' => 'string' ], 'value' => [ 'type' => 'string' ], 'net' => [ 'type' => 'string' ] ], 'required' => [ 'op' ] ] ];
+  return $tools;
+} );
+add_filter( 'gmcp_callback', function ( $existing, $tool, $args ) {
+  if ( $tool !== 'gmcp_smoke_rawwrite' ) {
+    return $existing;
+  }
+  if ( ( $args['net'] ?? '' ) === 'off' ) {
+    foreach ( [ 'wp_insert_post_data', 'wp_insert_attachment_data' ] as $h ) {
+      remove_filter( $h, [ 'GMCP_Core', 'pd_net_insert' ], PHP_INT_MAX - 1 );
+    }
+    foreach ( [ 'add', 'update', 'delete' ] as $op ) {
+      remove_filter( $op . '_post_metadata', [ 'GMCP_Core', 'pd_net_meta' ], PHP_INT_MIN + 1 );
+    }
+    foreach ( [ 'pre_delete_post', 'pre_delete_attachment', 'pre_trash_post', 'pre_untrash_post' ] as $h ) {
+      remove_filter( $h, [ 'GMCP_Core', 'pd_net_remove' ], PHP_INT_MIN + 1 );
+    }
+    remove_filter( 'wp_update_comment_data', [ 'GMCP_Core', 'pd_net_comment_update' ], PHP_INT_MAX - 1 );
+  }
+  $id = (int) ( $args['id'] ?? 0 );
+  switch ( $args['op'] ?? '' ) {
+    case 'parent':
+      $r = wp_update_post( [ 'ID' => $id, 'post_parent' => (int) ( $args['parent'] ?? 0 ) ], true );
+      break;
+    case 'title':
+      $r = wp_update_post( [ 'ID' => $id, 'post_title' => (string) ( $args['value'] ?? '' ) ], true );
+      break;
+    case 'meta':
+      $r = update_post_meta( $id, (string) ( $args['key'] ?? '' ), (string) ( $args['value'] ?? '' ) );
+      break;
+    case 'create':
+      $r = wp_insert_post( [ 'post_type' => 'page', 'post_status' => 'draft', 'post_title' => (string) ( $args['value'] ?? 'raw' ), 'post_parent' => (int) ( $args['parent'] ?? 0 ) ], true );
+      break;
+    case 'comment_post':
+      $r = wp_update_comment( [ 'comment_ID' => $id, 'comment_post_ID' => (int) ( $args['parent'] ?? 0 ) ] );
+      break;
+    default:
+      $r = 'unknown op';
+  }
+  return is_wp_error( $r ) ? 'error: ' . $r->get_error_message() : 'done ' . wp_json_encode( $r );
+}, 10, 3 );
 PHP
 SEED=$(wpe 'echo wp_json_encode(gmcp_smoke_seed("'"$M2"'"));')
 sid() { python3 -c 'import json,sys;print(json.loads(sys.argv[1])[sys.argv[2]][sys.argv[3]])' "$SEED" "$1" "$2"; }
@@ -370,12 +441,20 @@ wpe 'global $wpdb;$wpdb->update($wpdb->posts,["post_modified"=>current_time("mys
 echo "-- the change journal and the audit log do not name or quote a submission --"
 JOURNAL_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_change_journal"]??"unset";')
 wpe '$o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=true;update_option("gmcp_options",$o,false);GMCP_Journal::clear();' >/dev/null
+# A write to a submission, or to anything in its tree, is refused at every level, so a record about
+# one can only come from a writer that asks no guard. The suite registers a test-only tool that
+# writes through WordPress directly, with the net under the tools taken out (net=off): the
+# defence in depth, which is that the records are withheld whatever the writer.
 callas "$RW" j1 "$(tc wp_update_post_meta "{\"ID\":$SUB,\"key\":\"_field_message\",\"value\":\"agent-wrote-this\"}")"
-check "the write to the submission's meta is not refused (this guard is about reading it)" "$(verdict j1)" "ok"
-check "STORED: the submission's meta really changed" "$(wpe 'echo get_post_meta('"$SUB"',"_field_message",true);')" "agent-wrote-this"
+check "the write to the submission's meta is refused" "$(verdict j1)" "error"
+check "STORED: the submission's meta is unchanged" "$(wpe 'echo get_post_meta('"$SUB"',"_field_message",true);')" "$M2-sub-meta"
 callas "$RW" j2 "$(tc wp_update_post "{\"ID\":$SUB,\"fields\":{\"post_title\":\"$M2-retitled\"}}")"
-check "an edit of its title is not refused either" "$(verdict j2)" "ok"
-check "STORED: the title really changed" "$(wpe 'echo get_post('"$SUB"')->post_title;')" "$M2-retitled"
+check "an edit of its title is refused" "$(verdict j2)" "error"
+check "STORED: the title is unchanged" "$(wpe 'echo get_post('"$SUB"')->post_title;')" "$M2-sub-title"
+callas "$RW" j2b "$(tc gmcp_smoke_rawwrite "{\"op\":\"meta\",\"id\":$SUB,\"key\":\"_field_message\",\"value\":\"agent-wrote-this\",\"net\":\"off\"}")"
+check "CONTROL: with the net out, a raw writer does change the submission's meta (so the records below describe a real write)" "$(wpe 'echo get_post_meta('"$SUB"',"_field_message",true);')" "agent-wrote-this"
+callas "$RW" j2c "$(tc gmcp_smoke_rawwrite "{\"op\":\"title\",\"id\":$SUB,\"value\":\"$M2-retitled\",\"net\":\"off\"}")"
+check "CONTROL: and its title" "$(wpe 'echo get_post('"$SUB"')->post_title;')" "$M2-retitled"
 callas "$RW" j3 "$(tc wp_update_post_meta "{\"ID\":$CTL,\"key\":\"_field_message\",\"value\":\"agent-wrote-this\"}")"
 check "CONTROL: the same write to an ordinary post succeeds" "$(verdict j3)" "ok"
 callas "$RO" j4 "$(tc wp_list_changes '{"limit":40}')"
@@ -416,7 +495,7 @@ if [ "$(verdict j8)" = "ok" ]; then
 else
   echo "  SKIP  wp_get_audit_log is not offered; the audit half of the change records was not exercised"
 fi
-wpe 'wp_update_post(["ID"=>'"$SUB"',"post_title"=>"'"$M2"'-sub-title"]);' >/dev/null
+wpe 'wp_update_post(["ID"=>'"$SUB"',"post_title"=>"'"$M2"'-sub-title"]);update_post_meta('"$SUB"',"_field_message","'"$M2"'-sub-meta");' >/dev/null
 
 echo "-- a scan that returns the titles of posts --"
 check "CONTROL: a post that quotes a template shortcode is reported by the scan" \
@@ -475,6 +554,251 @@ wpe 'delete_option("gmcp_smoke_guard_pages");delete_transient(GMCP_Tools_Rest::C
 callas "$RO" t8 '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 check "CONTROL: with the option removed the pages tools are back" \
   "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"list_pages","get_pages"}-n) or "present")' t8)" "present"
+if [ "$REST_WAS" = unset ]; then
+  wpe '$o=get_option("gmcp_options",[]);unset($o["mcp_tools_rest"]);update_option("gmcp_options",$o,false);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null
+else
+  setrest "$REST_WAS"
+fi
+# ---------------------------------------------------------------------------------------------
+echo "-- the tree cannot be rearranged: nothing is moved out of a submission, or into one --"
+# The read guards judge a post by what it hangs from, so every generic writer that could change
+# post_parent or comment_post_ID was a way round all of them. Each attack is made by a READWRITE
+# key and the read by a READ-ONLY one; every outcome is asserted on the STORED row, and each attack
+# has a control that the same kind of write to an ordinary post succeeds.
+CTLCOM=$(sid ctl comment)
+# A real image: set_post_thumbnail() refuses an attachment that is not one, and the control for the
+# featured-image guard has to be a thumbnail that WordPress itself would accept.
+OU=$(wpe '$b=wp_upload_bits("'"$M2"'-ou.png",null,base64_decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="));echo wp_insert_attachment(["post_mime_type"=>"image/png","post_title"=>"'"$M2"'-ou-title","post_status"=>"inherit"],$b["file"]);')
+# An earlier block retitled the ordinary post's upload; the controls below look for its marker.
+wpe 'wp_update_post(["ID"=>'"$CTLATT"',"post_title"=>"'"$M2"'-ctl-att-title"]);' >/dev/null
+PG=$(wpe 'echo wp_insert_post(["post_type"=>"page","post_status"=>"publish","post_title"=>"'"$M2"'-pg-title","post_content"=>"'"$M2"'-pg-body"]);')
+PG2=$(wpe 'echo wp_insert_post(["post_type"=>"page","post_status"=>"publish","post_title"=>"'"$M2"'-pg2-title"]);')
+CLEAN="$CLEAN $OU $PG $PG2"
+parent_of() { wpe 'echo (int) get_post('"$1"')->post_parent;'; }
+check "CONTROL: the seed is what the attacks assume: the revision, the upload and the comment hang from the submission" \
+  "$(parent_of $SUBREV)|$(parent_of $SUBATT)|$(wpe 'echo (int) get_comment('"$SUBCOM"')->comment_post_ID;')" "$SUB|$SUB|$SUB"
+
+# 1a. a revision of a submission is given another parent
+callas "$RW" m1 "$(tc wp_update_post "{\"ID\":$SUBREV,\"fields\":{\"post_parent\":0}}")"
+check "re-parenting a revision of a submission to 0 is refused" "$(verdict m1)" "error"
+check "STORED: the revision still hangs from the submission" "$(parent_of $SUBREV)" "$SUB"
+deny "wp_get_post on that revision, by a read-only key" "$RO" wp_get_post "{\"ID\":$SUBREV}" "$M2-sub"
+callas "$RW" m1b "$(tc wp_update_post "{\"ID\":$SUBREV,\"fields\":{\"post_title\":\"x\"}}")"
+check "any other write to that revision is refused too" "$(verdict m1b)" "error"
+check "STORED: its title is unchanged" "$(wpe 'echo get_post('"$SUBREV"')->post_title;')" "$M2-sub-title"
+callas "$RW" m1c "$(tc wp_update_post "{\"ID\":$CTLREV,\"fields\":{\"post_parent\":0}}")"
+check "CONTROL: the same re-parenting of a revision of an ORDINARY post succeeds" "$(verdict m1c)" "ok"
+check "CONTROL: and STORED: its parent is now 0 (the probe sees a move)" "$(parent_of $CTLREV)" "0"
+wpe 'global $wpdb;$wpdb->update($wpdb->posts,["post_parent"=>'"$CTL"'],["ID"=>'"$CTLREV"']);clean_post_cache('"$CTLREV"');' >/dev/null
+
+# 1b. a visitor's upload is given an ordinary parent
+callas "$RW" m2 "$(tc wp_update_post "{\"ID\":$SUBATT,\"post_parent\":$CTL}")"
+check "re-parenting a submission's upload under an ordinary post is refused" "$(verdict m2)" "error"
+check "STORED: the upload still hangs from the submission" "$(parent_of $SUBATT)" "$SUB"
+callas "$RW" m2b "$(tc wp_update_post "{\"ID\":$SUBATT,\"fields\":{\"post_parent\":$CTL}}")"
+check "the same through fields" "$(verdict m2b)" "error"
+check "STORED: still unchanged" "$(parent_of $SUBATT)" "$SUB"
+quiet "wp_get_media after the attempts" "$RO" wp_get_media '{"search":"'"$M2"'","limit":200}' "$M2-sub"
+deny "wp_get_post_meta on the upload after the attempts" "$RO" wp_get_post_meta "{\"ID\":$SUBATT}" "$M2-sub"
+callas "$RW" m2c "$(tc wp_update_post "{\"ID\":$OU,\"post_parent\":$CTL}")"
+check "CONTROL: re-parenting an ordinary upload under an ordinary post succeeds" "$(verdict m2c)" "ok"
+check "CONTROL: and STORED: it moved" "$(parent_of $OU)" "$CTL"
+callas "$RW" m2d "$(tc wp_update_post "{\"ID\":$OU,\"post_parent\":0}")"
+
+# 1c. a comment on a submission is moved to an ordinary post
+callas "$RW" m3 "$(tc wp_update_comment "{\"comment_ID\":$SUBCOM,\"fields\":{\"comment_post_ID\":$CTL}}")"
+check "moving a comment on a submission to an ordinary post is refused" "$(verdict m3)" "error"
+check "STORED: it is still on the submission" "$(wpe 'echo (int) get_comment('"$SUBCOM"')->comment_post_ID;')" "$SUB"
+quiet "wp_get_comments after the attempt" "$RO" wp_get_comments '{"search":"'"$M2"'","limit":500}' "$M2-sub"
+callas "$RW" m3b "$(tc wp_update_comment "{\"comment_ID\":$SUBCOM,\"fields\":{\"comment_content\":\"edited\"}}")"
+check "editing a comment on a submission is refused" "$(verdict m3b)" "error"
+# wp_delete_comment, wp_delete_post, wp_delete_media and wp_delete_post_meta are admin-level tools:
+# a call by the read-write key would be refused for its level, which proves nothing about the guard.
+callas "$TOK" m3c "$(tc wp_delete_comment "{\"comment_ID\":$SUBCOM,\"force\":true}")"
+check "an admin key's deleting a comment on a submission is refused" "$(verdict m3c)" "error"
+check "and the refusal is the guard's, not the tool's level" "$(has m3c "form submission")" "yes"
+DELCOM=$(wpe 'echo wp_insert_comment(["comment_post_ID"=>'"$CTL"',"comment_content"=>"'"$M2"'-delcom","comment_author"=>"a","comment_approved"=>1]);')
+callas "$TOK" m3c2 "$(tc wp_delete_comment "{\"comment_ID\":$DELCOM,\"force\":true}")"
+check "CONTROL: an admin key's deleting a comment on an ordinary post succeeds" "$(verdict m3c2)" "ok"
+check "CONTROL: and STORED: it is gone" "$(wpe 'echo get_comment('"$DELCOM"')?"there":"gone";')" "gone"
+check "STORED: the comment is still there, unedited" "$(wpe 'echo get_comment('"$SUBCOM"')->comment_content;')" "$M2-sub-comment"
+callas "$RW" m3d "$(tc wp_create_comment "{\"post_id\":$SUB,\"comment_content\":\"agent-comment\"}")"
+check "creating a comment on a submission is refused" "$(verdict m3d)" "error"
+check "STORED: no such comment exists" "$(wpe 'echo count(get_comments(["search"=>"agent-comment"]));')" "0"
+callas "$RW" m3d2 "$(tc wp_create_comment "{\"post_id\":$CTL,\"comment_content\":\"agent-comment\"}")"
+check "CONTROL: creating a comment on an ordinary post succeeds" "$(verdict m3d2)" "ok"
+check "CONTROL: and STORED: it exists (the probe sees a created comment)" "$(wpe 'echo count(get_comments(["search"=>"agent-comment"]));')" "1"
+wpe 'foreach(get_comments(["search"=>"agent-comment"]) as $c){wp_delete_comment($c->comment_ID,true);}' >/dev/null
+callas "$RW" m3e "$(tc wp_update_comment "{\"comment_ID\":$CTLCOM,\"fields\":{\"comment_content\":\"$M2-ctl-edited\"}}")"
+check "CONTROL: editing a comment on an ordinary post succeeds" "$(verdict m3e)" "ok"
+check "CONTROL: and STORED: it changed" "$(wpe 'echo get_comment('"$CTLCOM"')->comment_content;')" "$M2-ctl-edited"
+callas "$RW" m3f "$(tc wp_update_comment "{\"comment_ID\":$CTLCOM,\"fields\":{\"comment_post_ID\":$PG}}")"
+check "CONTROL: moving a comment between ordinary posts succeeds" "$(verdict m3f)" "ok"
+check "CONTROL: and STORED: it moved" "$(wpe 'echo (int) get_comment('"$CTLCOM"')->comment_post_ID;')" "$PG"
+wpe 'wp_update_comment(["comment_ID"=>'"$CTLCOM"',"comment_post_ID"=>'"$CTL"',"comment_content"=>"'"$M2"'-ctl-comment"]);' >/dev/null
+
+# 1d. hiding: an ordinary page is parented under a submission
+callas "$RW" m4 "$(tc wp_update_post "{\"ID\":$PG,\"fields\":{\"post_parent\":$SUB}}")"
+check "parenting an ordinary page under a submission is refused" "$(verdict m4)" "error"
+check "STORED: the page has no parent" "$(parent_of $PG)" "0"
+allow "wp_get_post on the page, which a key could otherwise hide from every reader" "$RO" wp_get_post "{\"ID\":$PG}" "$M2-pg"
+callas "$RW" m4b "$(tc wp_update_post "{\"ID\":$PG,\"fields\":{\"post_parent\":$SUBATT}}")"
+check "and under a submission's upload" "$(verdict m4b)" "error"
+check "STORED: still no parent" "$(parent_of $PG)" "0"
+callas "$RW" m4c "$(tc wp_update_post "{\"ID\":$PG,\"fields\":{\"post_parent\":$PG2}}")"
+check "CONTROL: parenting it under another ordinary page succeeds" "$(verdict m4c)" "ok"
+check "CONTROL: and STORED: it has that parent" "$(parent_of $PG)" "$PG2"
+allow "wp_get_post on the child page, still readable" "$RO" wp_get_post "{\"ID\":$PG}" "$M2-pg"
+callas "$RW" m4d "$(tc wp_update_post "{\"ID\":$PG,\"fields\":{\"post_parent\":0}}")"
+check "CONTROL: and back to none" "$(parent_of $PG)" "0"
+# an order's tree is as closed to a move
+callas "$RW" m4e "$(tc wp_update_post "{\"ID\":$PG,\"fields\":{\"post_parent\":$ORD}}")"
+check "parenting an ordinary page under an order is refused as well" "$(verdict m4e)" "error"
+check "STORED: still no parent" "$(parent_of $PG)" "0"
+
+# 1e. the net under the tools, for a writer that asks no guard (the test tool writes through WordPress)
+callas "$RW" n1 "$(tc gmcp_smoke_rawwrite "{\"op\":\"parent\",\"id\":$SUBREV,\"parent\":0}")"
+check "the net refuses a raw re-parenting of a revision of a submission" "$(verdict n1)" "error"
+check "STORED: it still hangs from the submission" "$(parent_of $SUBREV)" "$SUB"
+callas "$RW" n2 "$(tc gmcp_smoke_rawwrite "{\"op\":\"parent\",\"id\":$PG,\"parent\":$SUB}")"
+check "the net refuses a raw parenting of an ordinary page under a submission" "$(verdict n2)" "error"
+check "STORED: the page has no parent" "$(parent_of $PG)" "0"
+callas "$RW" n3 "$(tc gmcp_smoke_rawwrite "{\"op\":\"comment_post\",\"id\":$SUBCOM,\"parent\":$CTL}")"
+check "the net refuses a raw move of a comment out of a submission" "$(verdict n3)" "error"
+check "STORED: the comment is still on the submission" "$(wpe 'echo (int) get_comment('"$SUBCOM"')->comment_post_ID;')" "$SUB"
+callas "$RW" n3b "$(tc gmcp_smoke_rawwrite "{\"op\":\"create\",\"parent\":$SUB,\"value\":\"$M2-raw-created\"}")"
+check "the net refuses a raw creation of a post under a submission" "$(verdict n3b)" "error"
+check "STORED: nothing was created" "$(wpe 'echo count(get_posts(["post_type"=>"page","post_status"=>"any","numberposts"=>-1,"s"=>"'"$M2"'-raw-created"]));')" "0"
+callas "$RW" n3c "$(tc gmcp_smoke_rawwrite "{\"op\":\"create\",\"parent\":$CTL,\"value\":\"$M2-raw-created\"}")"
+check "CONTROL: the same creation under an ordinary post is not refused" "$(verdict n3c)" "ok"
+check "CONTROL: and STORED: the page exists (the probe sees a creation)" "$(wpe 'echo count(get_posts(["post_type"=>"page","post_status"=>"any","numberposts"=>-1,"s"=>"'"$M2"'-raw-created"]));')" "1"
+wpe 'foreach(get_posts(["post_type"=>"page","post_status"=>"any","numberposts"=>-1,"s"=>"'"$M2"'-raw-created"]) as $p){wp_delete_post($p->ID,true);}' >/dev/null
+callas "$RW" n4 "$(tc gmcp_smoke_rawwrite "{\"op\":\"meta\",\"id\":$SUBATT,\"key\":\"_wp_attachment_image_alt\",\"value\":\"raw\"}")"
+check "the net refuses a raw meta write on a submission's upload" "$(verdict n4)" "error"
+check "STORED: the upload's meta is unchanged" "$(wpe 'echo get_post_meta('"$SUBATT"',"_wp_attachment_image_alt",true);')" ""
+# (update_post_meta() on a REVISION id writes to the revision's parent, so a meta write "on" a
+# revision is a write to the submission's own row, which the net leaves to the generic tools.)
+callas "$RW" n5 "$(tc gmcp_smoke_rawwrite "{\"op\":\"parent\",\"id\":$PG2,\"parent\":$PG}")"
+check "CONTROL: the same raw re-parenting between ordinary pages is not refused" "$(verdict n5)" "ok"
+check "CONTROL: and STORED: it moved" "$(parent_of $PG2)" "$PG"
+wpe 'global $wpdb;$wpdb->update($wpdb->posts,["post_parent"=>0],["ID"=>'"$PG2"']);clean_post_cache('"$PG2"');' >/dev/null
+
+echo "-- a form plugin's own bookkeeping, from a hook a tool call fires, is not refused --"
+# Flamingo saves a contact (a post of a guarded type, with meta) every time a user profile is saved,
+# so wp_update_user and wp_create_user fire a write to such a row. The net under the tools refuses
+# what hangs FROM a submission and leaves the submission's own row to the generic tools, which refuse
+# it themselves; a net that refused it too broke those two tools on a site with Flamingo, which was
+# measured on the first full run. The mu-plugin stands in for the plugin, so this does not depend on it.
+SEU=$(wpe 'echo wp_insert_user(["user_login"=>"'"$M2"'-seu","user_email"=>"seu-'"$RANDOM"'@example.test","user_pass"=>wp_generate_password(),"role"=>"subscriber"]);')
+wpe 'update_option("gmcp_smoke_sideeffect",1);delete_option("gmcp_smoke_contact");' >/dev/null
+callas "$TOK" se1 "$(tc wp_update_user "{\"ID\":$SEU,\"fields\":{\"display_name\":\"$M2-seu-name\"}}")"
+check "wp_update_user succeeds although a plugin hook creates and writes a submission-type post during the call" "$(verdict se1)" "ok"
+check "STORED: the user's display name changed" "$(wpe 'echo get_userdata('"$SEU"')->display_name;')" "$M2-seu-name"
+check "STORED: and the hook's own writes to its contact row went through (title and meta)" \
+  "$(wpe '$c=(int) get_option("gmcp_smoke_contact");echo get_post_type($c),"|",get_post($c)->post_title,"|",get_post_meta($c,"_gmcp_smoke_side",true);')" "flamingo_contact|contact-updated-$SEU|meta-$SEU"
+callas "$TOK" se2 "$(tc wp_update_user "{\"ID\":$SEU,\"fields\":{\"display_name\":\"$M2-seu-name-2\"}}")"
+check "and a second call, which UPDATES the row the first created, succeeds as well" "$(verdict se2)" "ok"
+wpe 'wp_delete_post((int) get_option("gmcp_smoke_contact"),true);delete_option("gmcp_smoke_contact");delete_option("gmcp_smoke_sideeffect");wp_delete_user('"$SEU"');' >/dev/null
+
+echo "-- a featured image is a read: nothing makes a visitor's upload a public page's thumbnail --"
+callas "$RW" f1 "$(tc wp_set_featured_image "{\"post_id\":$PG,\"media_id\":$SUBATT}")"
+check "setting a submission's upload as a page's featured image is refused" "$(verdict f1)" "error"
+check "STORED: the page has no thumbnail" "$(wpe 'echo (int) get_post_meta('"$PG"',"_thumbnail_id",true);')" "0"
+callas "$RW" f1b "$(tc wp_update_post_meta "{\"ID\":$PG,\"meta\":{\"_thumbnail_id\":\"$SUBATT\"}}")"
+check "writing _thumbnail_id through the meta tool is refused too" "$(verdict f1b)" "error"
+check "STORED: still no thumbnail" "$(wpe 'echo (int) get_post_meta('"$PG"',"_thumbnail_id",true);')" "0"
+callas "$RW" f1c "$(tc gmcp_smoke_rawwrite "{\"op\":\"meta\",\"id\":$PG,\"key\":\"_thumbnail_id\",\"value\":\"$SUBATT\"}")"
+check "and through a raw writer (the net)" "$(verdict f1c)" "error"
+check "STORED: still no thumbnail" "$(wpe 'echo (int) get_post_meta('"$PG"',"_thumbnail_id",true);')" "0"
+callas "$RW" f1d "$(tc wp_update_post "{\"ID\":$PG,\"meta_input\":{\"_thumbnail_id\":\"$SUBATT\"}}")"
+check "writing _thumbnail_id through meta_input is refused too" "$(verdict f1d)" "error"
+check "STORED: still no thumbnail" "$(wpe 'echo (int) get_post_meta('"$PG"',"_thumbnail_id",true);')" "0"
+BEFORE_PC=$(wpe 'echo count(get_posts(["post_type"=>"post","post_status"=>"any","numberposts"=>-1,"s"=>"'"$M2"'-pointer"]));')
+callas "$RW" f1e "$(tc wp_create_post "{\"post_title\":\"$M2-pointer\",\"meta_input\":{\"_thumbnail_id\":\"$SUBATT\"}}")"
+check "creating a post with the submission's upload as its thumbnail is refused" "$(verdict f1e)" "error"
+check "STORED: and no post was created by the attempt" "$(wpe 'echo count(get_posts(["post_type"=>"post","post_status"=>"any","numberposts"=>-1,"s"=>"'"$M2"'-pointer"]));')" "$BEFORE_PC"
+callas "$RW" f2 "$(tc wp_set_featured_image "{\"post_id\":$PG,\"media_id\":$OU}")"
+check "CONTROL: setting an ordinary upload as the featured image succeeds" "$(verdict f2)" "ok"
+check "CONTROL: and STORED: it is the thumbnail" "$(wpe 'echo (int) get_post_meta('"$PG"',"_thumbnail_id",true);')" "$OU"
+allow "wp_get_post_snapshot of the page shows its ordinary thumbnail" "$RO" wp_get_post_snapshot "{\"ID\":$PG}" "$M2-ou"
+# A thumbnail already in place before the guard existed, set outside any tool call.
+wpe 'update_post_meta('"$PG"',"_thumbnail_id",'"$SUBATT"');' >/dev/null
+check "CONTROL: the page now carries the submission's upload as its thumbnail (set outside a tool)" "$(wpe 'echo (int) get_post_meta('"$PG"',"_thumbnail_id",true);')" "$SUBATT"
+callas "$RO" f3 "$(tc wp_get_post_snapshot "{\"ID\":$PG}")"
+check "wp_get_post_snapshot of the page answers" "$(verdict f3)" "ok"
+check "and does not return the submission's upload as its thumbnail" "$(has f3 "$M2-sub")" "no"
+check "CONTROL: it still returns the page itself" "$(has f3 "$M2-pg")" "yes"
+wpe 'delete_post_meta('"$PG"',"_thumbnail_id");' >/dev/null
+
+echo "-- a menu item is a read of what it points at --"
+MENU=$(wpe 'echo wp_create_nav_menu("'"$M2"'-menu");')
+MI_OK=$(wpe 'echo wp_update_nav_menu_item('"$MENU"',0,["menu-item-type"=>"post_type","menu-item-object"=>"post","menu-item-object-id"=>'"$CTL"',"menu-item-status"=>"publish"]);')
+MI_AIM=$(wpe 'echo wp_update_nav_menu_item('"$MENU"',0,["menu-item-type"=>"post_type","menu-item-object"=>"post","menu-item-object-id"=>'"$CTL"',"menu-item-status"=>"publish"]);')
+MI_OLD=$(wpe 'echo wp_update_nav_menu_item('"$MENU"',0,["menu-item-type"=>"post_type","menu-item-object"=>"flamingo_inbound","menu-item-object-id"=>'"$SUB"',"menu-item-status"=>"publish"]);')
+CLEAN="$CLEAN $MI_OK $MI_AIM $MI_OLD"
+check "CONTROL: the menu holds an item that points at the submission (made outside any tool)" "$(wpe 'echo (int) get_post_meta('"$MI_OLD"',"_menu_item_object_id",true);')" "$SUB"
+callas "$RO" mi0 "$(tc wp_get_menu_items "{\"menu\":\"$MENU\"}")"
+check "wp_get_menu_items answers" "$(verdict mi0)" "ok"
+check "CONTROL: it lists the item that points at an ordinary post, with that post's title" "$(has mi0 "$M2-ctl-title")" "yes"
+check "it does not list the item that points at a submission" "$(has mi0 "$M2-sub-title")" "no"
+check "nor give its id" "$(has mi0 "\"item_id\": $MI_OLD")" "no"
+callas "$RW" mi1 "$(tc wp_update_post_meta "{\"ID\":$MI_AIM,\"meta\":{\"_menu_item_object_id\":\"$SUB\",\"_menu_item_object\":\"flamingo_inbound\"}}")"
+check "re-pointing a menu item at a submission through its meta is refused" "$(verdict mi1)" "error"
+check "STORED: the item still points at the ordinary post" "$(wpe 'echo (int) get_post_meta('"$MI_AIM"',"_menu_item_object_id",true),"|",get_post_meta('"$MI_AIM"',"_menu_item_object",true);')" "$CTL|post"
+callas "$RW" mi1b "$(tc wp_update_post_meta "{\"ID\":$MI_AIM,\"meta\":{\"_menu_item_object_id\":\"$SUBATT\"}}")"
+check "and at a submission's upload" "$(verdict mi1b)" "error"
+callas "$RW" mi1c "$(tc gmcp_smoke_rawwrite "{\"op\":\"meta\",\"id\":$MI_AIM,\"key\":\"_menu_item_object_id\",\"value\":\"$SUB\"}")"
+check "and through a raw writer (the net)" "$(verdict mi1c)" "error"
+check "STORED: still the ordinary post" "$(wpe 'echo (int) get_post_meta('"$MI_AIM"',"_menu_item_object_id",true);')" "$CTL"
+# The same attack in two steps: make it a taxonomy item, point it at the number, switch it back.
+callas "$RW" mi2a "$(tc wp_update_post_meta "{\"ID\":$MI_AIM,\"meta\":{\"_menu_item_type\":\"taxonomy\"}}")"
+callas "$RW" mi2b "$(tc wp_update_post_meta "{\"ID\":$MI_AIM,\"meta\":{\"_menu_item_object_id\":\"$SUB\"}}")"
+callas "$RW" mi2c "$(tc wp_update_post_meta "{\"ID\":$MI_AIM,\"meta\":{\"_menu_item_type\":\"post_type\"}}")"
+check "switching the item back to a post item while it holds the submission's id is refused" "$(verdict mi2c)" "error"
+check "STORED: the item is not a post item pointing at the submission" \
+  "$(wpe 'echo get_post_meta('"$MI_AIM"',"_menu_item_type",true)==="post_type"&&(int) get_post_meta('"$MI_AIM"',"_menu_item_object_id",true)==='"$SUB"'?"pointing":"safe";')" "safe"
+wpe 'update_post_meta('"$MI_AIM"',"_menu_item_type","post_type");update_post_meta('"$MI_AIM"',"_menu_item_object_id",'"$CTL"');' >/dev/null
+callas "$RW" mi3 "$(tc wp_update_post_meta "{\"ID\":$MI_AIM,\"meta\":{\"_menu_item_object_id\":\"$PG\"}}")"
+check "CONTROL: re-pointing the item at another ordinary page succeeds" "$(verdict mi3)" "ok"
+check "CONTROL: and STORED: it points there" "$(wpe 'echo (int) get_post_meta('"$MI_AIM"',"_menu_item_object_id",true);')" "$PG"
+callas "$TOK" mi4 "$(tc wp_add_menu_item "{\"menu\":\"$MENU\",\"type\":\"post_type\",\"object_id\":$SUB}")"
+callas "$TOK" mi4b "$(tc wp_add_menu_item "{\"menu\":\"$MENU\",\"type\":\"post_type\",\"object_id\":987654321}")"
+check "wp_add_menu_item for a submission is answered as for a post that does not exist" "$(py 'import json,sys;d=json.load(sys.stdin);print(d["result"]["content"][0]["text"])' mi4)" "$(py 'import json,sys;d=json.load(sys.stdin);print(d["result"]["content"][0]["text"])' mi4b)"
+check "and is refused" "$(verdict mi4)" "error"
+callas "$TOK" mi4c "$(tc wp_update_menu_item "{\"item_id\":$MI_OLD,\"title\":\"x\"}")"
+check "wp_update_menu_item on the item that points at a submission is refused (its reply would print the submission's title)" "$(verdict mi4c)" "error"
+callas "$TOK" mi4d "$(tc wp_menu_health '{}')"
+check "wp_menu_health does not print the submission's title" "$(has mi4d "$M2-sub-title")" "no"
+wpe 'wp_delete_nav_menu('"$MENU"');' >/dev/null
+
+echo "-- a guessed value is not confirmed, and nothing is deleted out from under a submission --"
+callas "$TOK" x1 "$(tc wp_delete_post_meta "{\"ID\":$SUB,\"key\":\"_field_message\",\"value\":\"a-wrong-guess\"}")"
+callas "$TOK" x2 "$(tc wp_delete_post_meta "{\"ID\":$SUB,\"key\":\"_field_message\",\"value\":\"$M2-sub-meta\"}")"
+check "wp_delete_post_meta with a wrong value on a submission is refused" "$(verdict x1)" "error"
+check "and the refusal is the guard's, not the tool's level" "$(has x1 "form submission")" "yes"
+check "and with the right value too, so the two replies cannot tell a guess from a hit" "$(verdict x2)" "error"
+check "and the replies are the same" \
+  "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["content"][0]["text"])' x1)" "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["content"][0]["text"])' x2)"
+check "STORED: the submission's meta is still there" "$(wpe 'echo get_post_meta('"$SUB"',"_field_message",true);')" "$M2-sub-meta"
+wpe 'update_post_meta('"$CTL"',"_field_message","'"$M2"'-ctl-meta");' >/dev/null
+callas "$TOK" x3 "$(tc wp_delete_post_meta "{\"ID\":$CTL,\"key\":\"_field_message\",\"value\":\"$M2-ctl-meta\"}")"
+check "CONTROL: the same call with the right value on an ordinary post deletes it" "$(verdict x3)" "ok"
+check "CONTROL: and STORED: the meta is gone" "$(wpe 'echo metadata_exists("post",'"$CTL"',"_field_message")?"there":"gone";')" "gone"
+wpe 'update_post_meta('"$CTL"',"_field_message","'"$M2"'-ctl-meta");' >/dev/null
+callas "$TOK" x4 "$(tc wp_delete_post "{\"ID\":$SUB,\"force\":true}")"
+check "an admin key's wp_delete_post of a submission is refused" "$(verdict x4)" "error"
+check "STORED: the submission, its revision and its upload are all still there, and the upload still hangs from it" \
+  "$(wpe 'echo get_post('"$SUB"')?"sub":"nosub","|",get_post('"$SUBREV"')?"rev":"norev","|",(int) get_post('"$SUBATT"')->post_parent==='"$SUB"'?"att":"orphan";')" "sub|rev|att"
+callas "$TOK" x5 "$(tc wp_delete_media "{\"ID\":$SUBATT,\"force\":true}")"
+check "deleting a submission's upload through wp_delete_media is refused" "$(verdict x5)" "error"
+check "STORED: the upload is still there" "$(wpe 'echo get_post('"$SUBATT"')?"there":"gone";')" "there"
+callas "$TOK" x6 "$(tc gmcp_smoke_rawwrite "{\"op\":\"title\",\"id\":$SUBATT,\"value\":\"x\"}")"
+check "the net refuses a raw edit of the upload" "$(verdict x6)" "error"
+DEL=$(wpe 'echo wp_insert_post(["post_type"=>"post","post_status"=>"publish","post_title"=>"'"$M2"'-del"]);')
+callas "$TOK" x7 "$(tc wp_delete_post "{\"ID\":$DEL,\"force\":true}")"
+check "CONTROL: an admin key's wp_delete_post of an ordinary post succeeds" "$(verdict x7)" "ok"
+check "CONTROL: and STORED: it is gone" "$(wpe 'echo get_post('"$DEL"')?"there":"gone";')" "gone"
+
 if [ "$REST_WAS" = unset ]; then
   wpe '$o=get_option("gmcp_options",[]);unset($o["mcp_tools_rest"]);update_option("gmcp_options",$o,false);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null
 else

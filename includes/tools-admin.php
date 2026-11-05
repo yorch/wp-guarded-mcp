@@ -2607,6 +2607,12 @@ class GMCP_Tools_Admin {
     $items = wp_get_nav_menu_items( $menu->term_id, [ 'post_status' => 'publish,draft' ] );
     $out = [];
     foreach ( (array) $items as $item ) {
+      // WordPress fills an item's title and URL from the object it points at, so an item that
+      // points at a form submission (or an upload of one) would print the visitor's subject
+      // line. Left out, as an item whose target is missing is.
+      if ( !$this->menu_target_readable( $item ) ) {
+        continue;
+      }
       $out[] = [
         'item_id' => (int) $item->ID,
         'title' => $item->title,
@@ -2730,13 +2736,16 @@ class GMCP_Tools_Admin {
 
     if ( $type === 'post_type' ) {
       $post = $object_id ? get_post( $object_id ) : null;
-      if ( !$post ) {
+      // A form submission is "publish" as far as its status goes, and its title is what the
+      // visitor typed. A menu item would copy that into the public navigation. Answered as an
+      // id that names no post, as every read of one is. @see GMCP_Core::post_read_guard().
+      if ( !$post || GMCP_Core::post_read_guard( $object_id ) !== true ) {
         return $this->error( $r, 'A post_type item needs object_id set to an existing post or page id.' );
       }
-      // A form submission is "publish" as far as its status goes, and its title is what the
-      // visitor typed. A menu item would copy that into the public navigation.
-      $menu_target = GMCP_Core::personal_data_post_guard( $object_id );
-      if ( $menu_target !== true ) {
+      // Whatever level asks, an upload or a submission is never a menu target: the net under
+      // update_post_meta asks the same of the stored value.
+      $menu_target = GMCP_Core::pointer_meta_refusal( '_menu_item_object_id', $object_id, 0 );
+      if ( $menu_target !== null ) {
         return $this->error( $r, $menu_target );
       }
       // The item stores its own copy of the title, and core's front-end filter
@@ -2935,6 +2944,11 @@ class GMCP_Tools_Admin {
       return $this->error( $r, "{$item_id} is not a menu item id. Use wp_get_menu_items to find one." );
     }
     $post = get_post( $item_id );
+    // An item that points at something this caller may not read is answered as no menu item,
+    // like the lister leaves it out: the reply below prints its resolved title and URL.
+    if ( !$this->menu_target_readable( wp_setup_nav_menu_item( $post ) ) ) {
+      return $this->error( $r, "{$item_id} is not a menu item id. Use wp_get_menu_items to find one." );
+    }
     $menu_id = $this->menu_of_item( $item_id );
     if ( !$menu_id ) {
       return $this->error( $r, "Menu item {$item_id} belongs to no menu, so there is no menu to update it in. WordPress leaves items in this state when a menu is edited in wp-admin and not saved; wp_delete_menu_item removes one." );
@@ -3272,7 +3286,25 @@ class GMCP_Tools_Admin {
         'terms' => $menu->term_taxonomy_id,
       ] ],
     ] );
-    return array_map( 'wp_setup_nav_menu_item', $items );
+    return array_values( array_filter( array_map( 'wp_setup_nav_menu_item', $items ), [ $this, 'menu_target_readable' ] ) );
+  }
+
+  /**
+  * Whether the object a menu item points at is one this caller may read. The item's own title
+  * and URL are the object's, so listing one is reading it. A custom or taxonomy item has no
+  * post behind it.
+  *
+  * @param object $item As wp_setup_nav_menu_item() returns it.
+  */
+  private function menu_target_readable( $item ): bool {
+    $type = (string) ( $item->type ?? '' );
+    if ( $type === 'post_type' && (int) ( $item->object_id ?? 0 ) > 0 ) {
+      return GMCP_Core::post_read_guard( (int) $item->object_id ) === true;
+    }
+    if ( $type === 'post_type_archive' ) {
+      return !in_array( strtolower( (string) ( $item->object ?? '' ) ), GMCP_Core::read_excluded_post_types(), true );
+    }
+    return true;
   }
 
   /**

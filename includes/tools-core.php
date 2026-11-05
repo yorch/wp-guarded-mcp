@@ -1123,6 +1123,11 @@ class GMCP_Tools_Core {
         if ( $protected !== null ) {
           return new WP_Error( 'gmcp_protected_meta', $protected . ' Nothing was created.' );
         }
+        // A value that points at a post this key may not use (a featured image, a menu target).
+        $pointer = GMCP_Core::pointer_meta_refusal( (string) $meta_k, $meta_input[ $meta_k ], 0 );
+        if ( $pointer !== null ) {
+          return new WP_Error( 'gmcp_pointer_meta', $pointer . ' Nothing was created.' );
+        }
       }
       // JSON for an array is decoded here as every other meta writer decodes it, so the
       // same payload is not an array through wp_update_post_meta and a string through this
@@ -2481,7 +2486,9 @@ class GMCP_Tools_Core {
     // different key than the write would describe the wrong comment.
     $id = (int) ( $a['comment_ID'] ?? 0 );
     $comment = get_comment( $id );
-    if ( !$comment ) {
+    // A comment on a post the caller may not read is not described, and is answered as one
+    // that is not there: the preview prints its author and its text.
+    if ( !$comment || ( (int) $comment->comment_post_ID > 0 && GMCP_Core::post_read_guard( (int) $comment->comment_post_ID ) !== true ) ) {
       $r = $this->error( $r, 'No comment with ID ' . $id . '.', -32602 );
       return $r;
     }
@@ -2913,6 +2920,11 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'post_id & comment_content required', -32602 );
           break;
         }
+        $comment_held = GMCP_Core::comment_write_guard( 0, intval( $a['post_id'] ), 'Creating' );
+        if ( $comment_held !== true ) {
+          $r = $this->error( $r, $comment_held, -32600 );
+          break;
+        }
         $ins = [
           'comment_post_ID' => intval( $a['post_id'] ),
           'comment_content' => $this->kses_arg( (string) $a['comment_content'] ),
@@ -2938,6 +2950,17 @@ class GMCP_Tools_Core {
           break;
         }
         $c = [ 'comment_ID' => intval( $a['comment_ID'] ) ];
+        // The post the comment is on, and the one `fields` would move it to. A comment is read
+        // as the post it is on, so moving one out of a submission's tree makes it readable.
+        $comment_held = GMCP_Core::comment_write_guard(
+          intval( $a['comment_ID'] ),
+          ( !empty( $a['fields'] ) && is_array( $a['fields'] ) && isset( $a['fields']['comment_post_ID'] ) && is_scalar( $a['fields']['comment_post_ID'] ) ) ? (int) $a['fields']['comment_post_ID'] : null,
+          'Updating'
+        );
+        if ( $comment_held !== true ) {
+          $r = $this->error( $r, $comment_held, -32600 );
+          break;
+        }
         // wp_update_comment() hands a comment_approved of "trash" to wp_trash_comment(), which
         // is a deletion that WordPress completes on its own schedule. wp_delete_comment is the
         // tool that says so, and the one an approval can hold.
@@ -2985,6 +3008,11 @@ class GMCP_Tools_Core {
           break;
         }
         $comment_id = intval( $a['comment_ID'] );
+        $comment_held = GMCP_Core::comment_write_guard( $comment_id, null, 'Deleting' );
+        if ( $comment_held !== true ) {
+          $r = $this->error( $r, $comment_held, -32600 );
+          break;
+        }
         $done = wp_delete_comment( $comment_id, !empty( $a['force'] ) );
         if ( $done ) {
           $after = get_comment( $comment_id );
@@ -3739,7 +3767,9 @@ class GMCP_Tools_Core {
         // Include featured image
         if ( in_array( 'thumbnail', $include ) ) {
           $thumb_id = get_post_thumbnail_id( $post_id );
-          if ( $thumb_id ) {
+          // The file a featured image names is judged as the post it hangs from, like any other
+          // read of media: an upload of a form submission is not shown because a page holds it.
+          if ( $thumb_id && GMCP_Core::post_read_guard( (int) $thumb_id ) === true ) {
             $snapshot['thumbnail'] = [
               'ID' => $thumb_id,
               'url' => wp_get_attachment_url( $thumb_id ),
@@ -3926,11 +3956,6 @@ class GMCP_Tools_Core {
         $src = get_post( intval( $a['ID'] ?? 0 ) );
         if ( !$src ) {
           $r = $this->error( $r, 'No post with ID ' . intval( $a['ID'] ?? 0 ) . '.', -32602 );
-          break;
-        }
-        $commerce = GMCP_Core::commerce_post_guard( $src->ID, 'Duplicating' );
-        if ( $commerce !== true ) {
-          $r = $this->error( $r, $commerce, -32600 );
           break;
         }
         // The source is read and its content and meta carried across, so the read policies
@@ -4244,6 +4269,16 @@ class GMCP_Tools_Core {
           }
         }
 
+        // What a post hangs from decides who may read it, so a parent that moves it into or out
+        // of a submission's (or an order's) tree is refused. @see GMCP_Core::tree_move_guard().
+        if ( array_key_exists( 'post_parent', $fields ) ) {
+          $moved = GMCP_Core::tree_move_guard( $post_id, is_scalar( $fields['post_parent'] ) ? (int) $fields['post_parent'] : 0 );
+          if ( $moved !== true ) {
+            $r = $this->error( $r, $moved, -32600 );
+            break;
+          }
+        }
+
         // A status that is a deletion in waiting. Judged on what the call asks for, before
         // anything is written. @see GMCP_Core::status_write_refusal().
         $status_why = array_key_exists( 'post_status', $fields ) ? GMCP_Core::status_write_refusal( $fields['post_status'] ) : null;
@@ -4350,6 +4385,12 @@ class GMCP_Tools_Core {
             $meta_why = $this->meta_key_allowed( (string) $meta_k );
             if ( $meta_why !== true ) {
               $meta_refusal = $meta_why;
+              break;
+            }
+            // A value that points at a post this key may not use (a featured image, a menu target).
+            $pointer_why = GMCP_Core::pointer_meta_refusal( (string) $meta_k, $meta_input[ $meta_k ], $post_id );
+            if ( $pointer_why !== null ) {
+              $meta_refusal = $pointer_why;
               break;
             }
           }
@@ -4665,6 +4706,19 @@ class GMCP_Tools_Core {
         }
         if ( $bad_key !== null ) {
           $r = $this->error( $r, $bad_key . ' Nothing was written.', -32602 );
+          break;
+        }
+        // A value that is another post's id and that something renders or reads from (a
+        // featured image, a menu item's target). Before any pair is written, as the keys are.
+        foreach ( $pairs as $k => $v ) {
+          $pointer_why = GMCP_Core::pointer_meta_refusal( (string) $k, $v, $pid );
+          if ( $pointer_why !== null ) {
+            $bad_key = $pointer_why;
+            break;
+          }
+        }
+        if ( $bad_key !== null ) {
+          $r = $this->error( $r, $bad_key . ' Nothing was written.', -32600 );
           break;
         }
         $meta_lines = [ 'Meta updated for post #' . $pid ];
@@ -5057,6 +5111,14 @@ class GMCP_Tools_Core {
           break;
         }
         $media_id = isset( $a['media_id'] ) ? intval( $a['media_id'] ) : 0;
+        // A featured image is shown on the page that holds it and returned by the snapshot, so
+        // a visitor's upload, or one hanging from an order, is not something to set. The net
+        // under update_post_meta asks the same question. @see GMCP_Core::pointer_meta_refusal().
+        $thumb_why = $media_id ? GMCP_Core::pointer_meta_refusal( '_thumbnail_id', $media_id, $post_id ) : null;
+        if ( $thumb_why !== null ) {
+          $r = $this->error( $r, $thumb_why, -32600 );
+          break;
+        }
         if ( $media_id ) {
           $done = set_post_thumbnail( $post_id, $media_id );
           if ( $done ) {
@@ -5457,6 +5519,13 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'No attachment with ID ' . intval( $a['ID'] ) . '. This tool edits media only; use wp_update_post for other posts.', -32602 );
           break;
         }
+        // A file that hangs from a form submission is the visitor's upload, and nothing here
+        // edits it. @see GMCP_Core::personal_data_write_guard().
+        $upload_guard = GMCP_Core::personal_data_write_guard( intval( $a['ID'] ), 'Updating' );
+        if ( $upload_guard !== true ) {
+          $r = $this->error( $r, $upload_guard, -32600 );
+          break;
+        }
         // $removing is true although this edits: the title, caption and alt text of a file with
         // no parent change what every live page showing it displays, and nothing here can find
         // those pages. Only media attached to a draft is the key's to edit.
@@ -5501,6 +5570,11 @@ class GMCP_Tools_Core {
         // the template guard that wp_delete_post asks.
         if ( get_post_type( $media_id ) !== 'attachment' ) {
           $r = $this->error( $r, 'No attachment with ID ' . $media_id . '. This tool deletes media only; use wp_delete_post for other posts.', -32602 );
+          break;
+        }
+        $upload_guard = GMCP_Core::personal_data_write_guard( $media_id, 'Deleting' );
+        if ( $upload_guard !== true ) {
+          $r = $this->error( $r, $upload_guard, -32600 );
           break;
         }
         $drafts = GMCP_Core::drafts_only_guard( $media_id, 'Deleting', '', true );
