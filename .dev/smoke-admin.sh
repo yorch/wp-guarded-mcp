@@ -2774,8 +2774,9 @@ tc_restore_unprefixed() { # tc_restore_unprefixed <rest 0|1> <subscriptions 0|1>
 # the count moves with whatever happens to be installed, which is the drift the table exists
 # to catch. Current prefixes: elementor_ (free and Pro), kirki_, yoast_, acf_, wsal_, gf_
 # (Gravity Forms), ld_ (LearnDash), redirection_ (Redirection), pll_ (Polylang), rankmath_ and aioseo_
-# (includes/tools-seo.php), cf7_, fluentform_ and ninjaform_ (includes/tools-forms.php). WooCommerce Subscriptions is wcs_ and is deliberately not
-# listed, because this block never switches that group on.
+# (includes/tools-seo.php), cf7_, fluentform_ and ninjaform_ (includes/tools-forms.php), wpforms_, wf_ (Wordfence), stream_ and beaver_. WooCommerce Subscriptions
+# is wcs_ and is deliberately not listed, because tc_groups() switches that group off, as it does
+# the generated REST group, whose tool names carry no prefix at all.
 tc_count() { # tc_count <secret>
   curl -sS -X POST "$URL" -H "Authorization: Bearer $1" \
     -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
