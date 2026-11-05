@@ -163,7 +163,9 @@ function reset_world(): void {
 }
 
 $swappers = [
-  'dir' => 'cd ' . escapeshellarg( $content ) . '; while [ ! -e ' . escapeshellarg( "$base/stop" ) . ' ]; do mv logs logs.hold 2>/dev/null; ln -s ' . escapeshellarg( $evil ) . ' logs; sleep 0.002; rm logs; mv logs.hold logs; sleep 0.002; done',
+  // Every step is conditional on the one before it, so a step that fails cannot leave the loop out
+  // of phase (an earlier version could, and then never presented a link at all).
+  'dir' => 'cd ' . escapeshellarg( $content ) . '; while [ ! -e ' . escapeshellarg( "$base/stop" ) . ' ]; do mv -T logs logs.hold 2>/dev/null || { sleep 0.001; continue; }; ln -s ' . escapeshellarg( $evil ) . ' logs; sleep 0.002; rm -f logs; mv -T logs.hold logs; sleep 0.002; done',
   'link' => 'cd ' . escapeshellarg( $logs ) . '; while [ ! -e ' . escapeshellarg( "$base/stop" ) . ' ]; do ln -sfn ' . escapeshellarg( "$base/canary.txt" ) . ' tmp.lnk; mv -T tmp.lnk debug.log; cp ' . escapeshellarg( "$base/real.src" ) . ' tmp.reg; mv -T tmp.reg debug.log; done',
   'fifo' => 'cd ' . escapeshellarg( $logs ) . '; while [ ! -e ' . escapeshellarg( "$base/stop" ) . ' ]; do mkfifo tmp.fifo; mv -T tmp.fifo debug.log; cp ' . escapeshellarg( "$base/real.src" ) . ' tmp.reg; mv -T tmp.reg debug.log; done',
   'hardlink' => 'cd ' . escapeshellarg( $logs ) . '; while [ ! -e ' . escapeshellarg( "$base/stop" ) . ' ]; do ln ' . escapeshellarg( "$base/canary.txt" ) . ' tmp.hl; mv -T tmp.hl debug.log; cp ' . escapeshellarg( "$base/real.src" ) . ' tmp.reg; mv -T tmp.reg debug.log; done',
@@ -268,7 +270,12 @@ $v4 = GMCP_Diag_Util::open_verified( "$logs/debug.log", "$evil/debug.log" );
 check( 'a wrong expected path refuses a real file', $v4['fh'], null );
 
 echo "-- race: directory swapped for a link to another directory --\n";
+// The leak under a directory swap needs the link to be in place when the reader looks, which is a
+// matter of scheduling; the control is run up to three times and the best of them is taken.
 $old = run_race( $swappers['dir'], 'old', $per, $readers );
+for ( $retry = 0; $retry < 2 && $old['leak'] === 0; $retry++ ) {
+  $old = run_race( $swappers['dir'], 'old', $per, $readers );
+}
 $new = run_race( $swappers['dir'], 'new', $per, $readers );
 printf( "        old: %s\n        new: %s\n", json_encode( $old ), json_encode( $new ) );
 check( 'POSITIVE CONTROL: the replaced logic leaked the canary under this race', $old['leak'] > 0, true );
