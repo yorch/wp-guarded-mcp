@@ -28,13 +28,22 @@ spl_autoload_register( function ( $class ) {
     'GMCP_Tools_Gravityforms' => '/includes/tools-gravityforms.php',
     'GMCP_Tools_Learndash' => '/includes/tools-learndash.php',
     'GMCP_Tools_Wsal' => '/includes/tools-wsal.php',
+    'GMCP_Tools_Redirection' => '/includes/tools-redirection.php',
+    'GMCP_Tools_Polylang' => '/includes/tools-polylang.php',
+    'GMCP_Tools_Seo' => '/includes/tools-seo.php',
+    'GMCP_Tools_Forms' => '/includes/tools-forms.php',
     'GMCP_Tools_Admin' => '/includes/tools-admin.php',
+    'GMCP_Tools_Diagnostics' => '/includes/tools-diagnostics.php',
+    'GMCP_Diag_Util' => '/includes/diagnostics-util.php',
+    'GMCP_Preview' => '/includes/preview.php',
     'GMCP_Audit' => '/includes/audit.php',
     'GMCP_Audit_Table' => '/includes/audit-table.php',
+    'GMCP_Approvals' => '/includes/approvals.php',
     'GMCP_Backup' => '/includes/backup.php',
     'GMCP_Changes' => '/includes/changes.php',
     'GMCP_Journal' => '/includes/journal.php',
     'GMCP_Tokens' => '/includes/tokens.php',
+    'GMCP_Markdown_Blocks' => '/includes/markdown-blocks.php',
     'GMCP_SelfTest' => '/includes/selftest.php',
     'GMCP_Prompts' => '/includes/prompts.php',
     'GMCP_Resources' => '/includes/resources.php',
@@ -57,6 +66,7 @@ register_activation_hook( GMCP_ENTRY, function () {
   require_once( GMCP_PATH . '/includes/audit.php' );
   require_once( GMCP_PATH . '/includes/journal.php' );
   GMCP_Audit::install();
+  GMCP_Approvals::install();
   // The journal's meta snapshots. Created here as well as lazily from the journal's own
   // constructor, so a site that has the change journal switched off still has the table
   // waiting rather than creating it on the first request after somebody switches it on.

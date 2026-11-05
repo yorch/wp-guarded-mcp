@@ -52,6 +52,46 @@ class GMCP_OAuth {
   public const AUTH_CODE_TTL = 60;            // seconds
   public const NONCE_ACTION = 'gmcp_oauth_consent';
 
+  /**
+  * The marker a read-only grant carries in its scope, and the only place the level lives.
+  *
+  * The scope column already travels with every grant, is copied onto the new row by a
+  * refresh, and is read back at validation, so a level stored there needs no schema change
+  * and a grant made before this existed (scope "mcp", or whatever the client sent) has no
+  * marker and stays what it always was: full. The check is for the marker as a whole word
+  * and nothing else, so no spelling a client invents reads as read-only by accident, and
+  * the absence of it is never a way to read a grant as narrower than it is.
+  */
+  public const SCOPE_READONLY = 'mcp:readonly';
+
+  public static function scope_is_readonly( string $scope ): bool {
+    return in_array( self::SCOPE_READONLY, preg_split( '/\s+/', trim( $scope ) ) ?: [], true );
+  }
+
+  /**
+  * The scope to store for a grant: whatever the client asked for, minus any claim about
+  * level, plus the marker if the person chose read-only. The client's own scope string never
+  * decides the level, because it can be anything the client likes; only the person's choice
+  * on the consent screen does.
+  */
+  public static function scope_for( string $requested, bool $readonly ): string {
+    $kept = [];
+    foreach ( preg_split( '/\s+/', trim( $requested ) ) ?: [] as $word ) {
+      if ( $word !== '' && $word !== self::SCOPE_READONLY ) {
+        $kept[] = $word;
+      }
+    }
+    if ( !$kept ) {
+      $kept[] = 'mcp';
+    }
+    // The column is 255 characters. What is cut is the client's own text, never the marker.
+    $joined = implode( ' ', $kept );
+    if ( $readonly ) {
+      return substr( $joined, 0, 255 - strlen( ' ' . self::SCOPE_READONLY ) ) . ' ' . self::SCOPE_READONLY;
+    }
+    return substr( $joined, 0, 255 );
+  }
+
   private $core;
   private $mcp;
   private $namespace = 'mcp/v1';
@@ -532,6 +572,12 @@ class GMCP_OAuth {
     $code_challenge_method = (string) $request->get_param( 'code_challenge_method' );
     $scope = (string) ( $request->get_param( 'scope' ) ?? 'mcp' );
     $action = (string) ( $request->get_param( 'action' ) ?? 'deny' );
+    // The person's choice on the consent screen. Absent only from a consent page rendered
+    // before the choice existed, which is the full access it always granted. Anything
+    // present that is not exactly "full" is read-only: an unrecognised value fails narrow.
+    $access = $request->get_param( 'gmcp_access' );
+    $readonly = $access !== null && (string) $access !== 'full';
+    $scope = self::scope_for( $scope, $readonly );
 
     $client = $this->get_client( $client_id );
     if ( !$client || !$this->redirect_uri_registered( $client, $redirect_uri ) ) {
@@ -572,7 +618,8 @@ class GMCP_OAuth {
     }
 
     if ( $this->logging ) {
-      error_log( '[Guarded MCP OAuth] Authorized user ' . get_current_user_id() . ' for client ' . $client_id );
+      error_log( '[Guarded MCP OAuth] Authorized user ' . get_current_user_id() . ' for client ' . $client_id
+        . ' with ' . ( $readonly ? 'read-only' : 'full' ) . ' access' );
     }
 
     wp_redirect( $this->append_params( $redirect_uri, $params ) );
@@ -913,7 +960,7 @@ class GMCP_OAuth {
     global $wpdb;
     $rows = $wpdb->get_results(
       "SELECT t.id, t.client_id, t.user_id, t.created, t.last_used, t.access_expires, t.refresh_expires, t.revoked,
-              c.client_name
+              t.scope, c.client_name
        FROM {$this->table_tokens} t
        LEFT JOIN {$this->table_clients} c ON c.client_id = t.client_id
        WHERE t.revoked = 0
@@ -933,6 +980,7 @@ class GMCP_OAuth {
         'last_used' => $r->last_used,
         'access_expires' => $r->access_expires,
         'refresh_expires' => $r->refresh_expires,
+        'access' => self::scope_is_readonly( (string) $r->scope ) ? 'readonly' : 'full',
       ];
     }
     return new WP_REST_Response( [ 'apps' => $out ], 200 );
@@ -1088,6 +1136,15 @@ class GMCP_OAuth {
     foreach ( $hidden_fields as $name => $value ) {
       echo '<input type="hidden" name="' . esc_attr( $name ) . '" value="' . esc_attr( $value ) . '">';
     }
+
+    // Full access stays the default, because it is what every connection before this choice
+    // existed was granted and a change of default should be a decision, not a side effect.
+    // A client that asks for the read-only scope by name gets it preselected.
+    $ask_readonly = self::scope_is_readonly( (string) $params['scope'] );
+    echo '<fieldset class="gmcp-oauth-access"><legend>What may this app do?</legend>';
+    echo '<label><input type="radio" name="gmcp_access" value="full"' . ( $ask_readonly ? '' : ' checked' ) . '> <span><strong>Full access</strong> Read and change everything your account can through the tools you have switched on.</span></label>';
+    echo '<label><input type="radio" name="gmcp_access" value="readonly"' . ( $ask_readonly ? ' checked' : '' ) . '> <span><strong>Read-only</strong> Look at the site and change nothing. Only read tools are offered or accepted.</span></label>';
+    echo '</fieldset>';
     echo '<div class="gmcp-oauth-buttons">';
     echo '<button type="submit" name="action" value="approve" class="gmcp-oauth-approve">Approve</button>';
     echo '<button type="submit" name="action" value="deny" class="gmcp-oauth-deny">Deny</button>';
@@ -1136,6 +1193,10 @@ class GMCP_OAuth {
       .gmcp-oauth-label { color: #6b7280; }
       .gmcp-oauth-value { color: #1d2330; font-weight: 500; text-align: right; }
       .gmcp-oauth-note { font-size: 13px; color: #6b7280; line-height: 1.5; margin: 0 0 24px; }
+      .gmcp-oauth-access { border: 1px solid #d0d4da; border-radius: 8px; margin: 0 0 20px; padding: 10px 14px 12px; }
+      .gmcp-oauth-access legend { font-size: 13px; color: #6b7280; padding: 0 6px; }
+      .gmcp-oauth-access label { display: flex; gap: 8px; align-items: flex-start; font-size: 14px; line-height: 1.4; padding: 6px 0; cursor: pointer; }
+      .gmcp-oauth-access label span strong { display: block; }
       .gmcp-oauth-buttons { display: flex; gap: 10px; }
       .gmcp-oauth-buttons button { flex: 1; padding: 11px 14px; border-radius: 8px; border: 1px solid transparent; font-size: 14px; font-weight: 600; cursor: pointer; transition: background .15s; }
       .gmcp-oauth-approve { background: #2271b1; color: #fff; }

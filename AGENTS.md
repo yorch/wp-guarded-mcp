@@ -33,6 +33,29 @@ ordering storage off, and their billing period, next payment date and status liv
 same rows. One write tool enforcing it and the next not is the same defect as the settings
 tool that once enforced an option policy no other writer did.
 
+**A drafts-only key is held by the post, not by the tool.** `GMCP_Core::drafts_only_guard()`
+(through `post_write_guard()` for the generic writers) is asked by every tool that writes a
+post, its meta, its terms or its thumbnail, and `restrict_caller_to_drafts()` installs hooks
+under WordPress that ask it again for writers that do not. A new tool that writes a post asks
+the guard; the net is the backstop, not the plan. Attachments are filtered through
+`wp_insert_attachment_data`, not `wp_insert_post_data`, and the net needs both. The flag caps the
+key at `readwrite`; that cap is part of the guard.
+What it covers is posts, their meta, term assignments, featured image and attached media, and
+nothing else: comments, taxonomy terms, users, options and preview links are outside it, and
+every sentence that describes it (refusal text, key label, README, readme.txt, guardrails) must
+say so rather than "anything that is live". Media attached to no post is refused for edits as
+well as deletes, because a live page may be showing it and nothing can find which.
+
+**A deletion is not always a delete tool.** WordPress deletes on markers it reads from
+ordinary rows: `wp_scheduled_delete()` removes every post with an old `_wp_trash_meta_time`
+and `wp_delete_auto_drafts()` every old auto-draft. So `GMCP_Core::status_write_refusal()`
+refuses a status of `trash` or `auto-draft` in the write tools (and `spam` on a comment, which
+Akismet deletes after fifteen days), `protected_meta_refusal()`
+refuses the `_wp_trash_meta_` keys in every meta writer (with a net under the WordPress
+meta functions for writers that are not ours), and `GMCP_Approvals::classify_call()` reads
+the arguments as well as the tool's name. A write-level key that can reach any of them has a
+delete tool, whatever the README calls the level.
+
 **Never run `wp plugin install --force`, `wp plugin update` or `wp plugin delete` against
 the `.dev` stack.** Its plugin directory is a bind mount of this repository, and WordPress
 deletes the old directory before unpacking the new one. The delete goes through the mount
@@ -64,6 +87,17 @@ for the first caller that passes a secret.
 
 **There is no restore tool, at any access level.** Backups can be started and read. That is
 deliberate and not an omission to be helpfully filled in.
+
+**No tool reads, lists, answers or edits the approval queue, at any access level.** The
+approval queue (`GMCP_Approvals`) holds a call until a person signed in to wp-admin answers
+it, and its whole value is that the agent cannot answer for itself. `decide()` is the only
+place a request leaves pending, and it demands a logged-in cookie that belongs to the
+current user, because a bearer key and an OAuth grant both set the current user to an
+administrator with no cookie. A tool that listed pending requests would hand a
+prompt-injected agent the ids and arguments to reason about; a tool that approved would
+delete the feature. `smoke-admin.sh` asserts no such tool exists at any level. Which tools
+are held is derived from their registration (`GMCP_Approvals::classify()`), never from a
+list of names, and an unclassifiable tool is held.
 
 **There is no kit import, and no tool that takes an archive.** `elementor_set_active_kit`
 switches between kits the site already has, which is reversible because the previous one is
@@ -133,8 +167,11 @@ destructive. `smoke-woo.sh` covers the shop tools, `smoke-elementor.sh` covers t
 `smoke-acf.sh` covers the ACF tools, `smoke-gravityforms.sh` covers the Gravity Forms tools,
 `smoke-learndash.sh` covers the LearnDash tools, `smoke-elementor-pro.sh` covers the
 Elementor Pro tools, `smoke-woo-subscriptions.sh` covers the Subscriptions tools, and
-`smoke-wsal.sh` covers the WP Activity Log tools. Run all
-fourteen before committing. The last eleven need
+`smoke-wsal.sh` covers the WP Activity Log tools, `smoke-redirection.sh` covers the
+Redirection tools, `smoke-polylang.sh` covers the Polylang tools, `smoke-seo.sh` covers the Rank Math and
+All in One SEO tools, and `smoke-forms.sh` covers the form-submission tools (Contact Form 7 with
+Flamingo, Fluent Forms, Ninja Forms; its first block needs no form plugin). Run all
+sixteen before committing. All but the first two need
 their plugin installed and say so and exit rather than reporting failures against a site that
 simply does not have it.
 
@@ -244,3 +281,28 @@ Conventional Commits, atomic, and only your own changes. If a file holds edits y
 make, stage yours alone. Explain in the body why the change is right, not what the diff
 already shows; the commit log here is the reasoning record, and several entries exist
 purely to say why an obvious-looking alternative was wrong.
+
+**A pull request is written the same way.** Its title is a Conventional Commit, `type(scope):
+subject`, in the imperative and under about 72 characters, because the title becomes the commit
+subject when the PR is squash-merged and the log is the reasoning record. Use the types the
+history already uses: `feat`, `fix`, `docs`, `test`, `refactor`, `ci`, `build`. Mark a breaking
+change with `!` and a `BREAKING CHANGE:` line. Do not prefix the title with a model name,
+"WIP" or a ticket number; a draft is marked by being a draft.
+
+The description is the body of that commit, not a changelog of the diff. Put these in it, in
+this order:
+
+1. **Why**, in a sentence or two: the defect or the gap, and what was wrong with the obvious
+   alternative if there was one.
+2. **What changed**, grouped by behaviour a reader would notice (a new tool group, a guard whose
+   reach changed), each as its own Conventional-Commit-style bullet, not by file.
+3. **Guard and doc reach**, whenever a guard's reach changed: which sentences in `README.md`,
+   `readme.txt` and `docs/guardrails.md` were updated, and what the change deliberately does
+   *not* cover.
+4. **Verification**, stated as measured: which suites ran and their counts, which new tests were
+   shown to fail without the fix, and which suites **did not run and why**. A suite that could
+   not run is listed as not run, never as passing, and an assumption about a third-party plugin
+   that was not checked against its source is listed as unverified.
+
+A PR that carries several commits keeps one Conventional Commit per logical change, so a squash
+can be avoided when the history is worth keeping.

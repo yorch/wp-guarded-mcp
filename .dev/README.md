@@ -75,11 +75,23 @@ docker compose exec -T cli wp plugin activate gravityforms
 docker compose exec -T cli wp plugin activate sfwd-lms
 ./smoke-learndash.sh  # the LearnDash tools; needs LearnDash
 
+docker compose exec -T cli wp plugin install seo-by-rank-math --activate    # and/or all-in-one-seo-pack
+./smoke-seo.sh        # the Rank Math / All in One SEO tools; each block skips if its plugin is absent
+
+docker compose exec -T cli wp plugin install contact-form-7 flamingo --activate    # and/or fluentform, ninja-forms
+./smoke-forms.sh      # the form-submission tools; block 0 needs no form plugin
+
 docker compose exec -T cli wp plugin activate elementor-pro
 ./smoke-elementor-pro.sh  # the Elementor Pro tools; needs Elementor Pro (and Elementor)
 
 docker compose exec -T cli wp plugin activate woocommerce-subscriptions
 ./smoke-woo-subscriptions.sh  # the Subscriptions tools; needs WooCommerce Subscriptions
+
+docker compose exec -T cli wp plugin install redirection --activate   # a fresh slug, not this repository's directory
+./smoke-redirection.sh  # the Redirection tools; needs Redirection
+
+docker compose exec -T cli wp plugin install polylang --activate
+./smoke-polylang.sh  # the Polylang tools (read only); needs Polylang
 ```
 
 `smoke-admin.sh` also expects a theme named `futuretheme` that declares a PHP version this

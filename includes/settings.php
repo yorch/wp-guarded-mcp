@@ -21,6 +21,7 @@ class GMCP_Settings {
   const PAGE_SLUG = 'guarded-mcp-settings';
   const PAGE_ACCESS = 'guarded-mcp-access';
   const PAGE_TOOLS = 'guarded-mcp-tools';
+  const PAGE_APPROVALS = 'guarded-mcp-approvals';
   const PAGE_LOGGING = 'guarded-mcp-logging';
   const PAGE_LOGS = 'guarded-mcp-logs';
   const NONCE_ACTION = 'gmcp_save_settings';
@@ -37,12 +38,14 @@ class GMCP_Settings {
     'connect' => self::PAGE_SLUG,
     'access' => self::PAGE_ACCESS,
     'tools' => self::PAGE_TOOLS,
+    'approvals' => self::PAGE_APPROVALS,
     'logging' => self::PAGE_LOGGING,
     'logs' => self::PAGE_LOGS,
   ];
 
   private $core = null;
   private $notice = null;
+  private $notice_failed = false;
 
   public function __construct( $core ) {
     $this->core = $core;
@@ -172,6 +175,18 @@ class GMCP_Settings {
       self::PAGE_TOOLS,
       [ $this, 'render_tools_page' ]
     );
+    // The count is a badge, not a label: a request that waits an hour for somebody to
+    // notice it is a request the agent sat idle through.
+    $waiting = GMCP_Approvals::pending_count();
+    $hooks[] = add_submenu_page(
+      self::PAGE_SLUG,
+      __( 'Approvals', 'guarded-mcp' ),
+      esc_html__( 'Approvals', 'guarded-mcp' ) . ( $waiting > 0
+        ? ' <span class="awaiting-mod">' . (int) $waiting . '</span>' : '' ),
+      'manage_options',
+      self::PAGE_APPROVALS,
+      [ $this, 'render_approvals_page' ]
+    );
     $hooks[] = add_submenu_page(
       self::PAGE_SLUG,
       __( 'Logging', 'guarded-mcp' ),
@@ -298,7 +313,7 @@ class GMCP_Settings {
       .gmcp-verdict-broken { border-left-color: #d63638; }
       /* A refusal is worth spotting from across the table, not by reading it. */
       tr.gmcp-row-refused td { box-shadow: inset 3px 0 0 #d63638; }
-      .gmcp-args { white-space: pre-wrap; font-size: 11px; margin: 4px 0 0; }
+      .gmcp-args { white-space: pre-wrap; font-size: 11px; margin: 4px 0 0; max-height: 28em; overflow: auto; }
       .gmcp-summary { cursor: pointer; color: #2271b1; font-size: 12px; }
       .gmcp-limits { font-size: 11px; }
       .gmcp-intro { max-width: 800px; }
@@ -335,6 +350,11 @@ class GMCP_Settings {
       'mcp_tools_gravityforms' => 'bool',
       'mcp_tools_learndash' => 'bool',
       'mcp_tools_wp_activity_log' => 'bool',
+      'mcp_tools_redirection' => 'bool',
+      'mcp_tools_polylang' => 'bool',
+      'mcp_tools_seo' => 'bool',
+      'mcp_tools_forms' => 'bool',
+      'mcp_approval_mode' => 'approval_mode',
       'mcp_debug_mode' => 'bool',
       'mcp_activity_log' => 'bool',
       'mcp_audit_days' => 'days',
@@ -424,6 +444,15 @@ class GMCP_Settings {
     elseif ( $action === 'create_key' ) {
       $this->create_key();
     }
+    elseif ( $action === 'approve_request' || $action === 'decline_request' ) {
+      // One request at a time and nothing in bulk, like the audit log: each approval is a
+      // decision about one call, and a button that answers fifty of them is a button that
+      // is pressed without reading. decide() checks the session and its own nonce.
+      $id = isset( $_POST['request_id'] ) ? (int) $_POST['request_id'] : 0;
+      $nonce = isset( $_POST['gmcp_approval_nonce'] ) ? sanitize_text_field( wp_unslash( $_POST['gmcp_approval_nonce'] ) ) : '';
+      [ $ok, $this->notice ] = GMCP_Approvals::decide( $id, $action === 'approve_request' ? 'approve' : 'decline', $nonce );
+      $this->notice_failed = !$ok;
+    }
     elseif ( $action === 'revoke_key' ) {
       $id = isset( $_POST['key_id'] ) ? sanitize_key( wp_unslash( $_POST['key_id'] ) ) : '';
       $this->notice = GMCP_Tokens::revoke( $id )
@@ -440,7 +469,10 @@ class GMCP_Settings {
     $slug = isset( $_REQUEST['page'] ) ? sanitize_key( wp_unslash( $_REQUEST['page'] ) ) : '';
     $page_key = array_search( self::page_for_slug( $slug ), self::PAGES, true );
     $url = add_query_arg(
-      [ 'gmcp_notice' => $this->notice ? rawurlencode( $this->notice ) : null ],
+      [
+        'gmcp_notice' => $this->notice ? rawurlencode( $this->notice ) : null,
+        'gmcp_failed' => $this->notice && $this->notice_failed ? '1' : null,
+      ],
       self::page_url( is_string( $page_key ) ? $page_key : '' )
     );
     wp_safe_redirect( $url );
@@ -483,7 +515,10 @@ class GMCP_Settings {
       }
     }
 
-    $key = GMCP_Tokens::create( $label, $level, $days, $tools );
+    // A checkbox, so unchecked is simply absent. Drafts-only caps the level at read and
+    // write; the notice says so when that changed what was asked for.
+    $drafts_only = !empty( $_POST['key_drafts_only'] );
+    $key = GMCP_Tokens::create( $label, $level, $days, $tools, 0, $drafts_only );
     // Named for the person who minted it, so it is not a fixed target that anything else
     // can go and read. Belt to the option guard's braces: without a persistent object
     // cache a transient is an ordinary wp_options row, so for its sixty seconds the
@@ -491,6 +526,9 @@ class GMCP_Settings {
     // keys exists to avoid.
     set_transient( self::new_key_transient(), $key['secret'], MINUTE_IN_SECONDS );
     $this->notice = __( 'Key created. Copy it now: it is stored hashed and cannot be shown again.', 'guarded-mcp' );
+    if ( $drafts_only && $level === 'admin' ) {
+      $this->notice .= ' ' . __( 'A drafts-only key cannot have full administration, so it was created with read and write access.', 'guarded-mcp' );
+    }
   }
 
   /**
@@ -702,6 +740,12 @@ class GMCP_Settings {
         $role = isset( $_POST[ $key ] ) ? sanitize_key( wp_unslash( $_POST[ $key ] ) ) : '';
         $options[ $key ] = in_array( $role, [ 'admin', 'readwrite', 'readonly' ], true ) ? $role : 'admin';
       }
+      elseif ( $kinds[ $key ] === 'approval_mode' ) {
+        // A value outside the list is the strictest mode, not 'never': a forged or
+        // truncated field must not be a way to switch the gate off.
+        $mode = isset( $_POST[ $key ] ) ? sanitize_key( wp_unslash( $_POST[ $key ] ) ) : 'site';
+        $options[ $key ] = in_array( $mode, GMCP_Approvals::MODES, true ) ? $mode : 'site';
+      }
       elseif ( $kinds[ $key ] === 'days' ) {
         $options[ $key ] = isset( $_POST[ $key ] ) ? max( 1, min( 3650, (int) $_POST[ $key ] ) ) : 90;
       }
@@ -772,12 +816,13 @@ class GMCP_Settings {
     }
 
     $notice = isset( $_GET['gmcp_notice'] ) ? sanitize_text_field( wp_unslash( $_GET['gmcp_notice'] ) ) : '';
+    $notice_class = !empty( $_GET['gmcp_failed'] ) ? 'notice-error' : 'notice-success';
     ?>
     <div class="wrap">
       <h1><?php echo esc_html( $title ); ?></h1>
 
       <?php if ( $notice !== '' ) : ?>
-        <div class="notice notice-success is-dismissible"><p><?php echo esc_html( $notice ); ?></p></div>
+        <div class="notice <?php echo esc_attr( $notice_class ); ?> is-dismissible"><p><?php echo esc_html( $notice ); ?></p></div>
       <?php endif; ?>
 
       <?php $body(); ?>
@@ -805,6 +850,14 @@ class GMCP_Settings {
     $this->render_page( __( 'Tools', 'guarded-mcp' ), function () {
       $options = $this->core->get_all_options( true );
       $this->render_tools( $options );
+    } );
+  }
+
+  /** The Approvals page. */
+  public function render_approvals_page() {
+    $this->render_page( __( 'Approvals', 'guarded-mcp' ), function () {
+      $options = $this->core->get_all_options( true );
+      $this->render_approvals( $options );
     } );
   }
 
@@ -1040,7 +1093,12 @@ class GMCP_Settings {
         <?php foreach ( $keys as $key ) : $expired = GMCP_Tokens::is_expired( $key ); ?>
           <tr<?php echo $expired ? ' class="gmcp-expired"' : ''; ?>>
             <td><strong><?php echo esc_html( $key['label'] ); ?></strong></td>
-            <td><?php echo esc_html( $key['level'] ); ?></td>
+            <td>
+              <?php echo esc_html( GMCP_Tokens::effective_level( $key ) ); ?>
+              <?php if ( GMCP_Tokens::is_drafts_only( $key ) ) : ?>
+                <br><strong><?php esc_html_e( 'drafts only', 'guarded-mcp' ); ?></strong>
+              <?php endif; ?>
+            </td>
             <td>
               <?php if ( empty( $key['tools'] ) ) : ?>
                 <span class="gmcp-muted"><?php esc_html_e( 'everything its access level allows', 'guarded-mcp' ); ?></span>
@@ -1097,6 +1155,18 @@ class GMCP_Settings {
           </td>
         </tr>
         <tr>
+          <th scope="row"><?php esc_html_e( 'Drafts only', 'guarded-mcp' ); ?></th>
+          <td>
+            <label for="key_drafts_only">
+              <input type="checkbox" id="key_drafts_only" name="key_drafts_only" value="1">
+              <?php esc_html_e( 'Never publish, schedule or change a post that is live', 'guarded-mcp' ); ?>
+            </label>
+            <p class="description">
+              <?php esc_html_e( 'The key can create and edit drafts and pending posts, and upload media for them. It is refused any write that would publish, schedule or make a post private, and any edit, deletion or unpublishing of a post that is already live, whichever tool is used. That covers posts and what is stored as posts, their custom fields, categories and tags, featured image and attached media. Media attached to no post cannot be edited or deleted by this key, because a live page may be showing it. It does NOT cover comments, taxonomy terms (renaming a category changes every live post in it), users or options, and it does not stop a preview link being made for a draft. Because full administration reaches tools this cannot police, a drafts-only key is held to read and write.', 'guarded-mcp' ); ?>
+            </p>
+          </td>
+        </tr>
+        <tr>
           <th scope="row"><label for="key_expires"><?php esc_html_e( 'Expires after', 'guarded-mcp' ); ?></label></th>
           <td>
             <select id="key_expires" name="key_expires">
@@ -1143,6 +1213,7 @@ class GMCP_Settings {
         <tr>
           <th scope="col"><?php esc_html_e( 'App', 'guarded-mcp' ); ?></th>
           <th scope="col"><?php esc_html_e( 'Account', 'guarded-mcp' ); ?></th>
+          <th scope="col"><?php esc_html_e( 'Access', 'guarded-mcp' ); ?></th>
           <th scope="col"><?php esc_html_e( 'Connected', 'guarded-mcp' ); ?></th>
           <th scope="col"><?php esc_html_e( 'Last used', 'guarded-mcp' ); ?></th>
           <th scope="col"><span class="screen-reader-text"><?php esc_html_e( 'Actions', 'guarded-mcp' ); ?></span></th>
@@ -1153,6 +1224,7 @@ class GMCP_Settings {
           <tr>
             <td><?php echo esc_html( $app['client_name'] ); ?></td>
             <td><?php echo esc_html( $app['user_display'] . ' (' . $app['user_login'] . ')' ); ?></td>
+            <td><?php echo esc_html( ( $app['access'] ?? 'full' ) === 'readonly' ? __( 'Read-only', 'guarded-mcp' ) : __( 'Full', 'guarded-mcp' ) ); ?></td>
             <td><?php echo esc_html( $this->format_date( $app['created'] ) ); ?></td>
             <td><?php echo esc_html( $app['last_used'] ? $this->format_date( $app['last_used'] ) : __( 'Never', 'guarded-mcp' ) ); ?></td>
             <td>
@@ -1199,6 +1271,21 @@ class GMCP_Settings {
     // WP Activity Log: the version constant plus the class and method the message renderer
     // calls, which is the same per-call signal the group itself uses.
     $wsal = defined( 'WSAL_VERSION' ) && class_exists( '\WSAL\Controllers\Alert' ) && method_exists( '\WSAL\Controllers\Alert', 'get_original_alert_message' );
+    // Redirection: the version constant plus the class and the three methods its tools call,
+    // the same signal the group's own per-call check uses.
+    $redirection = defined( 'REDIRECTION_VERSION' ) && class_exists( 'Red_Item' ) && method_exists( 'Red_Item', 'get_by_id' ) && method_exists( 'Red_Item', 'create' ) && method_exists( 'Red_Item', 'get_filtered' );
+    // Polylang (free or Pro): its version constant plus the functions the tools call.
+    $polylang = defined( 'POLYLANG_VERSION' ) && function_exists( 'pll_languages_list' ) && function_exists( 'pll_get_post_translations' );
+    // Rank Math and All in One SEO: the same version-constant-plus-accessor signal each tool
+    // group checks per call. One switch covers whichever of the two is present.
+    $seo = ( defined( 'RANK_MATH_VERSION' ) && function_exists( 'rank_math' ) )
+      || ( defined( 'AIOSEO_VERSION' ) && function_exists( 'aioseo' ) && class_exists( '\AIOSEO\Plugin\Common\Models\Post' ) );
+    // Form stores: Contact Form 7 or Flamingo, Fluent Forms, Ninja Forms. Presence only; the
+    // tools themselves report whether a store or table exists.
+    $forms = ( defined( 'WPCF7_VERSION' ) && class_exists( 'WPCF7_ContactForm' ) )
+      || defined( 'FLAMINGO_VERSION' )
+      || defined( 'FLUENTFORM_VERSION' )
+      || ( class_exists( 'Ninja_Forms' ) && function_exists( 'Ninja_Forms' ) );
     // Subscriptions has no version constant in 7.7.0, so presence is the classes plus a
     // function a tool here calls. WC_Subscription alone is not enough: a gateway bundling
     // the subscriptions core library provides it without WooCommerce Subscriptions.
@@ -1241,6 +1328,18 @@ class GMCP_Settings {
     if ( $wsal ) {
       $keys[] = 'mcp_tools_wp_activity_log';
     }
+    if ( $redirection ) {
+      $keys[] = 'mcp_tools_redirection';
+    }
+    if ( $polylang ) {
+      $keys[] = 'mcp_tools_polylang';
+    }
+    if ( $seo ) {
+      $keys[] = 'mcp_tools_seo';
+    }
+    if ( $forms ) {
+      $keys[] = 'mcp_tools_forms';
+    }
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'Which groups of tools an agent is offered. A group that is off is not merely hidden: its tools are refused if asked for by name.', 'guarded-mcp' ); ?></p>
 
@@ -1262,7 +1361,7 @@ class GMCP_Settings {
               </label>
               <label>
                 <input type="checkbox" name="mcp_tools_admin" value="1" <?php checked( !empty( $options['mcp_tools_admin'] ) ); ?>>
-                <?php esc_html_e( 'Site administration (plugins, themes, menus, widgets, settings, permalinks, site health)', 'guarded-mcp' ); ?>
+                <?php esc_html_e( 'Site administration (plugins, themes, menus, widgets, settings, permalinks, site health, error log, page fetch, preview links)', 'guarded-mcp' ); ?>
               </label>
               <?php if ( $woo ) : ?>
                 <label>
@@ -1324,6 +1423,30 @@ class GMCP_Settings {
                   <?php esc_html_e( 'WP Activity Log (read the site\'s security log: event counts, and the events themselves at admin level)', 'guarded-mcp' ); ?>
                 </label>
               <?php endif; ?>
+              <?php if ( $redirection ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_redirection" value="1" <?php checked( !empty( $options['mcp_tools_redirection'] ) ); ?>>
+                  <?php esc_html_e( 'Redirection (list, create, edit and switch redirects on or off, with a target and source policy)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
+              <?php if ( $polylang ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_polylang" value="1" <?php checked( !empty( $options['mcp_tools_polylang'] ) ); ?>>
+                  <?php esc_html_e( 'Polylang (read the configured languages and a post\'s translation group; read only)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
+              <?php if ( $seo ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_seo" value="1" <?php checked( !empty( $options['mcp_tools_seo'] ) ); ?>>
+                  <?php esc_html_e( 'Rank Math / All in One SEO (per-post title, description, canonical, index or noindex, social tags)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
+              <?php if ( $forms ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_forms" value="1" <?php checked( !empty( $options['mcp_tools_forms'] ) ); ?>>
+                  <?php esc_html_e( 'Form submissions, read only (Contact Form 7 with Flamingo, Fluent Forms, Ninja Forms)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
               <label>
                 <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>
                 <?php esc_html_e( 'Generate create, read, update and delete tools for posts, pages and media from the REST API', 'guarded-mcp' ); ?>
@@ -1357,6 +1480,16 @@ class GMCP_Settings {
                 <?php esc_html_e( 'The Kirki tools resolve a field\'s storage model from its registration and write through the right path, so a value written through them lands where Kirki reads it. Writing through the generic option tools instead is a silent success: the value lands in a row nothing reads, and the front end keeps rendering the old one.', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
+            <?php if ( $redirection ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'A redirect sends every visitor of one URL somewhere else, so a redirect to a site you do not control is an open redirect, and one on the login page locks you out. The Redirection tools therefore accept a target only on this site\'s own host (other https hosts only if listed through the gmcp_redirect_allowed_hosts filter), refuse regular-expression sources unless gmcp_redirect_allow_regex allows them, refuse sources on wp-login, wp-admin, the REST API and this plugin\'s endpoint, and re-check a redirect before switching it on. There is no delete tool; switching a redirect off is the way to remove one.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $polylang ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The Polylang tools only read. They say which languages are configured and which posts Polylang links as translations of one another, and they tell "Polylang has no languages" apart from "this post has no translations". There is no tool that links posts or assigns a language.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
             <?php if ( $yoast ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The Yoast tools exist because writing _yoast_wpseo_* post meta through the generic tools appears to work and does not: Yoast reads from the wp_yoast_indexable table on the front end, not from post meta, and a write to post meta alone leaves the indexable stale. These write through Yoast\'s own API and rebuild the indexable, so the front end shows the new value on the next load.', 'guarded-mcp' ); ?>
@@ -1375,6 +1508,16 @@ class GMCP_Settings {
             <?php if ( $ld ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The LearnDash tools exist because enrolment is stored as user meta and a course\'s structure is LearnDash\'s own tree, so the generic tools answer neither question correctly. They distinguish "enrolled" from "can view the course": an open course, or one whose join setting is empty, can be viewed by anyone with nobody enrolled. The tools that return or change student data are admin-level, and removing an enrolment takes a two-step confirmation and refuses when the access actually comes from a LearnDash Group.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $seo ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The Rank Math and All in One SEO tools set a post\'s SEO title, description, canonical URL, index or noindex, and social title and description, at write level. noindex removes a page from search results and a canonical elsewhere moves its ranking, so a canonical must be on this site, the robots field accepts only index, noindex or default, and every reply says what the value was before. Rank Math\'s settings are post meta and are recorded by the change journal. All in One SEO keeps them in its own table, which the journal does not watch, so a change there cannot be undone with wp_undo_change.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $forms ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The form tools only read. They answer how many submissions exist at read level, and return individual submissions at admin level, because a submission is personal data a member of the public wrote. Password and file-upload answers, IP addresses and user agents are never returned, there is no search over answers, and nothing can be edited or deleted. Every reply says whether the store is there at all, so "none arrived" is not confused with "nothing is being kept".', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
             <p class="description">
@@ -1445,7 +1588,7 @@ class GMCP_Settings {
               <?php esc_html_e( 'Remember previous values so changes can be reverted', 'guarded-mcp' ); ?>
             </label>
             <p class="description">
-              <?php esc_html_e( 'Records what a setting or post said before an agent changed it, and lets the change be put back with the wp_undo_change tool. Only writes made through this API are recorded, never your own. Fields that look like credentials are blanked and never stored; the rest of the value is kept, and putting it back leaves those fields as they are.', 'guarded-mcp' ); ?>
+              <?php esc_html_e( 'Records what a setting, post, custom field, term, set of terms or theme setting said before an agent changed it, and lets the change be put back with the wp_undo_change tool, and the undo itself can be undone. Creations, deletions and users are not recorded. Only writes made through this API are recorded, never your own. Fields that look like credentials are blanked and never stored; the rest of the value is kept, and putting it back leaves those fields as they are.', 'guarded-mcp' ); ?>
             </p>
           </td>
         </tr>
@@ -1466,6 +1609,165 @@ class GMCP_Settings {
     </form>
     <?php
   }
+
+  #region Approvals
+
+  /**
+  * The queue of calls waiting for a person, and the setting that decides what waits.
+  *
+  * Plain forms, no script: every button is its own POST with the page nonce and a nonce
+  * for that one request and that one verdict, so a link cannot be crafted that answers a
+  * request and a form cannot be replayed against a different one. There is no select-all,
+  * no bulk action and no delete. A request leaves the list by being answered or by lapsing.
+  *
+  * Everything shown from a request is escaped, and the arguments are the redacted copy the
+  * queue stored: this screen never holds an unredacted credential to print.
+  */
+  private function render_approvals( array $options ): void {
+    GMCP_Approvals::expire_stale();
+    $mode = in_array( $options['mcp_approval_mode'] ?? 'never', GMCP_Approvals::MODES, true )
+      ? $options['mcp_approval_mode'] : 'site';
+    $pending = GMCP_Approvals::pending();
+    $recent = GMCP_Approvals::recent( 25 );
+    ?>
+    <p class="gmcp-intro"><?php esc_html_e( 'When this is switched on, a tool call that would delete something or change the site does not run. It waits here for you. The agent is told it is waiting and cannot approve it: there is no tool that does, and an approval only counts when it comes from you, signed in to wp-admin. After you approve, the agent repeats the same call and it runs once. An approval is for one key, one tool and exactly those arguments; it lapses after 15 minutes unused, and an unanswered request lapses after an hour. The two-step confirmation on irreversible tools still applies inside an approved call.', 'guarded-mcp' ); ?></p>
+
+    <?php if ( GMCP_Approvals::session_problem() === 'recent_change' ) : ?>
+      <div class="notice notice-warning inline"><p><?php esc_html_e( 'An AI tool call created this account, or changed its password, email address or role, in the last 24 hours, so this account cannot approve or decline requests yet. Use another administrator account that no tool has changed, or wait until the day is up.', 'guarded-mcp' ); ?></p></div>
+    <?php endif; ?>
+
+    <h2 class="title"><?php esc_html_e( 'Ask before', 'guarded-mcp' ); ?></h2>
+    <form method="post">
+      <?php
+      $this->form_head( 'save' );
+      $this->form_fields( [ 'mcp_approval_mode' ] );
+      ?>
+      <table class="form-table" role="presentation">
+        <tr>
+          <th scope="row"><?php esc_html_e( 'Hold for approval', 'guarded-mcp' ); ?></th>
+          <td>
+            <fieldset class="gmcp-choices">
+              <label><input type="radio" name="mcp_approval_mode" value="never" <?php checked( $mode, 'never' ); ?>>
+                <?php esc_html_e( 'Never: calls run as soon as the key and the tool allow them', 'guarded-mcp' ); ?></label>
+              <label><input type="radio" name="mcp_approval_mode" value="deletes" <?php checked( $mode, 'deletes' ); ?>>
+                <?php esc_html_e( 'Deletes: anything that removes something, and any tool this plugin cannot classify', 'guarded-mcp' ); ?></label>
+              <label><input type="radio" name="mcp_approval_mode" value="site" <?php checked( $mode, 'site' ); ?>>
+                <?php esc_html_e( 'Deletes and site changes: also settings, plugins, themes, users, options and the other administrative writes', 'guarded-mcp' ); ?></label>
+            </fieldset>
+            <p class="description"><?php esc_html_e( "Applies to every key and every connected app, so a key made later is covered too. Which tools count is worked out from each tool's own access level and annotations, not from a list. Content edits at the read and write level never wait. Previews wait like anything else: the setting cannot tell a preview from the call it previews.", 'guarded-mcp' ); ?></p>
+            <?php if ( $mode !== 'never' && empty( $options['mcp_activity_log'] ) ) : ?>
+              <p class="description gmcp-warn"><?php esc_html_e( 'The audit log is switched off, so requests and decisions are kept in this queue for 30 days but not written to the log.', 'guarded-mcp' ); ?></p>
+            <?php endif; ?>
+          </td>
+        </tr>
+      </table>
+      <?php submit_button(); ?>
+    </form>
+
+    <h2 class="title"><?php
+      /* translators: %d: number of requests waiting. */
+      echo esc_html( sprintf( __( 'Waiting for you (%d)', 'guarded-mcp' ), count( $pending ) ) ); ?></h2>
+    <?php if ( !$pending ) : ?>
+      <p class="gmcp-muted"><?php esc_html_e( 'Nothing is waiting.', 'guarded-mcp' ); ?></p>
+    <?php else : ?>
+      <table class="widefat striped gmcp-table">
+        <thead><tr>
+          <th><?php esc_html_e( 'Request', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Asked by', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Call', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Lapses', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Answer', 'guarded-mcp' ); ?></th>
+        </tr></thead>
+        <tbody>
+        <?php foreach ( $pending as $row ) : $rid = (int) $row['id']; ?>
+          <tr>
+            <td class="gmcp-nowrap">#<?php echo (int) $rid; ?><br>
+              <span class="gmcp-detail"><?php echo esc_html( self::ago_for( (int) $row['created'] ) ); ?></span></td>
+            <td><?php echo esc_html( $row['label'] !== '' ? $row['label'] : $row['identity'] ); ?><br>
+              <span class="gmcp-detail"><?php echo esc_html( $row['identity'] ); ?></span></td>
+            <td><code><?php echo esc_html( $row['tool'] ); ?></code>
+              <span class="gmcp-detail">(<?php echo esc_html( $row['tool_class'] ); ?>)</span>
+              <?php echo self::approval_args_html( (string) $row['args_view'], $row['args_redacted'] ?? null ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- every piece is escaped inside. ?></td>
+            <td class="gmcp-nowrap"><?php echo esc_html( human_time_diff( time(), (int) $row['expires'] ) ); ?></td>
+            <td class="gmcp-nowrap">
+              <?php foreach ( [ 'approve' => __( 'Approve', 'guarded-mcp' ), 'decline' => __( 'Decline', 'guarded-mcp' ) ] as $verdict => $label ) : ?>
+                <form method="post" style="display:inline">
+                  <?php
+                  $this->form_head( $verdict . '_request' );
+                  printf( '<input type="hidden" name="request_id" value="%d">', (int) $rid );
+                  printf( '<input type="hidden" name="gmcp_approval_nonce" value="%s">',
+                    esc_attr( wp_create_nonce( GMCP_Approvals::nonce_action( $verdict, $rid ) ) ) );
+                  ?>
+                  <button type="submit" class="button <?php echo $verdict === 'approve' ? 'button-primary' : ''; ?>"><?php echo esc_html( $label ); ?></button>
+                </form>
+              <?php endforeach; ?>
+            </td>
+          </tr>
+        <?php endforeach; ?>
+        </tbody>
+      </table>
+    <?php endif; ?>
+
+    <h2 class="title"><?php esc_html_e( 'Recently answered or lapsed', 'guarded-mcp' ); ?></h2>
+    <?php if ( !$recent ) : ?>
+      <p class="gmcp-muted"><?php esc_html_e( 'Nothing yet.', 'guarded-mcp' ); ?></p>
+    <?php else : ?>
+      <table class="widefat striped gmcp-table">
+        <thead><tr>
+          <th><?php esc_html_e( 'Request', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Asked by', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Call', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Outcome', 'guarded-mcp' ); ?></th>
+        </tr></thead>
+        <tbody>
+        <?php foreach ( $recent as $row ) :
+          $who = (int) $row['decided_by'] > 0 ? ( get_userdata( (int) $row['decided_by'] )->user_login ?? '' ) : ''; ?>
+          <tr>
+            <td class="gmcp-nowrap">#<?php echo (int) $row['id']; ?><br>
+              <span class="gmcp-detail"><?php echo esc_html( self::ago_for( (int) $row['created'] ) ); ?></span></td>
+            <td><?php echo esc_html( $row['label'] !== '' ? $row['label'] : $row['identity'] ); ?></td>
+            <td><code><?php echo esc_html( $row['tool'] ); ?></code></td>
+            <td><?php echo esc_html( $row['status'] ); ?><?php if ( $who !== '' ) : ?>
+              <span class="gmcp-detail"> <?php echo esc_html( sprintf( /* translators: %s: user login. */ __( 'by %s', 'guarded-mcp' ), $who ) ); ?></span><?php endif; ?></td>
+          </tr>
+        <?php endforeach; ?>
+        </tbody>
+      </table>
+    <?php endif; ?>
+    <?php
+  }
+
+  /**
+  * The arguments exactly as stored, in the one canonical order, with what is hidden named.
+  *
+  * Not shortened and not reordered here: GMCP_Approvals::build_view() refuses to queue a call
+  * that does not fit, so the text this prints is every byte the approval covers, except the
+  * values it says it hides. A row from before that (no redaction list, or a stored preview)
+  * is labelled as possibly incomplete instead of being passed off as whole.
+  *
+  * @param string|null $redacted JSON list of the paths hidden, or null for an older row.
+  */
+  private static function approval_args_html( string $text, $redacted ): string {
+    $names = is_string( $redacted ) ? json_decode( $redacted, true ) : null;
+    $note = '';
+    if ( is_array( $names ) && $names ) {
+      $shown = array_map( function ( $n ) {
+        return '"' . mb_substr( (string) $n, 0, 60 ) . '"';
+      }, array_slice( $names, 0, 20 ) );
+      $note = '<p class="gmcp-detail gmcp-warn"><strong>' . esc_html( sprintf(
+        /* translators: %d: number of hidden values. */
+        _n( '%d value is hidden from this screen and is still part of what you approve:', '%d values are hidden from this screen and are still part of what you approve:', count( $names ), 'guarded-mcp' ),
+        count( $names )
+      ) ) . '</strong> ' . esc_html( implode( ', ', $shown ) . ( count( $names ) > 20 ? sprintf( /* translators: %d: how many more. */ __( ' and %d more', 'guarded-mcp' ), count( $names ) - 20 ) : '' ) ) . '</p>';
+    }
+    elseif ( !is_array( $names ) || strpos( $text, '__gmcp_truncated' ) !== false ) {
+      $note = '<p class="gmcp-detail gmcp-warn">' . esc_html__( 'This request was stored by an earlier version. What is shown may be shortened and may hide values you cannot see here; decline it unless you are sure.', 'guarded-mcp' ) . '</p>';
+    }
+    return $note . '<details open><summary class="gmcp-summary">' . esc_html__( 'Arguments', 'guarded-mcp' ) . '</summary><pre class="gmcp-args">'
+      . esc_html( $text ) . '</pre></details>';
+  }
+
+  #endregion
 
   /**
   * The record itself: the table, one entry, or the off notice.

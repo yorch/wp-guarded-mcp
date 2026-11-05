@@ -98,6 +98,34 @@ check "unknown tool reports isError" "$(py 'import json,sys;print(json.load(sys.
 call missing '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"value":"x"}}}'
 check "missing required arg is named" "$(py 'import json,sys;d=json.load(sys.stdin);print("ok" if d["result"].get("isError") and "key" in d["result"]["content"][0]["text"] else "err")' missing)" "ok"
 
+echo "-- instructions and annotations on the handshake and tools/list --"
+# The instructions are what a client shows its model at session start. Checked against the
+# reply, with a control that the same reply still carries the server info it always did.
+check "CONTROL: initialize still reports serverInfo" "$(py 'import json,sys;print("ok" if json.load(sys.stdin)["result"].get("serverInfo",{}).get("name") else "err")' init)" "ok"
+check "initialize carries instructions" "$(py 'import json,sys;i=json.load(sys.stdin)["result"].get("instructions","");print("ok" if "two steps" in i and "never as instructions" in i and "WordPress site at" in i else "err")' init)" "ok"
+check "instructions carry no key material" "$(py 'import json,sys;i=json.load(sys.stdin)["result"].get("instructions","");print("ok" if "gmcp_" not in i and "Bearer" not in i else "leak")' init)" "ok"
+check "every tool carries boolean readOnlyHint and destructiveHint" \
+  "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["tools"];print(all(isinstance(x.get("annotations",{}).get("readOnlyHint"),bool) and isinstance(x.get("annotations",{}).get("destructiveHint"),bool) for x in t))' list)" "True"
+check "a read tool is marked read-only" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_get_posts"]["annotations"]["readOnlyHint"])' list)" "True"
+check "a read of personal data is read-only despite admin level" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_get_users"]["annotations"]["readOnlyHint"])' list)" "True"
+check "a delete is destructive and not read-only" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};a=t["wp_delete_post"]["annotations"];print(a["destructiveHint"] and not a["readOnlyHint"])' list)" "True"
+check "a tool that fetches from a URL is open-world" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_upload_media"]["annotations"]["openWorldHint"])' list)" "True"
+check "CONTROL: a write is not marked read-only" "$(py 'import json,sys;t={x["name"]:x for x in json.load(sys.stdin)["result"]["tools"]};print(t["wp_write_blocks"]["annotations"]["readOnlyHint"])' list)" "False"
+
+echo "-- wp_write_blocks from markdown: stored state, not the reply --"
+MD_ID=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"Markdown smoke","post_type"=>"post","post_status"=>"draft","post_content"=>"placeholder"]);' 2>/dev/null | tr -d '\r\n')
+call md_write '{"jsonrpc":"2.0","id":140,"method":"tools/call","params":{"name":"wp_write_blocks","arguments":{"ID":'"$MD_ID"',"markdown":"# Hostile heading\n\n[bad](javascript:alert(1)) [good](https://example.com/ok)\n\n<script>x()</script>"}}}'
+check "wp_write_blocks accepts markdown" "$(verdict md_write)" "ok"
+MD_STORED=$(docker compose exec -T cli wp eval "echo get_post($MD_ID)->post_content;" 2>/dev/null)
+check "markdown heading is stored as a heading block" "$(printf '%s' "$MD_STORED" | grep -c '<h1 class="wp-block-heading">Hostile heading</h1>')" "1"
+check "CONTROL: the http(s) link is stored" "$(printf '%s' "$MD_STORED" | grep -c 'href="https://example.com/ok"')" "1"
+check "a javascript: link is not stored as an anchor" "$(printf '%s' "$MD_STORED" | grep -ci 'href="javascript')" "0"
+check "CONTROL: source HTML is stored as escaped text" "$(printf '%s' "$MD_STORED" | grep -c '&lt;script&gt;x()&lt;/script&gt;')" "1"
+check "no live script element is stored" "$(printf '%s' "$MD_STORED" | grep -ci '<script')" "0"
+call md_both '{"jsonrpc":"2.0","id":141,"method":"tools/call","params":{"name":"wp_write_blocks","arguments":{"ID":'"$MD_ID"',"markdown":"x","blocks":[{"type":"paragraph","content":"y"}]}}}'
+check "blocks and markdown together are refused" "$(verdict md_both)" "error"
+docker compose exec -T cli wp eval "wp_delete_post($MD_ID, true);" >/dev/null 2>&1
+
 echo "-- a delete says which of the two things it did --"
 # "Deleted" was the answer for both trashing and destroying, and they are not the same
 # event. The description promised the trash flatly, so an agent could truthfully relay
@@ -1068,6 +1096,757 @@ check "and the override goes ahead when asked" \
 docker compose exec -T cli wp eval "\$o=get_option('gmcp_options',[]);\$o['mcp_tools_elementor']=('$ELEM_WAS'==='1');update_option('gmcp_options',\$o,false);" >/dev/null 2>&1
 check "and the Elementor group is back as it was found" \
   "$(docker compose exec -T cli wp eval 'global $gmcp_core; echo $gmcp_core->get_option("mcp_tools_elementor") ? "1" : "0";' 2>/dev/null | tr -d '\r\n')" "$ELEM_WAS"
+
+echo "-- drafts-only keys: nothing live is touched, whichever tool is asked --"
+# A drafts-only key may write drafts and nothing the public can see. Every refusal below is
+# asserted against the STORED state, never the reply, and every "this did not happen" check
+# sits beside a control that makes the same kind of write succeed with a key that is not
+# drafts-only, so a probe that cannot find a post (a wrong id, a failed seed) cannot read as
+# a pass. The fixtures are made through WordPress's own writers, not hand-built rows.
+callk() { # callk <file> <key> <json>
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $2" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d "$3" -o "$OUT/$1"
+}
+tool_json() { # tool_json <id> <tool> <arguments-json>
+  printf '{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$1" "$2" "$3"
+}
+wpe() { docker compose exec -T cli wp eval "$1" 2>/dev/null | tr -d '\r\n'; }
+# The stored column, not get_post_status(): that resolves an attachment's "inherit" to its parent's.
+pstatus() { wpe "wp_cache_flush(); \$p = get_post($1); echo \$p ? \$p->post_status : 'none';"; }
+ptitle() { wpe "wp_cache_flush(); echo get_post_field('post_title', $1);"; }
+pmeta() { wpe "wp_cache_flush(); echo metadata_exists('post', $1, '$2') ? 'set:' . get_post_meta($1, '$2', true) : 'absent';"; }
+pcount() { wpe "wp_cache_flush(); echo count(get_posts(['title'=>'$1','post_status'=>'any','post_type'=>'any','numberposts'=>-1]));"; }
+pcontent() { wpe "wp_cache_flush(); echo get_post_field('post_content', $1);"; }
+
+# The fixtures. The attachment on the live post, the one on the draft and the free one are
+# the three cases the media rule distinguishes.
+DO_FIX=$(wpe '
+  $mk = function ( $t, $s, $x = [] ) { return wp_insert_post( array_merge( [ "post_title" => $t, "post_status" => $s, "post_content" => "body" ], $x ) ); };
+  $live = $mk( "DO live", "publish" ); $draft = $mk( "DO draft", "draft" ); $priv = $mk( "DO private", "private" );
+  $fut = $mk( "DO future", "future", [ "post_date" => gmdate( "Y-m-d H:i:s", time() + 2592000 ) ] );
+  $at = function ( $t, $parent ) { $id = wp_insert_attachment( [ "post_title" => $t, "post_mime_type" => "image/png", "post_status" => "inherit" ], false, $parent ); update_post_meta( $id, "_wp_attached_file", "do-fixture.png" ); return $id; };
+  echo implode( " ", [ $live, $draft, $priv, $fut, $at( "DO att live", $live ), $at( "DO att draft", $draft ), $at( "DO att free", 0 ) ] );')
+read -r DO_LIVE DO_DRAFT DO_PRIV DO_FUT DO_ATL DO_ATD DO_ATF <<< "$DO_FIX"
+check "CONTROL: the fixtures exist with the statuses the tests assume" \
+  "$(for i in $DO_LIVE $DO_DRAFT $DO_PRIV $DO_FUT $DO_ATL; do pstatus $i; printf ' '; done)" "publish draft private future inherit "
+
+K_DO=$(wpe '$a=GMCP_Tokens::create("drafts only writer","readwrite",0,[],0,true);echo $a["secret"];')
+K_PW=$(wpe '$a=GMCP_Tokens::create("plain writer","readwrite",0,[]);echo $a["secret"];')
+K_DA=$(wpe '$a=GMCP_Tokens::create("drafts only admin","admin",0,[],0,true);echo $a["secret"];')
+# A row exactly as a version without the flag stored it: no drafts_only field at all.
+K_OLD=$(wpe '$a=GMCP_Tokens::create("pre-flag writer","readwrite",0,[]);$r=GMCP_Tokens::all();unset($r[$a["id"]]["drafts_only"]);update_option("gmcp_tokens",$r,false);echo $a["secret"];')
+K_ADMIN=$(wpe '$a=GMCP_Tokens::create("do admin","admin",0,[]);echo $a["secret"];')
+case "$K_DO$K_PW$K_DA$K_OLD$K_ADMIN" in *gmcp_*gmcp_*gmcp_*gmcp_*gmcp_*) ;; *) echo "could not mint the drafts-only keys" >&2; exit 1 ;; esac
+
+echo "  -- creating --"
+for st in publish future private; do
+  callk do_c "$K_DO" "$(tool_json 1 wp_create_post "{\"post_title\":\"DO created $st\",\"post_status\":\"$st\"}")"
+  check "drafts-only: wp_create_post with status $st is refused" "$(verdict do_c)" "error"
+  check "  and nothing named for it exists" "$(pcount "DO created $st")" "0"
+done
+callk do_c "$K_DO" "$(tool_json 2 wp_create_post '{"post_title":"DO created draft"}')"
+check "CONTROL: the same key creates a draft" "$(pcount 'DO created draft')" "1"
+callk do_c "$K_PW" "$(tool_json 3 wp_create_post '{"post_title":"DO plain published","post_status":"publish"}')"
+check "CONTROL: a key without the flag still publishes" "$(pstatus "$(wpe "echo get_page_by_title('DO plain published', OBJECT, 'post')->ID;")")" "publish"
+callk do_c "$K_OLD" "$(tool_json 3 wp_create_post '{"post_title":"DO old published","post_status":"publish"}')"
+check "CONTROL: a key stored before the flag existed still publishes" "$(pstatus "$(wpe "echo get_page_by_title('DO old published', OBJECT, 'post')->ID;")")" "publish"
+
+callk do_b "$K_DO" "$(tool_json 4 wp_create_posts '{"items":[{"post_title":"DO batch one"},{"post_title":"DO batch two","post_status":"publish"}]}')"
+check "drafts-only: a batch with one live item is refused" "$(verdict do_b)" "error"
+check "  and the draft item BEFORE it was not created either" "$(pcount 'DO batch one')$(pcount 'DO batch two')" "00"
+callk do_b "$K_DO" "$(tool_json 5 wp_create_posts '{"items":[{"post_title":"DO batch three"},{"post_title":"DO batch four"}]}')"
+check "CONTROL: a batch of drafts is created" "$(pcount 'DO batch three')$(pcount 'DO batch four')" "11"
+
+echo "  -- going live --"
+callk do_u "$K_DO" "$(tool_json 6 wp_update_post "{\"ID\":$DO_DRAFT,\"fields\":{\"post_status\":\"publish\"}}")"
+check "drafts-only: publishing a draft is refused" "$(verdict do_u)" "error"
+check "  and it is still a draft" "$(pstatus $DO_DRAFT)" "draft"
+callk do_u "$K_DO" "$(tool_json 7 wp_update_post "{\"ID\":$DO_DRAFT,\"schedule_for\":\"2099-01-01 10:00:00\"}")"
+check "drafts-only: scheduling a draft is refused" "$(verdict do_u)" "error"
+check "  and it is still a draft, not future" "$(pstatus $DO_DRAFT)" "draft"
+callk do_u "$K_DO" "$(tool_json 8 wp_update_post "{\"ID\":$DO_DRAFT,\"fields\":{\"post_status\":\"private\"}}")"
+check "drafts-only: making a draft private is refused" "$(pstatus $DO_DRAFT)" "draft"
+callk do_u "$K_DO" "$(tool_json 9 wp_update_post "{\"ID\":$DO_DRAFT,\"fields\":{\"post_title\":\"DO draft edited\"}}")"
+check "CONTROL: the same key edits a draft's title" "$(ptitle $DO_DRAFT)" "DO draft edited"
+
+echo "  -- editing what is live --"
+for pair in "$DO_LIVE:publish" "$DO_PRIV:private" "$DO_FUT:future"; do
+  id=${pair%%:*}; st=${pair##*:}
+  callk do_u "$K_DO" "$(tool_json 10 wp_update_post "{\"ID\":$id,\"fields\":{\"post_title\":\"DO hijacked\"}}")"
+  check "drafts-only: editing a $st post is refused" "$(verdict do_u)" "error"
+  check "  and its title is unchanged" "$(ptitle $id | grep -c hijacked)" "0"
+  callk do_u "$K_DO" "$(tool_json 11 wp_update_post "{\"ID\":$id,\"fields\":{\"post_status\":\"draft\"}}")"
+  check "drafts-only: unpublishing a $st post is refused" "$(pstatus $id)" "$st"
+done
+callk do_u "$K_PW" "$(tool_json 12 wp_update_post "{\"ID\":$DO_LIVE,\"fields\":{\"post_title\":\"DO live edited\"}}")"
+check "CONTROL: a key without the flag can edit that same live post" "$(ptitle $DO_LIVE)" "DO live edited"
+
+callk do_a "$K_DO" "$(tool_json 13 wp_alter_post "{\"ID\":$DO_LIVE,\"field\":\"post_content\",\"search\":\"body\",\"replace\":\"changed\"}")"
+check "drafts-only: wp_alter_post on a live post is refused" "$(pcontent $DO_LIVE)" "body"
+callk do_a "$K_DO" "$(tool_json 14 wp_alter_post "{\"ID\":$DO_DRAFT,\"field\":\"post_content\",\"search\":\"body\",\"replace\":\"changed\"}")"
+check "CONTROL: wp_alter_post on a draft goes through" "$(pcontent $DO_DRAFT)" "changed"
+callk do_a "$K_DO" "$(tool_json 15 wp_write_blocks "{\"ID\":$DO_LIVE,\"blocks\":[{\"type\":\"paragraph\",\"content\":\"hacked\"}]}")"
+check "drafts-only: wp_write_blocks on a live post is refused" "$(pcontent $DO_LIVE)" "body"
+callk do_a "$K_PW" "$(tool_json 16 wp_write_blocks "{\"ID\":$DO_PRIV,\"blocks\":[{\"type\":\"paragraph\",\"content\":\"hacked\"}]}")"
+check "CONTROL: the same wp_write_blocks call works for a key without the flag" "$(pcontent $DO_PRIV | grep -c hacked)" "1"
+
+echo "  -- meta, terms, thumbnail, copy, duplicate --"
+callk do_m "$K_DO" "$(tool_json 17 wp_update_post_meta "{\"ID\":$DO_LIVE,\"key\":\"do_probe\",\"value\":\"x\"}")"
+check "drafts-only: setting meta on a live post is refused" "$(pmeta $DO_LIVE do_probe)" "absent"
+callk do_m "$K_DO" "$(tool_json 18 wp_update_post_meta "{\"ID\":$DO_DRAFT,\"key\":\"do_probe\",\"value\":\"x\"}")"
+check "CONTROL: setting meta on a draft works" "$(pmeta $DO_DRAFT do_probe)" "set:x"
+callk do_m "$K_PW" "$(tool_json 19 wp_update_post_meta "{\"ID\":$DO_LIVE,\"key\":\"do_probe\",\"value\":\"y\"}")"
+check "CONTROL: a key without the flag can set it on the live post (the probe can find a write)" "$(pmeta $DO_LIVE do_probe)" "set:y"
+wpe "delete_post_meta($DO_LIVE, 'do_probe');" >/dev/null
+callk do_m "$K_DO" "$(tool_json 20 wp_copy_post_meta "{\"from_id\":$DO_DRAFT,\"to_id\":$DO_LIVE,\"keys\":[\"do_probe\"]}")"
+check "drafts-only: wp_copy_post_meta onto a live post is refused" "$(pmeta $DO_LIVE do_probe)" "absent"
+callk do_m "$K_PW" "$(tool_json 21 wp_copy_post_meta "{\"from_id\":$DO_DRAFT,\"to_id\":$DO_LIVE,\"keys\":[\"do_probe\"]}")"
+check "CONTROL: the same copy works for a key without the flag" "$(pmeta $DO_LIVE do_probe)" "set:x"
+wpe "delete_post_meta($DO_LIVE, 'do_probe');" >/dev/null
+callk do_m "$K_DO" "$(tool_json 22 wp_write_post_meta_chunk "{\"session\":\"do1\",\"ID\":$DO_LIVE,\"key\":\"do_probe\",\"data\":\"zzz\",\"final\":true}")"
+check "drafts-only: the chunk writer onto a live post is refused" "$(pmeta $DO_LIVE do_probe)" "absent"
+callk do_m "$K_DO" "$(tool_json 23 wp_write_post_meta_chunk "{\"session\":\"do2\",\"ID\":$DO_DRAFT,\"key\":\"do_chunk\",\"data\":\"zzz\",\"final\":true}")"
+check "CONTROL: the chunk writer onto a draft works" "$(pmeta $DO_DRAFT do_chunk)" "set:zzz"
+
+callk do_t "$K_DO" "$(tool_json 24 wp_add_post_terms "{\"ID\":$DO_LIVE,\"terms\":[\"do-term\"],\"taxonomy\":\"post_tag\"}")"
+check "drafts-only: tagging a live post is refused" "$(wpe "wp_cache_flush(); echo count(wp_get_object_terms($DO_LIVE, 'post_tag'));")" "0"
+callk do_t "$K_DO" "$(tool_json 25 wp_add_post_terms "{\"ID\":$DO_DRAFT,\"terms\":[\"do-term\"],\"taxonomy\":\"post_tag\"}")"
+check "CONTROL: tagging a draft works" "$(wpe "wp_cache_flush(); echo count(wp_get_object_terms($DO_DRAFT, 'post_tag'));")" "1"
+callk do_t "$K_DO" "$(tool_json 26 wp_set_featured_image "{\"post_id\":$DO_LIVE,\"media_id\":$DO_ATF}")"
+check "drafts-only: setting a live post's featured image is refused" "$(pmeta $DO_LIVE _thumbnail_id)" "absent"
+callk do_t "$K_DO" "$(tool_json 27 wp_set_featured_image "{\"post_id\":$DO_DRAFT,\"media_id\":$DO_ATF}")"
+check "CONTROL: a draft's featured image can be set" "$(pmeta $DO_DRAFT _thumbnail_id)" "set:$DO_ATF"
+callk do_t "$K_DO" "$(tool_json 28 wp_set_featured_image "{\"post_id\":$DO_DRAFT}")"
+check "  and removed again" "$(pmeta $DO_DRAFT _thumbnail_id)" "absent"
+
+callk do_d "$K_DO" "$(tool_json 29 wp_duplicate_post "{\"ID\":$DO_LIVE,\"post_title\":\"DO dup live\",\"post_status\":\"publish\"}")"
+check "drafts-only: duplicating into a published copy is refused" "$(pcount 'DO dup live')" "0"
+callk do_d "$K_DO" "$(tool_json 30 wp_duplicate_post "{\"ID\":$DO_LIVE,\"post_title\":\"DO dup draft\"}")"
+check "CONTROL: copying a live page to a DRAFT is allowed (the source is only read)" "$(pcount 'DO dup draft')" "1"
+check "  and the copy really is a draft" "$(wpe "wp_cache_flush(); \$p=get_posts(['title'=>'DO dup draft','post_status'=>'any','numberposts'=>1]); echo \$p[0]->post_status;")" "draft"
+
+echo "  -- media --"
+callk do_i "$K_DO" "$(tool_json 31 wp_update_media "{\"ID\":$DO_ATL,\"title\":\"DO att hijack\"}")"
+check "drafts-only: editing media attached to a live post is refused" "$(ptitle $DO_ATL)" "DO att live"
+callk do_i "$K_DO" "$(tool_json 32 wp_update_media "{\"ID\":$DO_ATD,\"title\":\"DO att renamed\"}")"
+check "CONTROL: media attached to a draft can be edited" "$(ptitle $DO_ATD)" "DO att renamed"
+PNG=iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==
+callk do_i "$K_DO" "$(tool_json 33 wp_upload_media "{\"base64\":\"$PNG\",\"filename\":\"do-probe.png\",\"title\":\"DO uploaded\",\"alt\":\"probe\"}")"
+check "CONTROL: uploading media for a draft is allowed, title and alt included" \
+  "$(wpe "wp_cache_flush(); \$p=get_posts(['title'=>'DO uploaded','post_type'=>'attachment','post_status'=>'any','numberposts'=>1]); echo \$p ? get_post_meta(\$p[0]->ID, '_wp_attachment_image_alt', true) : 'none';")" "probe"
+
+echo "  -- the net under the tools: writers that are not drafts-only aware --"
+# In-process, with the restriction switched on the way the server switches it, calling
+# WordPress's own functions the way a plugin behind some other tool would. Each prints
+# refused or wrote; the stored state is re-read afterwards.
+DO_NET=$(wpe '
+  $try = function ( $label, $fn ) { try { $fn(); echo $label, "=wrote;"; } catch ( GMCP_Drafts_Only_Refusal $e ) { echo $label, "=refused;"; } catch ( Throwable $e ) { echo $label, "=error:", get_class( $e ), ";"; } };
+  $L = '"$DO_LIVE"'; $D = '"$DO_DRAFT"'; $P = '"$DO_PRIV"'; $A = '"$DO_ATF"'; $AL = '"$DO_ATL"'; $AD = '"$DO_ATD"';
+  update_post_meta( $L, "do_seed", "1" );
+  GMCP_Core::restrict_caller_to_drafts();
+  $try( "update_live", function () use ( $L ) { wp_update_post( [ "ID" => $L, "post_title" => "DO net hijack" ] ); } );
+  $try( "update_private", function () use ( $P ) { wp_update_post( [ "ID" => $P, "post_title" => "DO net hijack" ] ); } );
+  $try( "publish_draft", function () use ( $D ) { wp_update_post( [ "ID" => $D, "post_status" => "publish" ] ); } );
+  $try( "publish_draft_odd_case", function () use ( $D ) { wp_update_post( [ "ID" => $D, "post_status" => "Publish " ] ); } );
+  $try( "insert_publish", function () { wp_insert_post( [ "post_title" => "DO net pub", "post_status" => "publish" ] ); } );
+  $try( "insert_future", function () { wp_insert_post( [ "post_title" => "DO net fut", "post_status" => "future", "post_date" => gmdate( "Y-m-d H:i:s", time() + 86400 ) ] ); } );
+  $try( "meta_update_live", function () use ( $L ) { update_post_meta( $L, "do_net", "1" ); } );
+  $try( "meta_add_live", function () use ( $L ) { add_post_meta( $L, "do_net_add", "1" ); } );
+  $try( "meta_delete_live", function () use ( $L ) { delete_post_meta( $L, "_edit_last" ); } );
+  $try( "terms_live", function () use ( $L ) { wp_set_object_terms( $L, [ "do-net" ], "post_tag" ); } );
+  $try( "thumbnail_live", function () use ( $L, $A ) { set_post_thumbnail( $L, $A ); } );
+  $try( "trash_live", function () use ( $L ) { wp_trash_post( $L ); } );
+  $try( "delete_live", function () use ( $L ) { wp_delete_post( $L, true ); } );
+  $try( "delete_unattached_media", function () use ( $A ) { wp_delete_post( $A, true ); } );
+  $try( "attach_new_media_to_live", function () use ( $L ) { wp_insert_attachment( [ "post_title" => "DO net att", "post_mime_type" => "image/png", "post_status" => "inherit" ], false, $L ); } );
+  $try( "menu_item", function () { $m = wp_create_nav_menu( "DO net menu" ); wp_update_nav_menu_item( $m, 0, [ "menu-item-title" => "DO net item", "menu-item-url" => "http://example.test/", "menu-item-status" => "publish", "menu-item-type" => "custom" ] ); } );
+  $try( "meta_by_mid_live", function () use ( $L ) { global $wpdb; $mid = (int) $wpdb->get_var( $wpdb->prepare( "SELECT meta_id FROM $wpdb->postmeta WHERE post_id = %d AND meta_key = %s", $L, "do_seed" ) ); if ( ! $mid ) { echo "(no row to probe)"; } update_metadata_by_mid( "post", $mid, "changed" ); } );
+  $try( "media_edit_on_live", function () use ( $AL ) { wp_update_post( [ "ID" => $AL, "post_title" => "DO net att hijack" ] ); } );
+  $try( "CONTROL_media_edit_on_draft", function () use ( $AD ) { wp_update_post( [ "ID" => $AD, "post_title" => "DO net att ok" ] ); } );
+  $try( "CONTROL_new_media_unattached", function () { wp_insert_attachment( [ "post_title" => "DO net free", "post_mime_type" => "image/png", "post_status" => "inherit" ], false, 0 ); } );
+  $try( "CONTROL_update_draft", function () use ( $D ) { wp_update_post( [ "ID" => $D, "post_title" => "DO net draft ok" ] ); } );
+  $try( "CONTROL_meta_draft", function () use ( $D ) { update_post_meta( $D, "do_net", "1" ); } );
+  $try( "CONTROL_terms_draft", function () use ( $D ) { wp_set_object_terms( $D, [ "do-net" ], "post_tag" ); } );
+  $try( "CONTROL_insert_draft", function () { wp_insert_post( [ "post_title" => "DO net draft new", "post_status" => "draft" ] ); } );
+  $try( "CONTROL_trash_draft", function () use ( $D ) { wp_trash_post( $D ); } );
+  $try( "CONTROL_untrash_comes_back_draft", function () use ( $D ) { wp_untrash_post( $D ); } );
+')
+for want in update_live=refused update_private=refused publish_draft=refused publish_draft_odd_case=refused insert_publish=refused insert_future=refused \
+  meta_update_live=refused meta_add_live=refused meta_delete_live=refused terms_live=refused thumbnail_live=refused \
+  trash_live=refused delete_live=refused delete_unattached_media=refused attach_new_media_to_live=refused menu_item=refused \
+  meta_by_mid_live=refused media_edit_on_live=refused \
+  CONTROL_media_edit_on_draft=wrote CONTROL_new_media_unattached=wrote \
+  CONTROL_update_draft=wrote CONTROL_meta_draft=wrote CONTROL_terms_draft=wrote CONTROL_insert_draft=wrote \
+  CONTROL_trash_draft=wrote CONTROL_untrash_comes_back_draft=wrote; do
+  check "net: ${want%%=*}" "$(printf '%s' "$DO_NET" | tr ';' '\n' | grep "^${want%%=*}=" | head -1)" "$want"
+done
+check "net, stored: the live post is still published, still titled, and still exists" \
+  "$(pstatus $DO_LIVE)/$(ptitle $DO_LIVE)" "publish/DO live edited"
+check "net, stored: nothing was written to the live post's meta or terms (the seeded row is unchanged)" \
+  "$(pmeta $DO_LIVE do_net)/$(pmeta $DO_LIVE do_net_add)/$(wpe "wp_cache_flush(); echo count(wp_get_object_terms($DO_LIVE, 'post_tag'));")/$(pmeta $DO_LIVE do_seed)" "absent/absent/0/set:1"
+check "net, stored: no menu item or published post slipped in" \
+  "$(pcount 'DO net pub')$(pcount 'DO net fut')$(pcount 'DO net item')" "000"
+check "net, stored: the draft restored from the trash is a draft" "$(pstatus $DO_DRAFT)" "draft"
+check "net, stored: the unattached media is still there, and the live post's media kept its title" "$(pstatus $DO_ATF)/$(ptitle $DO_ATL)" "inherit/DO att live"
+
+echo "  -- the generated REST tools reach the same posts through another door --"
+DO_REST_WAS=$(wpe '$o=get_option("gmcp_options",[]);echo !empty($o["mcp_tools_rest"])?"1":"0";')
+wpe '$o=get_option("gmcp_options",[]);$o["mcp_tools_rest"]=true;update_option("gmcp_options",$o,false);' >/dev/null
+callk do_r "$K_DO" "$(tool_json 35 create_posts '{"title":"DO rest pub","status":"publish"}')"
+check "drafts-only: the generated create_posts tool cannot publish" "$(verdict do_r)/$(pcount 'DO rest pub')" "error/0"
+callk do_r "$K_DO" "$(tool_json 36 update_posts "{\"id\":$DO_PRIV,\"title\":\"DO rest hijack\"}")"
+check "drafts-only: the generated update_posts tool cannot edit a private post" "$(verdict do_r)/$(ptitle $DO_PRIV | grep -c hijack)" "error/0"
+callk do_r "$K_DO" "$(tool_json 37 create_posts '{"title":"DO rest draft","status":"draft"}')"
+check "CONTROL: the generated create_posts tool makes a draft for the same key" "$(pcount 'DO rest draft')" "1"
+callk do_r "$K_PW" "$(tool_json 38 update_posts "{\"id\":$DO_PRIV,\"title\":\"DO rest edited\"}")"
+check "CONTROL: the same update_posts call works for a key without the flag" "$(ptitle $DO_PRIV)" "DO rest edited"
+wpe "\$o=get_option('gmcp_options',[]);\$o['mcp_tools_rest']=('$DO_REST_WAS'==='1');update_option('gmcp_options',\$o,false);" >/dev/null
+
+echo "  -- the cap on level, the journal, and the audit log --"
+callk do_l "$K_DA" '{"jsonrpc":"2.0","id":40,"method":"tools/list"}'
+check "drafts-only: a key asked for administration is held to read and write (no admin tool is listed)" \
+  "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print("wp_delete_post" in n, "wp_update_post" in n)' do_l)" "False True"
+check "  and the stored level is readwrite, with the flag" "$(wpe '$r=array_values(array_filter(GMCP_Tokens::all(),function($k){return $k["label"]==="drafts only admin";}));echo $r[0]["level"],"/",$r[0]["drafts_only"]?"flag":"noflag";')" "readwrite/flag"
+callk do_l "$K_DA" "$(tool_json 41 wp_delete_post "{\"ID\":$DO_LIVE,\"force\":true}")"
+check "  and naming the admin tool anyway is refused, the post still exists" "$(verdict do_l)$(pstatus $DO_LIVE)" "errorpublish"
+
+# Undo is the same write backwards. A field changed while the post was a draft cannot be
+# put back by a drafts-only key once the post has gone live: that is editing a live post.
+callk do_j "$K_ADMIN" "$(tool_json 42 wp_update_post_meta "{\"ID\":$DO_DRAFT,\"key\":\"do_undo\",\"value\":\"first\"}")"
+callk do_j "$K_ADMIN" "$(tool_json 43 wp_update_post_meta "{\"ID\":$DO_DRAFT,\"key\":\"do_undo\",\"value\":\"second\"}")"
+wpe "wp_update_post(['ID'=>$DO_DRAFT,'post_status'=>'publish']);" >/dev/null
+callk do_j "$K_ADMIN" "$(tool_json 44 wp_list_changes '{"limit":10}')"
+DO_CHG=$(py 'import json,sys;d=json.load(sys.stdin);c=json.loads(d["result"]["content"][0]["text"]);c=c if isinstance(c,list) else c.get("changes",[]);print(next((x["id"] for x in c if "do_undo" in json.dumps(x) and "second" not in json.dumps(x.get("previous","")) ),""))' do_j)
+check "CONTROL: the journal holds the change to undo (a missing id would read as a pass)" "$([ -n "$DO_CHG" ] && echo yes || echo no)" "yes"
+callk do_j "$K_DO" "$(tool_json 45 wp_undo_change "{\"id\":\"$DO_CHG\"}")"
+check "drafts-only: reverting a change on a post that has since gone live is refused" "$(verdict do_j)" "error"
+check "  and the field still holds the later value" "$(pmeta $DO_DRAFT do_undo)" "set:second"
+callk do_j "$K_PW" "$(tool_json 46 wp_undo_change "{\"id\":\"$DO_CHG\"}")"
+check "CONTROL: a key without the flag can revert it" "$(pmeta $DO_DRAFT do_undo)" "set:first"
+
+check "refusals are in the audit log, attributed to the key by its label" \
+  "$(wpe '$n=0;foreach(GMCP_Audit::query(["outcome"=>"refused","limit"=>300]) as $r){if($r["client"]==="drafts only writer"){$n++;}}echo $n>=20?"logged":"only $n";')" "logged"
+check "CONTROL: the key's allowed writes are in the log as ok, so the filter can tell them apart" \
+  "$(wpe '$n=0;foreach(GMCP_Audit::query(["outcome"=>"ok","limit"=>300]) as $r){if($r["client"]==="drafts only writer"){$n++;}}echo $n>0?"logged":"none";')" "logged"
+
+echo "-- deletion by another name: trash, auto-draft and the schedule WordPress deletes by --"
+# A write-level key must not be able to destroy a post. wp_scheduled_delete() permanently
+# deletes whatever carries an old _wp_trash_meta_time, and wp_delete_auto_drafts() whatever is
+# an old auto-draft, so "set the status, stamp the meta" was a permanent delete with no
+# approval and no second call. Every refusal is asserted against the STORED state, and each
+# has a control that makes the legitimate version of the same write succeed.
+DX_P=$(wpe 'echo wp_insert_post(["post_title"=>"DX victim","post_status"=>"publish","post_content"=>"body"]);')
+# Hosted on a post of its own: trashing DX victim below turns its comments "post-trashed".
+DX_C=$(wpe '$h=wp_insert_post(["post_title"=>"DX comment host","post_status"=>"publish"]);echo wp_insert_comment(["comment_post_ID"=>$h,"comment_content"=>"DX comment","comment_approved"=>"1"]);')
+check "CONTROL: the fixtures exist" "$(pstatus $DX_P)/$(wpe "echo get_comment($DX_C)->comment_approved;")" "publish/1"
+K_DXA=$(wpe '$a=GMCP_Tokens::create("dx admin","admin",0,[]);echo $a["secret"];')
+case "$K_DXA" in gmcp_*) ;; *) echo "could not mint the dx key" >&2; exit 1 ;; esac
+dxstate() { wpe "wp_cache_flush(); \$p=get_post($1); echo \$p ? \$p->post_status : 'gone', '/', metadata_exists('post',$1,'_wp_trash_meta_time') ? 'stamped' : 'unstamped';"; }
+
+callk dx "$K_PW" "$(tool_json 1 wp_update_post "{\"ID\":$DX_P,\"fields\":{\"post_status\":\"trash\"}}")"
+check "a write key cannot trash a post through wp_update_post" "$(verdict dx)/$(dxstate $DX_P)" "error/publish/unstamped"
+callk dx "$K_PW" "$(tool_json 2 wp_update_post "{\"ID\":$DX_P,\"post_status\":\" TRASH\"}")"
+check "  nor with the status at the top level, in capitals" "$(verdict dx)/$(dxstate $DX_P)" "error/publish/unstamped"
+callk dx "$K_PW" "$(tool_json 3 wp_update_post "{\"ID\":$DX_P,\"fields\":{\"post_status\":\"Auto-Draft \",\"post_date\":\"2020-01-01 00:00:00\"}}")"
+check "a write key cannot turn a post into an old auto-draft (wp_delete_auto_drafts deletes those)" "$(verdict dx)/$(dxstate $DX_P)" "error/publish/unstamped"
+check "  and its date was not rewritten either" "$(wpe "wp_cache_flush(); echo substr(get_post($DX_P)->post_date,0,4) > 2020 ? 'kept' : 'rewritten';")" "kept"
+
+callk dx "$K_PW" "$(tool_json 4 wp_update_post_meta "{\"ID\":$DX_P,\"key\":\"_wp_trash_meta_time\",\"value\":\"1\"}")"
+check "the trash timestamp cannot be written through wp_update_post_meta" "$(verdict dx)/$(pmeta $DX_P _wp_trash_meta_time)" "error/absent"
+callk dx "$K_PW" "$(tool_json 5 wp_update_post_meta "{\"ID\":$DX_P,\"key\":\"_WP_Trash_Meta_Time \",\"value\":\"1\"}")"
+check "  in another case with a trailing space (the column compares that way)" "$(verdict dx)/$(pmeta $DX_P _wp_trash_meta_time)" "error/absent"
+callk dx "$K_PW" "$(tool_json 6 wp_update_post_meta "{\"ID\":$DX_P,\"key\":\"_wp_trash_meta_status\",\"value\":\"publish\"}")"
+check "  the status half of the pair is refused as well" "$(verdict dx)/$(pmeta $DX_P _wp_trash_meta_status)" "error/absent"
+callk dx "$K_PW" "$(tool_json 7 wp_update_post "{\"ID\":$DX_P,\"meta_input\":{\"dx_ok\":\"1\",\"_wp_trash_meta_time\":\"1\"}}")"
+check "  and through meta_input on wp_update_post, which writes nothing at all (the allowed key too)" "$(verdict dx)/$(pmeta $DX_P _wp_trash_meta_time)/$(pmeta $DX_P dx_ok)" "error/absent/absent"
+callk dx "$K_PW" "$(tool_json 8 wp_create_post '{"post_title":"DX born stamped","meta_input":{"_wp_trash_meta_time":"1"}}')"
+check "  and through meta_input on wp_create_post, which creates nothing" "$(verdict dx)/$(pcount 'DX born stamped')" "error/0"
+callk dx "$K_PW" "$(tool_json 9 wp_write_post_meta_chunk "{\"session\":\"dx1\",\"ID\":$DX_P,\"key\":\"_wp_trash_meta_time\",\"data\":\"MQ\",\"final\":true}")"
+check "  and through the chunked writer" "$(verdict dx)/$(pmeta $DX_P _wp_trash_meta_time)" "error/absent"
+callk dx "$K_PW" "$(tool_json 10 wp_update_post_meta "{\"ID\":$DX_P,\"key\":\"dx_plain\",\"value\":\"1\"}")"
+check "CONTROL: an ordinary key is written by the same tool, so the probe can see a write" "$(verdict dx)/$(pmeta $DX_P dx_plain)" "ok/set:1"
+callk dx "$K_PW" "$(tool_json 11 wp_get_post_meta "{\"ID\":$DX_P,\"key\":\"_wp_trash_meta_time\"}")"
+check "CONTROL: reading that key is not refused" "$(verdict dx)" "ok"
+
+echo "  -- the net under the tools, for a writer that is not one of them --"
+DX_NET=$(wpe '
+  $try = function ( $label, $fn ) { try { $fn(); echo $label, "=wrote;"; } catch ( GMCP_Policy_Refusal $e ) { echo $label, "=refused;"; } catch ( Throwable $e ) { echo $label, "=error:", get_class( $e ), ";"; } };
+  $P = '"$DX_P"';
+  $try( "CONTROL_outside_a_tool_call", function () use ( $P ) { update_post_meta( $P, "_wp_trash_meta_time", "1" ); delete_post_meta( $P, "_wp_trash_meta_time" ); } );
+  do_action( "gmcp_tool_start", "wp_update_post", [] );
+  $try( "update_in_a_tool_call", function () use ( $P ) { update_post_meta( $P, "_wp_trash_meta_time", "1" ); } );
+  $try( "add_in_a_tool_call", function () use ( $P ) { add_post_meta( $P, "_wp_trash_meta_status", "publish" ); } );
+  $try( "CONTROL_other_key_in_a_tool_call", function () use ( $P ) { update_post_meta( $P, "dx_net", "1" ); } );
+  $try( "CONTROL_core_trash_in_a_tool_call", function () use ( $P ) { wp_trash_post( $P ); } );
+')
+for want in update_in_a_tool_call=refused add_in_a_tool_call=refused CONTROL_outside_a_tool_call=wrote CONTROL_other_key_in_a_tool_call=wrote CONTROL_core_trash_in_a_tool_call=wrote; do
+  check "net: ${want%%=*}" "$(printf '%s' "$DX_NET" | tr ';' '\n' | grep "^${want%%=*}=" | head -1)" "$want"
+done
+check "net, stored: core's own trash wrote its bookkeeping, and nothing else did" "$(dxstate $DX_P)/$(pmeta $DX_P dx_net)" "trash/stamped/set:1"
+callk dx "$K_PW" "$(tool_json 12 wp_update_post "{\"ID\":$DX_P,\"fields\":{\"post_status\":\"draft\"}}")"
+check "CONTROL: restoring from the trash by status still works, and clears the stamp" "$(verdict dx)/$(dxstate $DX_P)" "ok/draft/unstamped"
+callk dx "$K_DXA" "$(tool_json 13 wp_delete_post "{\"ID\":$DX_P}")"
+check "CONTROL: wp_delete_post is the way to trash, and stamps it" "$(verdict dx)/$(dxstate $DX_P)" "ok/trash/stamped"
+
+check "CONTROL: and a permanent delete inside a tool call, which clears that stamp itself, is not refused" \
+  "$(wpe 'do_action("gmcp_tool_start","wp_delete_post",[]); try { wp_delete_post('"$DX_P"',true); echo "wrote"; } catch ( Throwable $e ) { echo "refused"; }')/$(pstatus $DX_P)" "wrote/none"
+
+echo "  -- a comment is a deletion too --"
+callk dx "$K_PW" "$(tool_json 14 wp_update_comment "{\"comment_ID\":$DX_C,\"fields\":{\"comment_approved\":\"trash\"}}")"
+check "wp_update_comment cannot trash a comment" "$(verdict dx)/$(wpe "wp_cache_flush(); echo get_comment($DX_C)->comment_approved;")" "error/1"
+callk dx "$K_PW" "$(tool_json 15 wp_update_comment "{\"comment_ID\":$DX_C,\"fields\":{\"comment_approved\":\"0\"}}")"
+check "CONTROL: it still changes a comment's approval" "$(verdict dx)/$(wpe "wp_cache_flush(); echo get_comment($DX_C)->comment_approved;")" "ok/0"
+# Spam is the comment's trash: Akismet (bundled with WordPress) permanently deletes spam older
+# than fifteen days. Stored state is asserted, not the reply, and the neighbouring statuses are
+# the controls: "0" (held) was just written above, so it is the value that must survive.
+callk dx "$K_PW" "$(tool_json 16 wp_update_comment "{\"comment_ID\":$DX_C,\"fields\":{\"comment_approved\":\"spam\"}}")"
+check "wp_update_comment cannot mark a comment spam, and the stored status is unchanged" "$(verdict dx)/$(wpe "wp_cache_flush(); echo get_comment($DX_C)->comment_approved;")" "error/0"
+callk dx "$K_PW" "$(tool_json 17 wp_update_comment "{\"comment_ID\":$DX_C,\"fields\":{\"comment_approved\":\" SPAM \"}}")"
+check "  and case and whitespace do not get round it" "$(verdict dx)/$(wpe "wp_cache_flush(); echo get_comment($DX_C)->comment_approved;")" "error/0"
+callk dx "$K_PW" "$(tool_json 18 wp_update_comment "{\"comment_ID\":$DX_C,\"fields\":{\"comment_approved\":\"1\"}}")"
+check "CONTROL: approving it still works, so the refusal is about spam and not about the field" "$(verdict dx)/$(wpe "wp_cache_flush(); echo get_comment($DX_C)->comment_approved;")" "ok/1"
+check "classify_call: spam on a comment widens a write to destructive" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_update_thing","accessLevel"=>"write"],["fields"=>["comment_approved"=>"spam"]]);')" "destructive"
+check "CONTROL: the word spam as a post status is not a deletion, so it stays content" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_update_thing","accessLevel"=>"write"],["fields"=>["post_status"=>"spam"]]);')" "content"
+
+echo "  -- the approval gate sees the same thing --"
+# Pure: what the classifier answers for definitions and arguments, with controls for each
+# direction so a classifier that says "destructive" to everything cannot pass.
+check "classify_call: a status of trash on a write widens it to destructive" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_update_thing","accessLevel"=>"write"],["fields"=>["post_status"=>"Trash "]]);')" "destructive"
+check "  and so does one at the top level, whatever the tool is called" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_edit_thing","accessLevel"=>"admin"],["status"=>"trash"]);')" "destructive"
+check "  and an auto-draft status" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_update_thing","accessLevel"=>"write"],["post_status"=>"auto-draft"]);')" "destructive"
+check "  and a fields value it cannot read, which it cannot vouch for" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_update_thing","accessLevel"=>"write"],["fields"=>"{broken"]);')" "destructive"
+check "CONTROL: the same write with an ordinary status stays content" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_update_thing","accessLevel"=>"write"],["fields"=>["post_status"=>"draft"]]);')" "content"
+check "CONTROL: a read tool that LISTS trashed things stays read" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"x_list_things","accessLevel"=>"read"],["status"=>"trash"]);')" "read"
+check "running a scheduled event is destructive by name (a cron callback can delete anything)" \
+  "$(wpe 'echo GMCP_Approvals::classify(["name"=>"wp_run_cron_event","accessLevel"=>"admin"]);')" "destructive"
+check "CONTROL: an unrelated admin write is still only site" \
+  "$(wpe 'echo GMCP_Approvals::classify(["name"=>"wp_flush_cache","accessLevel"=>"admin"]);')" "site"
+
+DX_MODE_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "never";')
+wpe '$o=get_option("gmcp_options",[]);$o["mcp_approval_mode"]="deletes";update_option("gmcp_options",$o,false);' >/dev/null
+DX_P2=$(wpe 'echo wp_insert_post(["post_title"=>"DX victim two","post_status"=>"publish"]);')
+callk dx "$K_PW" "$(tool_json 16 wp_update_post "{\"ID\":$DX_P2,\"fields\":{\"post_status\":\"trash\"}}")"
+check "in mode deletes, a write key asking for trash is HELD, not run and not merely refused by the tool" \
+  "$(py 'import json,sys;print(json.load(sys.stdin)["result"].get("data",{}).get("status","-"))' dx)/$(pstatus $DX_P2)" "awaiting_human_approval/publish"
+callk dx "$K_PW" "$(tool_json 17 wp_update_post "{\"ID\":$DX_P2,\"fields\":{\"post_title\":\"DX victim two edited\"}}")"
+check "CONTROL: an ordinary edit under the same mode is not held" "$(ptitle $DX_P2)" "DX victim two edited"
+wpe "\$o=get_option('gmcp_options',[]);\$o['mcp_approval_mode']='$DX_MODE_WAS';update_option('gmcp_options',\$o,false);global \$wpdb;\$wpdb->query(\"DELETE FROM {\$wpdb->prefix}gmcp_approvals WHERE tool='wp_update_post'\");" >/dev/null
+check "the mode is back where it was" "$(wpe 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "never";')" "$DX_MODE_WAS"
+wpe 'foreach(get_posts(["post_status"=>"any","post_type"=>"post","numberposts"=>-1,"s"=>"DX "]) as $p){ if(strpos($p->post_title,"DX ")===0){wp_delete_post($p->ID,true);} } foreach(GMCP_Tokens::all() as $t){ if($t["label"]==="dx admin"){GMCP_Tokens::revoke($t["id"]);} }' >/dev/null
+
+echo "-- an agent cannot mint the account that approves its own calls --"
+# In mode "deletes" an admin key could create an administrator with a password it chose, sign
+# in at wp-login.php, and approve its own held calls, because the approval screen asks for a
+# valid cookie that belongs to the current user and nothing about who that user is. So the
+# account tools wait in every mode but "never" (what they ask for decides it, not their names
+# being on a list), and an account a tool call made or re-credentialed cannot answer the queue.
+# The pure part here; the sign-in itself is in smoke-admin.sh, which has a wp-admin session.
+AC_IDS=$(wpe '
+  $s = wp_insert_user( [ "user_login" => "ac_subscriber", "user_email" => "ac_sub@example.test", "user_pass" => wp_generate_password(), "role" => "subscriber" ] );
+  $a = get_users( [ "role" => "administrator", "number" => 1, "orderby" => "ID", "order" => "ASC" ] );
+  echo $s, " ", $a[0]->ID;')
+read -r AC_SUB AC_ADM <<< "$AC_IDS"
+check "CONTROL: the fixture users exist and differ" "$([ -n "$AC_SUB" ] && [ -n "$AC_ADM" ] && [ "$AC_SUB" != "$AC_ADM" ] && echo yes || echo no)" "yes"
+accls() { wpe 'echo GMCP_Approvals::classify_call(["name"=>"'"$1"'","accessLevel"=>"admin"],json_decode(base64_decode("'"$(printf '%s' "$2" | base64 | tr -d '\n')"'"),true));'; }
+check "creating any account is held in every mode but never: even a subscriber" "$(accls wp_create_user '{"user_login":"x","user_email":"x@example.test","role":"subscriber"}')" "account"
+check "  and one with no role named" "$(accls wp_create_user '{"user_login":"x","user_email":"x@example.test"}')" "account"
+check "  held under deletes and under site, not under never" \
+  "$(wpe 'echo implode(",",array_map(function($m){return GMCP_Approvals::needs_approval($m,"account")?"held":"runs";},["never","deletes","site"]));')" "runs,held,held"
+check "a password change on an ordinary user waits" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":{\"user_pass\":\"p\"}}")" "account"
+check "an address change waits" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":{\"user_email\":\"z@example.test\"}}")" "account"
+check "any role waits, a demotion included" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":{\"role\":\"subscriber\"}}")" "account"
+check "a field this list does not know waits" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":{\"wp_capabilities\":\"x\"}}")" "account"
+check "a nested ID waits" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":{\"ID\":$AC_ADM,\"display_name\":\"d\"}}")" "account"
+check "an argument outside the schema waits" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"user_pass\":\"p\",\"fields\":{\"display_name\":\"d\"}}")" "account"
+check "fields it cannot read wait (as the stricter class: the deletion scan cannot vouch for them either)" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":\"{broken\"}")" "destructive"
+check "ANY change to an account that can run the site waits, display name included" "$(accls wp_update_user "{\"ID\":$AC_ADM,\"fields\":{\"display_name\":\"d\"}}")" "account"
+check "CONTROL: a display name on an ordinary user is only a site change, so the mode decides" "$(accls wp_update_user "{\"ID\":$AC_SUB,\"fields\":{\"display_name\":\"d\"}}")" "site"
+check "CONTROL: reading users is still read" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"wp_get_users","accessLevel"=>"read"],["role"=>"administrator"]);')" "read"
+check "CONTROL: a tool with no user in its name is untouched by the rule" \
+  "$(wpe 'echo GMCP_Approvals::classify_call(["name"=>"wp_update_option","accessLevel"=>"admin"],["key"=>"blogname","value"=>"x"]);')" "site"
+
+echo "  -- the marker: set by a tool call, not by a person --"
+AC_MARK=$(wpe '
+  $u = '"$AC_SUB"';
+  $h = function () use ( $u ) { return GMCP_Approvals::account_changed_by_tool( $u ) ? "marked" : "clean"; };
+  wp_update_user( [ "ID" => $u, "user_pass" => "Outside-1!" ] );
+  echo "person_password=", $h(), ";";
+  do_action( "gmcp_tool_start", "wp_update_user", [] );
+  wp_update_user( [ "ID" => $u, "display_name" => "Only a name" ] );
+  echo "tool_display_name=", $h(), ";";
+  wp_update_user( [ "ID" => $u, "user_pass" => "Tool-Set-1!" ] );
+  echo "tool_password=", $h(), ";";
+  delete_user_meta( $u, GMCP_Approvals::TOUCHED_META );
+  wp_update_user( [ "ID" => $u, "user_email" => "ac_sub2@example.test" ] );
+  echo "tool_email=", $h(), ";";
+  delete_user_meta( $u, GMCP_Approvals::TOUCHED_META );
+  ( new WP_User( $u ) )->set_role( "editor" );
+  echo "tool_role=", $h(), ";";
+  delete_user_meta( $u, GMCP_Approvals::TOUCHED_META );
+  update_user_meta( $u, GMCP_Approvals::TOUCHED_META, time() - 2 * DAY_IN_SECONDS );
+  echo "old_marker=", $h(), ";";
+  $n = wp_insert_user( [ "user_login" => "ac_created", "user_email" => "ac_c@example.test", "user_pass" => wp_generate_password(), "role" => "subscriber" ] );
+  echo "tool_created=", GMCP_Approvals::account_changed_by_tool( $n ) ? "marked" : "clean", ";";
+  wp_delete_user( $n );')
+for want in person_password=clean tool_display_name=clean tool_password=marked tool_email=marked tool_role=marked old_marker=clean tool_created=marked; do
+  check "marker: ${want%%=*}" "$(printf '%s' "$AC_MARK" | tr ';' '\n' | grep "^${want%%=*}=" | head -1)" "$want"
+done
+wpe 'foreach ( [ "ac_subscriber" ] as $l ) { $u = get_user_by( "login", $l ); if ( $u ) { wp_delete_user( $u->ID ); } }' >/dev/null
+
+echo "-- what an approver is shown is what the hash covers --"
+# The Approvals screen printed the arguments in the order the client sent them, cut at 4000
+# characters, with credential-shaped values hidden: a page that could show a different call
+# from the one approved. build_view() is now the one place the view is made, and it either
+# shows the whole call or refuses to queue it. Pure checks here; the page itself is in
+# smoke-admin.sh.
+BV_DEF='["name"=>"x_delete_thing","accessLevel"=>"admin","inputSchema"=>["type"=>"object","properties"=>["ID"=>["type"=>"integer"],"force"=>["type"=>"boolean"],"note"=>["type"=>"string"],"fields"=>["type"=>"object"],"key"=>["type"=>"string"],"value"=>["type"=>"string"],"confirm"=>["type"=>"string"]]]]'
+bv() { wpe '$d='"$BV_DEF"'; $a=json_decode(base64_decode("'"$(printf '%s' "$1" | base64 | tr -d '\n')"'"),true); '"$2"; }
+check "the same call in another key order is shown in one order" \
+  "$(bv '{}' 'echo GMCP_Approvals::build_view(["force"=>true,"ID"=>3,"fields"=>["b"=>1,"a"=>2]],$d)["text"]===GMCP_Approvals::build_view(["fields"=>["a"=>2,"b"=>1],"ID"=>3,"force"=>true],$d)["text"]?"same":"DIFFERENT";')" "same"
+check "  and it is sorted, not in the order sent" \
+  "$(bv '{}' '$t=GMCP_Approvals::build_view(["note"=>"n","ID"=>3,"force"=>true],$d)["text"]; echo strpos($t,"\"ID\"")<strpos($t,"\"force\"") && strpos($t,"\"force\"")<strpos($t,"\"note\"") ? "sorted":"UNSORTED";')" "sorted"
+check "the view is faithful: reading it back gives the call that is hashed" \
+  "$(bv '{}' '$a=["ID"=>3,"note"=>"ünï \"quoted\" <b>","fields"=>["z"=>[3,1,2],"a"=>["x"=>null,"y"=>false]]]; $v=GMCP_Approvals::build_view($a,$d); echo GMCP_Approvals::canonical_json(json_decode($v["text"],true))===GMCP_Approvals::canonical_json($a)?"faithful":"DIFFERS";')" "faithful"
+check "the two-step token is not part of the view, as it is not part of the hash" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["ID"=>3,"confirm"=>"abcdef"],$d); echo strpos($v["text"],"abcdef")===false?"absent":"SHOWN";')" "absent"
+check "an argument the tool does not declare refuses the call" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["ID"=>3,"sneaky"=>"x"],$d); echo isset($v["refusal"]) && strpos($v["refusal"],"sneaky")!==false ? "refused":"QUEUED";')" "refused"
+check "CONTROL: the same call without it is shown" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["ID"=>3],$d); echo isset($v["text"]) ? "shown":"REFUSED";')" "shown"
+check "a call that would be cut off is refused, not queued" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["note"=>str_repeat("a",GMCP_Approvals::VIEW_MAX)],$d); echo isset($v["refusal"]) ? "refused":"QUEUED";')" "refused"
+check "CONTROL: one that fits, and is longer than the old 4000-character cut, is shown whole" \
+  "$(bv '{}' '$n=str_repeat("a",9000)."END"; $v=GMCP_Approvals::build_view(["note"=>$n],$d); echo isset($v["text"]) && strpos($v["text"],"aEND")!==false ? "whole":"CUT";')" "whole"
+check "arguments nested past the depth limit are refused" \
+  "$(bv '{}' '$n="x"; for($i=0;$i<20;$i++){$n=["k"=>$n];} $v=GMCP_Approvals::build_view(["fields"=>$n],$d); echo isset($v["refusal"]) ? "refused":"QUEUED";')" "refused"
+check "a list of unnamed arguments is refused" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view([1,2],$d); echo isset($v["refusal"]) ? "refused":"QUEUED";')" "refused"
+check "credential-shaped fields are hidden, counted and named" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["ID"=>3,"fields"=>["user_pass"=>"SECRETPW123","display_name"=>"d","api_token"=>"SECRETTOK"]],$d); echo strpos($v["text"],"SECRET")===false ? implode(",",$v["redacted"]) : "LEAKED";')" "fields.user_pass,fields.api_token"
+check "CONTROL: a call with nothing hidden lists nothing hidden" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["ID"=>3,"fields"=>["display_name"=>"d"]],$d); echo count($v["redacted"]);')" "0"
+check "the value stored under a credential-shaped option name is hidden, the name is not" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["key"=>"smtp_pwd","value"=>"SECRETSMTP"],$d); echo strpos($v["text"],"SECRETSMTP")===false && strpos($v["text"],"smtp_pwd")!==false ? implode(",",$v["redacted"]) : "WRONG";')" "value"
+check "a string that holds a credential inside it is hidden whole" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["note"=>"{\"password\":\"SECRETJSON\"}"],$d); echo strpos($v["text"],"SECRETJSON")===false ? implode(",",$v["redacted"]) : "LEAKED";')" "note"
+check "a text-reordering character is shown as an escape, not applied" \
+  "$(bv '{}' '$v=GMCP_Approvals::build_view(["note"=>"safe\u{202E}evil"],$d); echo strpos($v["text"],"\u{202E}")===false && strpos($v["text"],"\\u202e")!==false ? "escaped":"RAW";')" "escaped"
+
+echo "-- undo is the same write backwards, so the approval gate asks about the write it repeats --"
+# wp_undo_change is a write-level tool, so on its own name it is never held. It replays an
+# earlier value, though, and an option written back is the option written: in the wider mode
+# an admin key could not write the option (held) but could undo-write it (not held). The gate
+# now classifies an undo as the strictest tool that made the recorded change, and an entry it
+# cannot find as unknown, which is held. Controls: the same undo runs where the direct write
+# would, and the same direct write is held where the undo is.
+UN_DESC_WAS=$(wpe 'echo get_option("blogdescription");')
+UN_MODE_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "never";')
+unmode() { wpe '$o=get_option("gmcp_options",[]);$o["mcp_approval_mode"]="'"$1"'";update_option("gmcp_options",$o,false);' >/dev/null; }
+unstate() { py 'import json,sys;print(json.load(sys.stdin)["result"].get("data",{}).get("status","-"))' "$1"; }
+unmode never
+wpe 'update_option("blogdescription","UN first");' >/dev/null
+callk un "$K_ADMIN" "$(tool_json 1 wp_update_option '{"key":"blogdescription","value":"UN second"}')"
+UN_ENTRY=$(wpe 'foreach ( GMCP_Journal::recent( 30 ) as $e ) { if ( strpos( wp_json_encode( $e ), "blogdescription" ) !== false ) { echo $e["id"], " ", $e["call"]; break; } }')
+read -r UN_ID UN_CALL <<< "$UN_ENTRY"
+check "CONTROL: the journal holds the option change, and the option has the new value" \
+  "$([ -n "$UN_ID" ] && [ -n "$UN_CALL" ] && echo yes || echo no)/$(wpe 'echo get_option("blogdescription");')" "yes/UN second"
+
+unmode site
+callk un "$K_ADMIN" "$(tool_json 2 wp_update_option '{"key":"blogdescription","value":"UN direct"}')"
+check "CONTROL: in the wider mode the direct option write is held" "$(unstate un)/$(wpe 'echo get_option("blogdescription");')" "awaiting_human_approval/UN second"
+callk un "$K_ADMIN" "$(tool_json 3 wp_undo_change "{\"id\":\"$UN_ID\"}")"
+check "in the wider mode, undoing that option write by id is held too, and the option is unchanged" \
+  "$(unstate un)/$(wpe 'echo get_option("blogdescription");')" "awaiting_human_approval/UN second"
+callk un "$K_ADMIN" "$(tool_json 4 wp_undo_change "{\"call\":\"$UN_CALL\"}")"
+check "  and so is undoing the whole call" "$(unstate un)/$(wpe 'echo get_option("blogdescription");')" "awaiting_human_approval/UN second"
+
+unmode deletes
+callk un "$K_ADMIN" "$(tool_json 5 wp_undo_change '{"id":"no-such-entry"}')"
+check "an entry the gate cannot find is held, not passed" "$(unstate un)" "awaiting_human_approval"
+callk un "$K_ADMIN" "$(tool_json 6 wp_undo_change '{"id":"x","call":"y"}')"
+check "an undo naming both is held as unknown, not guessed at" "$(unstate un)" "awaiting_human_approval"
+callk un "$K_ADMIN" "$(tool_json 7 wp_undo_change "{\"id\":\"$UN_ID\"}")"
+check "CONTROL: in the narrower mode, where the direct write is not held either, the undo runs" \
+  "$(unstate un)/$(wpe 'echo get_option("blogdescription");')" "-/UN first"
+
+# A post edit is a write-level change: undoing one is not held in the wider mode.
+UN_POST=$(wpe 'echo wp_insert_post(["post_title"=>"UN draft","post_status"=>"draft"]);')
+unmode never
+callk un "$K_ADMIN" "$(tool_json 8 wp_update_post_meta "{\"ID\":$UN_POST,\"key\":\"un_meta\",\"value\":\"one\"}")"
+callk un "$K_ADMIN" "$(tool_json 9 wp_update_post_meta "{\"ID\":$UN_POST,\"key\":\"un_meta\",\"value\":\"two\"}")"
+UN_MID=$(wpe 'foreach ( GMCP_Journal::recent( 30 ) as $e ) { if ( strpos( wp_json_encode( $e ), "un_meta" ) !== false ) { echo $e["id"]; break; } }')
+check "CONTROL: a meta change is on record" "$([ -n "$UN_MID" ] && echo yes || echo no)/$(pmeta $UN_POST un_meta)" "yes/set:two"
+unmode site
+callk un "$K_ADMIN" "$(tool_json 10 wp_undo_change "{\"id\":\"$UN_MID\"}")"
+check "CONTROL: in the wider mode undoing a content edit is not held, because writing it is not" "$(unstate un)/$(pmeta $UN_POST un_meta)" "-/set:one"
+
+unmode "$UN_MODE_WAS"
+wpe 'update_option("blogdescription", base64_decode("'"$(printf '%s' "$UN_DESC_WAS" | base64 | tr -d '\n')"'")); wp_delete_post('"$UN_POST"', true); global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_approvals WHERE tool IN (\"wp_undo_change\",\"wp_update_option\")");' >/dev/null
+check "put back: the description and the mode" "$(wpe 'echo get_option("blogdescription");')/$(wpe 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "never";')" "$UN_DESC_WAS/$UN_MODE_WAS"
+
+echo "-- drafts-only: media attached to nothing is not the key's to edit, and the refusal says what is covered --"
+# The key was documented as unable to touch "anything that is live". It could still edit a
+# file attached to no post, which a live page may be showing as its featured image or an
+# embed, and nothing can find those pages. The case it cannot judge is refused. Fixtures are
+# made here: the earlier block publishes the draft it attached its media to.
+DM_FIX=$(wpe '
+  $d = wp_insert_post( [ "post_title" => "DM draft", "post_status" => "draft" ] );
+  $at = function ( $t, $parent ) { $id = wp_insert_attachment( [ "post_title" => $t, "post_mime_type" => "image/png", "post_status" => "inherit" ], false, $parent ); update_post_meta( $id, "_wp_attached_file", "dm-fixture.png" ); return $id; };
+  echo implode( " ", [ $d, $at( "DM att draft", $d ), $at( "DM att free", 0 ) ] );')
+read -r DM_DRAFT DM_ATD DM_ATF <<< "$DM_FIX"
+check "CONTROL: the fixtures exist (a draft, media on it, media on nothing)" \
+  "$(pstatus $DM_DRAFT)/$(wpe "echo (int) get_post($DM_ATD)->post_parent === $DM_DRAFT ? 'attached' : 'wrong';")/$(wpe "echo (int) get_post($DM_ATF)->post_parent;")" "draft/attached/0"
+callk dm "$K_DO" "$(tool_json 1 wp_update_media "{\"ID\":$DM_ATF,\"title\":\"DM hijack\",\"alt\":\"DM alt hijack\"}")"
+check "drafts-only: wp_update_media on a file attached to nothing is refused, and nothing changed" \
+  "$(verdict dm)/$(ptitle $DM_ATF)/$(pmeta $DM_ATF _wp_attachment_image_alt)" "error/DM att free/absent"
+callk dm "$K_DO" "$(tool_json 2 wp_update_post "{\"ID\":$DM_ATF,\"fields\":{\"post_title\":\"DM hijack two\"}}")"
+check "  and so is wp_update_post aimed at the same attachment" "$(verdict dm)/$(ptitle $DM_ATF)" "error/DM att free"
+callk dm "$K_DO" "$(tool_json 3 wp_update_media "{\"ID\":$DM_ATD,\"title\":\"DM draft media edited\"}")"
+check "CONTROL: media attached to a draft is still editable by the same key" "$(verdict dm)/$(ptitle $DM_ATD)" "ok/DM draft media edited"
+callk dm "$K_PW" "$(tool_json 4 wp_update_media "{\"ID\":$DM_ATF,\"title\":\"DM plain edit\"}")"
+check "CONTROL: a key without the flag edits the unattached file, so the refusal was the flag's" "$(verdict dm)/$(ptitle $DM_ATF)" "ok/DM plain edit"
+
+callk dm "$K_DO" "$(tool_json 5 wp_update_post "{\"ID\":$DO_LIVE,\"fields\":{\"post_title\":\"DM refused\"}}")"
+DM_TEXT=$(py 'import json,sys;d=json.load(sys.stdin);print(d["result"]["content"][0]["text"] if "result" in d else d["error"]["message"])' dm)
+check "the refusal for a live post names what is and is not covered" \
+  "$(printf '%s' "$DM_TEXT" | grep -c 'comments, taxonomy terms, users and options are outside this setting')" "1"
+check "  and no longer claims the key cannot touch anything that is live" "$(printf '%s' "$DM_TEXT" | grep -c 'anything that is live')" "0"
+check "CONTROL: the text probe sees the refusal at all" "$(printf '%s' "$DM_TEXT" | grep -c 'This key is drafts-only')" "1"
+# What the sentence says is NOT covered really is not: a drafts-only key still edits a comment
+# and renames a term, so the documentation is true to the code and not just carefully worded.
+DM_CT=$(wpe '$c=wp_insert_comment(["comment_post_ID"=>'"$DO_LIVE"',"comment_content"=>"DM comment","comment_approved"=>"1"]); $t=wp_insert_term("DM term","category"); echo $c," ",$t["term_id"];')
+read -r DM_COMMENT DM_TERM <<< "$DM_CT"
+callk dm "$K_DO" "$(tool_json 6 wp_update_comment "{\"comment_ID\":$DM_COMMENT,\"fields\":{\"comment_content\":\"DM comment edited\"}}")"
+check "outside the setting, stated: a drafts-only key edits a comment on a live post" "$(wpe "wp_cache_flush(); echo get_comment($DM_COMMENT)->comment_content;")" "DM comment edited"
+callk dm "$K_DO" "$(tool_json 7 wp_update_term "{\"term_id\":$DM_TERM,\"taxonomy\":\"category\",\"name\":\"DM term renamed\"}")"
+check "  and renames a taxonomy term" "$(wpe "wp_cache_flush(); echo get_term($DM_TERM)->name;")" "DM term renamed"
+wpe 'wp_delete_term('"$DM_TERM"',"category"); wp_delete_comment('"$DM_COMMENT"',true); foreach(get_posts(["post_status"=>"any","post_type"=>["post","attachment"],"numberposts"=>-1,"s"=>"DM "]) as $p){ if(strpos($p->post_title,"DM ")===0){wp_delete_post($p->ID,true);} }' >/dev/null
+
+echo "-- OAuth: the consent screen offers full or read-only, and the grant carries it --"
+JAR="$OUT/oauth.jar"
+curl -sS -c "$JAR" -b "$JAR" -d 'log=admin&pwd=admin&rememberme=forever&testcookie=1' "$BASE/wp-login.php" -o /dev/null 2>/dev/null
+oauth_grant() { # oauth_grant <readonly|full|omit> <prefix>: writes $OUT/<prefix>.tok .ref .cid .scope .consent
+  python3 - "$BASE" "$JAR" "$OUT" "$1" "$2" <<'PY'
+import sys, json, re, html, hashlib, base64, os, urllib.request, urllib.parse, urllib.error, http.cookiejar
+base, jar, out, choice, prefix = sys.argv[1:6]
+cj = http.cookiejar.MozillaCookieJar(jar); cj.load(ignore_discard=True, ignore_expires=True)
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k): return None
+op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj), NoRedirect)
+reg = json.load(urllib.request.urlopen(urllib.request.Request(base + "/wp-json/mcp/v1/oauth/register",
+    json.dumps({"redirect_uris": ["http://localhost:9/cb"], "client_name": "drafts test", "token_endpoint_auth_method": "none"}).encode(),
+    {"Content-Type": "application/json"})))
+cid = reg["client_id"]
+verifier = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+chal = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+q = urllib.parse.urlencode({"response_type": "code", "client_id": cid, "redirect_uri": "http://localhost:9/cb", "state": "s",
+    "scope": "mcp", "code_challenge": chal, "code_challenge_method": "S256"})
+page = op.open(base + "/wp-json/mcp/v1/oauth/authorize?" + q).read().decode()
+open(out + "/" + prefix + ".consent", "w").write(page)
+fields = {m.group(1): html.unescape(m.group(2)) for m in re.finditer(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', page)}
+fields["action"] = "approve"
+if choice != "omit":
+    fields["gmcp_access"] = choice
+loc = ""
+try:
+    op.open(urllib.request.Request(base + "/wp-json/mcp/v1/oauth/authorize", urllib.parse.urlencode(fields).encode()))
+except urllib.error.HTTPError as e:
+    loc = e.headers.get("Location", "")
+code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["code"][0]
+data = urllib.parse.urlencode({"grant_type": "authorization_code", "code": code, "redirect_uri": "http://localhost:9/cb",
+    "code_verifier": verifier, "client_id": cid}).encode()
+tok = json.load(urllib.request.urlopen(urllib.request.Request(base + "/wp-json/mcp/v1/oauth/token", data)))
+for ext, val in (("tok", tok["access_token"]), ("ref", tok["refresh_token"]), ("cid", cid), ("scope", tok.get("scope", ""))):
+    open(out + "/" + prefix + "." + ext, "w").write(val)
+PY
+}
+oauth_refresh() { # oauth_refresh <prefix>: replaces .tok and .ref with the refreshed pair
+  curl -sS -X POST "$BASE/wp-json/mcp/v1/oauth/token" --data-urlencode grant_type=refresh_token \
+    --data-urlencode "refresh_token=$(cat "$OUT/$1.ref")" --data-urlencode "client_id=$(cat "$OUT/$1.cid")" -o "$OUT/$1.refreshed"
+  python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));open(sys.argv[2]+".tok","w").write(d["access_token"]);open(sys.argv[2]+".ref","w").write(d["refresh_token"])' "$OUT/$1.refreshed" "$OUT/$1"
+}
+oauth_grant readonly oro; oauth_grant full ofull; oauth_grant omit oold
+check "CONTROL: the three grants were issued (a failed flow would leave empty tokens)" \
+  "$(for p in oro ofull oold; do [ -s "$OUT/$p.tok" ] && printf y || printf n; done)" "yyy"
+check "the consent screen offers both choices, full preselected" \
+  "$(python3 -c 'import sys;p=open(sys.argv[1]).read();print("value=\"full\" checked" in p, "value=\"readonly\"" in p and "value=\"readonly\" checked" not in p)' "$OUT/oro.consent")" "True True"
+oauth_tools() { # oauth_tools <prefix>: "<has wp_update_post> <has wp_delete_post>"
+  callk o_l "$(cat "$OUT/$1.tok")" '{"jsonrpc":"2.0","id":50,"method":"tools/list"}'
+  py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print("wp_update_post" in n, "wp_delete_post" in n)' o_l
+}
+check "CONTROL: the full grant lists the write and admin tools" "$(oauth_tools ofull)" "True True"
+check "a grant made before the choice existed (no field posted) is still full" "$(oauth_tools oold)" "True True"
+check "a read-only grant is offered neither write nor admin tools" "$(oauth_tools oro)" "False False"
+check "  and what it is offered is a real catalog, not an empty list" \
+  "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(len(n)>5, "wp_get_posts" in n, sorted(n & {"wp_create_post","wp_upload_media","wp_undo_change","wp_update_option","wp_start_backup","wp_create_comment"}))' o_l)" "True True []"
+RO_TITLE_BEFORE=$(ptitle $DO_LIVE)
+callk o_c "$(cat "$OUT/oro.tok")" "$(tool_json 53 wp_update_post "{\"ID\":$DO_LIVE,\"fields\":{\"post_title\":\"DO oauth write\"}}")"
+check "a read-only grant naming a write tool anyway is refused, and the post is unchanged" "$(verdict o_c)/$(ptitle $DO_LIVE)" "error/$RO_TITLE_BEFORE"
+callk o_c "$(cat "$OUT/ofull.tok")" "$(tool_json 54 wp_update_post "{\"ID\":$DO_LIVE,\"fields\":{\"post_title\":\"DO oauth write\"}}")"
+check "CONTROL: the same call with the full grant writes" "$(ptitle $DO_LIVE)" "DO oauth write"
+callk o_c "$(cat "$OUT/oro.tok")" "$(tool_json 55 wp_get_post "{\"ID\":$DO_LIVE}")"
+check "CONTROL: the read-only grant can read" "$(verdict o_c)" "ok"
+oauth_refresh oro
+check "the refresh itself worked (a failed one would leave the old token and prove nothing)" "$(python3 -c 'import json,sys;print("access_token" in json.load(open(sys.argv[1])))' "$OUT/oro.refreshed")" "True"
+check "a refreshed read-only grant is still read-only" "$(oauth_tools oro)" "False False"
+callk o_c "$(cat "$OUT/oro.tok")" "$(tool_json 56 wp_update_post "{\"ID\":$DO_LIVE,\"fields\":{\"post_title\":\"DO oauth write 2\"}}")"
+check "  and still cannot write" "$(verdict o_c)/$(ptitle $DO_LIVE)" "error/DO oauth write"
+check "the grants are stored with the marker only where read-only was chosen" \
+  "$(wpe 'global $wpdb; $n=["ro"=>0,"full"=>0]; foreach($wpdb->get_col("SELECT t.scope FROM {$wpdb->prefix}gmcp_oauth_tokens t JOIN {$wpdb->prefix}gmcp_oauth_clients c ON c.client_id=t.client_id WHERE c.client_name=\"drafts test\" AND t.revoked=0") as $sc){ $n[GMCP_OAuth::scope_is_readonly($sc)?"ro":"full"]++; } echo $n["ro"],"/",$n["full"];')" "1/2"
+
+echo "-- wp_create_posts with meta_input and the journal on: the reply is a success --"
+# The note that tells the caller how to undo the custom fields named a constant that does not
+# exist, so the reply was an isError of "Undefined constant" AFTER the posts and fields had
+# been written. An agent told a call failed retries it, and the posts were duplicated.
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=true;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+call bm1 '{"jsonrpc":"2.0","id":9101,"method":"tools/call","params":{"name":"wp_create_posts","arguments":{"items":[{"post_title":"BMX batch one","meta_input":{"bmx_f":"v1"}},{"post_title":"BMX batch two","meta_input":{"bmx_f":"v2"}}]}}}'
+check "the reply is not an error" "$(py 'import json,sys;d=json.load(sys.stdin);print("error" if ("error" in d or d["result"].get("isError")) else "ok")' bm1)" "ok"
+check "stored state: each post exists exactly once" "$(docker compose exec -T cli wp eval 'echo count( get_posts( [ "post_type" => "post", "post_status" => "any", "title" => "BMX batch one", "numberposts" => -1 ] ) ) . "," . count( get_posts( [ "post_type" => "post", "post_status" => "any", "title" => "BMX batch two", "numberposts" => -1 ] ) );' 2>/dev/null | tr -d '\r\n')" "1,1"
+check "stored state: and carries its custom field" "$(docker compose exec -T cli wp eval 'echo count( get_posts( [ "post_type" => "post", "post_status" => "any", "meta_key" => "bmx_f", "numberposts" => -1 ] ) );' 2>/dev/null | tr -d '\r\n')" "2"
+BM_CALL=$(py 'import json,re,sys;t=json.load(sys.stdin)["result"]["content"][0]["text"];m=re.search(r"wp_undo_change \{\"call\":\"([^\"]+)\"\}",json.loads(t)["undo"]);print(m.group(1) if m else "MISSING")' bm1)
+check "the reply names the call id to pass to wp_undo_change" "$([ "$BM_CALL" != MISSING ] && echo yes || echo no)" "yes"
+call bm2 "{\"jsonrpc\":\"2.0\",\"id\":9102,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"call\":\"$BM_CALL\"}}}"
+check "and that id works: the custom fields are gone" "$(docker compose exec -T cli wp eval 'echo count( get_posts( [ "post_type" => "post", "post_status" => "any", "meta_key" => "bmx_f", "numberposts" => -1 ] ) );' 2>/dev/null | tr -d '\r\n')" "0"
+check "...and the posts were left standing" "$(docker compose exec -T cli wp eval 'echo count( get_posts( [ "post_type" => "post", "post_status" => "any", "title" => "BMX batch one", "numberposts" => -1 ] ) );' 2>/dev/null | tr -d '\r\n')" "1"
+docker compose exec -T cli wp eval 'foreach ( get_posts( [ "post_type" => "post", "post_status" => "any", "numberposts" => -1, "s" => "BMX batch" ] ) as $p ) { wp_delete_post( $p->ID, true ); }' >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+
+echo "-- the theme mod readers answer --"
+# Both called $this->json(), a method this class does not have, so every call ended in
+# "Call to undefined method GMCP_Tools_Core::json()". Present at 7b966ad; nothing exercised them.
+docker compose exec -T cli wp eval 'set_theme_mod( "tmx_plain", "TMX-VISIBLE-VALUE" ); set_theme_mod( "tmx_api_key", "TMX-SECRET-VALUE" );' >/dev/null 2>&1
+check "control: the theme mods are stored" "$(docker compose exec -T cli wp eval 'echo get_theme_mod( "tmx_plain" ) . "|" . get_theme_mod( "tmx_api_key" );' 2>/dev/null | tr -d '\r\n')" "TMX-VISIBLE-VALUE|TMX-SECRET-VALUE"
+call tm1 '{"jsonrpc":"2.0","id":9301,"method":"tools/call","params":{"name":"wp_get_theme_mod","arguments":{"key":"tmx_plain"}}}'
+check "wp_get_theme_mod is not an error" "$(verdict tm1)" "ok"
+check "...and returns the stored value" "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["content"][0]["text"])' tm1)" '"TMX-VISIBLE-VALUE"'
+call tm2 '{"jsonrpc":"2.0","id":9302,"method":"tools/call","params":{"name":"wp_get_theme_mod","arguments":{"key":"tmx_api_key"}}}'
+check "a credential-named theme mod is blanked in the reply" "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["content"][0]["text"])' tm2)" '"[redacted]"'
+call tm3 '{"jsonrpc":"2.0","id":9303,"method":"tools/call","params":{"name":"wp_list_theme_mods","arguments":{}}}'
+check "wp_list_theme_mods is not an error" "$(verdict tm3)" "ok"
+check "...lists the plain one" "$(grep -c 'TMX-VISIBLE-VALUE' "$OUT/tm3")" "1"
+check "...and does not list the secret" "$(grep -c 'TMX-SECRET-VALUE' "$OUT/tm3")" "0"
+docker compose exec -T cli wp eval 'remove_theme_mod( "tmx_plain" ); remove_theme_mod( "tmx_api_key" );' >/dev/null 2>&1
+
+echo "-- wp_write_blocks keeps backslashes, on the blocks path as on the markdown path --"
+# The blocks path unslashed text that was never slashed and then slashed it once for the
+# writer, so a Windows path in a code block lost its separators and "a\b" became "ab", while
+# the markdown path stored the same text intact. Asserted on the stored post_content, with the
+# markdown path as the control that the probe can see an intact backslash.
+WB_P=$(docker compose exec -T cli wp eval 'echo wp_insert_post( [ "post_title" => "WBX backslash", "post_status" => "draft" ] );' 2>/dev/null | tr -d '\r\n')
+wb_stored() { docker compose exec -T cli wp eval "\$c = get_post($WB_P)->post_content; \$bs = chr(92); echo ( strpos( \$c, '<code>C:' . \$bs . 'Users' . \$bs . 'x</code>' ) !== false ? 'code-intact' : 'code-mangled' ) . ',' . ( strpos( \$c, '<p>a' . \$bs . 'b</p>' ) !== false ? 'para-intact' : 'para-mangled' );" 2>/dev/null | tr -d '\r\n'; }
+WB_JSON_BLOCKS=$(python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":9201,"method":"tools/call","params":{"name":"wp_write_blocks","arguments":{"ID":int(sys.argv[1]),"blocks":[{"type":"paragraph","content":"a\\b"},{"type":"code","content":"C:\\Users\\x"}]}}}))' "$WB_P")
+WB_JSON_MD=$(python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":9202,"method":"tools/call","params":{"name":"wp_write_blocks","arguments":{"ID":int(sys.argv[1]),"markdown":"a\\b\n\n```\nC:\\Users\\x\n```"}}}))' "$WB_P")
+call wb_md "$WB_JSON_MD"
+check "control: the markdown path reports success" "$(verdict wb_md)" "ok"
+check "control: the markdown path stored the backslashes (code block)" "$(docker compose exec -T cli wp eval "\$c = get_post($WB_P)->post_content; \$bs = chr(92); echo strpos( \$c, 'C:' . \$bs . 'Users' . \$bs . 'x' ) !== false ? 'intact' : 'mangled';" 2>/dev/null | tr -d '\r\n')" "intact"
+call wb_bl "$WB_JSON_BLOCKS"
+check "the blocks path reports success" "$(verdict wb_bl)" "ok"
+check "stored state: the blocks path kept both backslashes" "$(wb_stored)" "code-intact,para-intact"
+docker compose exec -T cli wp post delete "$WB_P" --force >/dev/null 2>&1
+
+echo "-- OAuth: the level comes from the person's choice and its nonce, from nothing else --"
+# More than the three grants above. A consent POST that omits the choice means "full" (that is
+# how a grant made before the choice existed behaves), so the only thing keeping a forged POST
+# from minting a full grant is the nonce; a scope the client names, on the way in or on a
+# refresh, must neither lower a grant nor raise one. Each refusal has a control that makes the
+# same flow succeed, so a broken helper cannot read as a refusal.
+oauth_flow() { # oauth_flow <prefix> <client scope> <choice: full|readonly|omit> <nonce: ok|bad|none>
+  python3 - "$BASE" "$JAR" "$OUT" "$1" "$2" "$3" "$4" <<'PY'
+import sys, json, re, html, hashlib, base64, os, urllib.request, urllib.parse, urllib.error, http.cookiejar
+base, jar, out, prefix, scope, choice, nonce = sys.argv[1:8]
+cj = http.cookiejar.MozillaCookieJar(jar); cj.load(ignore_discard=True, ignore_expires=True)
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k): return None
+op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj), NoRedirect)
+reg = json.load(urllib.request.urlopen(urllib.request.Request(base + "/wp-json/mcp/v1/oauth/register",
+    json.dumps({"redirect_uris": ["http://localhost:9/cb"], "client_name": "drafts test", "token_endpoint_auth_method": "none"}).encode(),
+    {"Content-Type": "application/json"})))
+cid = reg["client_id"]
+verifier = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+chal = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+q = urllib.parse.urlencode({"response_type": "code", "client_id": cid, "redirect_uri": "http://localhost:9/cb", "state": "s",
+    "scope": scope, "code_challenge": chal, "code_challenge_method": "S256"})
+page = op.open(base + "/wp-json/mcp/v1/oauth/authorize?" + q).read().decode()
+fields = {m.group(1): html.unescape(m.group(2)) for m in re.finditer(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', page)}
+fields["action"] = "approve"
+if choice != "omit":
+    fields["gmcp_access"] = choice
+else:
+    fields.pop("gmcp_access", None)
+if nonce == "none":
+    fields.pop("_gmcp_nonce", None)
+elif nonce == "bad":
+    fields["_gmcp_nonce"] = "0000000000"
+loc = ""
+try:
+    op.open(urllib.request.Request(base + "/wp-json/mcp/v1/oauth/authorize", urllib.parse.urlencode(fields).encode()))
+except urllib.error.HTTPError as e:
+    loc = e.headers.get("Location", "")
+codes = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query).get("code")
+open(out + "/" + prefix + ".issued", "w").write("yes" if codes else "no")
+if not codes:
+    sys.exit(0)
+data = urllib.parse.urlencode({"grant_type": "authorization_code", "code": codes[0], "redirect_uri": "http://localhost:9/cb",
+    "code_verifier": verifier, "client_id": cid}).encode()
+tok = json.load(urllib.request.urlopen(urllib.request.Request(base + "/wp-json/mcp/v1/oauth/token", data)))
+for ext, val in (("tok", tok["access_token"]), ("ref", tok["refresh_token"]), ("cid", cid), ("scope", tok.get("scope", ""))):
+    open(out + "/" + prefix + "." + ext, "w").write(val)
+PY
+}
+oauth_refresh_scope() { # oauth_refresh_scope <prefix> <scope the client asks for on refresh>
+  curl -sS -X POST "$BASE/wp-json/mcp/v1/oauth/token" --data-urlencode grant_type=refresh_token --data-urlencode "scope=$2" \
+    --data-urlencode "refresh_token=$(cat "$OUT/$1.ref")" --data-urlencode "client_id=$(cat "$OUT/$1.cid")" -o "$OUT/$1.refreshed"
+  python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));open(sys.argv[2]+".tok","w").write(d["access_token"]);open(sys.argv[2]+".ref","w").write(d["refresh_token"])' "$OUT/$1.refreshed" "$OUT/$1"
+}
+rm -f "$OUT"/oq_*.issued
+oauth_flow oq_good "mcp" full ok
+check "CONTROL: a consent POST with a valid nonce issues a code, and the grant is full" "$(cat "$OUT/oq_good.issued")/$(oauth_tools oq_good)" "yes/True True"
+oauth_flow oq_omit_ok "mcp" omit ok
+check "an omitted choice with a valid nonce is full (the pre-choice behaviour, kept)" "$(cat "$OUT/oq_omit_ok.issued")/$(oauth_tools oq_omit_ok)" "yes/True True"
+oauth_flow oq_omit_bad "mcp" omit bad
+check "an omitted choice with a forged nonce issues nothing" "$(cat "$OUT/oq_omit_bad.issued")" "no"
+oauth_flow oq_omit_none "mcp" omit none
+check "  nor does one with no nonce at all" "$(cat "$OUT/oq_omit_none.issued")" "no"
+oauth_flow oq_full_bad "mcp" full bad
+check "  nor does an explicit full with a forged nonce" "$(cat "$OUT/oq_full_bad.issued")" "no"
+check "and no token was minted by any of the refused flows" \
+  "$(for p in oq_omit_bad oq_omit_none oq_full_bad; do [ -e "$OUT/$p.tok" ] && printf y || printf n; done)" "nnn"
+check "CONTROL: the probe does see a token where a flow succeeded" \
+  "$(for p in oq_good oq_omit_ok; do [ -s "$OUT/$p.tok" ] && printf y || printf n; done)" "yy"
+
+oauth_flow oq_claim_ro "mcp mcp:readonly" full ok
+check "a client that NAMES the read-only scope cannot lower a grant the person made full" \
+  "$(cat "$OUT/oq_claim_ro.issued")/$(oauth_tools oq_claim_ro)/$(wpe 'echo GMCP_OAuth::scope_is_readonly("'"$(cat "$OUT/oq_claim_ro.scope")"'") ? "ro" : "full";')" "yes/True True/full"
+oauth_flow oq_claim_omit "mcp:readonly" omit ok
+check "  nor with the choice omitted: the scope string is not the choice" \
+  "$(cat "$OUT/oq_claim_omit.issued")/$(oauth_tools oq_claim_omit)" "yes/True True"
+oauth_flow oq_ro "mcp" readonly ok
+check "CONTROL: the person's read-only choice does lower it, whatever scope the client named" "$(cat "$OUT/oq_ro.issued")/$(oauth_tools oq_ro)" "yes/False False"
+
+oauth_refresh_scope oq_ro "mcp"
+check "a refresh that asks for plain mcp cannot raise a read-only grant" "$(oauth_tools oq_ro)" "False False"
+oauth_refresh_scope oq_ro "mcp admin write"
+check "  nor can one that asks for more scopes than were granted" "$(oauth_tools oq_ro)" "False False"
+oauth_refresh_scope oq_ro ""
+check "  nor one that names none, and the stored scope still carries the marker" \
+  "$(oauth_tools oq_ro)/$(wpe 'global $wpdb; echo GMCP_OAuth::scope_is_readonly((string)$wpdb->get_var("SELECT t.scope FROM {$wpdb->prefix}gmcp_oauth_tokens t WHERE t.client_id=\"'"$(cat "$OUT/oq_ro.cid")"'\" AND t.revoked=0 ORDER BY t.id DESC LIMIT 1")) ? "marked" : "UNMARKED";')" "False False/marked"
+oauth_refresh_scope oq_good "mcp:readonly"
+check "a refresh that names the read-only scope does not lower a full grant either" "$(oauth_tools oq_good)" "True True"
+callk o_c "$(cat "$OUT/oq_ro.tok")" "$(tool_json 57 wp_update_post "{\"ID\":$DO_LIVE,\"fields\":{\"post_title\":\"DO oauth write 3\"}}")"
+check "and after all those refreshes the read-only grant still cannot write" "$(verdict o_c)/$(ptitle $DO_LIVE)" "error/DO oauth write"
+
+# Put the site back: the fixtures, the keys, the grants. A guard test must not leave them.
+wpe 'foreach(get_posts(["post_status"=>"any","post_type"=>["post","page","attachment"],"numberposts"=>-1,"s"=>"DO "]) as $p){ if(strpos($p->post_title,"DO ")===0){wp_delete_post($p->ID,true);} } foreach(wp_get_nav_menus() as $m){ if($m->name==="DO net menu"){wp_delete_nav_menu($m->term_id);} } foreach(GMCP_Tokens::all() as $t){ if(in_array($t["label"],["drafts only writer","plain writer","drafts only admin","pre-flag writer","do admin"],true)){GMCP_Tokens::revoke($t["id"]);} } global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_tokens WHERE client_id IN (SELECT client_id FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\")"); $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\"");' >/dev/null
 
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

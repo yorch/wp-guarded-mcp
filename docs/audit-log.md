@@ -51,6 +51,13 @@ because the credential patterns are written for field names inside a value,
 where `key` signals a secret, and at the top level of a call it is the name of
 the thing being changed.
 
+One credential has no field name to give it away: a draft preview link, whose
+token rides in a URL. `redact()` therefore also scrubs the `gmcp_preview`
+parameter (whichever spelling of its name PHP maps to it) out of any string it is
+handed, and the reply text the entry keeps is
+scrubbed the same way, so the tool that hands a link out does not also write it
+into the log.
+
 ### What was called is not what changed
 
 An entry saying `wp_update_post` ran on post 12 with certain arguments does not
@@ -278,6 +285,19 @@ chain exists to catch. Without it the screen printed a break and, directly
 underneath, that all fifty thousand entries were intact and nothing had changed
 since. A remembered break is kept either way, because it covers rows the window
 cannot reach and the window finding nothing does not answer it.
+
+## Approval events are rows in the same chain
+
+When the human approval queue is on, a person answering a request, a request lapsing
+and a refused replay are not tool calls, so nothing would have recorded them. They are
+written through `GMCP_Audit::record_event()` into the same chain, under the names
+`approval:requested`, `approval:approved`, `approval:declined`, `approval:expired`,
+`approval:used` and `approval:replay_refused`, with the gated tool as the target and the
+request id and calling key as the arguments. The held call itself is recorded as a
+refusal, since nothing ran. If the log is switched off none of this is written; the
+queue keeps its own rows for 30 days either way. The agent can read these rows through
+`wp_get_audit_log` like any other, which tells it nothing it could use to approve: an id
+grants nothing.
 
 ## The agent can read the log
 

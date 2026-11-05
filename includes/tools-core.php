@@ -59,19 +59,16 @@ class GMCP_Tools_Core {
     unset( $r['error'] );
     return $r;
   }
-  private function clean_html( string $v ): string {
-    return wp_kses_post( wp_unslash( $v ) );
-  }
-
   /**
   * An argument filtered through kses, with nothing unslashed.
   *
-  * clean_html() unslashes first, which is right for nothing that reaches this class:
-  * arguments arrive from json_decode() of the request body, never from $_POST, so no
-  * slashes were added on the way in and the unslash removes real ones. Every WordPress
-  * writer then unslashes again, so a comment reading "C:\Users\x" was stored as
-  * "C:Usersx" and reported as created. Callers using this slash the array they hand to
-  * the writer, the way the post writers already do.
+  * There used to be a sibling that unslashed first. That is right for nothing that reaches
+  * this class: arguments arrive from json_decode() of the request body, never from $_POST,
+  * so no slashes were added on the way in and the unslash removes real ones. Every
+  * WordPress writer then unslashes again, so a comment reading "C:\Users\x" was stored as
+  * "C:Usersx" and reported as created, and the same sibling cost wp_write_blocks every
+  * backslash in a code or paragraph block. Callers of this slash the array they hand to the
+  * writer, the way the post writers already do.
   */
   private function kses_arg( string $v ): string {
     return wp_kses_post( $v );
@@ -174,7 +171,7 @@ class GMCP_Tools_Core {
   }
 
   // Return stored post_content verbatim for read tools (wp_get_post, snapshot).
-  // The DB value is NOT slashed, so clean_html()'s wp_unslash() would strip the
+  // The DB value is NOT slashed, so an unslash here would strip the
   // real backslash from block-JSON Unicode escapes (Gutenberg's \uXXXX form for
   // < and >, as Rank Math FAQ blocks use) and wp_kses_post() would drop the
   // admin-authored markup that store_html() preserved on write. A read must
@@ -274,7 +271,7 @@ class GMCP_Tools_Core {
   private function render_block_spec( string $type, array $b, string $at ): array {
     switch ( $type ) {
       case 'paragraph':
-        return [ "<!-- wp:paragraph -->\n<p>" . $this->clean_html( $b['content'] ?? '' ) . "</p>\n<!-- /wp:paragraph -->", null ];
+        return [ "<!-- wp:paragraph -->\n<p>" . $this->kses_arg( $b['content'] ?? '' ) . "</p>\n<!-- /wp:paragraph -->", null ];
 
       case 'heading':
         $level = isset( $b['level'] ) ? (int) $b['level'] : 2;
@@ -282,7 +279,7 @@ class GMCP_Tools_Core {
           return [ null, $at . ' heading level must be between 1 and 6.' ];
         }
         $attrs = $level === 2 ? '' : ' ' . wp_json_encode( [ 'level' => $level ] );
-        $text = $this->clean_html( $b['content'] ?? '' );
+        $text = $this->kses_arg( $b['content'] ?? '' );
         return [ '<!-- wp:heading' . $attrs . " -->\n<h" . $level . ' class="wp-block-heading">' . $text . '</h' . $level . ">\n<!-- /wp:heading -->", null ];
 
       case 'list':
@@ -295,13 +292,13 @@ class GMCP_Tools_Core {
         $listAttrs = $ordered ? ' ' . wp_json_encode( [ 'ordered' => true ] ) : '';
         $lis = '';
         foreach ( $items as $it ) {
-          $lis .= "<!-- wp:list-item -->\n<li>" . $this->clean_html( is_string( $it ) ? $it : '' ) . "</li>\n<!-- /wp:list-item -->\n";
+          $lis .= "<!-- wp:list-item -->\n<li>" . $this->kses_arg( is_string( $it ) ? $it : '' ) . "</li>\n<!-- /wp:list-item -->\n";
         }
         return [ '<!-- wp:list' . $listAttrs . " -->\n<" . $tag . ' class="wp-block-list">' . rtrim( $lis, "\n" ) . '</' . $tag . ">\n<!-- /wp:list -->", null ];
 
       case 'quote':
-        $qInner = "<!-- wp:paragraph -->\n<p>" . $this->clean_html( $b['content'] ?? '' ) . "</p>\n<!-- /wp:paragraph -->";
-        $cite = ( isset( $b['citation'] ) && $b['citation'] !== '' ) ? '<cite>' . $this->clean_html( $b['citation'] ) . '</cite>' : '';
+        $qInner = "<!-- wp:paragraph -->\n<p>" . $this->kses_arg( $b['content'] ?? '' ) . "</p>\n<!-- /wp:paragraph -->";
+        $cite = ( isset( $b['citation'] ) && $b['citation'] !== '' ) ? '<cite>' . $this->kses_arg( $b['citation'] ) . '</cite>' : '';
         return [ "<!-- wp:quote -->\n<blockquote class=\"wp-block-quote\">" . $qInner . $cite . "</blockquote>\n<!-- /wp:quote -->", null ];
 
       case 'image':
@@ -310,7 +307,7 @@ class GMCP_Tools_Core {
           return [ null, $at . ' image requires a "url".' ];
         }
         $alt = esc_attr( $b['alt'] ?? '' );
-        $caption = ( isset( $b['caption'] ) && $b['caption'] !== '' ) ? '<figcaption class="wp-element-caption">' . $this->clean_html( $b['caption'] ) . '</figcaption>' : '';
+        $caption = ( isset( $b['caption'] ) && $b['caption'] !== '' ) ? '<figcaption class="wp-element-caption">' . $this->kses_arg( $b['caption'] ) . '</figcaption>' : '';
         $img = '<img src="' . $url . '" alt="' . $alt . '"/>';
         return [ "<!-- wp:image -->\n<figure class=\"wp-block-image\">" . $img . $caption . "</figure>\n<!-- /wp:image -->", null ];
 
@@ -326,7 +323,7 @@ class GMCP_Tools_Core {
           }
           $href = esc_url_raw( $btn['url'] ?? '' );
           $hrefAttr = $href !== '' ? ' href="' . $href . '"' : '';
-          $btnInner .= "<!-- wp:button -->\n<div class=\"wp-block-button\"><a class=\"wp-block-button__link wp-element-button\"" . $hrefAttr . '>' . $this->clean_html( $btn['text'] ) . "</a></div>\n<!-- /wp:button -->\n";
+          $btnInner .= "<!-- wp:button -->\n<div class=\"wp-block-button\"><a class=\"wp-block-button__link wp-element-button\"" . $hrefAttr . '>' . $this->kses_arg( $btn['text'] ) . "</a></div>\n<!-- /wp:button -->\n";
         }
         return [ "<!-- wp:buttons -->\n<div class=\"wp-block-buttons\">" . rtrim( $btnInner, "\n" ) . "</div>\n<!-- /wp:buttons -->", null ];
 
@@ -363,11 +360,11 @@ class GMCP_Tools_Core {
         return [ '<!-- wp:spacer ' . wp_json_encode( [ 'height' => $h . 'px' ] ) . " -->\n<div style=\"height:" . $h . "px\" aria-hidden=\"true\" class=\"wp-block-spacer\"></div>\n<!-- /wp:spacer -->", null ];
 
       case 'code':
-        return [ "<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>" . esc_html( wp_unslash( (string) ( $b['content'] ?? '' ) ) ) . "</code></pre>\n<!-- /wp:code -->", null ];
+        return [ "<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>" . esc_html( (string) ( $b['content'] ?? '' ) ) . "</code></pre>\n<!-- /wp:code -->", null ];
 
       case 'html':
         // core/html stores raw HTML and is always valid on re-open. Sanitize to post-safe HTML.
-        return [ "<!-- wp:html -->\n" . $this->clean_html( $b['content'] ?? '' ) . "\n<!-- /wp:html -->", null ];
+        return [ "<!-- wp:html -->\n" . $this->kses_arg( $b['content'] ?? '' ) . "\n<!-- /wp:html -->", null ];
     }
     return [ null, $at . ' could not be rendered.' ];
   }
@@ -474,15 +471,17 @@ class GMCP_Tools_Core {
   * not. So a write passes wp_slash( $key ) and a read passes $key, and only then do the
   * writer and the reader mean the same row.
   *
-  * There is nothing to smuggle past by keeping the case. No guard stands in front of a
-  * meta key at any access level, and the one case-sensitive comparison in this file,
+  * There is nothing to smuggle past by keeping the case. The one guard in front of a meta key
+  * is GMCP_Core::protected_meta_refusal(), which is itself case-insensitive, and the one
+  * case-sensitive comparison in this file,
   * META_KEYS_NEVER_COPIED, is made against keys already present on the source post rather
   * than against anything a caller typed. GMCP_Core::field_looks_secret() lowercases what
   * it is handed before matching, so redaction is unaffected either way.
   *
+  * @param bool $writing False for a read, which is not refused the keys a write may not touch.
   * @return true|string True if the key is usable, otherwise the refusal message.
   */
-  private function meta_key_allowed( string $key ) {
+  private function meta_key_allowed( string $key, bool $writing = true ) {
     // Both strings WordPress itself calls "no key". add_metadata(), update_metadata(),
     // delete_metadata() and get_metadata_raw() all gate on ! $meta_key, which is false for
     // "" and for "0" alike. Measured: update_post_meta( $id, "0", ... ) returns false and
@@ -504,6 +503,15 @@ class GMCP_Tools_Core {
     $length = mb_strlen( $key );
     if ( $length > 255 ) {
       return 'The meta key is ' . $length . ' characters. wp_postmeta.meta_key holds 255, and a longer one is refused by the database rather than shortened, so no row can exist under it and no write to it would store anything. Use a key of 255 characters or fewer.';
+    }
+    // Writers only. Reading a trash timestamp is harmless; writing one schedules a permanent
+    // deletion. A policy about the key, asked by every meta writer through this function and
+    // by GMCP_Core::trash_meta_net() for the writers that do not come through here.
+    if ( $writing ) {
+      $protected = GMCP_Core::protected_meta_refusal( $key );
+      if ( $protected !== null ) {
+        return $protected;
+      }
     }
     return true;
   }
@@ -881,6 +889,12 @@ class GMCP_Tools_Core {
   * @return array{0: array<string,array{bytes:int,rows:int}>, 1: array<string,string>} what was copied, and key => why it was skipped.
   */
   private function copy_post_meta( int $from, int $to, array $only, bool $overwrite ): array {
+    // The callers ask first and say why in a sentence. This is the same question asked where
+    // the rows actually move, so a caller added later cannot copy what a reader may not read.
+    $may_read = GMCP_Core::post_read_guard( $from );
+    if ( $may_read !== true ) {
+      return [ [], [ '(nothing)' => $may_read ] ];
+    }
     $source = get_post_meta( $from );
     $copied = [];
     $skipped = [];
@@ -907,6 +921,10 @@ class GMCP_Tools_Core {
       }
       if ( in_array( $key, self::META_KEYS_NEVER_COPIED, true ) ) {
         $skipped[ $key ] = 'names whoever is editing post #' . $from . ', so it belongs to that post and not to its content';
+        continue;
+      }
+      if ( GMCP_Core::protected_meta_refusal( (string) $key ) !== null ) {
+        $skipped[ $key ] = 'is the schedule WordPress deletes posts by, so it is never copied onto another post';
         continue;
       }
       if ( !$overwrite && metadata_exists( 'post', $to, $key ) ) {
@@ -1059,6 +1077,16 @@ class GMCP_Tools_Core {
     if ( $commerce !== true ) {
       return new WP_Error( 'gmcp_commerce_post', $commerce );
     }
+    $submission = GMCP_Core::personal_data_retype_guard( 0, sanitize_key( $a['post_type'] ?? 'post' ) );
+    if ( $submission !== true ) {
+      return new WP_Error( 'gmcp_personal_data_post', $submission );
+    }
+    // Before anything is built or written. The net under wp_insert_post would catch it too,
+    // but this says why in a sentence instead of as an exception from inside WordPress.
+    $drafts = GMCP_Core::drafts_only_status_guard( (string) ( $a['post_status'] ?? 'draft' ), 'Creating a post' );
+    if ( $drafts !== true ) {
+      return new WP_Error( 'gmcp_drafts_only', $drafts );
+    }
     $ins = [
       'post_title' => sanitize_text_field( $a['post_title'] ),
       'post_status' => sanitize_key( $a['post_status'] ?? 'draft' ),
@@ -1080,6 +1108,14 @@ class GMCP_Tools_Core {
       $meta_input = json_decode( $meta_input, true ) ?? [];
     }
     if ( !empty( $meta_input ) && is_array( $meta_input ) ) {
+      // Before the post exists, so a refused key leaves nothing half made. The net under
+      // update_post_metadata would stop it too, but only after wp_insert_post() had stored the row.
+      foreach ( array_keys( $meta_input ) as $meta_k ) {
+        $protected = GMCP_Core::protected_meta_refusal( (string) $meta_k );
+        if ( $protected !== null ) {
+          return new WP_Error( 'gmcp_protected_meta', $protected . ' Nothing was created.' );
+        }
+      }
       // JSON for an array is decoded here as every other meta writer decodes it, so the
       // same payload is not an array through wp_update_post_meta and a string through this
       // tool. Not slashed here: wp_slash( $ins ) below does that once for the whole row.
@@ -1126,7 +1162,7 @@ class GMCP_Tools_Core {
   */
   private function batch_undo_note( bool $wrote_meta ): string {
     $note = 'wp_undo_change cannot remove a created post: the change journal records option'
-      . ' writes, post updates and custom fields, and has no entry for a creation. Delete the'
+      . ' writes, post updates, custom fields, term edits and term assignments, and has no entry for a creation. Delete the'
       . ' ids above with wp_delete_post instead.';
     if ( !$wrote_meta ) {
       return $note . ' This call journalled nothing, so it has no group to revert.';
@@ -1138,7 +1174,7 @@ class GMCP_Tools_Core {
     if ( class_exists( 'GMCP_Changes' ) ) {
       foreach ( GMCP_Changes::captured() as $record ) {
         if ( ( $record['call'] ?? '' ) !== '' ) {
-          $group = GMCP_Journal::GROUP_PREFIX . $record['call'];
+          $group = (string) $record['call'];
           break;
         }
       }
@@ -1146,7 +1182,7 @@ class GMCP_Tools_Core {
     $note .= ' The custom fields this call wrote ARE journalled, grouped under this one call';
     return $group === ''
       ? $note . '; wp_list_changes shows the group.'
-      : $note . ' as "' . $group . '", and one wp_undo_change on that id removes all of them'
+      : $note . ', and wp_undo_change {"call":"' . $group . '"} removes all of them'
         . ' while leaving the posts standing.';
   }
 
@@ -1263,7 +1299,7 @@ class GMCP_Tools_Core {
       ],
       'wp_update_comment' => [
         'name' => 'wp_update_comment',
-        'description' => 'Update a comment – pass comment_ID plus fields (comment_content, comment_approved).',
+        'description' => 'Update a comment – pass comment_ID plus fields (comment_content, comment_approved). A comment_approved of "trash" or "spam" is refused, because both end in permanent deletion; use wp_delete_comment, and a person marks spam in wp-admin.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1299,7 +1335,7 @@ class GMCP_Tools_Core {
       /* -------- Options -------- */
       'wp_list_changes' => [
         'name' => 'wp_list_changes',
-        'description' => 'List recent changes this API made that can be put back, newest first. Each entry has an id to pass to wp_undo_change. Only writes made through this API are recorded, never changes a person made in wp-admin.',
+        'description' => 'List recent changes this API made that can be put back, newest first. Each entry has an id to pass to wp_undo_change. Covered: setting and option writes (a Customizer theme setting, including a menu-location assignment, is one entry per setting), post edits, custom fields, term edits (name, slug, description, parent, which includes renaming a menu), and which terms a post carries. Menu item edits are covered because a menu item is a post and some custom fields; adding or deleting one is not. NOT covered: creations, deletions and users. An undo is listed as its own entry with an undoes field naming the entry it reversed, and reverting that entry puts the edit back. Only writes made through this API are recorded, never changes a person made in wp-admin.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1310,7 +1346,7 @@ class GMCP_Tools_Core {
       ],
       'wp_undo_change' => [
         'name' => 'wp_undo_change',
-        'description' => 'Put one recorded change back the way it was, by the id from wp_list_changes. Restores only the fields that changed, so later unrelated edits are left alone. Cannot be applied twice. Pass "call" instead of "id" to put back everything one tool call did: a single call routinely changes several things, since writing a page can move an option another plugin keeps in step with it and a page-builder save writes a handful of meta keys, and those arrive as separate entries sharing a call id. Reverting a whole call goes newest first, because two entries can touch the same row and replaying them in the order they happened leaves the value the call set rather than the value it found. Partial success is reported as partial: an individual entry can still be irreversible on its own.',
+        'description' => 'Put one recorded change back the way it was, by the id from wp_list_changes. Restores only the fields that changed, so later unrelated edits are left alone. An entry cannot be applied twice, but the undo is itself recorded as a new entry (named in the reply and shown by wp_list_changes with an undoes field), and reverting THAT entry puts the edit back. That second step is refused if the target has changed since the undo, so it cannot overwrite newer work with an older copy. Covers settings, posts, custom fields, term edits, a post\'s term assignments and individual theme settings; it cannot undo a creation, a deletion or a user change. Pass "call" instead of "id" to put back everything one tool call did: a single call routinely changes several things, since writing a page can move an option another plugin keeps in step with it and a page-builder save writes a handful of meta keys, and those arrive as separate entries sharing a call id. Reverting a whole call goes newest first, because two entries can touch the same row and replaying them in the order they happened leaves the value the call set rather than the value it found. Partial success is reported as partial: an individual entry can still be irreversible on its own.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1388,7 +1424,7 @@ class GMCP_Tools_Core {
       ],
       'wp_set_theme_mod' => [
         'name' => 'wp_set_theme_mod',
-        'description' => 'Set a single theme modification value for the active theme. Uses set_theme_mod(), which merges one key into the theme_mods_<stylesheet> array rather than replacing the whole row, so nav_menu_locations, sidebars_widgets and the other keys in that row are left alone. This is the safe primitive for changing a customizer value: wp_update_option on theme_mods_* does a full-array replace and a mistake wipes every other mod. The write is journalled, so wp_undo_change can put it back.',
+        'description' => 'Set a single theme modification value for the active theme. Uses set_theme_mod(), which merges one key into the theme_mods_<stylesheet> array rather than replacing the whole row, so nav_menu_locations, sidebars_widgets and the other keys in that row are left alone. This is the safe primitive for changing a customizer value: wp_update_option on theme_mods_* does a full-array replace and a mistake wipes every other mod. The write is journalled one setting at a time, so wp_undo_change puts back this key and leaves every other setting as it is now.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1407,7 +1443,7 @@ class GMCP_Tools_Core {
       ],
       'wp_remove_theme_mod' => [
         'name' => 'wp_remove_theme_mod',
-        'description' => 'Remove a single theme modification value for the active theme, so the customizer falls back to its default for that key. Uses remove_theme_mod(), which removes one key from the theme_mods_<stylesheet> array rather than deleting the row. The removal is journalled as an update (the previous value is kept), so wp_undo_change can put it back.',
+        'description' => 'Remove a single theme modification value for the active theme, so the customizer falls back to its default for that key. Uses remove_theme_mod(), which removes one key from the theme_mods_<stylesheet> array rather than deleting the row. The removal is journalled as an update to that one setting (the previous value is kept), so wp_undo_change can put it back without touching the other settings.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1683,7 +1719,7 @@ class GMCP_Tools_Core {
       ],
       'wp_write_blocks' => [
         'name' => 'wp_write_blocks',
-        'description' => 'Build a valid Gutenberg (block editor) layout on an existing post or page from a simple block spec, so the result opens cleanly in the editor with no "invalid content" warnings. Create the post first with wp_create_post, then pass its ID plus "blocks", an ordered array of specs like {"type":"heading","level":2,"content":"..."}. Supported types: paragraph (content), heading (content, level 1-6), list (items[], ordered), quote (content, citation), image (url, alt, caption), buttons (buttons[] of {text,url}), group (blocks[]), columns (columns[] of block-spec arrays), separator, spacer (height px), code (content), html (content, raw HTML escape hatch). content fields accept inline HTML. mode replaces (default), appends, or prepends. For prose you do not need to lay out visually, plain wp_create_post/wp_update_post with Markdown is simpler; use this when you want real, editable blocks.',
+        'description' => 'Build a valid Gutenberg (block editor) layout on an existing post or page from a simple block spec, so the result opens cleanly in the editor with no "invalid content" warnings. Create the post first with wp_create_post, then pass its ID plus either "blocks", an ordered array of specs like {"type":"heading","level":2,"content":"..."}, or "markdown", a Markdown string converted to the same kind of blocks. Supported types: paragraph (content), heading (content, level 1-6), list (items[], ordered), quote (content, citation), image (url, alt, caption), buttons (buttons[] of {text,url}), group (blocks[]), columns (columns[] of block-spec arrays), separator, spacer (height px), code (content), html (content, raw HTML escape hatch). content fields accept inline HTML. Markdown supports headings, paragraphs, bulleted and numbered lists, blockquotes, fenced code, bold, italic, code spans, links and images (http, https or mailto only); HTML written in markdown is shown as text, not run. mode replaces (default), appends, or prepends. For prose you do not need to lay out visually, plain wp_create_post/wp_update_post with Markdown is simpler; use this when you want real, editable blocks.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1693,9 +1729,10 @@ class GMCP_Tools_Core {
               'description' => 'Ordered array of block specs. Each item is an object with a "type" and the fields for that type (see the tool description).',
               'items' => [ 'type' => 'object', 'additionalProperties' => true ],
             ],
+            'markdown' => [ 'type' => 'string', 'description' => 'Markdown to convert to blocks, instead of "blocks". Supports a small subset: # headings, paragraphs, - or 1. lists, > blockquotes, ``` fenced code, **bold**, *italic*, `code`, [text](url) and ![alt](url) with http(s) URLs. Anything else is shown as text, and HTML is escaped rather than kept.' ],
             'mode' => [ 'type' => 'string', 'enum' => [ 'replace', 'append', 'prepend' ], 'description' => 'replace (default) overwrites post_content; append/prepend add the blocks to the existing content.' ],
           ],
-          'required' => [ 'ID', 'blocks' ],
+          'required' => [ 'ID' ],
         ],
         'accessLevel' => 'write',
       ],
@@ -1883,7 +1920,7 @@ class GMCP_Tools_Core {
       ],
       'wp_update_term' => [
         'name' => 'wp_update_term',
-        'description' => 'Update a term.',
+        'description' => 'Update a term: its name, slug, description or parent. The previous values are journalled, so wp_undo_change can put them back. Deleting a term is not recorded and cannot be undone.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1927,7 +1964,7 @@ class GMCP_Tools_Core {
       ],
       'wp_add_post_terms' => [
         'name' => 'wp_add_post_terms',
-        'description' => 'Attach or replace terms for a post. By default (append true) the terms are ADDED to the ones the post already has; pass "append": false to REPLACE them all. Terms are term ids; for a hierarchical taxonomy such as category, a name is looked up and refused if it does not exist, and for a flat one such as post_tag a new name creates the tag. The reply lists the term ids the post holds afterwards. Use for categories, tags, or WooCommerce attributes (pa_color, pa_size, etc.).',
+        'description' => 'Attach or replace terms for a post. By default (append true) the terms are ADDED to the ones the post already has; pass "append": false to REPLACE them all. Terms are term ids; for a hierarchical taxonomy such as category, a name is looked up and refused if it does not exist, and for a flat one such as post_tag a new name creates the tag. The reply lists the term ids the post holds afterwards. Use for categories, tags, or WooCommerce attributes (pa_color, pa_size, etc.). The set of terms the post held before is journalled, so wp_undo_change can put it back; the first terms given to a post as it is created are not.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1961,6 +1998,8 @@ class GMCP_Tools_Core {
       'wp_upload_media' => [
         'name' => 'wp_upload_media',
         'description' => 'Upload a file to the WordPress Media Library. Provide either a url (WordPress will download it) or base64-encoded content with a filename. Base64 mode is useful for local files but doubles the payload size — keep files under a few MB to avoid memory or timeout issues.',
+        // A url makes WordPress fetch from outside the site, so this one is open-world.
+        'annotations' => [ 'openWorldHint' => true ],
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -2044,34 +2083,12 @@ class GMCP_Tools_Core {
     // All 36 core tools enabled and tested with ChatGPT.
     // Automatic validation in mcp.php fixes problematic type definitions.
 
-    // Add category and annotations to each tool
+    // Add category to each tool. Annotations are not set here: GMCP_Server derives them
+    // for every tool from its access level, and a second, name-based guess made here would
+    // answer first and contradict it (it called wp_update_post non-destructive).
     foreach ( $tools as &$tool ) {
       if ( !isset( $tool['category'] ) ) {
         $tool['category'] = 'WordPress';
-      }
-
-      // Add MCP tool annotations based on tool name/behavior
-      if ( !isset( $tool['annotations'] ) ) {
-        $name = $tool['name'];
-
-        // Read-only tools (safe, no modifications)
-        $is_readonly = (
-          strpos( $name, 'wp_get_' ) === 0 ||
-          strpos( $name, 'wp_list_' ) === 0 ||
-          strpos( $name, 'wp_count_' ) === 0
-        );
-
-        // Destructive tools (can delete/destroy data)
-        $is_destructive = (
-          strpos( $name, 'wp_delete_' ) === 0 ||
-          $name === 'wp_update_user' // Can change passwords/roles
-        );
-
-        $tool['annotations'] = [
-          'readOnlyHint' => $is_readonly,
-          'destructiveHint' => !$is_readonly && $is_destructive,
-          'openWorldHint' => false, // All operate on closed WordPress system
-        ];
       }
     }
 
@@ -2550,6 +2567,29 @@ class GMCP_Tools_Core {
       }
     }
 
+    // Readers of a single post's content or meta, and the listing, refuse a post type that is a
+    // form submission. One check ahead of the switch rather than one per case, so a reader added
+    // later to this list is the only edit a new route needs. The tool list is explicit: a
+    // tool that is not named here is not covered, and docs/guardrails.md says which.
+    //
+    // wp_alter_post and the previews are readers too. A regular-expression replace answers
+    // "how many places matched" (an oracle over the body of a message), and a preview of an
+    // update or a delete prints the title and the start of the body it is about to change.
+    $reads_one = in_array( $tool, [ 'wp_get_post', 'wp_get_post_snapshot', 'wp_get_post_meta', 'wp_read_post_meta_chunk', 'wp_alter_post' ], true )
+      || ( !empty( $a['preview'] ) && in_array( $tool, [ 'wp_update_post', 'wp_delete_post' ], true ) );
+    if ( $reads_one ) {
+      $held = GMCP_Core::personal_data_post_guard( (int) ( $a['ID'] ?? 0 ) );
+      if ( $held !== true ) {
+        return $this->error( $r, $held, -32600 );
+      }
+    }
+    elseif ( $tool === 'wp_get_posts' ) {
+      $held = GMCP_Core::personal_data_post_guard( 0, sanitize_key( $a['post_type'] ?? 'post' ) );
+      if ( $held !== true ) {
+        return $this->error( $r, $held, -32600 );
+      }
+    }
+
     // Say what would happen, change nothing. Placed before the switch so a preview
     // cannot fall through into the real handler by way of a missed early return in one
     // of forty case blocks.
@@ -2869,6 +2909,16 @@ class GMCP_Tools_Core {
           break;
         }
         $c = [ 'comment_ID' => intval( $a['comment_ID'] ) ];
+        // wp_update_comment() hands a comment_approved of "trash" to wp_trash_comment(), which
+        // is a deletion that WordPress completes on its own schedule. wp_delete_comment is the
+        // tool that says so, and the one an approval can hold.
+        if ( !empty( $a['fields'] ) && is_array( $a['fields'] ) && array_key_exists( 'comment_approved', $a['fields'] ) ) {
+          $comment_status_why = GMCP_Core::status_write_refusal( $a['fields']['comment_approved'], 'comment' );
+          if ( $comment_status_why !== null ) {
+            $r = $this->error( $r, $comment_status_why, -32600 );
+            break;
+          }
+        }
         if ( !empty( $a['fields'] ) && is_array( $a['fields'] ) ) {
           foreach ( $a['fields'] as $k => $v ) {
             if ( !is_scalar( $v ) ) {
@@ -3120,9 +3170,9 @@ class GMCP_Tools_Core {
           $value = '[redacted]';
         }
         else {
-          $value = GMCP_Core::redact( $value );
+          $value = GMCP_Core::redact( $value, 0, false );
         }
-        $r = $this->json( $r, $value );
+        $this->add_result_text( $r, wp_json_encode( $value, JSON_PRETTY_PRINT ) );
         break;
 
       case 'wp_set_theme_mod':
@@ -3176,8 +3226,8 @@ class GMCP_Tools_Core {
         // text. redact() walks the value and blanks the leaves the same way it does for
         // an audit-log argument, keeping the shape so the caller can still see what is
         // there without seeing what was in it.
-        $mods = GMCP_Core::redact( $mods );
-        $r = $this->json( $r, $mods );
+        $mods = GMCP_Core::redact( $mods, 0, false );
+        $this->add_result_text( $r, wp_json_encode( $mods, JSON_PRETTY_PRINT ) );
         break;
 
       case 'wp_remove_theme_mod':
@@ -3527,6 +3577,11 @@ class GMCP_Tools_Core {
           if ( GMCP_Core::commerce_post_read_guard( $p ) !== true ) {
             continue;
           }
+          // The same for a form submission: the type check above only sees a type named in
+          // the request, and "any" names none.
+          if ( GMCP_Core::personal_data_post_guard( (int) $p->ID ) !== true ) {
+            continue;
+          }
           $rows[] = [
             'ID' => $p->ID,
             'post_title' => $p->post_title,
@@ -3753,6 +3808,21 @@ class GMCP_Tools_Core {
           if ( $item_commerce !== true ) {
             $unfit[] = 'item ' . $i . ': ' . $item_commerce;
           }
+          $item_submission = GMCP_Core::personal_data_retype_guard( 0, sanitize_key( (string) ( $item['post_type'] ?? 'post' ) ) );
+          if ( $item_submission !== true ) {
+            $unfit[] = 'item ' . $i . ': ' . $item_submission;
+          }
+        }
+        // A drafts-only key is refused the whole batch if any item would go live, and
+        // before anything is written: a refusal at item twelve would leave eleven posts behind.
+        foreach ( $items as $i => $item ) {
+          if ( is_array( $item ) ) {
+            $drafts = GMCP_Core::drafts_only_status_guard( (string) ( $item['post_status'] ?? 'draft' ), 'Creating item ' . $i );
+            if ( $drafts !== true ) {
+              $r = $this->error( $r, 'Nothing was created. ' . $drafts, -32600 );
+              break 2;
+            }
+          }
         }
         if ( $unfit ) {
           $r = $this->error( $r, 'Nothing was created. ' . count( $unfit ) . ' of ' . count( $items )
@@ -3835,6 +3905,20 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $commerce, -32600 );
           break;
         }
+        // The source is read and its content and meta carried across, so the read policies
+        // apply to it as they would to wp_get_post: a form submission, or an order below admin.
+        $dup_read = GMCP_Core::post_read_guard( (int) $src->ID );
+        if ( $dup_read !== true ) {
+          $r = $this->error( $r, $dup_read, -32600 );
+          break;
+        }
+        // The source is only read, so a live page may be copied by a drafts-only key; what
+        // matters is the status the copy would be given.
+        $drafts = GMCP_Core::drafts_only_status_guard( (string) ( $a['post_status'] ?? 'draft' ), 'Duplicating post #' . $src->ID );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
+          break;
+        }
         $dup = [
           'post_title' => ( $a['post_title'] ?? '' ) !== '' ? sanitize_text_field( $a['post_title'] ) : $src->post_title,
           // A copy is a draft unless the caller says otherwise, and the source's own
@@ -3913,15 +3997,47 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $commerce, -32600 );
           break;
         }
-        // Some MCP clients send arrays as JSON strings.
-        $wb_blocks = $a['blocks'] ?? null;
-        if ( is_string( $wb_blocks ) ) {
-          $wb_blocks = json_decode( $wb_blocks, true );
-        }
-        list( $wb_markup, $wb_err ) = $this->blocks_to_markup( $wb_blocks );
-        if ( $wb_err !== null ) {
-          $r = $this->error( $r, $wb_err, -32602 );
+        $drafts = GMCP_Core::drafts_only_guard( $wb_id, 'Writing blocks to' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
           break;
+        }
+        // Exactly one of blocks and markdown. Both or neither is ambiguous, and an
+        // ambiguous write is refused rather than guessed at.
+        $wb_has_blocks = array_key_exists( 'blocks', $a ) && $a['blocks'] !== null;
+        $wb_has_md = array_key_exists( 'markdown', $a ) && $a['markdown'] !== null;
+        if ( $wb_has_blocks === $wb_has_md ) {
+          $r = $this->error( $r, $wb_has_blocks ? 'Pass either "blocks" or "markdown", not both.' : 'Pass "blocks" (an array of block specs) or "markdown" (a string).', -32602 );
+          break;
+        }
+        if ( $wb_has_md ) {
+          if ( !is_string( $a['markdown'] ) ) {
+            $r = $this->error( $r, '"markdown" must be a string.', -32602 );
+            break;
+          }
+          list( $wb_markup, $wb_err, $wb_count ) = GMCP_Markdown_Blocks::to_markup( $a['markdown'] );
+          if ( $wb_err !== null ) {
+            $r = $this->error( $r, $wb_err, -32602 );
+            break;
+          }
+          // Markdown output is block markup, so it takes the same sanitising path as any
+          // other post HTML: store_html() honours gmcp_allow_unfiltered_post_html and
+          // otherwise runs kses over each block. The converter escapes source HTML, so
+          // this is a second layer, not the only one.
+          $wb_markup = $this->store_html( $wb_markup );
+        }
+        else {
+          // Some MCP clients send arrays as JSON strings.
+          $wb_blocks = $a['blocks'];
+          if ( is_string( $wb_blocks ) ) {
+            $wb_blocks = json_decode( $wb_blocks, true );
+          }
+          list( $wb_markup, $wb_err ) = $this->blocks_to_markup( $wb_blocks );
+          if ( $wb_err !== null ) {
+            $r = $this->error( $r, $wb_err, -32602 );
+            break;
+          }
+          $wb_count = count( $wb_blocks );
         }
         $wb_mode = in_array( $a['mode'] ?? 'replace', [ 'replace', 'append', 'prepend' ], true ) ? ( $a['mode'] ?? 'replace' ) : 'replace';
         if ( $wb_mode === 'append' ) {
@@ -3939,7 +4055,7 @@ class GMCP_Tools_Core {
           break;
         }
         $this->bust_post_cache( $wb_id, [ 'tool' => 'wp_write_blocks' ] );
-        $this->add_result_text( $r, 'Wrote ' . count( $wb_blocks ) . ' block(s) to post ' . $wb_id . ' (mode: ' . $wb_mode . ').' );
+        $this->add_result_text( $r, 'Wrote ' . $wb_count . ' block(s) to post ' . $wb_id . ' (mode: ' . $wb_mode . ').' );
         break;
 
         /* ===== Block patterns: list ===== */
@@ -4015,6 +4131,11 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $commerce, -32600 );
           break;
         }
+        $drafts = GMCP_Core::drafts_only_guard( $bp_id, 'Inserting a pattern into' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
+          break;
+        }
         $bp_mode = in_array( $a['mode'] ?? 'append', [ 'replace', 'append', 'prepend' ], true ) ? ( $a['mode'] ?? 'append' ) : 'append';
         if ( $bp_mode === 'replace' ) {
           $bp_new = $bp_markup;
@@ -4041,7 +4162,7 @@ class GMCP_Tools_Core {
           break;
         }
         $post_id = intval( $a['ID'] );
-        $commerce = GMCP_Core::commerce_post_guard( $post_id, 'Updating' );
+        $commerce = GMCP_Core::post_write_guard( $post_id, 'Updating' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
           break;
@@ -4086,6 +4207,21 @@ class GMCP_Tools_Core {
             $r = $this->error( $r, $retype, -32600 );
             break;
           }
+          // The read guards are keyed on the post's type, so retyping a form submission to
+          // "post" makes it a post wp_get_post will return, body and all. Out of, or into.
+          $retype_pd = GMCP_Core::personal_data_retype_guard( $post_id, is_scalar( $fields['post_type'] ) ? (string) $fields['post_type'] : '' );
+          if ( $retype_pd !== true ) {
+            $r = $this->error( $r, $retype_pd, -32600 );
+            break;
+          }
+        }
+
+        // A status that is a deletion in waiting. Judged on what the call asks for, before
+        // anything is written. @see GMCP_Core::status_write_refusal().
+        $status_why = array_key_exists( 'post_status', $fields ) ? GMCP_Core::status_write_refusal( $fields['post_status'] ) : null;
+        if ( $status_why !== null ) {
+          $r = $this->error( $r, $status_why, -32600 );
+          break;
         }
 
         // Track what we're trying to update for verification
@@ -4139,6 +4275,18 @@ class GMCP_Tools_Core {
         }
 
         // Handle JSON strings for meta_input
+        // The status this call would leave the post in is only known now that fields and
+        // schedule_for are both folded into $c, and it is asked before anything is written:
+        // the trash and restore steps below write before wp_update_post does.
+        // An attachment is judged as hard as a deletion would be, for the reason given at
+        // wp_update_media: with no parent it may be the featured image or an embed of a live
+        // page. @see GMCP_Core::drafts_only_guard().
+        $drafts = GMCP_Core::drafts_only_guard( $post_id, 'Updating', (string) ( $c['post_status'] ?? '' ), get_post_type( $post_id ) === 'attachment' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
+          break;
+        }
+
         $meta_raw = $a['meta_input'] ?? null;
         $meta_input = $meta_raw;
         if ( is_string( $meta_input ) ) {
@@ -4296,7 +4444,7 @@ class GMCP_Tools_Core {
           break;
         }
         $delete_id = intval( $a['ID'] );
-        $commerce = GMCP_Core::commerce_post_guard( $delete_id, 'Deleting' );
+        $commerce = GMCP_Core::post_write_guard( $delete_id, 'Deleting' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
           break;
@@ -4354,6 +4502,11 @@ class GMCP_Tools_Core {
         $commerce = GMCP_Core::commerce_post_guard( $post_id, 'Altering' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
+        $drafts = GMCP_Core::drafts_only_guard( $post_id, 'Altering' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
           break;
         }
 
@@ -4424,7 +4577,7 @@ class GMCP_Tools_Core {
           }
         }
         else {
-          $get_why = $this->meta_key_allowed( $get_key );
+          $get_why = $this->meta_key_allowed( $get_key, false );
           if ( $get_why !== true ) {
             $r = $this->error( $r, $get_why, -32602 );
             break;
@@ -4441,7 +4594,7 @@ class GMCP_Tools_Core {
           break;
         }
         $pid = intval( $a['ID'] );
-        $commerce = GMCP_Core::commerce_post_guard( $pid, 'Setting meta on' );
+        $commerce = GMCP_Core::post_write_guard( $pid, 'Setting meta on' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
           break;
@@ -4515,7 +4668,7 @@ class GMCP_Tools_Core {
           break;
         }
         $pid = intval( $a['ID'] );
-        $commerce = GMCP_Core::commerce_post_guard( $pid, 'Deleting meta from' );
+        $commerce = GMCP_Core::post_write_guard( $pid, 'Deleting meta from' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
           break;
@@ -4555,6 +4708,21 @@ class GMCP_Tools_Core {
         $commerce = GMCP_Core::commerce_post_guard( $to_id, 'Copying meta to' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
+        // The source is READ, and its meta travels to a post this caller can then read back.
+        // Asking only about the target left every key of a form submission (a Flamingo
+        // message's _meta holds the visitor's IP address and user agent) or of an order
+        // copyable onto a draft of the caller's own. The read policies apply to the source.
+        $source_read = GMCP_Core::post_read_guard( $from_id );
+        if ( $source_read !== true ) {
+          $r = $this->error( $r, $source_read, -32600 );
+          break;
+        }
+        // The target is the write.
+        $drafts = GMCP_Core::drafts_only_guard( $to_id, 'Copying meta onto' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
           break;
         }
         // Some MCP clients send arrays as JSON strings.
@@ -4606,6 +4774,13 @@ class GMCP_Tools_Core {
         $commerce = GMCP_Core::commerce_post_guard( $chunk_pid, 'Setting meta on' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
+        // Asked on every chunk, not only the last: a refusal after the whole value has been
+        // staged is a refusal the caller learns about too late to have saved the bytes.
+        $drafts = GMCP_Core::drafts_only_guard( $chunk_pid, 'Writing meta on' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
           break;
         }
         $chunk_why = $this->meta_key_allowed( $chunk_key );
@@ -4710,7 +4885,7 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $chunk_read, -32600 );
           break;
         }
-        $read_why = $this->meta_key_allowed( $read_key );
+        $read_why = $this->meta_key_allowed( $read_key, false );
         if ( $read_why !== true ) {
           $r = $this->error( $r, $read_why, -32602 );
           break;
@@ -4846,6 +5021,11 @@ class GMCP_Tools_Core {
         $commerce = GMCP_Core::commerce_post_guard( $post_id, 'Setting the featured image of' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
+        $drafts = GMCP_Core::drafts_only_guard( $post_id, 'Setting the featured image of' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
           break;
         }
         $media_id = isset( $a['media_id'] ) ? intval( $a['media_id'] ) : 0;
@@ -4998,6 +5178,11 @@ class GMCP_Tools_Core {
         $commerce = GMCP_Core::commerce_post_guard( intval( $a['ID'] ), 'Setting terms on' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
+          break;
+        }
+        $drafts = GMCP_Core::drafts_only_guard( intval( $a['ID'] ), 'Setting the terms of' );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
           break;
         }
         $tax = sanitize_key( $a['taxonomy'] ?? 'category' );
@@ -5187,6 +5372,14 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'No attachment with ID ' . intval( $a['ID'] ) . '. This tool edits media only; use wp_update_post for other posts.', -32602 );
           break;
         }
+        // $removing is true although this edits: the title, caption and alt text of a file with
+        // no parent change what every live page showing it displays, and nothing here can find
+        // those pages. Only media attached to a draft is the key's to edit.
+        $drafts = GMCP_Core::drafts_only_guard( intval( $a['ID'] ), 'Updating', '', true );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
+          break;
+        }
         $upd = [ 'ID' => intval( $a['ID'] ) ];
         if ( $a['title'] ?? '' ) {
           $upd['post_title'] = sanitize_text_field( $a['title'] );
@@ -5223,6 +5416,11 @@ class GMCP_Tools_Core {
         // the template guard that wp_delete_post asks.
         if ( get_post_type( $media_id ) !== 'attachment' ) {
           $r = $this->error( $r, 'No attachment with ID ' . $media_id . '. This tool deletes media only; use wp_delete_post for other posts.', -32602 );
+          break;
+        }
+        $drafts = GMCP_Core::drafts_only_guard( $media_id, 'Deleting', '', true );
+        if ( $drafts !== true ) {
+          $r = $this->error( $r, $drafts, -32600 );
           break;
         }
         $d = wp_delete_post( $media_id, !empty( $a['force'] ) );

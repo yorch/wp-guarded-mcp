@@ -786,7 +786,7 @@ class GMCP_Tools_Admin {
       ],
       'wp_update_menu_item' => [
         'name' => 'wp_update_menu_item',
-        'description' => 'Change one menu item in place: its title, its URL, which item it sits under, its position, or whether it opens in a new tab. Only the fields passed change. Everything else is read and written back as it was, because WordPress\'s own updater blanks every field an update omits, which leaves the item sitting in the menu with no link and no error. Refuses to move an item under itself, under one of its own descendants, or under an item in another menu: each of those breaks the menu silently. A post_type or taxonomy item takes its link from the thing it points at, so setting url on one is refused rather than stored and ignored. position is the stored order counting from 0, the same number wp_get_menu_items reports. The reply reports the resolved title and url — the same values wp_get_menu_items reports — so a post_type item that inherits its title shows the title of the page it points at, not the empty string WordPress stores. Do not write that resolved title back: it freezes the item and it stops following the page.',
+        'description' => 'Change one menu item in place: its title, its URL, which item it sits under, its position, or whether it opens in a new tab. Only the fields passed change. Everything else is read and written back as it was, because WordPress\'s own updater blanks every field an update omits, which leaves the item sitting in the menu with no link and no error. Refuses to move an item under itself, under one of its own descendants, or under an item in another menu: each of those breaks the menu silently. A post_type or taxonomy item takes its link from the thing it points at, so setting url on one is refused rather than stored and ignored. position is the stored order counting from 0, the same number wp_get_menu_items reports. The reply reports the resolved title and url — the same values wp_get_menu_items reports — so a post_type item that inherits its title shows the title of the page it points at, not the empty string WordPress stores. Do not write that resolved title back: it freezes the item and it stops following the page. The edit is journalled (the item\'s post fields and custom fields, all under this one call), so wp_undo_change with the call id puts the item back; adding or deleting an item is not recorded and cannot be undone.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -813,7 +813,7 @@ class GMCP_Tools_Admin {
       ],
       'wp_assign_menu_location' => [
         'name' => 'wp_assign_menu_location',
-        'description' => 'Assign a menu to a theme location, or clear a location by passing an empty menu. Locations belong to the active theme, so switching theme clears them.',
+        'description' => 'Assign a menu to a theme location, or clear a location by passing an empty menu. Locations belong to the active theme, so switching theme clears them. The assignment is journalled as one theme setting (nav_menu_locations), so wp_undo_change can put the previous assignments back without touching the theme\'s other settings.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -911,14 +911,22 @@ class GMCP_Tools_Admin {
     foreach ( $tools as &$tool ) {
       $tool['category'] = 'WordPress Admin';
       $name = $tool['name'];
-      $readonly = strpos( $name, 'wp_list_' ) === 0 || strpos( $name, 'wp_get_' ) === 0;
+      // Only the one hint this group knows and GMCP_Server cannot: installers and updaters
+      // reach wordpress.org. readOnlyHint and destructiveHint are derived from accessLevel
+      // in GMCP_Server::derive_annotations(), so they are not restated here, where a
+      // name-based guess would override them key by key.
       $tool['annotations'] = [
-        'readOnlyHint' => $readonly,
-        // Named as well as prefixed: unscheduling an event destroys something the
-        // journal cannot put back, so the naming convention is not enough to catch it.
-        'destructiveHint' => strpos( $name, 'wp_delete_' ) === 0 || $name === 'wp_unschedule_cron_event',
         'openWorldHint' => strpos( $name, 'wp_install_' ) === 0 || strpos( $name, 'wp_update_' ) === 0,
       ];
+      // A "get" that is not a read. Site Health's direct tests are WordPress's own and are
+      // run as they are: wp_check_php_version() asks api.wordpress.org and stores the answer
+      // in the php_check_* site transient, other tests may refresh the HTTPS-support option,
+      // and a plugin can register further tests through site_status_tests that do anything.
+      // The access level stays 'read' (it changes nothing a visitor or editor would notice,
+      // and who may call it is a separate question), but the hints say what it does.
+      if ( $name === 'wp_get_site_health' ) {
+        $tool['annotations'] = [ 'readOnlyHint' => false, 'openWorldHint' => true ];
+      }
     }
     unset( $tool );
     return array_merge( $prev, array_values( $tools ) );

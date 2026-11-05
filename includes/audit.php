@@ -273,7 +273,7 @@ class GMCP_Audit {
   const IDENTIFIER_ARGS = [ 'key', 'meta_key', 'option_key' ];
 
   /** Arguments as they will be stored: redacted, size-capped, and honest about both. */
-  private function storable_args( array $args, bool $failed = false ): string {
+  public static function storable_args( array $args, bool $failed = false ): string {
     foreach ( self::NEVER_RECORD as $field ) {
       if ( array_key_exists( $field, $args ) ) {
         $args[ $field ] = '[redacted]';
@@ -355,17 +355,19 @@ class GMCP_Audit {
       'target' => $this->target( $args ),
       'outcome' => $failed ? 'refused' : 'ok',
       'ms' => (int) ( $call['duration_ms'] ?? 0 ),
-      'args' => $this->storable_args( $args, $failed ),
+      'args' => self::storable_args( $args, $failed ),
       'changes' => class_exists( 'GMCP_Changes' )
         ? GMCP_Changes::summarise( GMCP_Changes::captured(), self::MAX_CHANGES )
         : null,
       'detail' => $this->detail( $call, $failed ),
     ];
-    self::write( $row );
+    self::append( $row );
   }
 
   /**
-  * Append one row to the chain.
+  * Append one row to the chain. The chain's single writer: record(), note() and
+  * record_event() all come through here, because two insert paths would be two places to
+  * get the previous hash wrong, and a row that does not chain is reported as tampering.
   *
   * The read of the previous hash and the insert have to be one step. Parallel tool calls
   * arrive as separate requests, and two that read the same predecessor before either has
@@ -385,7 +387,7 @@ class GMCP_Audit {
   *
   * @param array $row the columns, without prev_hash and hash.
   */
-  private static function write( array $row ): void {
+  private static function append( array $row ): void {
     global $wpdb;
 
     // HyperDB and LudicrousDB may send the SELECT below to a lagging replica, which forks
@@ -468,7 +470,7 @@ class GMCP_Audit {
       return;
     }
     $user = get_current_user_id();
-    self::write( [
+    self::append( [
       'ts' => gmdate( 'Y-m-d H:i:s' ),
       'actor' => $user,
       'actor_name' => $user ? (string) ( get_userdata( $user )->user_login ?? '' ) : '',
@@ -481,6 +483,48 @@ class GMCP_Audit {
       'args' => '{}',
       'changes' => null,
       'detail' => mb_substr( $detail, 0, 1000 ),
+    ] );
+  }
+
+  /**
+  * Write a row that is not a tool call.
+  *
+  * The approval queue has events no tool call describes: a person approving a request
+  * from wp-admin, a request expiring, a replay being refused. They belong in the same
+  * hash chain as the calls they concern, or the log would tell the story of a request
+  * and omit the only part a person did.
+  *
+  * Arguments are taken as already redacted and are redacted again here, so a caller that
+  * forgets cannot put a credential in the table. Does nothing when the log is switched
+  * off or at a hard bound, for the same reasons record() does not.
+  *
+  * @param array $fields tool (an event name), actor, client, auth_method, target, outcome,
+  *                      args (array), detail
+  */
+  public static function record_event( array $fields ): void {
+    $core = $GLOBALS['gmcp_core'] ?? null;
+    if ( !$core || !$core->get_option( 'mcp_activity_log' ) ) {
+      return;
+    }
+    if ( self::over_bound() ) {
+      return;
+    }
+    $actor = (int) ( $fields['actor'] ?? 0 );
+    $args = GMCP_Core::redact( is_array( $fields['args'] ?? null ) ? $fields['args'] : [] );
+    $json = wp_json_encode( $args, JSON_UNESCAPED_SLASHES );
+    self::append( [
+      'ts' => gmdate( 'Y-m-d H:i:s' ),
+      'actor' => $actor,
+      'actor_name' => $actor ? (string) ( get_userdata( $actor )->user_login ?? '' ) : '',
+      'client' => mb_substr( (string) ( $fields['client'] ?? '' ), 0, 191 ),
+      'auth_method' => mb_substr( (string) ( $fields['auth_method'] ?? '' ), 0, 32 ),
+      'tool' => mb_substr( (string) ( $fields['tool'] ?? '' ), 0, 64 ),
+      'target' => mb_substr( (string) ( $fields['target'] ?? '' ), 0, 191 ),
+      'outcome' => ( $fields['outcome'] ?? 'ok' ) === 'refused' ? 'refused' : 'ok',
+      'ms' => 0,
+      'args' => $json === false ? '{}' : mb_substr( $json, 0, self::MAX_ARGS ),
+      'changes' => null,
+      'detail' => mb_substr( GMCP_Core::scrub_preview_tokens( wp_strip_all_tags( (string) ( $fields['detail'] ?? '' ) ) ), 0, 1000 ),
     ] );
   }
 
@@ -505,7 +549,11 @@ class GMCP_Audit {
     // margin is wide enough that the second cut, not the first, decides the result for
     // anything but text that is almost entirely markup, where a shorter line is the
     // right answer anyway.
-    return mb_substr( wp_strip_all_tags( mb_substr( $text, 0, 8000 ) ), 0, 1000 );
+    $text = wp_strip_all_tags( mb_substr( $text, 0, 8000 ) );
+    // A preview link is a bearer credential and its tool's reply is where it is handed out.
+    // The reply is recorded here, so the token is cut out of it: an audit log that holds a
+    // working link to an unpublished post is a second place that link can be read from.
+    return mb_substr( GMCP_Core::scrub_preview_tokens( $text ), 0, 1000 );
   }
 
   /**

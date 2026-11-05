@@ -120,6 +120,42 @@ and carry their own guards:
   entities, and kses does not recognise such a delimiter comment: it escapes the
   opener and destroys the block. Only the rendered HTML inside each block is
   filtered, and the attributes round-trip as JSON.
+- Markdown given to `wp_write_blocks` is converted to blocks by
+  `GMCP_Markdown_Blocks`, which escapes every piece of HTML in the source instead of
+  passing it through, and accepts links only for `http`, `https` and `mailto`, and
+  images only for `http` and `https`. The converted markup then goes through the same
+  `store_html()` path as block markup written directly, so the rules above apply to
+  it too. Neither layer is trusted alone: the converter is the one that knows what the
+  source meant, and the filter is the one that knows what the editor will render.
+  Block specs given to the same tool are filtered leaf by leaf with `wp_kses_post()`
+  as each block is rendered, without unslashing (the text arrives from JSON, not from
+  `$_POST`, so a backslash in it is the author's), and that filtering is unconditional:
+  it does not honour `gmcp_allow_unfiltered_post_html`, which `store_html()` does, so a
+  site that opted into raw HTML still gets filtered text from block specs. That is the
+  stricter of the two and was left that way on purpose.
+- Tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
+  `openWorldHint`) are advisory and are not a guard. Clients may use them to decide
+  whether to ask first, so a wrong hint costs a prompt or skips one; it does not
+  change what the server allows. They are derived from the access level and the
+  tool's name, and an individual tool may override them. `readOnlyHint` is set for a
+  `read`-level tool and for a tool with a read verb directly after the group prefix,
+  because about two dozen admin-level tools only read (some of them personal data,
+  such as form entries and customers; others options and theme mods). That makes it
+  a statement about what the registration looks like, not a measurement of what the
+  code does, and it is not claimed to be exact. The handlers of the tools it marks
+  were read for direct calls that write, reach out or schedule (the code of a
+  third-party plugin a read calls into was not exercised for the optional groups,
+  and a read that calls WordPress may prime an object cache, which is not counted):
+  `wp_get_site_health` was the one that did (it runs WordPress's own Site Health tests, which ask
+  api.wordpress.org about PHP and store the answer as a site transient), and it now
+  says so itself with `readOnlyHint: false` and `openWorldHint: true`. A
+  read that writes is a defect to fix or to override, and the hint does not cover it
+  either way. Refusal and two-step confirmation are enforced by the tools, whatever
+  the hint says.
+- The server's `instructions` text tells the model that content read from the site
+  is data and not instructions. That is guidance, not a control: it is the reason
+  the guards exist, and it must not be the only thing standing between a comment and
+  an action.
 - The default role for public registration is checked by construction: a role
   granting anything beyond a subscriber is refused, rather than checking a list
   of capabilities that would never stay complete.
@@ -187,6 +223,149 @@ minted key lives at `_transient_gmcp_new_key_<user>`, and a rule anchored to the
 start of the name would miss the row it most needs to catch. It replaced a list
 of exact names, which had been wrong twice: the change journal was readable until
 somebody named it, and that transient was never on it.
+
+### Diagnostics: the error log, a page as a visitor sees it, and draft preview links
+
+Four tools in the administration group, for the question "why is this page
+broken, and what does the client see". Each is a place where an agent is handed
+something that looks harmless and is not, so each says what it cannot promise.
+
+- **`wp_get_php_error_log`** (`admin`) reads the end of the file PHP is
+  configured to log to and nothing else. There is no path argument, so there is
+  no path to validate: the file is whatever `ini_get('error_log')` says, which
+  WordPress itself points at `wp-content/debug.log` or at the `WP_DEBUG_LOG`
+  path. A configured file is still refused if its name is not log-shaped, if it
+  is a script or a configuration file, or if it is a symbolic link, so a
+  misconfigured or swapped value cannot turn it into a general file reader.
+  The path is looked at without following a link (`lstat`) before it is opened, so a
+  link, a pipe or a device is refused untouched (a FIFO would otherwise block the
+  worker on open), and the handle that was opened is compared with what was looked
+  at by device and inode and must be a regular file, which catches a file swapped in
+  between. PHP cannot open with `O_NOFOLLOW`, so the window between the two calls is
+  narrowed and not removed, and a site where an attacker can write to the log
+  directory is outside what this protects.
+  It reads from the end of the file, at most 256KB of it, so a multi-gigabyte log
+  costs what a small one does. It has no search and no pattern argument; the model asks for the last
+  N lines and filters them itself.
+- Every line is scrubbed before it leaves: values under credential-shaped names
+  (the same `gmcp_credential_field_patterns` list the audit log and journal
+  use), bearer and basic credentials, user information in URLs, JWTs, password
+  hashes, this plugin's own keys, long opaque tokens, the value in a
+  `define( 'DB_PASSWORD', '...' )` of a credential-named constant, `pw=...`, AWS
+  access key ids and 40-character AWS-style secret keys, e-mail addresses, public IP
+  addresses (loopback and private ones stay, because `connect to 127.0.0.1` is
+  the diagnosis), the argument values in stack frames, and the values in a failed
+  SQL query past its first 120 characters. Paths are shown as `[content]/` and
+  `[abspath]/`. This recognises shapes. A secret written into an ordinary
+  sentence survives it, and so does personal data in a message PHP assembled from
+  a form, which is why the tool is `admin` and not `read`.
+- The reply distinguishes the cases that all look like "nothing to see":
+  logging is not going to a file at all, a file is configured and does not exist
+  yet, it exists and is empty, it has lines. It also reports `WP_DEBUG`,
+  `WP_DEBUG_LOG` and `log_errors` next to the answer, and says when the newest
+  entry is a week old and logging looks off. "Empty" is a statement about a
+  file, and the reply says it is not proof that logging is on.
+- **`wp_fetch_page`** (`admin`) makes the server request one URL of its own site
+  and reports status, redirects, title, robots signals, canonical and a bounded
+  excerpt of the visible text, optionally counting an expected string. It is the
+  only tool here that makes an outbound request, so it is built around the one
+  way that goes wrong. The URL must have the same scheme, host and port as the
+  site's address and a path inside the site's own path; it must be plain ASCII
+  with no backslash or user information, and the URL actually sent is rebuilt
+  from the parsed parts, never the string supplied, so a parser disagreement
+  between PHP and the HTTP client has nothing to exploit. The host is resolved
+  here, every address returned must be acceptable (a name with one public and one
+  internal record is refused), and the connection is pinned to the address that
+  was checked, so the answer cannot change between the check and the connect. If
+  the pin cannot be applied (the HTTP transport is not cURL, or another plugin
+  short-circuits the HTTP API) the response is discarded. Link-local, reserved
+  and multicast addresses are refused for every site, which is where the cloud
+  metadata service lives. Private and loopback addresses are accepted only when
+  the site's own host name is local (`localhost`, a bare name, an IP in those
+  ranges, `.test`, `.local` and similar); a production host name that resolves
+  privately is refused unless the site opts in through `gmcp_fetch_allow_private`.
+  Redirects are followed by hand, up to five, and each hop goes through the same
+  check, so a redirect off the site, to another port or to a metadata address is
+  reported and not followed. No cookies and no credentials are sent. The body is
+  cut at 1MB and only HTML is read.
+- Why `admin` and not `read`: the request originates from the server, so it
+  arrives from the one address a site's own IP allowlists and loopback-only
+  handlers trust. `wp-admin`, `wp-json`, `wp-login.php`, `wp-cron.php`,
+  `xmlrpc.php`, any other `.php` file (and `index.php` with anything after it,
+  which is how WordPress is reached as `/index.php/wp-json/...`) and a short
+  list of query parameters that change state on common plugins (`add-to-cart`,
+  `wc-ajax`, `action` and others) are refused. The comparison is made on what a
+  server would route, not on the text that was sent: the path is decoded and
+  refused if it carries an encoded letter, digit, hyphen, underscore or tilde, an
+  encoded dot, slash, backslash or NUL, or a second layer of encoding (so
+  `/wp%2Djson/` and `/wp-login.ph%70` are the plain request), and a query key is
+  compared as PHP will name it (`rest.route`, `rest+route` and `rest[route` are
+  all `rest_route`; `gmcp.preview` is the preview parameter). That list is a list. A front-end route on this site whose GET has
+  a side effect and an unfamiliar name is still reachable, and the tool says so
+  in its description rather than implying otherwise.
+- Page text is somebody else's words. Everything under `page_content_untrusted`
+  was written by whoever controls the page, and the reply says to treat it as
+  data. Elements marked `hidden`, `aria-hidden` or `display:none` inline, and
+  scripts, styles and templates, are left out so the excerpt is what is shown
+  and not what is merely present; a page that hides text with a CSS class cannot
+  be seen through from here and is not claimed to be.
+- **`wp_create_preview_link`** and **`wp_revoke_preview_links`** (`write`)
+  give someone with no account a way to read ONE unpublished post. A link is
+  `?p=ID&gmcp_preview=TOKEN` (`page_id` for a page). The token is 160 random
+  bits, shown once; the site keeps only its hash, the post id and an expiry in an
+  option whose name contains `gmcp_`, so every generic option tool refuses it and
+  an agent cannot lengthen a link by editing the row. Stored rather than signed,
+  because a signature cannot be revoked, carries whatever lifetime it was signed
+  with, and would bring every old link back when a published post is reverted to
+  a draft.
+  Ending every link on the site (`all: true`) needs an admin-level key, because it
+  also ends links other keys and other people made; every key acts as an
+  administrator user, so the user recorded with a link cannot tell keys apart and the
+  access level is the cut that exists. A key below admin can still end the links for
+  one post it can edit.
+- Verification happens on the front end, on the MAIN query only. `pre_get_posts`
+  accepts the token only when the request is already a single-post request for
+  exactly the post the token was issued for, and only then lets that query
+  return a draft, pending or scheduled post. `posts_results` empties the result
+  unless it is exactly that post in one of those states, and `template_redirect`
+  checks the queried object and expiry again before sending `X-Robots-Tag:
+  noindex`, `Referrer-Policy: no-referrer` (the token is in the URL, and the
+  Referer header would carry it to every external image on the page) and
+  no-store headers, and switching off canonical redirects that would drop it.
+  The statuses it can ever show are `draft`, `pending` and `future`: on a
+  published, private or trashed post the query matches nothing and the answer is
+  a 404, and publishing, trashing or deleting a post deletes its links so
+  reverting does not revive them. Lifetime is 24 hours by default, at most 168.
+  Feeds, embeds, trackbacks and the REST API never honour a token.
+- The link is a bearer credential and it travels in a URL, where no field name
+  marks it secret. `GMCP_Core::redact()` therefore scrubs the `gmcp_preview`
+  parameter (in any spelling PHP maps to it: `gmcp.preview`, `gmcp+preview`,
+  `gmcp[preview]`, percent-encoded characters in the name or the `=`) out of every
+  string it is handed on the logging paths, which is what the audit log's
+  arguments and the debug trace both use, and the audit log applies the same
+  scrub to the reply it keeps. It does not scrub what a tool returns to its caller:
+  a stored theme mod or field that happens to contain the text is the site's own
+  data, and the readers pass `scrub_preview = false` so it comes back as stored. The
+  debug trace prints a call's arguments through `redact_call_args()`, the same answer
+  the audit log gives, so a value under a credential-named option or meta key is not
+  printed there either. Without it the tool that hands the link out would
+  have written it into the audit log in the clear in the same call, which the
+  first test of it showed. The fetch tool refuses a URL carrying the parameter
+  for the same reason: it would be recorded as an argument, and a preview
+  credential has no business being fetched by a tool that cannot show a draft
+  anyway.
+- Not closed, and said so: viewing a link is not logged (only issuing and
+  revoking are); anyone who is given the link can forward it; a link pasted into a
+  post body or a message is outside what the audit log's scrub can see; the
+  window between the address check and the connect is closed by pinning only
+  where the HTTP transport is cURL. A proxy is never used for the fetch: libcurl
+  honours `http_proxy` and `HTTPS_PROXY` from the environment, and a proxy
+  resolves the host itself so the pin would hold nothing, so the request sets an
+  empty proxy and `NO_PROXY=*` on its own handle, and the response is discarded
+  unless both were accepted. A site whose WordPress proxy settings
+  (`WP_PROXY_HOST`, or the `pre_http_send_through_proxy` filter) apply to its
+  own host is refused outright rather than routed around. The reply's
+  `connection` field says so only for a response that passed that test.
 
 ## WooCommerce
 
@@ -632,6 +811,273 @@ subscription is built without a payment gateway, and a manual subscription repor
 gateway feature as supported. So the gateway-dependent branches are unreachable here, and
 the suite says so rather than implying coverage it does not have.
 
+## Redirection and Polylang
+
+**A redirect is two primitives in one row.** Pointed at a foreign host it is an open
+redirect: the site's own reputation, and its own URLs in a phishing mail, in front of
+someone else's page. Pointed from `/wp-login.php` or `/wp-admin/` it takes the operator's way
+back in. The agent that would write one also reads comments and post bodies written by
+strangers, so the policy is in the tool and is not a setting. A target must be a path on this
+site or a URL on its own host; another host is accepted only over `https`, by exact name, if
+the `gmcp_redirect_allowed_hosts` filter lists it (empty by default; entries that are not a
+bare host name are dropped, so a filter returning `*` matches nothing). Refused outright:
+`//host` and `/\host` (browsers read both as another site), tabs and newlines (browsers strip
+them from inside a URL), userinfo before the host, and a non-ASCII host. In a
+regular-expression redirect a `$1` that starts the target is the classic open redirect (the
+request `//evil.com` is copied in), so a capture is accepted only after a fixed first path
+segment.
+
+**The target is what `wp_redirect()` will send, not what was typed.** Redirection hands the
+stored target to `wp_redirect()`, whose `wp_sanitize_redirect()` DELETES every character outside
+`a-z 0-9 - ~ + _ . ? # = & ; , / : % ! * [ ] ( ) @`. Deleting is an open redirect: `/^/evil.com`
+begins with a single `/`, passes a check of its first two characters, is stored unchanged
+(Redirection's `sanitize_url` only strips newlines and control characters), and leaves
+`wp_redirect()` as `//evil.com`; the same for `'` `"` `{` `}` `|` `$` `` ` `` `<` `>` and `%0a`/`%0d`
+(`/%0a/evil.com`). A target is therefore accepted only if `wp_sanitize_redirect()` leaves it
+unchanged, and the `//`, host and scheme checks then run on exactly that text. The rule is in
+`problems_for()`, so create, update, enable and the read-back of a stored row all ask it. A
+non-ASCII path must be percent-encoded for the same reason (the sanitiser would encode it).
+In a regular-expression redirect `$1` is replaced before `wp_redirect()` sees the target, so
+it is stood in for with a digit when the rule is applied.
+
+**Sources.** A literal path, compared after percent-decoding to a fixed point, lower-casing,
+and rejecting `.`, `..` and empty segments; the site's subdirectory and a leading `index.php`
+are peeled off before the protected list is applied, and the protected paths are taken from
+WordPress (`wp_login_url()`, `admin_url()`, `rest_url()`, this plugin's endpoint) rather than
+hard-coded, so a moved login page is covered. `/wp-cron.php` and `/xmlrpc.php` are protected
+too: neither is a page, and a redirect on either stops scheduled posts, updates and
+WooCommerce jobs, or remote publishing, with nothing on screen. A `rest_route` query is refused
+on any path.
+Regular-expression sources are off by default because a pattern cannot be proven not to cover
+the login page; when a site allows them, the pattern is tested against the protected paths
+and refused if it matches one. That test is best effort and is the reason the default is off.
+What it knows about Redirection's own handling of a pattern (read in 5.10.1): the source is
+`rawurldecode`d once when it is saved (`Red_Item_Sanitize::sanitize_url`) and the stored form is
+`rawurldecode`d again every time a request is matched (`Red_Regex::__construct`), then wrapped as
+`'@' . pattern . '@s'` with an `i` appended only when the redirect ignores case (not `'@..@i'`).
+So `^/wp-login%255c.php` is stored as `^/wp-login%5c.php` and matches `/wp-login.php`, and a probe of
+the text as typed, or of the stored text, never sees it. A `%` in a regular-expression source is
+therefore refused, the decoded forms are probed as well (for rows made in the admin screen), both
+wrapper flavours are used, and the probes include query-string variants
+(`/wp-login.php?a=1`) and the cron and XML-RPC paths. A backslash is refused in any source, so a
+literal dot is written `[.]`, not `\.`.
+
+**The policy belongs to the redirect, not to the call.** It is evaluated on the stored row
+after every write, and a row that fails is switched off, because Redirection sanitises what it
+is given and the request was only ever a claim. Enabling an existing redirect evaluates it
+too: a redirect written in the Redirection screen to a foreign host stays off through this
+tool. Disabling asks nothing. Only the plain URL match and redirect action are managed,
+because match types that depend on the visitor (agent, referrer, cookie, IP, login status)
+are how a redirect is shown to a crawler and hidden from the owner, and an update that
+rebuilt one would drop its conditions without saying.
+
+**Facts about Redirection's API that these tools were corrected against (5.10.1).**
+`Red_Item::get_filtered` clamps `per_page` to at least 5 and offsets by `page * clamped size`, so
+asking for 3 returned 5 and page 2 started at row 10; the list now asks only for sizes it
+honours and cuts the requested page out locally. `to_json()` reports a redirect nobody has
+followed with `last_access` of `-`, which is reported as `null`. `Red_Item::create` honours
+`enabled => false`, so a redirect meant to be off is inserted off and not disabled afterwards
+(that left it live in between). `Red_Item_Sanitize::get_position()` answers 0 when no position
+is given, so an update carries the stored position over instead of moving the redirect to the
+front of its group.
+
+**No delete.** Disabling is the reversible removal and loses nothing. A deletion also loses
+the hit count and cannot be undone, and no task needs it. Adding one later means giving it
+the two-step every other irreversible tool here takes.
+
+**Not covered:** the change journal (the rows are in Redirection's own tables), a duplicate
+source (Redirection decides what a second redirect on the same path means), and a redirect
+whose Redirection group or module is disabled, which stays inert regardless of its own state.
+
+**Polylang is read only, and `log_state`-style honesty is the point.** Three answers look
+the same as an empty list and are different facts: Polylang loaded with no languages
+(`not_configured`), a post with no language or of a post type Polylang does not manage, and a
+post with a language and no siblings (`no_translations`). Linking posts or setting a language
+is not offered: it changes which page a visitor is shown and which URL is the original, and
+nothing here could undo it. The translation group can name drafts and private posts, so that
+tool is `write`, and it returns IDs, languages, statuses and post types but no titles.
+
+**WPML is deferred.** Its translation groups live in its own table behind filters rather than
+functions, its "not configured" state has several shapes, and it could not be installed to
+measure. A reader written from memory is how a confident "no translations" is produced.
+## Rank Math and All in One SEO
+
+How those plugins store their data was written from memory of their source, and has since been
+checked by running `smoke-seo.sh` against Rank Math 1.0.281 and All in One SEO 5.0.5: the post
+meta keys, the robots array and AIOSEO's table and robots columns are as described. Anything
+still marked UNVERIFIED in `includes/tools-seo.php` was not re-read. (Two checks of the suite
+simulate a missing table with `RENAME TABLE` and cannot pass on a SQLite stack.)
+
+- **The two plugins keep the data in different places, and that decides how each is
+  written.** Rank Math keeps per-post SEO in ordinary post meta (`rank_math_title`,
+  `rank_math_robots` and so on) and reads it from there, so a meta write is its own write and
+  there is no stale index of the kind Yoast keeps. All in One SEO keeps it in its own table,
+  `{prefix}aioseo_posts`, which no generic tool reaches, and which the change journal does
+  not watch.
+- **So an All in One SEO write cannot be undone with `wp_undo_change`, and the reply says
+  so.** It carries the previous value of every field it changed, which is the only copy.
+  A Rank Math write is journalled, with one exception worth knowing: the journal withholds
+  the old value of any meta key whose name looks credential-shaped, and
+  `rank_math_focus_keyword` contains the word "key". Its old value is in the reply and
+  nowhere else. The argument is called `focus_phrase` for the same reason, so the audit log
+  does not redact it.
+- **Every write is read back from storage and fails if it differs.** Rank Math rows are read
+  straight from `wp_postmeta`, not through the cache `update_post_meta()` has just refreshed;
+  the All in One SEO row is read from its table, not from the model that was just saved.
+  What is not checked is the rendered page, a page cache or the sitemap, and the reply says
+  so rather than implying it.
+- **`noindex` and a canonical URL are higher impact than a title, and the writers are still
+  `write` level.** The reasoning, which is the thing to attack: for Rank Math the same effect
+  is already one `wp_update_post_meta` call away at `write`, because the generic meta tool
+  has no policy on `rank_math_robots`, so a higher level would move the request to a tool
+  with fewer guards and not remove it; and a key that can edit a post's content and publish
+  it can already do more to its search presence than any field here. The honest remainder is
+  All in One SEO: its table is reachable only through this group, so a `write` key gains a
+  capability it did not have. That is accepted, not denied. What narrows it: `robots` is a
+  three-way enum (`index`, `noindex`, `default`) with no free-text directives, `index` and
+  `noindex` leave the other robots directives on the post as found (Rank Math) or switch the
+  row's other flags on from a clean slate (All in One SEO, below), and a canonical must be on this site
+  unless the site names another host through `gmcp_seo_canonical_hosts`. A canonical on
+  another host hands the page's ranking to that host, which is the one field in the group
+  with an attacker-shaped use.
+- **`default` means different things, and the reply says so.** Rank Math falls back to the
+  post type's setting only when the stored robots array is EMPTY (checked in its
+  `Paper::get_robots()`), and its `validate_robots()` adds `index` to any non-empty array that
+  lacks one, so a stray `nofollow` left behind would pin the page to `index` instead of handing
+  the decision back. `robots: default` therefore removes every robots directive on the post and
+  the reply names what it removed, and the reader reports `index` for a stored set with no
+  `noindex`. In All in One SEO an explicit `index` or `noindex` sets `robots_default` to 0, which
+  makes the plugin read the row's other robots flags (`robots_nofollow`, `robots_noarchive`,
+  `robots_nosnippet` ...), so a flag that did nothing while the row followed the site-wide
+  setting would start to apply; going from default to an explicit decision resets them to off and
+  says which were set. A row that already made an explicit decision keeps its flags.
+- **The commerce post guard and the drafts-only guard apply** (`GMCP_Core::post_write_guard()`),
+  and are asked before the "is this a public post type"
+  check, so on a site where a filter has made an order type viewable the policy about the
+  object is still what answers. The drafts-only half is the only thing holding a drafts-only key
+  on All in One SEO: it writes its own table through its own database layer, which no hook of
+  the net under WordPress sees. A refusal thrown by that net is reported as the policy's sentence,
+  not as "the SEO plugin threw an error". No tool here writes an option, so the option write policy is
+  not bypassed because it is never reached; site-wide SEO settings are options and stay
+  behind it.
+- **No nofollow, noarchive, snippet-length, schema or redirect controls, and the All in One
+  SEO focus keyphrase is read but not written.** Each of the first is another way to change
+  how a page is shown that no fix needs. The keyphrase lives in a JSON column the model
+  encodes itself; writing a string there would store a double-encoded value the plugin then
+  fails to parse, and a read-back that catches it would catch it after it was stored.
+- **A text field is not run through `sanitize_text_field()`.** It deletes every `%xx` pair,
+  and both plugins' template variables are percent-delimited, so `%date%` would be stored as
+  `%`. Tags are stripped and whitespace collapsed instead.
+
+## Form submissions (Contact Form 7, Fluent Forms, Ninja Forms)
+
+Read only, and the absence of a write is the design. As with Gravity Forms, a submission is
+the one record on the site a member of the public wrote. Unlike Gravity Forms there is no
+tool here that edits, trashes, marks as spam or deletes one, because nothing in this plugin
+can verify such a write against these three plugins and there is no restore tool behind it.
+The storage of Contact Form 7 + Flamingo, Fluent Forms and Ninja Forms was checked against the
+real plugins (Contact Form 7 6.2.4.1, Flamingo 2.6.4, Fluent Forms 6.2.17, Ninja Forms 3.16.0)
+by running `smoke-forms.sh` on them; two of its checks (the ones that simulate a missing table
+with `RENAME TABLE`) cannot pass on a SQLite stack, which does not perform that statement, and
+need MySQL or MariaDB. Items still marked UNVERIFIED in `includes/tools-forms.php` were not
+re-read.
+
+- **The three briefings are `read` and return counts only; every tool that returns a
+  submission is `admin`.** Same split as `gf_forms_briefing` against `gf_list_entries`. A
+  read-level key additionally gets a recency bucket for "newest" rather than a time.
+- **Every reply carries a `log_state` block, because a zero from these plugins has four
+  meanings.** None arrived; the plugin that stores them is not there (Contact Form 7 alone
+  stores nothing at all, so a count from it is meaningless); a table was never created; or a
+  form is set not to store. The block says which, and when there is nothing readable the
+  counts are `null`, not `0`. A failed query is never read as an empty result: the query
+  helper returns the database error as a string, and a caller that mistook it for a list of
+  zero rows would be the false "none" this block exists to prevent.
+- **What is returned of an answer is an allowlist built from the form's own definition.** A
+  value comes back only if the field is in the form's current schema, its type is a
+  plain-input type, and its name does not look credential-shaped by the same
+  `GMCP_Core::field_looks_secret()` the journal and the audit log ask. Password and
+  file-upload fields fail by not being on the list, and are named in a `withheld` list so the
+  absence is visible. A field that was answered but has since been removed from the form is
+  withheld, because nothing says what it was. If the definition cannot be read, no answer is
+  returned. Two details of Contact Form 7 matter and were found by reading its source and
+  Flamingo's. The form a message belongs to is found through the form post's own
+  `_flamingo` meta (`['channel' => term id]`, written when the form first stores a message),
+  not through the channel's slug: a slug is only the form's name when the term was made, and
+  `get_page_by_path()` on it picks a different form once one is renamed and another takes the
+  old name, whose field types would then decide what is returned. The slug is used only for a
+  form with no channel link at all (an imported or hand-made message), never for one linked
+  elsewhere. And Flamingo stores each answer under `sanitize_key( '_field_' . name )`, which
+  lower-cases, so the allowlist is keyed the same way: a field named `Your-Name` is returned
+  and one named `API-Key` is still withheld as credential-shaped. Before this, a capitalised
+  name matched nothing and its answer was withheld for the wrong reason. This is the shape the WP Activity Log group arrived at after a denylist returned
+  a credential, and it costs the same: a legitimate field is occasionally withheld, because
+  its name contains `pass`, `key` or `auth`. That is the right way round.
+- **No IP address, user agent or referring URL is returned, at any level.** They are in the
+  plugins' storage and are never selected: the Fluent and Ninja queries name their columns,
+  and the Flamingo reader takes only `_field_*` meta, never the `_meta` row that holds them.
+  The one other place they can get in is the message's mail **subject**, and it is handled:
+  Flamingo does not store what a visitor typed, it stores `wpcf7_mail_replace_tags()` of the
+  form's `flamingo_subject` setting, which may be `Enquiry from [_remote_ip] ([_user_agent])` or
+  contain any answer. `cf7_get_message` therefore returns the subject only when the form's
+  template is exactly the default `[your-subject]` and that field is one the answer filter
+  would return; otherwise `subject` is `null` and `subject_note` says it was withheld. A site
+  that filters `wpcf7_flamingo_get_value` can make the stored text anything, which is not
+  visible from here.
+- **No search over answers.** A text search over submissions is an oracle: "does any entry
+  contain `diff@`" confirms a value no tool will print, one guess at a time. Filters are by
+  form, status and date only. This is the reason Gravity Forms' own search was rebuilt
+  rather than passed through.
+- **The generic post readers refuse the post types Flamingo and Ninja Forms store
+  submissions under.** This is the part that is not in the new file, and it is there because
+  without it the rest is a sentence about the tool and not about the data: Flamingo and Ninja
+  Forms keep a submission as a post, `wp_get_post_meta` is a `read`-level tool that returns
+  any key on any post (its own source says post meta reads are ungated), and a read-only key
+  could therefore read every answer, and for Flamingo the visitor's IP address, through the
+  tool beside the admin-only ones. `GMCP_Core::personal_data_post_guard()` is asked, ahead of
+  the dispatch switch, by `wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`,
+  `wp_read_post_meta_chunk`, `wp_alter_post` (a match count over a body is an oracle) and the
+  previews of `wp_update_post` and `wp_delete_post` (which print a title and the start of the
+  body), for the post type `wp_get_posts` names, and per row in a `wp_get_posts` listing (type
+  `any` names none). The `gmcp://post/{id}` resource and `wp_create_preview_link` ask it too.
+  It is on whether or not the forms group is. The type list is filterable through
+  `gmcp_personal_data_post_types`.
+- **A tool that copies from a post is a reader.** `wp_copy_post_meta` used to ask the write
+  guards about the post it wrote TO and nothing about the post it read FROM, so a `readwrite`
+  key copied every meta key of a Flamingo message (its `_meta` holds the IP address and user
+  agent) or of a `shop_order` (HPOS off) onto a draft of its own and read the draft with
+  `wp_get_post_meta`. `GMCP_Core::post_read_guard()` (the personal-data guard, then the
+  commerce read guard, which only lets an admin key read an order's rows) is now asked about the
+  source by `wp_copy_post_meta` and `wp_duplicate_post`, and again inside the one function that
+  moves the rows. `wp_update_post` and `wp_create_post(s)` refuse to retype a post out of, or
+  into, a form-submission type (`GMCP_Core::personal_data_retype_guard()`): the read guards ask
+  what type a post is, so a message retyped to `post` was an ordinary post whose body
+  `wp_get_post` returns, and Flamingo builds that body from the fields, consent and meta. A
+  commerce post is not retypable either, because `commerce_post_guard()` refuses every generic
+  write to one.
+- **What the guards do not cover.** They are a list of readers, not a property of the data,
+  and the same weakness the commerce guard has: a reader added later has to be added to it.
+  Not covered today: `wp_get_post_terms` and the terms of a post in the resource header
+  (channel terms only), the REST-route tools when that group is on and a plugin exposes the
+  type through REST, the change journal (it records a changed meta key and withholds values
+  that look credential-shaped, and only for posts a tool changed), and every route to the
+  database that is not a post reader. WooCommerce orders stored as posts ARE covered by
+  `commerce_post_read_guard()` in `wp_get_posts`, `wp_get_post`, `wp_get_post_snapshot`,
+  `wp_get_post_meta`, `wp_read_post_meta_chunk`, `wp_get_comments` and, now, the copy tools
+  and the resource; that guard applies below admin level only, whereas the form-submission
+  guard applies at every level (an admin key uses the form tools).
+- **Fluent Forms has a setting that keeps no entries, and `fluentform_briefing` reports it.**
+  `formSettings.delete_entry_on_submission` (a form's settings JSON in `fluentform_form_meta`,
+  default `no`) deletes each entry as it is stored, and `delete_after_x_days` with
+  `auto_delete_days` purges old ones. A zero for such a form means nothing, so `log_state` lists
+  the forms with the first setting and the forms with the second (and a `null` means the settings
+  could not be read, not that none is set). Ninja Forms' equivalent is the "has an active action
+  that records submissions" check below.
+- **Fluent Forms and Ninja Forms tables are checked for existence before a count.**
+  Fluent stores answers as one JSON document per submission and the schema as JSON on the
+  form; a schema that does not parse means no answers. Ninja Forms is told whether each form
+  has an active action that records submissions: a form without one cannot have any, so its
+  zero is "not kept", and `null` is reported where that could not be determined.
+
 ## Theme mods
 
 Theme mods are the customizer's storage, and four generic tools cover them:
@@ -643,7 +1089,10 @@ The critical one is `wp_set_theme_mod`: it uses `set_theme_mod`, which merges on
 key, where `wp_update_option` on the same row does a full-array replace and a
 mistake wipes every other mod. The row passes through the same `option_guard`
 and `option_write_policy` as any other option, and the change journal recognises
-`theme_mods_*` rows, so `wp_undo_change` can put a write back.
+`theme_mods_*` rows, so `wp_undo_change` can put a write back. It does so one
+setting at a time: the row is a single array holding every Customizer value, and
+restoring the whole of it would throw away any other setting changed since. See
+[Undo](#undo).
 
 ## Batch create
 
@@ -687,11 +1136,12 @@ the write it was protecting.
 
 ## Undo
 
-`wp_list_changes` and `wp_undo_change` put back a setting or post an agent
-*modified*. The change capture layer listens to WordPress rather than to the
-tools, so it also covers widgets, which live in options, and menu items, which
-are posts. Only writes made during a tool call are recorded, never a person's own
-edits.
+`wp_list_changes` and `wp_undo_change` put back something an agent *modified*:
+an option or setting, a post, a custom field, a term's name, slug, description or
+parent, which terms a post carries, and a single theme setting. The change capture
+layer listens to WordPress rather than to the tools, so it also covers widgets,
+which live in options, and menu items, which are posts with some custom fields.
+Only writes made during a tool call are recorded, never a person's own edits.
 
 That layer is shared with the audit log, which wants the same facts from the
 other side: the journal keeps the previous value so it can put it back, the
@@ -699,13 +1149,15 @@ audit log keeps a description of the difference so a reader can see what moved.
 Two copies of the same diff would drift, and the day somebody added a field to
 one list the other would quietly stop mentioning it.
 
-Undo records modifications and not creations or deletions of posts, and that is
-a real limit rather than a nicety. The capture layer reports both and the
-journal declines them: putting back a creation means deleting something, and
-putting back a deletion means recreating it, and neither is the same write in
-reverse. Users, comments, terms, plugins, themes and media are reported too and
-journalled none of them, for the same reason. The audit log has all of it,
-which is the difference between the record and undo. Deleting a post without
+Undo records modifications and not creations or deletions, of posts, terms,
+menus, menu items or users, and that is a real limit rather than a nicety. The
+capture layer reports them and the journal declines them: putting back a
+creation means deleting something, and putting back a deletion means recreating
+it with its old id, its children, its relationships and its meta, and neither is
+the same write in reverse. Adding or deleting a menu item is a creation or a
+deletion in this sense; editing one is not. Users, comments, plugins, themes and
+media are reported too and journalled none of them, for the same reason. The audit
+log has all of it, which is the difference between the record and undo. Deleting a post without
 `force` puts it in the trash, where WordPress can restore it, which covers the
 most common case by accident rather than by design.
 
@@ -718,6 +1170,52 @@ this gets used to build. The noise that used to be the argument against it is
 handled by a short filterable list, `gmcp_meta_noise_keys`, holding the keys that
 say who is editing rather than what the post holds and the ones Elementor
 derives from the document and regenerates on demand.
+
+Three more kinds are journalled, each because it is an edit that has an exact
+reverse. A term edit keeps the previous name, slug, description and parent, and
+puts back only the fields the edit changed; a menu is a term, so renaming one is
+covered. A change to which terms a post carries keeps the earlier set of term
+ids and sets it again, which is the reverse of both an append and a replace
+because the entry records the set rather than the argument. The terms a post is
+given while it is being created are not recorded, because they are part of a
+creation, and neither are the `nav_menu` assignments that attach an item to its
+menu. A theme setting keeps the previous value of one key of the
+`theme_mods_<stylesheet>` row and writes that key back into whatever the row
+holds now, so undoing a menu-location assignment cannot discard a colour changed
+afterwards. A change that moves more than ten keys of the row at once is kept as
+one whole-row entry, as it used to be, so a single option write cannot fill the
+log by itself. Credential-shaped keys and values are judged by the same two
+tests as a meta value and are recorded as changed without a copy.
+
+Reverting a post, a custom field or a set of terms also asks
+`commerce_post_guard()`, because an order and a subscription are `wp_posts` rows
+and the policy about them belongs to the post type rather than to the tool that
+is writing it. Revert now enforces that for itself instead of relying on the
+original write having been refused. The guard judges the post as it is now, not a
+value the revert would write, so a post revert also restores only the fields the
+recorder watches (title, content, excerpt, status, slug, parent, menu order) and
+never `post_type`. No route to a post_type restore was found: the recorder does not
+record that field, and the journal's own row cannot be edited through any tool. The
+filter is a backstop for an entry this plugin did not write.
+
+An undo is recorded as a change of its own. The entry keeps what the undo
+overwrote, names the entry it reversed, and carries the tool of the original, so
+reverting it needs the same permissions as the original did. Reverting it puts
+the edit back, and that can be done again in turn. The first undo of an ordinary
+entry has never refused because something changed since: it restores the fields
+the entry recorded and leaves everything else alone, which is what lets a title
+be put back on a post that has since been rewritten. The undo of an undo has no
+such excuse, because it restores a whole recorded value taken before whatever
+happened next, so it is refused when the target is no longer in the state the undo
+left it in. That state is stored as a hash measured from the stored value after the
+write, never as a second copy of it. For a custom field it covers every row of the
+key, not the first, and an undo that would write one recorded value is refused when
+the key now holds several rows, because that write rewrites every row. Where the
+value the undo is about to overwrite holds a credential, the undo is recorded as
+not reversible instead of being copied, for the reason the original is not; that
+test runs for options, custom fields, theme settings and terms. A post's own fields
+(title, content, excerpt) are not tested for credential shapes, here or when the
+original edit is recorded. That is a gap, not a decision this document defends.
 
 Previous meta values live in a table of their own rather than in the journal's
 option row, because `_elementor_data` runs past 100KB and the option's per-value
@@ -892,6 +1390,77 @@ database dump is sent is not a decision to hand to something that reads
 instructions out of a comment queue. The reply says the scope was asked for
 rather than confirming what ran, because neither adapter reports back.
 
+## Drafts-only keys, and OAuth that can only read
+
+A named key can be marked drafts only. The point is a credential for an agent that
+writes copy: it may fill the drafts folder, and it must not be the thing that puts a
+sentence in front of the public, because the agent reads comments and pages that
+strangers wrote.
+
+**The policy belongs to the post, not to the tool.** Every tool that writes a post, its
+meta, its terms or its featured image asks `GMCP_Core::drafts_only_guard()` (the
+generic ones through `post_write_guard()`, which asks the commerce policy first), for
+the same reason `commerce_post_guard()` exists: one tool enforcing it and the next
+not is the defect the settings tool once had with options. Live means publish, future
+or private now, or a status that would make it so; plugin-registered public and
+private statuses count, and the comparison ignores case and trailing spaces, because
+the posts table does and a stricter PHP check would call "Publish " a draft that every
+query finds. Unpublishing a live post is refused as well as publishing: taking a page
+down is a change to what the public sees. An attachment takes its parent's visibility,
+so media attached to a live page is protected, and media attached to a draft can be made
+and edited. Media attached to NOTHING can be uploaded but neither edited (`wp_update_media`,
+or `wp_update_post` on an attachment) nor deleted: such a file can be a live page's featured
+image or an embed, and nothing here can find the pages that use it, so the guard refuses the
+case it cannot judge. An earlier version allowed the edit and said so in this paragraph;
+retitling or re-captioning a file changes what every live page showing it displays.
+
+**A net sits under the tools.** The tool-level checks give a clear sentence and stop
+before anything is half written, but a list of tools is not a proof that none was
+missed. When a request is authenticated by a drafts-only key, `restrict_caller_to_drafts()`
+hooks WordPress itself: the final row about to be stored (posts and attachments, which
+have separate filters; the attachment one was found missing by a test, not by reading),
+post meta added, changed or deleted including by meta id, trash, restore, permanent
+deletion, and term relationships. Each throws before anything is written, so Elementor,
+Yoast, ACF, WooCommerce, the generated REST tools, menu items and the journal's undo
+are held without knowing about it. It throws rather than short-circuiting with false
+because a pre-filter that returns false makes the caller believe it wrote.
+
+**What it does not do.** A plugin that updates the posts table with SQL, or calls
+`wp_publish_post()` (which does), is not seen by any hook, and none of this plugin's
+tools does either for content. That is why a drafts-only key is capped at read and
+write: the groups that reach third-party code (options, menus, the page builders, SEO
+and form plugins) are admin-level and are not offered to it. The
+cap is applied when the key is made and again whenever the key is presented.
+
+**What it covers, and what it does not.** Covered: posts and what is stored as posts
+(pages, products, menu items), their custom fields, term assignments, featured image, and
+attachments attached to a post. Not covered, so a drafts-only key can still do these:
+create, approve and edit comments (`wp_create_comment`, `wp_update_comment`); create and
+rename taxonomy terms (`wp_create_term`, `wp_update_term`: renaming a category changes every
+live post in it, and deleting one needs `admin`); change users and options (`admin`, capped
+away); act on orders and subscriptions (the generic post tools refuse those for every
+key, the shop tools are `admin`); and share a draft by preview link, which shows it to
+whoever holds the URL. Edits to media attached to no post are refused (see above), and a
+draft can still embed media or shortcodes that render live data. An earlier version of the
+refusal text and the key's label said the key cannot touch "anything that is live", which
+was wider than any of this and has been narrowed to what is true. Pair the flag with a
+tool list when the key should do less than that.
+
+A refusal is an ordinary tool failure, so the audit log records it as a refusal under
+the key's label. Keys made before the flag exist have no `drafts_only` field, which
+reads as false.
+
+**OAuth is no longer always full.** The consent screen offers Full access or Read-only,
+with Full preselected because a changed default is a decision and not a side effect. The
+level is stored in the grant's scope as a `mcp:readonly` marker. That reuses a column
+that already travels with the grant, is copied by every refresh, and needs no schema
+change; a grant made before has no marker and stays full. The level comes only from the
+person's choice, never from the scope string the client asked for, and an unrecognised
+value on the form fails narrow. The server used to exempt OAuth callers from the level
+filter by their authentication method; that exemption is gone, so a read-only grant
+is listed only read tools and is refused a write tool named anyway, in the same places a
+read-only key is. The "still an administrator" check on every request is unchanged.
+
 ## No restore, no kit import
 
 There is no restore tool at any access level. Restoring discards everything
@@ -909,6 +1478,184 @@ is a different thing and `elementor_set_active_kit` does it, because those were
 made here and the previous one is still there to switch back to. A site that
 genuinely wants an import has the Elementor screen for it, where a person sees
 what is about to happen.
+
+## Considered and not built
+
+Two things get proposed often enough to write down why they are not here.
+
+**A bridge to the WordPress Abilities API.** Other plugins register abilities there, each
+with its own permission callback, and a tool could expose them all to an agent. Every
+guard in this plugin belongs to the thing it protects: `option_write_policy()` to the
+option, `commerce_post_guard()` and `personal_data_post_guard()` to the post type,
+`status_write_refusal()` to the status. An ability that writes an option or a post
+reaches the same rows through a door none of those are asked at, and its permission callback
+answers "may this user do this" for a person, not "should an agent be handed this". The
+approval queue cannot classify it either, because it derives what a call does from the
+tool's registration and a generic bridge registers one tool for all of them. If it is ever
+built it has to be off by default, `admin` level, restricted to abilities that declare
+themselves read-only, or else every call through it held for approval.
+
+**Connections for roles below administrator.** `gmcp_oauth_user_can_authorize` already
+lets a site widen who may approve an OAuth connection, but everything downstream assumes the
+caller is an administrator: the tool set, the key's level cap, the approval screen, and the
+rule that a key stops working when its account stops holding `manage_options`. An editor
+connection needs its own, smaller tool set, drafts-only by default, and a check on every
+tool for what that user may edit, not for what the key may call. That is a product decision
+about who this plugin is for, not a missing feature.
+
+Not built for the same reason as the group above: translation plugins other than Polylang.
+See the WPML note under Redirection and Polylang.
+
+## Deletion by another name
+
+The `readwrite` level is defined as "create and update, no destructive tools", and the
+approval queue holds a call by what its tool is. Both promises were true of the tool names
+and false of the data. WordPress deletes on a schedule it reads from ordinary rows: every
+day `wp_scheduled_delete()` permanently deletes each post that carries a
+`_wp_trash_meta_time` older than `EMPTY_TRASH_DAYS`, and `wp_delete_auto_drafts()`
+force-deletes each auto-draft whose `post_date` is more than seven days old. So a
+`readwrite` key could set `post_status` to `trash` through `wp_update_post`, stamp the post
+with a timestamp from 1970 through any meta writer, and wait for the daily job (or call
+`wp_run_cron_event`, which was not held) to destroy it: a permanent delete with no
+approval and no second call, from the level that has no delete tool. Confirmed by running
+it, not by reading it.
+
+- **A status that is a deletion is refused.** `wp_update_post` and `wp_update_comment`
+  refuse a status of `trash`, `wp_update_post` refuses `auto-draft`, and `wp_update_comment`
+  refuses `spam`, with a sentence pointing at `wp_delete_post` / `wp_delete_comment`. Spam
+  is the comment's trash: Akismet, which ships with WordPress, permanently deletes every
+  comment marked spam once it is fifteen days old, from a daily event it registers whether
+  or not an Akismet key is set. Measured with Akismet active: an old comment moved to spam
+  was gone after the next run, while the same comment left approved and a recent one moved to
+  spam both survived. The cost is real and is accepted: an agent cannot mark spam at any
+  level, so a comment-triage run recommends and a person marks it in wp-admin. Other
+  anti-spam plugins that purge their queue behave the same way, and this refuses all of
+  them without naming them. Creating a comment with a spam status is not refused, because
+  the new comment is the agent's own and carries today's date. Refused rather than rerouted or held
+  by argument, because the honest tool already exists, is held by its name, and a second
+  door that merely behaves like it would have to be found and held again by every tool
+  that ever takes a status. `wp_alter_post` and `wp_update_media` write no status, and the
+  generated REST tools reject both values in the route's own enum (checked). Setting a
+  trashed post back to `draft` still works.
+- **The schedule itself is not writable.** Every meta key beginning `_wp_trash_meta_` is
+  refused by every tool that writes post meta (update, delete, copy, chunk, `meta_input`
+  on create and update). Matching ignores case and trailing spaces because the column
+  compares that way. Reading one is allowed. Because other plugins write meta through the
+  same three WordPress functions, the same refusal also sits under them while a tool call
+  is in flight (`GMCP_Core::trash_meta_net()`), letting through only core's own
+  `wp_trash_post`, `wp_untrash_post` and `wp_delete_post`, which write and clear the key
+  themselves. Not protected, and why: `_edit_lock`, `_wp_desired_post_slug` and
+  `_wp_old_slug` only name an editor, a slug to restore and a redirect from a slug the
+  writer could have set directly; none removes anything.
+- **The approval gate asks the arguments too.** `GMCP_Approvals::classify_call()` widens a
+  call whose arguments carry a deletion status (`post_status`, `status` or
+  `comment_approved`, top level or inside `fields`) to `destructive`, whatever the tool is
+  called. It only widens, and a read tool that is merely listing trashed things keeps its
+  class.
+- **Running a scheduled event is destructive.** `wp_run_cron_event` fires every callback
+  on a hook, and its own description says they can delete files. `run` is now one of the
+  destructive verbs. `wp_unschedule_cron_event` already was.
+
+## Human approval
+
+The two-step confirmation on irreversible tools is minted by the server and handed to
+whoever called, so an agent that was talked into a deletion by a comment it read makes
+the second call itself. It raises the bar from one call to two. The approval queue is the
+other kind of gate, and it exists because of that gap: the person, not the agent, supplies
+the second half.
+
+- **Where it sits.** In `execute_tool()`, after the key, level and required-argument
+  checks and before dispatch. That function is the only place a `tools/call` reaches a
+  tool: `handle_direct_jsonrpc()` is its one caller, and the resource layer only borrows
+  read-level tools directly. A gate in a tool class would be one gate per class, which is
+  how the option policy once protected one writer and not the others. A call refused
+  earlier never becomes a request, and a held call has done nothing.
+- **Nothing to steal.** No approval token exists. The agent is told a request id, which is
+  a reference and grants nothing. The retry is matched on what it is (key, tool, keyed
+  hash of canonical arguments) against a row that only `GMCP_Approvals::decide()` can move
+  to approved, and `decide()` refuses unless the request is a wp-admin page load with a
+  logged-in cookie belonging to the current user (a bearer key or OAuth grant sets the
+  current user without a cookie), `manage_options`, a nonce bound to the request and the
+  verdict, no tool call or REST request in flight, and an account that no tool call has
+  created or re-credentialed in the last 24 hours (see "An account the agent made" below).
+  A cookie proves a session, not a person: an agent that can make an administrator can
+  sign in as one. There is no tool that reads,
+  lists, approves, declines or edits the queue, and the setting and the table are not
+  reachable through the option tools (`gmcp_` rows are refused by name; the queue is not an
+  option at all).
+- **What it binds.** Key, tool and arguments. The arguments are canonical JSON with object
+  keys sorted, hashed with HMAC under the site's auth salt: arguments can hold a password,
+  and a plain digest stored beside the row would let a database read confirm a guess. The
+  one exception is `confirm`, dropped from the hash only when the tool declares it as its
+  two-step token, so the retry that carries the token is the same call finishing and one
+  approval covers both legs. `finish()` gives an approval back when the call only issued a
+  token, with its original deadline, and never after a leg that ran.
+- **Single use and lapse.** A pending request lapses after an hour, an approval after 15
+  minutes. The claim is one `UPDATE ... WHERE status = 'approved' AND approved_until >= now`,
+  so two retries racing each other cannot both run. A declined call is refused for 15
+  minutes so an agent does not refill the queue with the same question. A queue is capped
+  per credential and overall; hitting the cap is a refusal, not a pass.
+- **What counts.** Derived from each tool's own registration, not from a list of names.
+  `unknown` (no definition, or no recognised level) and `destructive` (a destructive hint
+  or verb, which outranks the level) are held in both modes. In the wider mode so is
+  `site`: any other admin-level write. A fourth class, `account`, waits in both modes (see
+  below). `read` and `write` levels never wait. That relies on
+  the README's definition of the `write` level as having no destructive tools, which
+  `smoke-admin.sh` checks against the registered tools. Honest limits: a destructive admin
+  tool with no hint and a verb outside the list is a site change, so it waits only in the
+  wider mode; the `wp_upload_request` endpoint is not a tool call; a preview waits like the call it
+  previews, because the setting cannot tell the two apart.
+- **An undo is the write it repeats.** `wp_undo_change` is a write-level tool, so on its name
+  alone it never waits, but it replays earlier values: in the wider mode a key held for
+  `wp_update_option` could put an option back, unheld. `classify_call()` looks the recorded
+  entry up (by `id`, or every entry of a `call`) and holds the undo as the strictest tool that
+  made the change, using the same list the undo itself asks "can this caller call it" about
+  (`GMCP_Journal::undo_tools()`). An entry it cannot find, a call naming both `id` and `call`,
+  or a recorded tool with no registration here is `unknown`, held in every mode. So an undo of
+  a post or meta edit waits where writing it would (never), and an undo of an option waits
+  where writing the option does (the wider mode).
+- **An account the agent made cannot answer for the agent.** In mode `deletes` an admin key
+  could create an administrator with a password it chose (`wp_create_user` and
+  `wp_update_user` were `site` changes, which wait only in the wider mode), sign in at
+  `wp-login.php`, and approve its own held calls. Reproduced end to end. Two locks. First,
+  `classify_call()` gives a user tool the `account` class, held in every mode but `never`:
+  every creation, any update that touches a password, an address, a role (a demotion too:
+  "the lowest role" is the site's own `default_role`) or a field outside the display fields,
+  any update to an account holding a privileged capability, and any argument outside the
+  tool's schema. Only a display-name-style edit of an ordinary account is left to the mode.
+  Second, `watch_accounts()` records, in user meta, any account that a tool call created or
+  whose password, address or role it changed, and `session_problem()` refuses that account
+  the approval screen for 24 hours, with its own message on the screen and in `decide()`.
+  This covers the call that got through the first lock (mode `never` at the time, a plugin's
+  own tool). The cost is real: an administrator whose own password an agent changed, or
+  who asked an agent to make them an account, approves from another administrator's account
+  or waits a day. There is no button to clear it, because a button is the way round;
+  `wp user meta delete <id> gmcp_changed_by_mcp` does. Mode `never` still holds nothing, and
+  the plugin cannot make an agent that was told to create an administrator in that mode
+  stop; it can only keep that administrator from approving anything. Not covered: a tool
+  that changes an account in some way the user tools' names do not say.
+- **What a person sees.** Exactly what the hash covers, or the call is not queued. The
+  screen once printed the arguments in the order the client sent them, cut at 4000
+  characters, with credential-shaped values hidden: three ways to show a different call
+  from the one approved. `GMCP_Approvals::build_view()` now makes the one view, at queue
+  time, and the screen prints it unchanged. Arguments are sorted (the tool's declared ones
+  first, objects sorted all the way down). A call is refused, with a normal error the agent
+  can read, if it carries an argument the tool's schema does not declare, if it is a list of
+  unnamed values, if it nests more than 12 levels, or if its arguments written out exceed
+  16000 bytes: an approval covers every byte, so it is not asked for what cannot be read.
+  A credential-shaped field, a string that holds one, and a preview-link token show as
+  `[redacted]`, and the screen says how many values are hidden and names their paths, so a
+  person knows a value they cannot see is part of what they approve. Bidirectional and
+  zero-width characters are shown as escapes. Rows stored before this existed are labelled
+  as possibly incomplete.
+- **A held call is not a success.** The reply is a normal result, not `isError`, so a
+  client does not send the agent looking for a workaround; the audit log records the call
+  as refused, because nothing ran. Requests, approvals, declines, lapses, uses and refused
+  replays are rows in the same hash chain (`approval:requested`, `approval:approved`, ...).
+  If the audit log is switched off they are not written, and the queue says so.
+- **No bulk and no delete.** Same reasoning as the audit log: an approval is a decision
+  about one call, and a button that answers fifty is pressed without reading. Settled rows
+  are pruned daily after 30 days; the audit log keeps the history.
 
 ## Prompts and resources
 

@@ -2649,7 +2649,8 @@ tc_groups() { # tc_groups <admin 0|1> <woo 0|1>
 # that are always present. Every optional group belongs in the list below: leave one out and
 # the count moves with whatever happens to be installed, which is the drift the table exists
 # to catch. Current prefixes: elementor_ (free and Pro), kirki_, yoast_, acf_, wsal_, gf_
-# (Gravity Forms), ld_ (LearnDash). WooCommerce Subscriptions is wcs_ and is deliberately not
+# (Gravity Forms), ld_ (LearnDash), redirection_ (Redirection), pll_ (Polylang), rankmath_ and aioseo_
+# (includes/tools-seo.php), cf7_, fluentform_ and ninjaform_ (includes/tools-forms.php). WooCommerce Subscriptions is wcs_ and is deliberately not
 # listed, because this block never switches that group on.
 tc_count() { # tc_count <secret>
   curl -sS -X POST "$URL" -H "Authorization: Bearer $1" \
@@ -2661,7 +2662,7 @@ try:
     t = json.load(sys.stdin)['result']['tools']
 except Exception:
     print('unreadable'); raise SystemExit
-print(len([x for x in t if not x['name'].startswith('elementor_') and not x['name'].startswith('kirki_') and not x['name'].startswith('yoast_') and not x['name'].startswith('acf_') and not x['name'].startswith('wsal_') and not x['name'].startswith('gf_') and not x['name'].startswith('ld_')]))"
+print(len([x for x in t if not x['name'].startswith('elementor_') and not x['name'].startswith('kirki_') and not x['name'].startswith('yoast_') and not x['name'].startswith('acf_') and not x['name'].startswith('wsal_') and not x['name'].startswith('gf_') and not x['name'].startswith('ld_') and not x['name'].startswith('rankmath_') and not x['name'].startswith('aioseo_') and not x['name'].startswith('cf7_') and not x['name'].startswith('fluentform_') and not x['name'].startswith('ninjaform_') and not x['name'].startswith('redirection_') and not x['name'].startswith('pll_')]))"
 }
 # The expected numbers come from the table itself, so the check fails whichever side moved.
 tc_doc() { # tc_doc <level> <column index, 1-3>
@@ -2900,6 +2901,1072 @@ check "passing both id and call is refused" \
   "$(py "import json,sys;print('not both' in json.load(sys.stdin)['result']['content'][0]['text'])" jm_both)" "True"
 docker compose exec -T cli wp post delete "$JM_ID" --force >/dev/null 2>&1
 
+echo "-- journal: terms, theme settings, menus, and undoing an undo --"
+# UNRUN. Written without a Docker daemon, so none of this has executed against WordPress. The
+# pure-PHP half of the same logic is .dev/journal-pure.php, which has run. Run this block
+# once on a real stack before relying on it, and expect to correct fixtures rather than code
+# on the first pass.
+#
+# Every state below is read back from the database with wp eval, never taken from a reply.
+# Fixtures that must be journalled are written through the plugin's own tools; fixtures
+# that must NOT be (a person's edit, which the journal ignores) are written with wp eval.
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+jn_find() { # jn_find <file> <python predicate on x> -> id of the newest matching entry, or MISSING
+  py "import json,sys
+rows = json.loads(json.load(sys.stdin)['result']['content'][0]['text'])
+hit = [x for x in rows if $2]
+print(hit[0]['id'] if hit else 'MISSING')" "$1"
+}
+jn_list() { call "$1" '{"jsonrpc":"2.0","id":400,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":40}}}'; }
+jn_undo() { call "$1" "{\"jsonrpc\":\"2.0\",\"id\":401,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"$2\":\"$3\"}}}"; }
+
+# --- a term edit ---
+call jn_mk '{"jsonrpc":"2.0","id":402,"method":"tools/call","params":{"name":"wp_create_term","arguments":{"taxonomy":"category","term_name":"Journal term","slug":"journal-term","description":"orig desc"}}}'
+JN_T=$(py "import json,sys,re;print(re.search(r'\d+', json.load(sys.stdin)['result']['content'][0]['text']).group())" jn_mk)
+check "control: the fixture term exists" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->name;" 2>/dev/null | tr -d '\r\n')" "Journal term"
+call jn_ut "{\"jsonrpc\":\"2.0\",\"id\":403,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_term\",\"arguments\":{\"term_id\":$JN_T,\"taxonomy\":\"category\",\"name\":\"Journal renamed\",\"description\":\"new desc\"}}}"
+check "control: the edit is stored" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->name;" 2>/dev/null | tr -d '\r\n')" "Journal renamed"
+jn_list jn_l1
+JN_E1=$(jn_find jn_l1 "'Journal renamed' in x['what'] and x['tool']=='wp_update_term'")
+check "the term edit is journalled and reversible" "$([ "$JN_E1" != MISSING ] && echo yes || echo no)" "yes"
+# The creation of the term is not an entry: there is no undo for a creation, and a list
+# that offered one would be promising a deletion. The control above proves the probe works.
+check "the term creation is not journalled" \
+  "$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in rows if 'created' in x['what'] and 'Journal term' in x['what']))" jn_l1)" "0"
+jn_undo jn_u1 id "$JN_E1"
+check "undoing a term edit restores the name" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->name;" 2>/dev/null | tr -d '\r\n')" "Journal term"
+check "and the description" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->description;" 2>/dev/null | tr -d '\r\n')" "orig desc"
+check "and leaves the slug, which the edit never touched" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->slug;" 2>/dev/null | tr -d '\r\n')" "journal-term"
+# The undo is itself an entry, and reverting it puts the edit back.
+jn_list jn_l2
+JN_U1=$(jn_find jn_l2 "x.get('undoes')=='$JN_E1'")
+check "the undo is on record, naming the entry it reversed" "$([ "$JN_U1" != MISSING ] && echo yes || echo no)" "yes"
+check "the original cannot be applied a second time" "$(jn_undo jn_u1b id "$JN_E1"; verdict jn_u1b)" "error"
+jn_undo jn_u2 id "$JN_U1"
+check "undoing the undo puts the edit back" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->name;" 2>/dev/null | tr -d '\r\n')" "Journal renamed"
+# Staleness: a person edits the term after the second step, so the third would overwrite
+# their work with an older copy. A person's own edit is not journalled, which is why this
+# is wp eval and not a tool.
+jn_list jn_l3
+JN_U2=$(jn_find jn_l3 "x.get('undoes')=='$JN_U1'")
+docker compose exec -T cli wp eval "wp_update_term($JN_T,'category',['name'=>'Edited by hand']);" >/dev/null 2>&1
+jn_undo jn_u3 id "$JN_U2"
+check "an undo is refused when the term changed since" "$(verdict jn_u3)" "error"
+check "and says it changed since" "$(refusal jn_u3 | grep -c 'changed since')" "1"
+check "and the person's edit is intact" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->name;" 2>/dev/null | tr -d '\r\n')" "Edited by hand"
+
+# --- the gate on a term undo ---
+# A key allowed to undo but not to update terms must not reach a term edit through undo,
+# for the reason the option gate above exists.
+call jn_ut2 "{\"jsonrpc\":\"2.0\",\"id\":404,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_term\",\"arguments\":{\"term_id\":$JN_T,\"taxonomy\":\"category\",\"name\":\"Gate subject\"}}}"
+jn_list jn_l4
+JN_E2=$(jn_find jn_l4 "'Gate subject' in x['what']")
+K_TU=$(docker compose exec -T cli wp eval '$a=GMCP_Tokens::create("Deploy","readwrite",0,["wp_list_changes","wp_undo_change"]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+kcall jn_gate "$K_TU" "{\"jsonrpc\":\"2.0\",\"id\":405,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$JN_E2\"}}}"
+check "a key without wp_update_term cannot undo a term edit" "$(verdict jn_gate)" "error"
+check "and the term is unchanged" \
+  "$(docker compose exec -T cli wp eval "echo get_term($JN_T,'category')->name;" 2>/dev/null | tr -d '\r\n')" "Gate subject"
+check "and the refusal names wp_update_term" "$(refusal jn_gate | grep -c wp_update_term)" "1"
+gmcp_clear_other_keys "smoke suite"
+
+# --- which terms a post carries ---
+call jn_cp '{"jsonrpc":"2.0","id":406,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"Journal term post","post_status":"draft"}}}'
+JN_P=$(py "import json,sys,re;print(re.search(r'\d+', json.load(sys.stdin)['result']['content'][0]['text']).group())" jn_cp)
+JN_BEFORE=$(docker compose exec -T cli wp eval "echo implode(',', wp_get_post_terms($JN_P,'category',['fields'=>'ids']));" 2>/dev/null | tr -d '\r\n')
+call jn_at "{\"jsonrpc\":\"2.0\",\"id\":407,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_post_terms\",\"arguments\":{\"ID\":$JN_P,\"taxonomy\":\"category\",\"terms\":[$JN_T],\"append\":false}}}"
+check "control: the new term set is stored" \
+  "$(docker compose exec -T cli wp eval "echo implode(',', wp_get_post_terms($JN_P,'category',['fields'=>'ids']));" 2>/dev/null | tr -d '\r\n')" "$JN_T"
+jn_list jn_l5
+check "exactly one term entry for the post: the assignment, not the creation's default category" \
+  "$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in rows if 'Journal term post' in x['what'] and 'terms in' in x['what']))" jn_l5)" "1"
+JN_TE=$(jn_find jn_l5 "'Journal term post' in x['what'] and 'terms in' in x['what']")
+jn_undo jn_u5 id "$JN_TE"
+check "undoing a term assignment restores the earlier set" \
+  "$(docker compose exec -T cli wp eval "echo implode(',', wp_get_post_terms($JN_P,'category',['fields'=>'ids']));" 2>/dev/null | tr -d '\r\n')" "$JN_BEFORE"
+call jn_dp "{\"jsonrpc\":\"2.0\",\"id\":408,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$JN_P,\"force\":true}}}"
+docker compose exec -T cli wp term delete category "$JN_T" >/dev/null 2>&1
+
+# --- one theme setting, and the others left alone ---
+docker compose exec -T cli wp eval 'set_theme_mod("jn_a","orig-a"); set_theme_mod("jn_b","orig-b");' >/dev/null 2>&1
+call jn_tm '{"jsonrpc":"2.0","id":409,"method":"tools/call","params":{"name":"wp_set_theme_mod","arguments":{"key":"jn_a","value":"tool-a"}}}'
+check "control: the tool wrote the setting" \
+  "$(docker compose exec -T cli wp eval 'echo get_theme_mod("jn_a");' 2>/dev/null | tr -d '\r\n')" "tool-a"
+# A person changes a different setting afterwards. Restoring the whole row, which is what
+# an option-level entry did, would throw this away.
+docker compose exec -T cli wp eval 'set_theme_mod("jn_b","later-b");' >/dev/null 2>&1
+jn_list jn_l6
+JN_TM=$(jn_find jn_l6 "x['tool']=='wp_set_theme_mod' and 'jn_a' in x['what']")
+check "the setting is journalled by name" "$([ "$JN_TM" != MISSING ] && echo yes || echo no)" "yes"
+jn_undo jn_u6 id "$JN_TM"
+check "undoing it puts that setting back" \
+  "$(docker compose exec -T cli wp eval 'echo get_theme_mod("jn_a");' 2>/dev/null | tr -d '\r\n')" "orig-a"
+check "and leaves the other setting at its later value" \
+  "$(docker compose exec -T cli wp eval 'echo get_theme_mod("jn_b");' 2>/dev/null | tr -d '\r\n')" "later-b"
+jn_list jn_l7
+JN_TU=$(jn_find jn_l7 "x.get('undoes')=='$JN_TM'")
+jn_undo jn_u7 id "$JN_TU"
+check "and the undo of it re-applies the tool's value" \
+  "$(docker compose exec -T cli wp eval 'echo get_theme_mod("jn_a");' 2>/dev/null | tr -d '\r\n')" "tool-a"
+docker compose exec -T cli wp eval 'remove_theme_mod("jn_a"); remove_theme_mod("jn_b");' >/dev/null 2>&1
+
+# --- a credential-shaped theme setting is recorded as changed and never copied ---
+docker compose exec -T cli wp eval 'set_theme_mod("jn_api_key","JN-LIVE-SECRET-1");' >/dev/null 2>&1
+call jn_ts '{"jsonrpc":"2.0","id":410,"method":"tools/call","params":{"name":"wp_set_theme_mod","arguments":{"key":"jn_api_key","value":"JN-ROTATED-2"}}}'
+jn_list jn_l8
+check "a credential-shaped setting is refused for undo, with the reason" \
+  "$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);h=[x for x in rows if 'jn_api_key' in x['what']];print('credential' in h[0].get('not_reversible_because','') if h else 'MISSING')" jn_l8)" "True"
+check "and neither value is in the journal row" \
+  "$(docker compose exec -T cli wp eval 'echo strpos(serialize(get_option("gmcp_journal")),"JN-LIVE-SECRET")===false && strpos(serialize(get_option("gmcp_journal")),"JN-ROTATED")===false ? "clean" : "leaked";' 2>/dev/null | tr -d '\r\n')" "clean"
+check "CONTROL: the journal row does hold other entries, so the scan could have found a leak" \
+  "$(docker compose exec -T cli wp eval 'echo strpos(serialize(get_option("gmcp_journal")),"jn_api_key")!==false ? "present" : "empty";' 2>/dev/null | tr -d '\r\n')" "present"
+docker compose exec -T cli wp eval 'remove_theme_mod("jn_api_key");' >/dev/null 2>&1
+
+# --- menus: a location assignment and a menu item edit ---
+JN_LOC=$(docker compose exec -T cli wp eval 'echo (string) array_key_first( get_registered_nav_menus() );' 2>/dev/null | tr -d '\r\n')
+if [ -z "$JN_LOC" ]; then
+  echo "  SKIP  the active theme registers no menu location, so the menu checks cannot run here"
+else
+  call jn_m1 '{"jsonrpc":"2.0","id":411,"method":"tools/call","params":{"name":"wp_create_menu","arguments":{"name":"Journal menu A","slug":"journal-menu-a"}}}'
+  call jn_m2 '{"jsonrpc":"2.0","id":412,"method":"tools/call","params":{"name":"wp_create_menu","arguments":{"name":"Journal menu B","slug":"journal-menu-b"}}}'
+  JN_MA=$(docker compose exec -T cli wp eval 'echo wp_get_nav_menu_object("journal-menu-a")->term_id;' 2>/dev/null | tr -d '\r\n')
+  JN_MB=$(docker compose exec -T cli wp eval 'echo wp_get_nav_menu_object("journal-menu-b")->term_id;' 2>/dev/null | tr -d '\r\n')
+  call jn_as1 "{\"jsonrpc\":\"2.0\",\"id\":413,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_assign_menu_location\",\"arguments\":{\"location\":\"$JN_LOC\",\"menu\":\"journal-menu-a\"}}}"
+  call jn_as2 "{\"jsonrpc\":\"2.0\",\"id\":414,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_assign_menu_location\",\"arguments\":{\"location\":\"$JN_LOC\",\"menu\":\"journal-menu-b\"}}}"
+  check "control: the second assignment is stored" \
+    "$(docker compose exec -T cli wp eval "echo get_nav_menu_locations()['$JN_LOC'];" 2>/dev/null | tr -d '\r\n')" "$JN_MB"
+  jn_list jn_l9
+  JN_LE=$(jn_find jn_l9 "x['tool']=='wp_assign_menu_location' and 'nav_menu_locations' in x['what']")
+  jn_undo jn_u9 id "$JN_LE"
+  check "undoing a location assignment puts the previous menu back" \
+    "$(docker compose exec -T cli wp eval "echo get_nav_menu_locations()['$JN_LOC'];" 2>/dev/null | tr -d '\r\n')" "$JN_MA"
+
+  call jn_ai "{\"jsonrpc\":\"2.0\",\"id\":415,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_add_menu_item\",\"arguments\":{\"menu\":\"journal-menu-a\",\"title\":\"Journal item\",\"type\":\"custom\",\"url\":\"https://example.test/a\"}}}"
+  JN_I=$(docker compose exec -T cli wp eval "echo wp_get_nav_menu_items($JN_MA)[0]->ID;" 2>/dev/null | tr -d '\r\n')
+  jn_item() { docker compose exec -T cli wp eval "\$i = wp_setup_nav_menu_item( get_post( $JN_I ) ); echo \$i->title . '|' . \$i->url;" 2>/dev/null | tr -d '\r\n'; }
+  check "control: the item starts as added" "$(jn_item)" "Journal item|https://example.test/a"
+  call jn_ui "{\"jsonrpc\":\"2.0\",\"id\":416,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_menu_item\",\"arguments\":{\"item_id\":$JN_I,\"title\":\"Renamed item\",\"url\":\"https://example.test/b\"}}}"
+  check "control: the edit is stored" "$(jn_item)" "Renamed item|https://example.test/b"
+  jn_list jn_l10
+  JN_CALL=$(py "import json,sys;rows=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);h=[x for x in rows if x['tool']=='wp_update_menu_item'];print(h[0]['call'] if h else 'MISSING')" jn_l10)
+  check "the menu item edit is journalled under a call" "$([ "$JN_CALL" != MISSING ] && echo yes || echo no)" "yes"
+  jn_undo jn_u10 call "$JN_CALL"
+  check "undoing the call puts the item's title and url back" "$(jn_item)" "Journal item|https://example.test/a"
+  # Adding an item is not asserted either way here. Its custom fields are written as part of
+  # the creation and the journal has always recorded those as added fields; the item itself
+  # is not an entry, so nothing in the list offers to remove it.
+  docker compose exec -T cli wp eval "wp_delete_nav_menu($JN_MA); wp_delete_nav_menu($JN_MB);" >/dev/null 2>&1
+fi
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+
+echo "-- journal: an undo records no credential, and meta staleness sees every row --"
+# Run on its own through the docker stand-in against a local WordPress; see the note on the
+# diagnostics block below. Two defects, each asserted on stored state:
+#  1. Undoing a term edit wrote the value it overwrote into the journal entry that reverses the
+#     undo, with no credential test, while recording the edit itself did have one.
+#  2. The staleness hash of a meta entry read the FIRST row only, and a single-value restore
+#     ran update_post_meta() with no previous value, which rewrites every row of the key.
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+jx_find() { # jx_find <file> <python predicate on x> -> id of the newest matching entry, or MISSING
+  py "import json,sys
+rows = json.loads(json.load(sys.stdin)['result']['content'][0]['text'])
+hit = [x for x in rows if $2]
+print(hit[0]['id'] if hit else 'MISSING')" "$1"
+}
+jx_list() { call "$1" '{"jsonrpc":"2.0","id":500,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":40}}}'; }
+jx_undo() { call "$1" "{\"jsonrpc\":\"2.0\",\"id\":501,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_undo_change\",\"arguments\":{\"id\":\"$2\"}}}"; }
+jx_journal() { docker compose exec -T cli wp eval 'echo serialize( get_option( "gmcp_journal", [] ) );' 2>/dev/null; }
+
+# --- 1. the term description that becomes a credential, then is undone ---
+JX_T=$(docker compose exec -T cli wp eval 'echo wp_insert_term( "JX term", "category", [ "slug" => "jx-term", "description" => "plain" ] )["term_id"];' 2>/dev/null | tr -d '\r\n')
+check "control: the fixture term holds the plain description" "$(docker compose exec -T cli wp eval "echo get_term($JX_T,'category')->description;" 2>/dev/null | tr -d '\r\n')" "plain"
+call jx_t1 "{\"jsonrpc\":\"2.0\",\"id\":502,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_term\",\"arguments\":{\"term_id\":$JX_T,\"taxonomy\":\"category\",\"description\":\"{\\\"api_key\\\":\\\"sk_live_SECRETVALUE123\\\"}\"}}}"
+check "control: the secret is now the stored description (so the probe below has something to find)" \
+  "$(docker compose exec -T cli wp eval "echo strpos(get_term($JX_T,'category')->description,'SECRETVALUE123')!==false?'present':'absent';" 2>/dev/null | tr -d '\r\n')" "present"
+jx_list jx_l1
+JX_E1=$(jx_find jx_l1 "x['tool']=='wp_update_term' and 'JX term' in x['what']")
+check "control: the edit is journalled" "$([ "$JX_E1" != MISSING ] && echo yes || echo no)" "yes"
+check "stored state: the journal holds no copy of the secret after the edit" "$(jx_journal | grep -c SECRETVALUE123)" "0"
+check "control: that probe does find a value that IS in the journal (the earlier description)" "$([ "$(jx_journal | grep -c plain)" -ge 1 ] && echo yes || echo no)" "yes"
+jx_undo jx_u1 "$JX_E1"
+check "the undo put the plain description back" "$(docker compose exec -T cli wp eval "echo get_term($JX_T,'category')->description;" 2>/dev/null | tr -d '\r\n')" "plain"
+check "stored state: the entry that reverses the undo carries no copy of the secret" "$(jx_journal | grep -c SECRETVALUE123)" "0"
+jx_list jx_l2
+JX_U1=$(jx_find jx_l2 "x.get('undoes')=='$JX_E1'")
+check "the undo is on record" "$([ "$JX_U1" != MISSING ] && echo yes || echo no)" "yes"
+jx_undo jx_u2 "$JX_U1"
+check "reverting it is refused" "$(verdict jx_u2)" "error"
+check "stored state: the description is still the plain one" "$(docker compose exec -T cli wp eval "echo get_term($JX_T,'category')->description;" 2>/dev/null | tr -d '\r\n')" "plain"
+# The other direction is the control: a credential going OUT of a term is not copied either.
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+docker compose exec -T cli wp eval "wp_update_term($JX_T,'category',['description'=>'{\"api_key\":\"sk_live_SECRETVALUE123\"}']);" >/dev/null 2>&1
+call jx_t2 "{\"jsonrpc\":\"2.0\",\"id\":503,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_term\",\"arguments\":{\"term_id\":$JX_T,\"taxonomy\":\"category\",\"description\":\"plain again\"}}}"
+check "control: secret to plain is journalled with nothing stored" "$(jx_journal | grep -c SECRETVALUE123)" "0"
+check "control: and the entry exists" "$([ "$(jx_journal | grep -c 'JX term')" -ge 1 ] && echo yes || echo no)" "yes"
+docker compose exec -T cli wp term delete category "$JX_T" >/dev/null 2>&1
+
+# --- 2. post meta: the staleness check and the single-value restore see every row ---
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+JX_P=$(docker compose exec -T cli wp eval 'echo wp_insert_post(["post_title"=>"JX meta","post_type"=>"page","post_status"=>"draft"]);' 2>/dev/null | tr -d '\r\n')
+jx_rows() { docker compose exec -T cli wp eval "echo wp_json_encode( get_post_meta($JX_P,'$1',false) );" 2>/dev/null | tr -d '\r\n'; }
+jx_set() { call "$1" "{\"jsonrpc\":\"2.0\",\"id\":504,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post_meta\",\"arguments\":{\"ID\":$JX_P,\"key\":\"$2\",\"value\":\"$3\"}}}"; }
+# (a) The reported case: an undo, then somebody else adds a row, then the undo is reverted.
+docker compose exec -T cli wp eval "update_post_meta($JX_P,'jx_mrk','A');" >/dev/null 2>&1
+jx_set jx_s1 jx_mrk B
+jx_list jx_l3
+JX_M1=$(jx_find jx_l3 "x['tool']=='wp_update_post_meta' and 'jx_mrk' in x['what']")
+check "control: the tool's edit is journalled and stored" "$(jx_rows jx_mrk)|$([ "$JX_M1" != MISSING ] && echo yes || echo no)" '["B"]|yes'
+jx_undo jx_u3 "$JX_M1"
+check "the undo put A back" "$(jx_rows jx_mrk)" '["A"]'
+jx_list jx_l4
+JX_MU1=$(jx_find jx_l4 "x.get('undoes')=='$JX_M1'")
+check "control: the undo is itself on record" "$([ "$JX_MU1" != MISSING ] && echo yes || echo no)" "yes"
+docker compose exec -T cli wp eval "add_post_meta($JX_P,'jx_mrk','C-newer');" >/dev/null 2>&1
+check "control: a person added a second row" "$(jx_rows jx_mrk)" '["A","C-newer"]'
+jx_undo jx_u4 "$JX_MU1"
+check "reverting the undo is refused now that the key changed" "$(verdict jx_u4)" "error"
+check "stored state: both rows are exactly as the person left them" "$(jx_rows jx_mrk)" '["A","C-newer"]'
+# Control for the probe: with no row added, the same revert of an undo goes through.
+docker compose exec -T cli wp eval "update_post_meta($JX_P,'jx_ok','A');" >/dev/null 2>&1
+jx_set jx_s2 jx_ok B
+jx_list jx_l5
+JX_M2=$(jx_find jx_l5 "x['tool']=='wp_update_post_meta' and 'jx_ok' in x['what']")
+jx_undo jx_u5 "$JX_M2"
+jx_list jx_l6
+JX_MU2=$(jx_find jx_l6 "x.get('undoes')=='$JX_M2'")
+jx_undo jx_u6 "$JX_MU2"
+check "control: reverting an undo whose key did not change works" "$(jx_rows jx_ok)" '["B"]'
+# (b) A sibling row added after the tool's edit, then the edit is undone: the one recorded value
+# must not be written over every row.
+docker compose exec -T cli wp eval "update_post_meta($JX_P,'jx_sib','A');" >/dev/null 2>&1
+jx_set jx_s3 jx_sib B
+jx_list jx_l7
+JX_M3=$(jx_find jx_l7 "x['tool']=='wp_update_post_meta' and 'jx_sib' in x['what']")
+docker compose exec -T cli wp eval "add_post_meta($JX_P,'jx_sib','C-sibling');" >/dev/null 2>&1
+check "control: the key holds two rows" "$(jx_rows jx_sib)" '["B","C-sibling"]'
+jx_undo jx_u7 "$JX_M3"
+check "undoing a single-value edit of a key that now has several rows is refused" "$(verdict jx_u7)" "error"
+check "stored state: neither row was overwritten" "$(jx_rows jx_sib)" '["B","C-sibling"]'
+docker compose exec -T cli wp post delete "$JX_P" --force >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_journal >/dev/null 2>&1
+
+echo "-- annotations: a get that writes is not advertised as read-only --"
+# wp_get_site_health is read level and named like a read, so the derived hints said
+# readOnlyHint true and openWorldHint false. It runs WordPress's own Site Health tests, one of
+# which asks api.wordpress.org for the PHP support status and stores it as a site transient.
+call an_list '{"jsonrpc":"2.0","id":600,"method":"tools/list"}'
+an_hint() { py "import json,sys;t={x['name']:x for x in json.load(sys.stdin)['result']['tools']};print(t['$1']['annotations'].get('$2'))" an_list; }
+check "control: a real read (wp_list_themes) is still read-only" "$(an_hint wp_list_themes readOnlyHint)" "True"
+check "control: and not open-world" "$(an_hint wp_list_themes openWorldHint)" "False"
+check "wp_get_site_health is not advertised as read-only" "$(an_hint wp_get_site_health readOnlyHint)" "False"
+check "wp_get_site_health is advertised as reaching outside the site" "$(an_hint wp_get_site_health openWorldHint)" "True"
+# The reason, from stored state: running it writes the transient.
+docker compose exec -T cli wp eval 'delete_site_transient( "php_check_" . md5( PHP_VERSION ) );' >/dev/null 2>&1
+check "control: the PHP-check transient is absent before the call" "$(docker compose exec -T cli wp eval 'echo get_site_transient( "php_check_" . md5( PHP_VERSION ) ) === false ? "absent" : "present";' 2>/dev/null | tr -d '\r\n')" "absent"
+call an_sh '{"jsonrpc":"2.0","id":601,"method":"tools/call","params":{"name":"wp_get_site_health","arguments":{}}}'
+check "wp_get_site_health answered" "$(verdict an_sh)" "ok"
+check "stored state: it wrote the PHP-check transient, which is why it is not read-only" "$(docker compose exec -T cli wp eval 'echo get_site_transient( "php_check_" . md5( PHP_VERSION ) ) === false ? "absent" : "present";' 2>/dev/null | tr -d '\r\n')" "present"
+
+echo "-- diagnostics: error log, page fetch, preview links --"
+# Written without a Docker daemon. This block was run, on its own, through a stand-in for the
+# docker CLI against a local WordPress with no daemon; the rest of this file was not run.
+# It has not run inside the compose stack, where the fetch checks behave differently (below).
+# The pure logic behind it is checked by .dev/test-diagnostics-util.php.
+#
+# The fetch tool makes the server request its own URL. In this compose stack the site is
+# advertised as http://localhost:8080 but Apache inside the container listens on 80, so a
+# fetch of the home page fails with a connection error HERE. That is the tool telling the
+# truth about an unreachable host, and it is not what these checks assert: they assert that
+# the POLICY admitted or refused the URL, which is the part that has to hold everywhere.
+K_PV_RW=$(docker compose exec -T cli wp eval '$a=GMCP_Tokens::create("Preview writer","readwrite",0,[]);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+case "$K_PV_RW" in gmcp_*) ;; *) echo "  FAIL  could not mint the readwrite key for the diagnostics block"; fail=$((fail+1));; esac
+pv_stored() { docker compose exec -T cli wp option get gmcp_preview_links --format=json 2>/dev/null | tr -d '\r'; }
+pv_posts() { pv_stored | python3 -c 'import json,sys
+raw=sys.stdin.read().strip()
+d=json.loads(raw) if raw else {}
+d=d if isinstance(d,dict) else {}
+print(",".join(str(g["post"]) for g in sorted(d.values(), key=lambda g:g["post"])))'; }
+pv_status() { curl -sS -o "$OUT/pv_body" -w '%{http_code}' "$BASE$1"; }
+docker compose exec -T cli wp option delete gmcp_preview_links >/dev/null 2>&1
+
+PV_A=$(docker compose exec -T cli wp post create --post_status=draft --post_title="PV alpha" --post_content="PVMARK-ALPHA" --porcelain 2>/dev/null | tr -d '\r\n')
+PV_B=$(docker compose exec -T cli wp post create --post_status=draft --post_title="PV beta" --post_content="PVMARK-BETA" --porcelain 2>/dev/null | tr -d '\r\n')
+PV_PUB=$(docker compose exec -T cli wp post create --post_status=publish --post_title="PV published" --post_content="PVMARK-PUB" --porcelain 2>/dev/null | tr -d '\r\n')
+check "control: the three fixtures exist" "$( [ -n "$PV_A" ] && [ -n "$PV_B" ] && [ -n "$PV_PUB" ] && echo yes || echo no)" "yes"
+
+kcall pv_make "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":401,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+check "a write-level key can make a link for a draft" "$(verdict pv_make)" "ok"
+PV_TOKEN=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_make)
+check "control: the token was extracted" "${#PV_TOKEN}" "40"
+check "stored state: one grant, for that post" "$(pv_posts)" "$PV_A"
+check "stored state: the token itself is not in the row" "$(pv_stored | grep -c "$PV_TOKEN")" "0"
+check "control: that grep finds a token in text that holds it" "$(echo "x$PV_TOKEN" | grep -c "$PV_TOKEN")" "1"
+
+check "the draft shows with its token" "$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_TOKEN")" "200"
+check "...and the body is the draft" "$(grep -c PVMARK-ALPHA "$OUT/pv_body")" "1"
+check "without the token the same URL is a 404" "$(pv_status "/?p=$PV_A&post_type=post")" "404"
+check "...and shows nothing" "$(grep -c PVMARK-ALPHA "$OUT/pv_body")" "0"
+check "the token does not open another draft" "$(pv_status "/?p=$PV_B&post_type=post&gmcp_preview=$PV_TOKEN")" "404"
+check "...and shows nothing of it" "$(grep -c PVMARK-BETA "$OUT/pv_body")" "0"
+check "p=A with page_id=B does not open B" "$(pv_status "/?p=$PV_A&page_id=$PV_B&gmcp_preview=$PV_TOKEN" >/dev/null; grep -c PVMARK-BETA "$OUT/pv_body")" "0"
+check "a search with the token reveals no draft" "$(pv_status "/?s=PV&gmcp_preview=$PV_TOKEN" >/dev/null; grep -c -e PVMARK-ALPHA -e PVMARK-BETA "$OUT/pv_body")" "0"
+check "a feed with the token reveals no draft" "$(pv_status "/?p=$PV_A&feed=rss2&gmcp_preview=$PV_TOKEN" >/dev/null; grep -c PVMARK-ALPHA "$OUT/pv_body")" "0"
+curl -sS -D "$OUT/pv_headers" -o /dev/null "$BASE/?p=$PV_A&post_type=post&gmcp_preview=$PV_TOKEN"
+check "the response is noindex" "$(grep -ic '^x-robots-tag:.*noindex' "$OUT/pv_headers")" "1"
+check "the response is not referrable" "$(grep -ic '^referrer-policy: no-referrer' "$OUT/pv_headers")" "1"
+check "the response is not cacheable" "$(grep -ic '^cache-control:.*no-store' "$OUT/pv_headers")" "1"
+check "a published post is not a preview: no noindex header comes with the token" \
+  "$(curl -sS -L -D - -o /dev/null "$BASE/?p=$PV_PUB&gmcp_preview=$PV_TOKEN" | grep -ic '^x-robots-tag:.*noindex')" "0"
+
+kcall pv_pub "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":402,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_PUB}}}"
+check "a link cannot be made for a published post" "$(verdict pv_pub)" "error"
+kcall pv_h "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":403,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_B,\"hours\":169}}}"
+check "more than 7 days is refused" "$(verdict pv_h)" "error"
+check "stored state: neither refusal stored anything" "$(pv_posts)" "$PV_A"
+
+# Expiry: age the stored grant directly. Writing the row is the fixture; the point is that
+# the tools cannot do it (checked below), so only a test may.
+docker compose exec -T cli wp eval '$l=get_option("gmcp_preview_links");foreach($l as $k=>$g){$l[$k]["exp"]=time()-10;}update_option("gmcp_preview_links",$l,false);' >/dev/null 2>&1
+check "after expiry the same link is a 404" "$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_TOKEN")" "404"
+check "...and shows nothing" "$(grep -c PVMARK-ALPHA "$OUT/pv_body")" "0"
+
+docker compose exec -T cli wp option delete gmcp_preview_links >/dev/null 2>&1
+kcall pv_make2 "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":404,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+PV_TOKEN=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_make2)
+check "control: a fresh link works" "$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_TOKEN")" "200"
+docker compose exec -T cli wp post update "$PV_A" --post_status=publish >/dev/null 2>&1
+check "publishing the post removes its grants (stored state)" "$(pv_posts)" ""
+docker compose exec -T cli wp post update "$PV_A" --post_status=draft >/dev/null 2>&1
+check "reverting it to a draft does not bring the link back" "$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_TOKEN")" "404"
+
+kcall pv_rev "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":405,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+check "control: another link made" "$(pv_posts)" "$PV_A"
+kcall pv_rev2 "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":406,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_revoke_preview_links\",\"arguments\":{\"post_id\":$PV_A}}}"
+check "revoking by post empties the store (stored state)" "$(pv_posts)" ""
+
+# The row is reachable only through this tool group, not through the generic option tools.
+kcall pv_make3 "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":407,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+call pv_opt_r '{"jsonrpc":"2.0","id":408,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"gmcp_preview_links"}}}'
+check "wp_get_option refuses the preview row" "$(verdict pv_opt_r)" "error"
+call pv_opt_ok '{"jsonrpc":"2.0","id":409,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"blogname"}}}'
+check "control: wp_get_option reads an ordinary option" "$(verdict pv_opt_ok)" "ok"
+call pv_opt_w '{"jsonrpc":"2.0","id":410,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"gmcp_preview_links","value":{"a":1}}}}'
+check "wp_update_option refuses to write it" "$(verdict pv_opt_w)" "error"
+check "stored state: the row is still the one the tool made" "$(pv_posts)" "$PV_A"
+
+# The audit log records the call and not the credential. The reply is where the link is
+# handed out and the audit detail keeps the start of the reply.
+PV_LAST=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_make3)
+check "control: the audit log recorded the calls" \
+  "$([ "$(audit_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_create_preview_link\" AND outcome=\"ok\"')" -ge 1 ] && echo yes || echo no)" "yes"
+check "no preview token in any audit row" "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE CONCAT(COALESCE(args,''),COALESCE(detail,'')) LIKE '%$PV_LAST%'")" "0"
+check "control: the recorded reply carries the redaction mark, so the probe above can find text there" \
+  "$([ "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE tool='wp_create_preview_link' AND detail LIKE '%gmcp_preview=[redacted]%'")" -ge 1 ] && echo yes || echo no)" "yes"
+
+# Access levels.
+kcall pv_ro_tok "$K_PV_RW" '{"jsonrpc":"2.0","id":411,"method":"tools/call","params":{"name":"wp_get_php_error_log","arguments":{}}}'
+check "a write-level key cannot read the PHP error log" "$(py 'import json,sys;d=json.load(sys.stdin);print("denied" if "error" in d and "Access denied" in d["error"]["message"] else "reached")' pv_ro_tok)" "denied"
+kcall pv_ro_fetch "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":412,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_fetch_page\",\"arguments\":{\"url\":\"$BASE/\"}}}"
+check "a write-level key cannot fetch a page" "$(py 'import json,sys;d=json.load(sys.stdin);print("denied" if "error" in d and "Access denied" in d["error"]["message"] else "reached")' pv_ro_fetch)" "denied"
+
+# Ending EVERY link on the site is an admin-level act: a write-level key could end links other
+# keys and people made. One link exists here (PV_A, from pv_make3).
+check "control: a link exists before the all:true attempts" "$(pv_posts)" "$PV_A"
+kcall pv_all_rw "$K_PV_RW" '{"jsonrpc":"2.0","id":413,"method":"tools/call","params":{"name":"wp_revoke_preview_links","arguments":{"all":true}}}'
+check "a write-level key cannot revoke every link on the site" "$(verdict pv_all_rw)" "error"
+check "...and says it needs an admin-level key" "$(refusal pv_all_rw | grep -c 'admin-level key')" "1"
+check "stored state: the link is still there" "$(pv_posts)" "$PV_A"
+kcall pv_one_rw "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":414,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_revoke_preview_links\",\"arguments\":{\"post_id\":$PV_B}}}"
+check "control: the same key can still end the links of one post" "$(verdict pv_one_rw)" "ok"
+call pv_all_admin '{"jsonrpc":"2.0","id":415,"method":"tools/call","params":{"name":"wp_revoke_preview_links","arguments":{"all":true}}}'
+check "control: an admin-level key can revoke every link" "$(verdict pv_all_admin)" "ok"
+check "stored state: and the store is empty" "$(pv_posts)" ""
+kcall pv_make4 "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":416,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+PV_LAST=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_make4)
+
+# Fetch policy. The refusals are deterministic and need no network.
+fetch_verdict() { # fetch_verdict <url> -> "refused" when the POLICY refused, "admitted" otherwise
+  call pv_f "{\"jsonrpc\":\"2.0\",\"id\":420,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_fetch_page\",\"arguments\":{\"url\":\"$1\"}}}"
+  py 'import json,sys;d=json.load(sys.stdin);t=d["result"]["content"][0]["text"] if "result" in d else "";print("refused" if t.startswith("Refused:") else "admitted")' pv_f
+}
+check "control: the site's own front page is admitted by the policy" "$(fetch_verdict "$BASE/")" "admitted"
+# The ways of spelling a blocked target. Each of these returned a real response (a 200 JSON
+# list of users, for the first) before the policy compared the DECODED path and the keys as
+# PHP names them. Every one is checked against the policy's refusal, with the controls above
+# and below showing the probe can see an admitted URL.
+check "index.php in front of the REST route is refused" "$(fetch_verdict "$BASE/index.php/wp-json/wp/v2/users")" "refused"
+check "an encoded hyphen in wp-json is refused" "$(fetch_verdict "$BASE/wp%2Djson/wp/v2/users")" "refused"
+check "rest.route (PHP reads it as rest_route) is refused" "$(fetch_verdict "$BASE/?rest.route=/wp/v2/users")" "refused"
+check "rest+route is refused" "$(fetch_verdict "$BASE/?rest+route=/wp/v2/users")" "refused"
+check "an encoded p in wp-login.php is refused" "$(fetch_verdict "$BASE/wp-login.ph%70")" "refused"
+check "an encoded p in wp-cron.php is refused" "$(fetch_verdict "$BASE/wp-cron.ph%70")" "refused"
+check "gmcp.preview (PHP reads it as the preview parameter) is refused" "$(fetch_verdict "$BASE/?p=$PV_A&gmcp.preview=$PV_LAST")" "refused"
+check "doing.wp.cron is refused" "$(fetch_verdict "$BASE/?doing.wp.cron=1")" "refused"
+check "control: an ordinary page with a query and an encoded space is admitted" "$(fetch_verdict "$BASE/?s=a%20b")" "admitted"
+check "stored state: the dotted-key preview URL did not put the token in any audit row" "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE args LIKE '%$PV_LAST%'")" "0"
+check "another host is refused" "$(fetch_verdict 'http://example.com/')" "refused"
+# example.com is also refused by a host that cannot be resolved, so that check can pass for
+# the wrong reason on a stack with no DNS. A loopback literal resolves by definition, and on a
+# local site it is an acceptable ADDRESS: only the host rule can refuse it.
+PV_PORT="${BASE##*:}"
+check "another loopback host on the site's own port is refused" "$(fetch_verdict "http://127.0.0.2:${PV_PORT}/")" "refused"
+check "the cloud metadata address is refused" "$(fetch_verdict 'http://169.254.169.254/latest/meta-data/')" "refused"
+check "a user name in the URL is refused" "$(fetch_verdict "http://admin:pw@${BASE#http://}/")" "refused"
+check "wp-admin is refused" "$(fetch_verdict "$BASE/wp-admin/")" "refused"
+check "wp-login.php is refused" "$(fetch_verdict "$BASE/wp-login.php?action=logout")" "refused"
+check "the REST API is refused" "$(fetch_verdict "$BASE/wp-json/wp/v2/users")" "refused"
+check "another port on the same host is refused" "$(fetch_verdict 'http://localhost:9/')" "refused"
+check "a preview credential in the URL is refused" "$(fetch_verdict "$BASE/?p=$PV_A&gmcp_preview=$PV_LAST")" "refused"
+check "a file URL is refused" "$(fetch_verdict 'file:///etc/passwd')" "refused"
+check "the refused fetch above, which carried a token in its url, did not record it" "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE args LIKE '%$PV_LAST%'")" "0"
+check "control: that call was recorded, with its url argument and the mark" \
+  "$([ "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE tool='wp_fetch_page' AND args LIKE '%gmcp_preview=[redacted]%'")" -ge 1 ] && echo yes || echo no)" "yes"
+
+# The pin and an environment proxy. libcurl honours http_proxy from the process environment, a
+# proxy resolves the host name itself, and so a fetch could be answered by the proxy while the
+# reply said the connection was pinned. The proxy here is a closed port: if it is used, the
+# request fails; if it is bypassed, the page comes back. Run in the CLI so the variable is in the
+# process that makes the request. The first fetch is the control: where the site cannot reach its
+# own advertised address (the compose stack, see above) nothing below can be read and it says so.
+pv_cli_fetch() { # pv_cli_fetch <proxy-env-or-empty> -> "<status>|<connection>"
+  docker compose exec -T cli wp eval '
+    if ( "'"$1"'" !== "" ) { putenv( "http_proxy='"$1"'" ); putenv( "HTTP_PROXY='"$1"'" ); putenv( "https_proxy='"$1"'" ); putenv( "ALL_PROXY='"$1"'" ); putenv( "no_proxy" ); putenv( "NO_PROXY" ); }
+    global $gmcp_core;
+    $t = new GMCP_Tools_Diagnostics( $gmcp_core );
+    $r = $t->handle_call( null, "wp_fetch_page", [ "url" => home_url( "/" ) ], 1 );
+    $j = json_decode( $r["result"]["content"][0]["text"] ?? "", true );
+    echo is_array( $j ) ? ( $j["status"] ?? "?" ) . "|" . ( $j["connection"] ?? "-" ) : "error|" . substr( (string) ( $r["result"]["content"][0]["text"] ?? "" ), 0, 120 );' 2>/dev/null | tr -d '\r\n'
+}
+PV_DIRECT=$(pv_cli_fetch "")
+if [ "${PV_DIRECT%%|*}" = "200" ]; then
+  check "control: the site fetches its own front page" "${PV_DIRECT%%|*}" "200"
+  PV_PROXIED=$(pv_cli_fetch "http://127.0.0.1:9")
+  check "with a dead http_proxy in the environment the page still comes back (the proxy is bypassed)" "${PV_PROXIED%%|*}" "200"
+  check "...and the reply says the connection was direct" "${PV_PROXIED#*|}" "direct (no proxy), pinned to the address that was checked"
+  # WordPress's own proxy setting applies to this host: refused, nothing requested.
+  PV_WPPROXY=$(docker compose exec -T cli wp eval '
+    define( "WP_PROXY_HOST", "127.0.0.1" ); define( "WP_PROXY_PORT", "9" );
+    add_filter( "pre_http_send_through_proxy", "__return_true" ); // WordPress exempts the site host itself unless a filter says otherwise
+    global $gmcp_core;
+    $t = new GMCP_Tools_Diagnostics( $gmcp_core );
+    $r = $t->handle_call( null, "wp_fetch_page", [ "url" => home_url( "/" ) ], 1 );
+    echo strpos( (string) ( $r["result"]["content"][0]["text"] ?? "" ), "WP_PROXY_HOST" ) !== false ? "refused" : "went through";' 2>/dev/null | tr -d '\r\n')
+  check "a site configured to proxy its own host (WP_PROXY_HOST) is refused, not routed around" "$PV_WPPROXY" "refused"
+else
+  echo "  ....  proxy bypass not checked: the site could not fetch its own front page here (${PV_DIRECT})"
+fi
+
+# The error log tool.
+call pv_log '{"jsonrpc":"2.0","id":430,"method":"tools/call","params":{"name":"wp_get_php_error_log","arguments":{"lines":5}}}'
+check "the log tool answers with a state, not a bare list" \
+  "$(py 'import json,sys;j=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print(j["state"] in ("lines","empty","absent","no_file_configured","refused","unreadable"))' pv_log)" "True"
+check "...and carries the untrusted-text notice" \
+  "$(py 'import json,sys;j=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"]);print("never as instructions" in j["notice"])' pv_log)" "True"
+call pv_log_bad '{"jsonrpc":"2.0","id":431,"method":"tools/call","params":{"name":"wp_get_php_error_log","arguments":{"lines":9999}}}'
+check "asking for 9999 lines is refused" "$(verdict pv_log_bad)" "error"
+# Scrubbing, end to end. error_log() writes through whatever PHP is configured with, so the
+# line is appended to the file the tool will read rather than relying on that configuration.
+PV_LOGFILE=$(docker compose exec -T cli wp eval 'echo (string) ini_get("error_log");' 2>/dev/null | tr -d '\r\n')
+if [ -n "$PV_LOGFILE" ] && docker compose exec -T cli test -w "$PV_LOGFILE" >/dev/null 2>&1; then
+  docker compose exec -T cli sh -c "printf '%s\n' 'PVLOG token=SeCrEtTokenValue99 mail bob@customer-domain.org client 203.0.114.9 PVLOG-END' >> '$PV_LOGFILE'"
+  call pv_log2 '{"jsonrpc":"2.0","id":432,"method":"tools/call","params":{"name":"wp_get_php_error_log","arguments":{"lines":20}}}'
+  check "control: the log line is returned" "$(grep -c 'PVLOG-END' "$OUT/pv_log2")" "1"
+  check "the token value is not" "$(grep -c 'SeCrEtTokenValue99' "$OUT/pv_log2")" "0"
+  check "the e-mail address is not" "$(grep -c 'customer-domain.org' "$OUT/pv_log2")" "0"
+  check "the public IP address is not" "$(grep -c '203.0.114.9' "$OUT/pv_log2")" "0"
+else
+  echo "  ....  log scrubbing end-to-end not checked: no writable error_log file is configured on this stack"
+fi
+
+# A read returns what the site stores. redact() scrubs a preview token out of every string it
+# is handed, which is right for what gets written down and wrong for a tool's reply: a theme
+# mod whose text happens to contain "gmcp_preview=" came back as "gmcp_preview=[redacted]".
+docker compose exec -T cli wp eval 'set_theme_mod( "fixc_note", "see gmcp_preview=abc123def456 for the draft" );' >/dev/null 2>&1
+call pv_tm '{"jsonrpc":"2.0","id":440,"method":"tools/call","params":{"name":"wp_get_theme_mod","arguments":{"key":"fixc_note"}}}'
+check "control: the stored theme mod holds the text" "$(docker compose exec -T cli wp eval 'echo strpos( (string) get_theme_mod( "fixc_note" ), "gmcp_preview=abc123def456" ) !== false ? "yes" : "no";' 2>/dev/null | tr -d '\r\n')" "yes"
+check "the reply carries the stored text, not a redaction mark" "$(grep -c 'gmcp_preview=abc123def456' "$OUT/pv_tm")" "1"
+# ...while the audit log, which writes arguments down, still scrubs the same shape.
+PV_TV="tokenvalue${RANDOM}${RANDOM}"
+call pv_tm2 "{\"jsonrpc\":\"2.0\",\"id\":441,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_theme_mod\",\"arguments\":{\"key\":\"fixc_none\",\"default\":\"see gmcp_preview=$PV_TV here\"}}}"
+check "the audit log still scrubs a token in an argument" "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE tool='wp_get_theme_mod' AND args LIKE '%$PV_TV%'")" "0"
+check "control: and that call is in the audit log, with the mark" "$([ "$(audit_q "SELECT COUNT(*) FROM {\$wpdb->prefix}gmcp_audit WHERE tool='wp_get_theme_mod' AND args LIKE '%gmcp_preview=[redacted]%'")" -ge 1 ] && echo yes || echo no)" "yes"
+docker compose exec -T cli wp eval 'remove_theme_mod( "fixc_note" );' >/dev/null 2>&1
+
+# The debug log (MCP debug mode) prints each call's arguments. It used to print them through
+# redact(), which judges field NAMES, so wp_update_option {key: "x_pwd", value: "..."} logged
+# the value: "value" is not a secret-looking field name, and the option name that makes it
+# one is in a sibling field. Needs a log file the stack writes to: GMCP_TEST_ERROR_LOG names
+# one for a stack that is not configured with its own.
+DBG_LOG="${GMCP_TEST_ERROR_LOG:-$PV_LOGFILE}"
+if [ -n "$DBG_LOG" ] && docker compose exec -T cli test -w "$DBG_LOG" >/dev/null 2>&1; then
+  DBG_WAS=$(docker compose exec -T cli wp eval 'echo empty( get_option( "gmcp_options", [] )["mcp_debug_mode"] ) ? "off" : "on";' 2>/dev/null | tr -d '\r\n')
+  docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_debug_mode"]=true;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+  # A value no earlier run can have left in the log file.
+  DBG_N="${RANDOM}${RANDOM}"
+  call dbg_1 "{\"jsonrpc\":\"2.0\",\"id\":450,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_option\",\"arguments\":{\"key\":\"fixc_vendor_pwd\",\"value\":\"HUNTER2-LOGLEAK-$DBG_N\"}}}"
+  call dbg_2 "{\"jsonrpc\":\"2.0\",\"id\":451,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_option\",\"arguments\":{\"key\":\"fixc_plain_opt\",\"value\":\"PLAINVALUE-LOGGED-$DBG_N\"}}}"
+  check "control: the secret-named option really was written" "$(docker compose exec -T cli wp option get fixc_vendor_pwd 2>/dev/null | tr -d '\r\n')" "HUNTER2-LOGLEAK-$DBG_N"
+  check "control: the debug log has this call's lines" "$([ "$(docker compose exec -T cli sh -c "grep -c 'tools/call - Tool: wp_update_option' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" -ge 2 ] && echo yes || echo no)" "yes"
+  check "control: an ordinary value IS printed in the arguments, so the probe can see one" "$([ "$(docker compose exec -T cli sh -c "grep -c 'PLAINVALUE-LOGGED-$DBG_N' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "the value stored under a secret-named option is not in the debug log" "$(docker compose exec -T cli sh -c "grep -c 'HUNTER2-LOGLEAK-$DBG_N' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" "0"
+  check "...but the option's name is, so the line still says what changed" "$([ "$(docker compose exec -T cli sh -c "grep -c 'fixc_vendor_pwd' '$DBG_LOG'" 2>/dev/null | tr -d '\r\n')" -ge 1 ] && echo yes || echo no)" "yes"
+  docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_debug_mode"]='"$([ "$DBG_WAS" = on ] && echo true || echo false)"';update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+  docker compose exec -T cli wp option delete fixc_vendor_pwd fixc_plain_opt >/dev/null 2>&1
+else
+  echo "  ....  debug-log redaction not checked: no writable error_log file is configured on this stack (set GMCP_TEST_ERROR_LOG to one the web server writes to)"
+fi
+
+# Put the site back.
+docker compose exec -T cli wp option delete gmcp_preview_links >/dev/null 2>&1
+docker compose exec -T cli wp post delete "$PV_A" "$PV_B" "$PV_PUB" --force >/dev/null 2>&1
+gmcp_clear_other_keys "smoke suite"
+echo "-- human approval queue (out-of-band approval) --"
+# NOT YET RUN. Written on a machine with no Docker daemon, so none of this block has
+# executed against a stack. Run it, read every failure as either a code defect or a typo
+# in this block, and delete this note once it has passed once.
+#
+# What it asserts, in the order the risks were thought of:
+#   1. a gated call does NOT run, and the stored state proves it (the post is still there);
+#   2. an agent cannot approve: no tool does, at any level, and no credential but a real
+#      wp-admin session moves a request out of 'pending';
+#   3. an approval is for one key, one tool, one set of arguments, once, for fifteen
+#      minutes, and a request lapses after an hour;
+#   4. credential-shaped arguments are in neither the queue, the page nor the audit log;
+#   5. the two-step still applies inside an approved call and one approval covers both legs.
+#
+# Every "did not run" is read from the database, never from the reply. Every absence has a
+# control that proves the probe can see a present one.
+ap_eval() { docker compose exec -T cli wp eval "$1" 2>/dev/null | tr -d '\r\n'; }
+ap_q() { ap_eval "global \$wpdb; echo (string) \$wpdb->get_var(\"$1\");"; }
+ap_mode() { docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_approval_mode"]="'"$1"'";update_option("gmcp_options",$o,false);' >/dev/null 2>&1; }
+ap_stored_mode() { ap_eval 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "(unset)";'; }
+ap_status() { ap_q 'SELECT status FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$1"; }
+ap_events() { ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"approval:'"$1"'\"'; }
+ap_call() { # ap_call <file> <tool> <args-json> [token]
+  curl -sS -X POST "$URL" -H "Authorization: Bearer ${4:-$TOK}" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":900,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$3}}" -o "$OUT/$1"
+}
+ap_text() { py 'import json,sys;d=json.load(sys.stdin);print(d["result"]["content"][0]["text"])' "$1"; }
+ap_state() { py 'import json,sys;d=json.load(sys.stdin);print(d["result"].get("data",{}).get("status","-"))' "$1"; }
+ap_rid() { py 'import json,sys;d=json.load(sys.stdin);print(d["result"].get("data",{}).get("request_id","-"))' "$1"; }
+ap_post() { docker compose exec -T cli wp post create --post_title="$1" --post_status=draft --porcelain 2>/dev/null | tr -d '\r\n'; }
+ap_post_state() { ap_eval 'echo get_post_status('"$1"') ?: "gone";'; }
+ap_key() { # ap_key <label> <level>
+  docker compose exec -T cli wp eval '
+    foreach ( GMCP_Tokens::all() as $k ) { if ( ( $k["label"] ?? "" ) === "'"$1"'" ) { GMCP_Tokens::revoke( $k["id"] ); } }
+    $a = get_users( [ "role" => "administrator", "number" => 1, "orderby" => "ID", "order" => "ASC" ] );
+    $r = GMCP_Tokens::create( "'"$1"'", "'"$2"'", 0, [], $a ? $a[0]->ID : 0 );
+    echo $r["secret"];' 2>/dev/null | tr -d '\r\n'
+}
+AP_ADMIN_ID=$(ap_eval 'echo get_users(["role"=>"administrator","number"=>1,"orderby"=>"ID","order"=>"ASC"])[0]->ID;')
+
+# Start from nothing. Rows are cleared with the plugin's own table name rather than by
+# dropping the table, so the schema under test is the one the plugin installed.
+ap_eval 'global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_approvals");' >/dev/null
+ap_mode never
+check "CONTROL: the mode switch took" "$(ap_stored_mode)" "never"
+
+echo "   -- off means off, and what is not gated is not held --"
+AP_A=$(ap_post "AP control A")
+ap_call ap_c1 wp_delete_post "{\"ID\":$AP_A,\"force\":true}"
+check "mode never: a destructive call simply runs" "$(ap_post_state "$AP_A")" "gone"
+check "mode never: nothing was queued" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "0"
+
+ap_mode deletes
+AP_B=$(ap_post "AP victim B")
+ap_call ap_c2 wp_update_post "{\"ID\":$AP_B,\"post_title\":\"AP content edit\"}"
+check "mode deletes: a content edit is not held" \
+  "$(ap_eval 'echo get_the_title('"$AP_B"');')" "AP content edit"
+
+echo "   -- a gated call waits and does nothing --"
+ap_call ap_h1 wp_delete_post "{\"ID\":$AP_B,\"force\":true}"
+AP_R1=$(ap_rid ap_h1)
+check "the held call is not an error" "$(verdict ap_h1)" "ok"
+check "the reply says it is awaiting human approval" "$(ap_state ap_h1)" "awaiting_human_approval"
+check "and tells the agent so in words" "$(ap_text ap_h1 | grep -ci 'waiting for human approval')" "1"
+check "the victim is still there (read from the database, not the reply)" "$(ap_post_state "$AP_B")" "draft"
+check "exactly one request is pending" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals WHERE status=\"pending\"')" "1"
+check "stored against the key that asked" \
+  "$(ap_q 'SELECT identity LIKE \"key:%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R1")" "1"
+check "and the stored arguments name the victim, so a person can read what they approve" \
+  "$(ap_q 'SELECT args_view LIKE \"%'"$AP_B"'%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R1")" "1"
+# Polling must not grow the queue: an agent that retries every turn would otherwise bury
+# the one request a person needs to read.
+ap_call ap_h1b wp_delete_post "{\"ID\":$AP_B,\"force\":true}"
+check "retrying while pending returns the same request id" "$(ap_rid ap_h1b)" "$AP_R1"
+check "and does not add a row" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "1"
+# Key order is not part of the call's identity; a value is.
+ap_call ap_h1c wp_delete_post "{\"force\":true,\"ID\":$AP_B}"
+check "argument order does not make a new request" "$(ap_rid ap_h1c)" "$AP_R1"
+ap_call ap_h2 wp_delete_post "{\"ID\":$AP_B,\"force\":false}"
+AP_R2=$(ap_rid ap_h2)
+check "different arguments are a different request" "$([ "$AP_R2" != "$AP_R1" ] && [ "$AP_R2" != "-" ] && echo yes || echo no)" "yes"
+check "and the victim is still there" "$(ap_post_state "$AP_B")" "draft"
+# The held call is not recorded as a success: nothing happened.
+check "the audit log records the held call as refused" \
+  "$(ap_q 'SELECT COUNT(*)>0 FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_delete_post\" AND outcome=\"refused\" AND detail LIKE \"%waiting for human approval%\"')" "1"
+check "the request is in the audit log" "$([ "$(ap_events requested)" -ge 2 ] && echo yes || echo no)" "yes"
+
+echo "   -- no tool can approve, at any access level --"
+AP_K_RW=$(ap_key "ap rw" readwrite)
+AP_K_RO=$(ap_key "ap ro" readonly)
+ap_names() { # ap_names <token> -> every tool name this key is offered
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $1" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":901,"method":"tools/list"}' \
+  | python3 -c "
+import json,sys
+try:
+    t=[x['name'] for x in json.load(sys.stdin)['result']['tools']]
+except Exception:
+    print('unreadable'); raise SystemExit
+print(' '.join(t))"
+}
+ap_has() { # ap_has <names> <regex>
+  python3 -c "import re,sys;print('yes' if re.search(sys.argv[2], sys.argv[1]) else 'no')" "$1" "$2"
+}
+AP_NAMES_ADMIN=$(ap_names "$TOK"); AP_NAMES_RW=$(ap_names "$AP_K_RW"); AP_NAMES_RO=$(ap_names "$AP_K_RO")
+# Controls first: a regex that is wrong, or a listing that is unreadable, finds nothing
+# either way.
+check "CONTROL: the admin listing is readable and has a destructive tool in it" "$(ap_has "$AP_NAMES_ADMIN" '(^| )wp_delete_post( |$)')" "yes"
+check "CONTROL: the readwrite listing is readable" "$(ap_has "$AP_NAMES_RW" '(^| )wp_update_post( |$)')" "yes"
+check "CONTROL: the readonly listing is readable" "$(ap_has "$AP_NAMES_RO" '(^| )wp_get_post( |$)')" "yes"
+check "CONTROL: the pattern does find a name that is there" "$(ap_has "$AP_NAMES_ADMIN" 'wp_delete')" "yes"
+AP_NOPE='approv|decline|pending|queue|human'
+check "no approval tool at admin level" "$(ap_has "$AP_NAMES_ADMIN" "$AP_NOPE")" "no"
+check "none at readwrite" "$(ap_has "$AP_NAMES_RW" "$AP_NOPE")" "no"
+check "none at readonly" "$(ap_has "$AP_NAMES_RO" "$AP_NOPE")" "no"
+# By name, with the gate switched off so the answer measured is "no such tool" and not
+# "held because unregistered names are held". With the gate on, an unregistered name is a
+# pending request, which is asserted separately below.
+ap_mode never
+for n in gmcp_approve_request wp_approve_request wp_decline_request wp_list_approvals wp_get_approvals wp_update_approval wp_delete_approval; do
+  ap_call ap_nope "$n" "{\"id\":$AP_R1,\"request_id\":$AP_R1}"
+  check "calling $n by name is refused" "$(verdict ap_nope)" "error"
+  check "and it is refused as unknown, not for some other reason" "$(refusal ap_nope | grep -ci 'unknown tool')" "1"
+done
+ap_call ap_nopec wp_get_option '{"key":"blogname"}'
+check "CONTROL: with the gate off a real tool answers through the same path" "$(verdict ap_nopec)" "ok"
+ap_mode deletes
+check "and nothing moved while the agent tried" \
+  "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals WHERE status=\"pending\"')" "2"
+# The generic tools must not be a way around it. The setting is in the plugin's own options
+# row and the table is not an option at all; the row is guarded by name.
+ap_call ap_opt wp_update_option '{"key":"gmcp_options","value":{"mcp_approval_mode":"never"}}'
+check "the options row holding the mode cannot be rewritten through wp_update_option" "$(verdict ap_opt)" "error"
+check "and the mode is still deletes" "$(ap_stored_mode)" "deletes"
+ap_call ap_optg wp_get_option '{"key":"gmcp_approvals_db_version"}'
+check "the queue's own bookkeeping is not readable through wp_get_option" "$(verdict ap_optg)" "error"
+ap_call ap_optc wp_get_option '{"key":"blogname"}'
+check "CONTROL: wp_get_option does read an ordinary option" "$(verdict ap_optc)" "ok"
+# A readonly key is held to the same rule it always was: it never reaches a gated tool, so
+# it never creates a request either.
+ap_call ap_ro wp_delete_post "{\"ID\":$AP_B,\"force\":true}" "$AP_K_RO"
+check "a readonly key is refused by its level, not queued" "$(verdict ap_ro)" "error"
+check "and no request was created for it" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "2"
+
+echo "   -- only a real wp-admin session can answer --"
+# The CLI as an administrator: the capability is true and the nonce is valid, and it must
+# still be refused, because there is no logged-in cookie and this is not wp-admin.
+check "an administrator identity with a valid nonce is not enough (wp-cli)" \
+  "$(docker compose exec -T cli wp eval --user="$AP_ADMIN_ID" '[$ok]=GMCP_Approvals::decide('"$AP_R1"',"approve",wp_create_nonce(GMCP_Approvals::nonce_action("approve",'"$AP_R1"')));echo $ok?"approved":"refused";' 2>/dev/null | tr -d '\r\n')" "refused"
+check "and the request is still pending" "$(ap_status "$AP_R1")" "pending"
+# The agent's own credential aimed at the real endpoint. It has no cookie and cannot make
+# a nonce, so this fails at the door; the stored state is what is asserted.
+curl -sS -o /dev/null -X POST "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" \
+  -H "Authorization: Bearer $TOK" \
+  --data-urlencode "gmcp_action=approve_request" --data-urlencode "request_id=$AP_R1" \
+  --data-urlencode "gmcp_approval_nonce=0000000000" --data-urlencode "_wpnonce=0000000000"
+check "a bearer key posting to the approve endpoint changes nothing" "$(ap_status "$AP_R1")" "pending"
+
+AP_JAR=$(mktemp)
+curl -sS -c "$AP_JAR" -b "$AP_JAR" -d 'log=admin&pwd=admin&rememberme=forever&testcookie=1' "$BASE/wp-login.php" -o /dev/null 2>/dev/null
+ap_form() { # ap_form <verdict> <request id> -> "<page nonce>|<request nonce>", empty when no such form
+  curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" | python3 -c '
+import re,sys
+html=sys.stdin.read()
+verdict,rid=sys.argv[1],sys.argv[2]
+for f in re.findall(r"<form.*?</form>",html,re.S):
+    if "value=\""+verdict+"_request\"" in f and re.search(r"name=\"request_id\" value=\""+rid+"\"",f):
+        a=re.search(r"name=\"_wpnonce\" value=\"([^\"]+)\"",f)
+        b=re.search(r"name=\"gmcp_approval_nonce\" value=\"([^\"]+)\"",f)
+        if a and b:
+            print(a.group(1)+"|"+b.group(1))
+        break
+' "$1" "$2"
+}
+ap_decide() { # ap_decide <verdict> <request id> [request-nonce override]
+  local n wn an
+  n=$(ap_form "$1" "$2"); wn=${n%%|*}; an=${n##*|}
+  [ -n "${3:-}" ] && an="$3"
+  curl -sS -b "$AP_JAR" -o /dev/null -X POST "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" \
+    --data-urlencode "_wpnonce=$wn" --data-urlencode "gmcp_action=$1_request" \
+    --data-urlencode "request_id=$2" --data-urlencode "gmcp_approval_nonce=$an"
+}
+if grep -q wordpress_logged_in "$AP_JAR"; then
+  check "the Approvals page renders" \
+    "$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null | grep -o '<h1>[^<]*</h1>' | head -n 1)" "<h1>Approvals</h1>"
+  AP_KEYS_PAGE=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-access" 2>/dev/null)
+  check "CONTROL: the keys page was fetched and has the drafts-only option" \
+    "$([ "$(printf '%s' "$AP_KEYS_PAGE" | grep -c 'name="key_drafts_only"')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "its label says a post that is live, not anything that is live" \
+    "$(printf '%s' "$AP_KEYS_PAGE" | grep -c 'Never publish, schedule or change a post that is live')/$(printf '%s' "$AP_KEYS_PAGE" | grep -c 'anything that is live')" "1/0"
+  check "and its help names what is NOT covered" \
+    "$(printf '%s' "$AP_KEYS_PAGE" | grep -c 'does NOT cover comments, taxonomy terms')" "1"
+  check "CONTROL: the form parser finds the Approve form for a pending request" \
+    "$([ -n "$(ap_form approve "$AP_R1")" ] && echo found || echo MISSING)" "found"
+  AP_PAGE=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null)
+  check "the page lists the pending call with its tool" \
+    "$([ "$(printf '%s' "$AP_PAGE" | grep -c 'wp_delete_post')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "CONTROL: it offers Approve and Decline per request" \
+    "$([ "$(printf '%s' "$AP_PAGE" | grep -c '>Approve<')" -ge 2 ] && [ "$(printf '%s' "$AP_PAGE" | grep -c '>Decline<')" -ge 2 ] && echo yes || echo no)" "yes"
+  # No bulk anything. A select-all box next to Approve is a button pressed without reading.
+  check "the page has no checkboxes, so no bulk selection" "$(printf '%s' "$AP_PAGE" | grep -c 'type="checkbox"')" "0"
+  check "CONTROL: that probe can see form controls (the mode is radio buttons)" \
+    "$([ "$(printf '%s' "$AP_PAGE" | grep -c 'type="radio"')" -ge 3 ] && echo yes || echo no)" "yes"
+
+  echo "   -- a session is necessary and not sufficient: the nonce binds request and verdict --"
+  ap_decide approve "$AP_R1" "badnonce"
+  check "a wrong request nonce answers nothing" "$(ap_status "$AP_R1")" "pending"
+  AP_N2=$(ap_form approve "$AP_R2"); AP_N2=${AP_N2##*|}
+  ap_decide approve "$AP_R1" "$AP_N2"
+  check "another request's nonce answers nothing" "$(ap_status "$AP_R1")" "pending"
+  AP_NDEC=$(ap_form decline "$AP_R1"); AP_NDEC=${AP_NDEC##*|}
+  ap_decide approve "$AP_R1" "$AP_NDEC"
+  check "a decline nonce does not approve" "$(ap_status "$AP_R1")" "pending"
+
+  echo "   -- the approved retry runs once, for that key and those arguments only --"
+  ap_decide approve "$AP_R1"
+  check "a signed-in administrator approves it" "$(ap_status "$AP_R1")" "approved"
+  check "the decision names the person" \
+    "$(ap_q 'SELECT decided_by FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R1")" "$AP_ADMIN_ID"
+  check "valid for fifteen minutes" \
+    "$(ap_q 'SELECT approved_until-decided_at FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R1")" "900"
+  check "approval alone ran nothing" "$(ap_post_state "$AP_B")" "draft"
+  # Different arguments are not covered.
+  ap_call ap_x1 wp_delete_post "{\"ID\":$AP_B,\"force\":false}"
+  check "a different argument set is still held" "$(ap_state ap_x1)" "awaiting_human_approval"
+  check "and still did nothing" "$(ap_post_state "$AP_B")" "draft"
+  # Another key is another caller.
+  AP_K_OTHER=$(ap_key "ap other" admin)
+  ap_call ap_x2 wp_delete_post "{\"ID\":$AP_B,\"force\":true}" "$AP_K_OTHER"
+  check "another key cannot spend this key's approval" "$(ap_state ap_x2)" "awaiting_human_approval"
+  check "and a request of its own was opened for it" "$([ "$(ap_rid ap_x2)" != "$AP_R1" ] && echo yes || echo no)" "yes"
+  check "the victim is still there" "$(ap_post_state "$AP_B")" "draft"
+  # A different tool with the same arguments is not covered either.
+  ap_call ap_x3 wp_delete_media "{\"ID\":$AP_B,\"force\":true}"
+  check "the same arguments to a different tool are held" "$(ap_state ap_x3)" "awaiting_human_approval"
+  check "and did nothing" "$(ap_post_state "$AP_B")" "draft"
+
+  ap_call ap_run wp_delete_post "{\"ID\":$AP_B,\"force\":true}"
+  check "the identical retry from the approved key runs" "$(ap_post_state "$AP_B")" "gone"
+  check "the approval is spent" "$(ap_status "$AP_R1")" "used"
+  check "and the use is in the audit log" "$([ "$(ap_events used)" -ge 1 ] && echo yes || echo no)" "yes"
+  ap_call ap_replay wp_delete_post "{\"ID\":$AP_B,\"force\":true}"
+  check "repeating it is held again, not run twice" "$(ap_state ap_replay)" "awaiting_human_approval"
+  check "exactly one approval has been used" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals WHERE status=\"used\" AND tool=\"wp_delete_post\"')" "1"
+  check "the refused replay is in the audit log" "$([ "$(ap_events replay_refused)" -ge 1 ] && echo yes || echo no)" "yes"
+
+  echo "   -- eight retries of one approved call at once: exactly one runs --"
+  # The claim is a single UPDATE ... WHERE status = 'approved', so two retries racing cannot
+  # both win. Asserted by counting what actually happened, not what was replied: the audit
+  # log's successful writes of this option, the approval row's state, and the option itself.
+  # The write is a scratch option under the wider mode, where wp_update_option is held.
+  ap_mode site
+  AP_RACE_KEY=smoke_probe_race
+  ap_eval 'delete_option("'"$AP_RACE_KEY"'");' >/dev/null
+  ap_race_ok() { ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"wp_update_option\" AND outcome=\"ok\" AND args LIKE \"%'"$AP_RACE_KEY"'%\"'; }
+  AP_RACE_BEFORE=$(ap_race_ok)
+  ap_call ap_rc0 wp_update_option '{"key":"'"$AP_RACE_KEY"'","value":"raced"}'
+  AP_RR=$(ap_rid ap_rc0)
+  check "CONTROL: the scratch write is held first, and did nothing" \
+    "$(ap_state ap_rc0)/$(ap_eval 'echo get_option("'"$AP_RACE_KEY"'","unset");')" "awaiting_human_approval/unset"
+  ap_decide approve "$AP_RR"
+  check "CONTROL: a person approved it" "$(ap_status "$AP_RR")" "approved"
+  for i in 1 2 3 4 5 6 7 8; do
+    ap_call ap_rc$i wp_update_option '{"key":"'"$AP_RACE_KEY"'","value":"raced"}' &
+  done
+  wait
+  AP_RAN=0; AP_HELD=0
+  for i in 1 2 3 4 5 6 7 8; do
+    case "$(ap_state ap_rc$i)" in
+      -) AP_RAN=$((AP_RAN + 1)) ;;
+      awaiting_human_approval) AP_HELD=$((AP_HELD + 1)) ;;
+    esac
+  done
+  check "exactly one of the eight parallel retries ran, and the other seven were held" "$AP_RAN/$AP_HELD" "1/7"
+  check "the audit log holds exactly one successful write of it" "$(( $(ap_race_ok) - AP_RACE_BEFORE ))" "1"
+  check "the approval was spent exactly once" "$(ap_status "$AP_RR")" "used"
+  check "and the write happened" "$(ap_eval 'echo get_option("'"$AP_RACE_KEY"'","unset");')" "raced"
+  ap_eval 'delete_option("'"$AP_RACE_KEY"'");' >/dev/null
+  # Eight requests at once write eight audit rows at once. The chain is serialised with a named
+  # lock (GMCP_Audit, GET_LOCK), which a SQLite drop-in does not have: it answers null or a
+  # mangled "1=1" (measured), never "1", the rows fork the chain, and the verification further down reports a break that is the
+  # stack's and not the plugin's. Said out loud and cleared there; on MariaDB nothing is cleared.
+  if [ "$(ap_eval 'global $wpdb; $g=$wpdb->get_var("SELECT GET_LOCK(\"gmcp_probe\",1)"); if($g==="1"){$wpdb->get_var("SELECT RELEASE_LOCK(\"gmcp_probe\")");} echo $g===null?"none":$g;')" != "1" ]; then
+    echo "  ....  this stack has no GET_LOCK, so parallel audit writes fork the hash chain; clearing the log after the race"
+    ap_eval 'GMCP_Audit::clear();' >/dev/null
+  fi
+  ap_mode deletes
+
+  echo "   -- declining, and the lapse of requests and approvals --"
+  AP_C=$(ap_post "AP victim C")
+  ap_call ap_d1 wp_delete_post "{\"ID\":$AP_C,\"force\":true}"
+  AP_R3=$(ap_rid ap_d1)
+  ap_decide decline "$AP_R3"
+  check "a declined request is stored as declined" "$(ap_status "$AP_R3")" "declined"
+  ap_call ap_d2 wp_delete_post "{\"ID\":$AP_C,\"force\":true}"
+  check "the same call is then refused as an error" "$(verdict ap_d2)" "error"
+  check "saying why" "$(ap_text ap_d2 | grep -ci 'declined')" "1"
+  check "and nothing ran" "$(ap_post_state "$AP_C")" "draft"
+  check "declining is in the audit log" "$([ "$(ap_events declined)" -ge 1 ] && echo yes || echo no)" "yes"
+
+  # A request nobody answers lapses. The clock is moved on the row the plugin itself
+  # wrote, so the code under test is the real one and only the date is faked.
+  AP_E=$(ap_post "AP victim E")
+  ap_call ap_e1 wp_delete_post "{\"ID\":$AP_E,\"force\":true}"
+  AP_R4=$(ap_rid ap_e1)
+  ap_eval 'global $wpdb; $wpdb->update($wpdb->prefix."gmcp_approvals",["expires"=>time()-1],["id"=>'"$AP_R4"']);' >/dev/null
+  ap_decide approve "$AP_R4"
+  check "an expired request is not offered for approval and is stored as expired" "$(ap_status "$AP_R4")" "expired"
+  check "lapsing is in the audit log" "$([ "$(ap_events expired)" -ge 1 ] && echo yes || echo no)" "yes"
+  ap_call ap_e2 wp_delete_post "{\"ID\":$AP_E,\"force\":true}"
+  AP_R5=$(ap_rid ap_e2)
+  check "asking again after a lapse opens a new request" "$([ "$AP_R5" != "$AP_R4" ] && [ "$AP_R5" != "-" ] && echo yes || echo no)" "yes"
+  ap_decide approve "$AP_R5"
+  check "CONTROL: the new request approves" "$(ap_status "$AP_R5")" "approved"
+  ap_eval 'global $wpdb; $wpdb->update($wpdb->prefix."gmcp_approvals",["approved_until"=>time()-1],["id"=>'"$AP_R5"']);' >/dev/null
+  ap_call ap_e3 wp_delete_post "{\"ID\":$AP_E,\"force\":true}"
+  check "an approval older than fifteen minutes does not run the call" "$(ap_post_state "$AP_E")" "draft"
+  check "and is held again" "$(ap_state ap_e3)" "awaiting_human_approval"
+  check "and is stored as expired" "$(ap_status "$AP_R5")" "expired"
+
+  echo "   -- the two-step still applies inside an approved call, on one approval --"
+  ap_call ap_mk wp_create_menu '{"name":"AP Menu"}'
+  check "CONTROL: the menu fixture exists (creating a menu is not held in mode deletes)" \
+    "$(ap_eval 'echo wp_get_nav_menu_object("AP Menu") ? "present" : "absent";')" "present"
+  ap_call ap_m1 wp_delete_menu '{"menu":"AP Menu"}'
+  AP_R6=$(ap_rid ap_m1)
+  check "deleting a menu is held" "$(ap_state ap_m1)" "awaiting_human_approval"
+  ap_decide approve "$AP_R6"
+  ap_call ap_m2 wp_delete_menu '{"menu":"AP Menu"}'
+  check "the approved call reaches the two-step, which changes nothing" \
+    "$(ap_text ap_m2 | grep -ci 'nothing has been changed')" "1"
+  check "so the menu is still there" "$(ap_eval 'echo wp_get_nav_menu_object("AP Menu") ? "present" : "absent";')" "present"
+  check "and the approval was not spent on a call that did nothing" "$(ap_status "$AP_R6")" "approved"
+  AP_TOKEN=$(ap_text ap_m2 | grep -o 'confirm set to "[0-9a-f]*"' | grep -o '[0-9a-f]\{16\}')
+  check "CONTROL: a confirmation token was extracted" "$([ -n "$AP_TOKEN" ] && echo yes || echo no)" "yes"
+  ap_call ap_m3 wp_delete_menu "{\"menu\":\"AP Menu\",\"confirm\":\"$AP_TOKEN\"}"
+  check "the second leg runs under the same approval" \
+    "$(ap_eval 'echo wp_get_nav_menu_object("AP Menu") ? "present" : "absent";')" "absent"
+  check "and spends it" "$(ap_status "$AP_R6")" "used"
+
+  echo "   -- credentials never reach the queue, the page or the log --"
+  ap_mode site
+  ap_call ap_pw wp_create_user '{"user_login":"apuser","user_email":"ap@example.test","user_pass":"APPLAINTEXTMUSTNOTAPPEAR","role":"subscriber"}'
+  AP_R7=$(ap_rid ap_pw)
+  check "creating a user is held in the wider mode" "$(ap_state ap_pw)" "awaiting_human_approval"
+  check "the user was not created" "$(ap_eval 'echo username_exists("apuser") ? "exists" : "absent";')" "absent"
+  check "CONTROL: the stored arguments carry the harmless fields" \
+    "$(ap_q 'SELECT args_view LIKE \"%apuser%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R7")" "1"
+  check "the password is not in the stored arguments" \
+    "$(ap_q 'SELECT args_view LIKE \"%APPLAINTEXTMUSTNOTAPPEAR%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R7")" "0"
+  # The binding hash covers the password, so it must not be a plain digest of it: with the
+  # row in hand, hashing guesses would confirm one offline. The control is that the stored
+  # value DOES equal the keyed form, so the comparison below is measuring the right thing.
+  AP_PW_JSON='{"user_login":"apuser","user_email":"ap@example.test","user_pass":"APPLAINTEXTMUSTNOTAPPEAR","role":"subscriber"}'
+  AP_MAC_CMD='global $wpdb; $a=json_decode(base64_decode("'"$(printf '%s' "$AP_PW_JSON" | base64 | tr -d '\n')"'"),true);
+    $m=(string)$wpdb->get_var("SELECT args_mac FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R7"'");
+    $j=GMCP_Approvals::canonical_json($a);'
+  check "CONTROL: the stored hash equals the keyed form of the arguments" \
+    "$(ap_eval "$AP_MAC_CMD"' echo $m === hash_hmac("sha256","wp_create_user\x1f".$j,wp_salt("auth")) ? "keyed" : "DIFFERENT";')" "keyed"
+  check "and is not a plain digest of them" \
+    "$(ap_eval "$AP_MAC_CMD"' echo $m === hash("sha256","wp_create_user\x1f".$j) ? "PLAIN" : "keyed-only";')" "keyed-only"
+  AP_PAGE=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null)
+  check "CONTROL: the page shows the request" \
+    "$([ "$(printf '%s' "$AP_PAGE" | grep -c 'apuser')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "the page does not show the password" "$(printf '%s' "$AP_PAGE" | grep -c 'APPLAINTEXTMUSTNOTAPPEAR')" "0"
+  check "the page says a value is hidden yet part of the approval, and names it" \
+    "$(printf '%s' "$AP_PAGE" | grep -c 'is still part of what you approve:</strong> &quot;user_pass&quot;')" "1"
+  check "the stored view is in canonical order, not the order the client sent (role, email, login, password)" \
+    "$(ap_eval 'global $wpdb; $t=(string)$wpdb->get_var("SELECT args_view FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R7"'"); $p=array_map(function($k) use ($t){return strpos($t,"\"".$k."\"");},["role","user_email","user_login","user_pass"]); $s=$p; sort($s); echo $p===$s && !in_array(false,$p,true) ? "ordered" : "UNORDERED";')" "ordered"
+  echo "   -- a call that cannot be shown in full is not queued --"
+  AP_BEFORE=$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')
+  AP_BIG=$(python3 -c 'print("x"*20000)')
+  ap_call ap_big wp_update_option '{"key":"smoke_probe_big","value":"'"$AP_BIG"'"}'
+  check "an oversized call is refused, as an error" "$(verdict ap_big)" "error"
+  check "  that says why" "$(ap_text ap_big | grep -c 'not queued for approval')" "1"
+  check "  and queued nothing" "$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "$AP_BEFORE"
+  check "  and ran nothing" "$(ap_eval 'echo get_option("smoke_probe_big","unset") === "unset" ? "unset" : "WRITTEN";')" "unset"
+  ap_call ap_unk wp_update_option '{"key":"smoke_probe_unk","value":"v","sneaky":"hidden from the person"}'
+  check "an argument the tool does not declare is refused too, and nothing is queued" \
+    "$(verdict ap_unk)/$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "error/$AP_BEFORE"
+  ap_call ap_okq wp_update_option '{"key":"smoke_probe_unk","value":"v"}'
+  check "CONTROL: the same call without it is queued (so the refusals above were about the argument and the size)" \
+    "$(ap_state ap_okq)/$(ap_q 'SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_approvals')" "awaiting_human_approval/$((AP_BEFORE + 1))"
+  ap_decide decline "$(ap_rid ap_okq)"
+  check "the audit log does not hold it" "$(leaked_audit APPLAINTEXTMUSTNOTAPPEAR)" "0"
+  check "CONTROL: the audit scan does see a harmless argument of the same call" "$(leaked_audit ap@example.test)" "1"
+  ap_decide decline "$AP_R7"
+  check "(cleanup) the user request is declined" "$(ap_status "$AP_R7")" "declined"
+
+  echo "   -- an account the agent made cannot approve for the agent --"
+  # The attack: with the mode at "deletes" an admin key created an administrator with a
+  # password it chose, signed in at wp-login.php, and approved its own held calls. The two
+  # locks are tested separately, so a pass on one cannot hide a hole in the other: the
+  # account tools are held (first lock), and an account that slipped through anyway cannot
+  # answer (second lock, the marker). Every "cannot" has a control that makes the same
+  # account answer once the marker is gone, so a probe that cannot log in cannot read as a pass.
+  AP_EVIL_PASS='Evil-Pass-1234!'
+  ap_mode deletes
+  ap_eval 'foreach ( [ "apevil", "apsub" ] as $l ) { $u = get_user_by( "login", $l ); if ( $u ) { require_once ABSPATH . "wp-admin/includes/user.php"; wp_delete_user( $u->ID ); } }' >/dev/null
+  ap_call ap_ac1 wp_create_user '{"user_login":"apevil","user_email":"apevil@example.test","user_pass":"'"$AP_EVIL_PASS"'","role":"administrator"}'
+  check "mode deletes: creating an administrator with a chosen password is held, not run" "$(ap_state ap_ac1)" "awaiting_human_approval"
+  check "  and the account does not exist" "$(ap_eval 'echo username_exists("apevil") ? "exists" : "absent";')" "absent"
+  ap_call ap_ac2 wp_create_user '{"user_login":"apsub","user_email":"apsub@example.test","role":"subscriber"}'
+  check "mode deletes: creating a plain subscriber is held too" "$(ap_state ap_ac2)/$(ap_eval 'echo username_exists("apsub") ? "exists" : "absent";')" "awaiting_human_approval/absent"
+  ap_mode never
+  ap_call ap_ac3 wp_create_user '{"user_login":"apsub","user_email":"apsub@example.test","role":"subscriber"}'
+  check "CONTROL: with the mode at never the same call creates the account" "$(ap_eval 'echo username_exists("apsub") ? "exists" : "absent";')" "exists"
+  AP_SUB_ID=$(ap_eval 'echo username_exists("apsub");')
+  ap_mode deletes
+  AP_SUB_HASH=$(ap_eval 'echo get_userdata('"$AP_SUB_ID"')->user_pass;')
+  ap_call ap_ac4 wp_update_user '{"ID":'"$AP_SUB_ID"',"fields":{"user_pass":"'"$AP_EVIL_PASS"'"}}'
+  check "mode deletes: setting a password on an ordinary account is held, and the hash is unchanged" \
+    "$(ap_state ap_ac4)/$([ "$(ap_eval 'echo get_userdata('"$AP_SUB_ID"')->user_pass;')" = "$AP_SUB_HASH" ] && echo unchanged || echo CHANGED)" "awaiting_human_approval/unchanged"
+  ap_call ap_ac5 wp_update_user '{"ID":'"$AP_ADMIN_ID"',"fields":{"display_name":"Held display name"}}'
+  check "mode deletes: even a display name on an account that can run the site is held" "$(ap_state ap_ac5)" "awaiting_human_approval"
+  ap_call ap_ac6 wp_update_user '{"ID":'"$AP_SUB_ID"',"fields":{"display_name":"Agent set display name"}}'
+  check "CONTROL: a display name on an ordinary account is not held in mode deletes, and is stored" \
+    "$(ap_eval 'echo get_userdata('"$AP_SUB_ID"')->display_name;')" "Agent set display name"
+
+  # Second lock. Mode never, so the first lock is out of the way: this is the call that got
+  # through (an older key, a mode that was off at the time, another plugin's tool).
+  ap_mode never
+  ap_call ap_ac7 wp_create_user '{"user_login":"apevil","user_email":"apevil@example.test","user_pass":"'"$AP_EVIL_PASS"'","role":"administrator"}'
+  AP_EV_TOKEN=$(ap_text ap_ac7 | grep -o 'confirm set to "[0-9a-f]*"' | grep -o '[0-9a-f]\{16\}')
+  ap_call ap_ac8 wp_create_user '{"user_login":"apevil","user_email":"apevil@example.test","user_pass":"'"$AP_EVIL_PASS"'","role":"administrator","confirm":"'"$AP_EV_TOKEN"'"}'
+  AP_EVIL_ID=$(ap_eval 'echo username_exists("apevil");')
+  check "CONTROL: in mode never the agent did create a working administrator" \
+    "$(ap_eval '$u=get_userdata('"${AP_EVIL_ID:-0}"'); echo $u && in_array("administrator",$u->roles,true) && wp_check_password("'"$AP_EVIL_PASS"'",$u->user_pass,$u->ID) ? "created" : "NOT CREATED";')" "created"
+  check "the plugin remembered a tool call made it" "$(ap_eval 'echo GMCP_Approvals::account_changed_by_tool('"${AP_EVIL_ID:-0}"') ? "marked" : "clean";')" "marked"
+  check "CONTROL: and did not mark the real administrator, whom no tool touched" "$(ap_eval 'echo GMCP_Approvals::account_changed_by_tool('"$AP_ADMIN_ID"') ? "marked" : "clean";')" "clean"
+  ap_mode deletes
+  AP_VICTIM=$(ap_post "AP victim evil")
+  ap_call ap_ac9 wp_delete_post "{\"ID\":$AP_VICTIM,\"force\":true}"
+  AP_R_EVIL=$(ap_rid ap_ac9)
+  check "CONTROL: a held request exists for the evil account to try to answer" "$(ap_status "$AP_R_EVIL")" "pending"
+  AP_JAR_ADMIN="$AP_JAR"
+  AP_JAR=$(mktemp)
+  curl -sS -c "$AP_JAR" -b "$AP_JAR" --data-urlencode 'log=apevil' --data-urlencode "pwd=$AP_EVIL_PASS" -d 'rememberme=forever&testcookie=1' "$BASE/wp-login.php" -o /dev/null 2>/dev/null
+  check "CONTROL: the agent's account really signed in (a login that fails would pass everything below)" \
+    "$(grep -q wordpress_logged_in "$AP_JAR" && echo cookie || echo NO-COOKIE)" "cookie"
+  check "CONTROL: the page serves the approve form to that session, so a refusal is the plugin's" \
+    "$([ -n "$(ap_form approve "$AP_R_EVIL")" ] && echo found || echo MISSING)" "found"
+  check "  and says why on the page" \
+    "$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null | grep -c 'cannot approve or decline requests yet')" "1"
+  ap_decide approve "$AP_R_EVIL"
+  check "the agent's own administrator cannot approve its held call" "$(ap_status "$AP_R_EVIL")" "pending"
+  ap_call ap_ac10 wp_delete_post "{\"ID\":$AP_VICTIM,\"force\":true}"
+  check "  and retrying the call still does not run it" "$(ap_post_state "$AP_VICTIM")" "draft"
+  check "  nor can it decline (it cannot tidy the queue either)" \
+    "$(ap_decide decline "$AP_R_EVIL"; ap_status "$AP_R_EVIL")" "pending"
+  # The control that proves the marker was the only thing in the way: take it off (as wp-cli
+  # would; nothing on any screen can) and the same session answers.
+  ap_eval 'delete_user_meta('"${AP_EVIL_ID:-0}"', GMCP_Approvals::TOUCHED_META);' >/dev/null
+  ap_decide approve "$AP_R_EVIL"
+  check "CONTROL: with the marker removed the same session approves, so the marker was the only barrier" "$(ap_status "$AP_R_EVIL")" "approved"
+  check "  and the decision names that account" \
+    "$(ap_q 'SELECT decided_by FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R_EVIL")" "$AP_EVIL_ID"
+  rm -f "$AP_JAR"
+  AP_JAR="$AP_JAR_ADMIN"
+  ap_eval 'require_once ABSPATH . "wp-admin/includes/user.php"; foreach ( [ "apevil", "apsub" ] as $l ) { $u = get_user_by( "login", $l ); if ( $u ) { wp_delete_user( $u->ID ); } }' >/dev/null
+  ap_mode never
+
+  echo "   -- the setting fails closed --"
+  AP_PN=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null \
+    | python3 -c '
+import re,sys
+html=sys.stdin.read()
+for f in re.findall(r"<form.*?</form>",html,re.S):
+    if "mcp_approval_mode" in f and "gmcp_fields" in f:
+        m=re.search(r"name=\"_wpnonce\" value=\"([^\"]+)\"",f)
+        if m: print(m.group(1))
+        break')
+  check "CONTROL: the settings form nonce was found" "$([ -n "$AP_PN" ] && echo yes || echo no)" "yes"
+  curl -sS -b "$AP_JAR" -o /dev/null -X POST "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" \
+    --data-urlencode "_wpnonce=$AP_PN" --data-urlencode "gmcp_action=save" \
+    --data-urlencode "gmcp_fields=mcp_approval_mode" --data-urlencode "mcp_approval_mode=bogus"
+  check "an unknown mode is stored as the strictest, not as never" "$(ap_stored_mode)" "site"
+  curl -sS -b "$AP_JAR" -o /dev/null -X POST "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" \
+    --data-urlencode "_wpnonce=$AP_PN" --data-urlencode "gmcp_action=save" \
+    --data-urlencode "gmcp_fields=mcp_approval_mode"
+  check "and so is a form that names the field and sends no value" "$(ap_stored_mode)" "site"
+  curl -sS -b "$AP_JAR" -o /dev/null -X POST "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" \
+    --data-urlencode "_wpnonce=$AP_PN" --data-urlencode "gmcp_action=save" \
+    --data-urlencode "gmcp_fields=mcp_approval_mode" --data-urlencode "mcp_approval_mode=never"
+  check "CONTROL: a valid value is accepted" "$(ap_stored_mode)" "never"
+else
+  echo "  ....  approval answers not checked: no wp-admin login (admin/admin) on this stack"
+fi
+
+echo "   -- classification fails closed --"
+check "a tool with no definition is unknown" "$(ap_eval 'echo GMCP_Approvals::classify(null);')" "unknown"
+check "a tool that declares no access level is unknown" \
+  "$(ap_eval 'echo GMCP_Approvals::classify(["name"=>"x_y"]);')" "unknown"
+check "CONTROL: a tool that does declare one is classified" \
+  "$(ap_eval 'echo GMCP_Approvals::classify(["name"=>"wp_delete_post","accessLevel"=>"admin"]);')" "destructive"
+# The classifier trusts the README's definition of the write level ("create and update, no
+# destructive tools"). This is where that trust is checked against the real registered
+# tools, so a destructive tool filed under write fails here instead of passing ungated.
+AP_CONTRACT='do_action("rest_api_init"); $bad=[]; $seen=[]; $n=0;
+  foreach ( apply_filters("gmcp_tools",[]) as $t ) { $n++; $c=GMCP_Approvals::classify($t); $seen[$c]=1;
+    $l=$t["accessLevel"]??null;
+    if ( in_array($l,["read","write"],true) && $c==="destructive" ) { $bad[]=$t["name"]; }
+    if ( $l===null ) { $bad[]=$t["name"]." (no level)"; } }'
+check "CONTROL: the registered tools were enumerated and every class that gates is represented" \
+  "$(ap_eval "$AP_CONTRACT"' echo $n>20 && isset($seen["destructive"],$seen["site"],$seen["read"],$seen["content"]) ? "enumerated" : "NOT ($n)";')" "enumerated"
+check "no read- or write-level tool is destructive, and none lacks a level" \
+  "$(ap_eval "$AP_CONTRACT"' echo $bad ? implode(",",$bad) : "none";')" "none"
+# A cron callback can do anything a plugin can, delete files included, and a scheduled
+# event can be a deletion's second half (wp_scheduled_delete). So running or unscheduling one
+# is held with the deletes. Read from the REGISTERED tools, not from a synthetic definition.
+check "the registered wp_run_cron_event is destructive" \
+  "$(ap_eval 'do_action("rest_api_init"); $c="NOT REGISTERED"; foreach ( apply_filters("gmcp_tools",[]) as $t ) { if ( ($t["name"]??"")==="wp_run_cron_event" ) { $c=GMCP_Approvals::classify($t); } } echo $c;')" "destructive"
+check "and so is wp_unschedule_cron_event" \
+  "$(ap_eval 'do_action("rest_api_init"); $c="NOT REGISTERED"; foreach ( apply_filters("gmcp_tools",[]) as $t ) { if ( ($t["name"]??"")==="wp_unschedule_cron_event" ) { $c=GMCP_Approvals::classify($t); } } echo $c;')" "destructive"
+check "CONTROL: the read-only listing next to them is not" \
+  "$(ap_eval 'do_action("rest_api_init"); $c="NOT REGISTERED"; foreach ( apply_filters("gmcp_tools",[]) as $t ) { if ( ($t["name"]??"")==="wp_list_cron_events" ) { $c=GMCP_Approvals::classify($t); } } echo $c;')" "read"
+check "a nonsense stored mode is read as the strictest" \
+  "$(ap_mode bogus; ap_eval 'echo GMCP_Approvals::mode();')" "site"
+AP_F=$(ap_post "AP victim F")
+ap_call ap_f1 wp_delete_post "{\"ID\":$AP_F,\"force\":true}"
+check "and under it a destructive call is held, not run" "$(ap_state ap_f1)" "awaiting_human_approval"
+check "the victim is still there" "$(ap_post_state "$AP_F")" "draft"
+ap_call ap_f3 wp_no_such_tool_at_all '{}'
+check "an unregistered tool name is held rather than passed through" "$(ap_state ap_f3)" "awaiting_human_approval"
+ap_mode never
+ap_call ap_f2 wp_delete_post "{\"ID\":$AP_F,\"force\":true}"
+check "CONTROL: with the mode put back to never the same call runs" "$(ap_post_state "$AP_F")" "gone"
+
+echo "   -- the audit chain survived all of it --"
+check "the hash chain still verifies end to end" \
+  "$(ap_eval 'echo GMCP_Audit::verify("all")["ok"] ? "intact" : "BROKEN";')" "intact"
+
+# Put the site back: mode off, queue empty, fixtures gone.
+ap_mode never
+ap_eval 'global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_approvals");' >/dev/null
+docker compose exec -T cli wp post delete "$AP_B" "$AP_C" "$AP_E" --force >/dev/null 2>&1
+docker compose exec -T cli wp user delete apuser --yes >/dev/null 2>&1
+gmcp_clear_other_keys "smoke suite"
+rm -f "$AP_JAR"
+
 echo "-- uninstall leaves nothing behind --"
 # Last, because it empties the plugin out from under everything above. Run through the
 # real uninstall.php rather than `wp plugin uninstall`, which deletes the plugin directory
@@ -2914,6 +3981,7 @@ docker compose exec -T cli wp eval '
   GMCP_Tokens::create( "uninstall probe", "admin", 0, [], $a ? $a[0]->ID : 0 );
   GMCP_Journal::install();
   GMCP_Audit::install();
+  GMCP_Approvals::install();
   update_option( "gmcp_audit_last_full_verify", [ "at" => time() ], false );' >/dev/null 2>&1
 # The control. Without it, a site that wrote nothing would pass the two checks below by
 # having nothing to leave behind, which is the shape that has produced false passes here
@@ -2921,7 +3989,7 @@ docker compose exec -T cli wp eval '
 UN_OPTS=$(docker compose exec -T cli wp db query "SELECT COUNT(*) FROM ${TABLE_PREFIX:-wp_}options WHERE option_name LIKE 'gmcp\\_%' AND option_name NOT LIKE 'gmcp\\_smoke\\_%'" --skip-column-names 2>/dev/null | tr -d '\r\n')
 UN_TABS=$(docker compose exec -T cli wp db query "SHOW TABLES LIKE '${TABLE_PREFIX:-wp_}gmcp%'" --skip-column-names 2>/dev/null | tr -d '\r' | grep -c .)
 check "CONTROL: the plugin has rows and tables to leave behind" \
-  "$( [ "${UN_OPTS:-0}" -gt 3 ] && [ "${UN_TABS:-0}" -ge 4 ] && echo present || echo "NOTHING TO TEST ($UN_OPTS opts, $UN_TABS tables)" )" "present"
+  "$( [ "${UN_OPTS:-0}" -gt 3 ] && [ "${UN_TABS:-0}" -ge 5 ] && echo present || echo "NOTHING TO TEST ($UN_OPTS opts, $UN_TABS tables)" )" "present"
 # Captured BEFORE the uninstall, which is the whole point: uninstall.php deletes this row
 # along with everything else, so reading it afterwards saves an empty array and restores
 # nothing. The first version of this did exactly that and the restore check below caught it.

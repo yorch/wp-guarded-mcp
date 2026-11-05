@@ -73,6 +73,25 @@ class GMCP_Core {
     // there is no write tool here and the option writer that could reach the log's own
     // settings refuses them (see option_write_policy()).
     'mcp_tools_wp_activity_log' => false,
+    // Redirection: redirects are an open-redirect and self-lockout primitive, so the writer
+    // keeps a target and source policy of its own (see GMCP_Tools_Redirection) and the group
+    // is off until someone switches it on.
+    'mcp_tools_redirection' => false,
+    // Polylang (free): read only. Languages and a post's translation group.
+    'mcp_tools_polylang' => false,
+    // Rank Math and All in One SEO: per-post SEO metadata. Its own switch, separate from
+    // Yoast's, so a site is not handed a writer for a plugin it has not chosen. Readers at
+    // read, writers at write; see the header of tools-seo.php for why write.
+    'mcp_tools_seo' => false,
+    // Contact Form 7 (through Flamingo), Fluent Forms and Ninja Forms: form submissions,
+    // READ ONLY. Submissions are personal data a member of the public wrote, so the tools
+    // that return one are admin and the briefings are counts at read.
+    'mcp_tools_forms' => false,
+    // Out-of-band human approval. 'never' | 'deletes' | 'site': which tool calls are held
+    // until a logged-in administrator approves them on the Approvals screen. Global rather
+    // than per key, so that a key, an OAuth grant and a key minted next week are all
+    // covered without anyone remembering to switch it on. @see GMCP_Approvals.
+    'mcp_approval_mode' => 'never',
     'mcp_debug_mode' => false,
     // Keep a short history of tool calls, including refused ones, for the settings
     // screen. An agent otherwise operates with no visible record at all.
@@ -80,6 +99,12 @@ class GMCP_Core {
     'mcp_audit_days' => 90,
     'mcp_change_journal' => true,
   ];
+
+  /**
+  * Set when confirm_gate() answered a call with a token instead of letting it proceed.
+  * Reset by the dispatcher before each tool runs and read once after it returns.
+  */
+  public static $gate_withheld = false;
 
   private $options = null;
 
@@ -828,6 +853,543 @@ class GMCP_Core {
       . 'This key is ' . self::caller_access_level() . '.';
   }
 
+  #region Drafts-only keys
+
+  /**
+  * Set once per request, by the server, when the credential presented is a drafts-only key.
+  * Nothing sets it back: a request has one caller.
+  */
+  private static $drafts_only = false;
+  private static $drafts_net_installed = false;
+
+  /** Whether the credential behind this request may only touch content that is not live. */
+  public static function caller_drafts_only(): bool {
+    return self::$drafts_only;
+  }
+
+  /**
+  * The statuses at which a post is in front of the public, or scheduled to be.
+  *
+  * publish, future and private are the three the brief names, and any status a plugin has
+  * registered as public or private joins them, so a custom "published" state is not a way
+  * round. inherit is deliberately not here: an attachment or a revision takes its parent's
+  * visibility, which status_is_live() resolves.
+  *
+  * @return string[]
+  */
+  public static function live_statuses(): array {
+    $statuses = [ 'publish', 'future', 'private' ];
+    if ( function_exists( 'get_post_stati' ) ) {
+      $statuses = array_merge(
+        $statuses,
+        array_values( get_post_stati( [ 'public' => true ] ) ),
+        array_values( get_post_stati( [ 'private' => true ] ) )
+      );
+    }
+    $statuses = (array) apply_filters( 'gmcp_live_post_statuses', $statuses );
+    return array_values( array_diff( array_unique( array_map( [ __CLASS__, 'normalise_status' ], $statuses ) ), [ 'inherit' ] ) );
+  }
+
+  /**
+  * Whether a status, for a post with this parent, is one the public can reach.
+  *
+  * An attachment is "inherit", and an attachment on a live page is part of that page. One
+  * attached to a draft, or to nothing, is not live content: uploading media while drafting
+  * is the ordinary use of a drafts-only key, and refusing it would make the key useless.
+  * The walk up the parents is bounded so a loop cannot hang the request.
+  */
+  public static function status_is_live( string $status, int $parent = 0, int $depth = 0 ): bool {
+    $status = self::normalise_status( $status );
+    if ( $status === 'inherit' ) {
+      if ( $parent <= 0 || $depth >= 5 ) {
+        return false;
+      }
+      $up = get_post( $parent );
+      return $up ? self::status_is_live( (string) $up->post_status, (int) $up->post_parent, $depth + 1 ) : false;
+    }
+    return in_array( $status, self::live_statuses(), true );
+  }
+
+  /**
+  * Lower case, no surrounding whitespace. The posts table compares with a case- and
+  * padding-insensitive collation on a stock install, so a post stored with the status
+  * "Publish" or "publish " is found by every query that asks for "publish", and a
+  * comparison here that was stricter than the database would call it a draft.
+  */
+  private static function normalise_status( $status ): string {
+    return strtolower( trim( (string) $status ) );
+  }
+
+  /** @param int|WP_Post $post */
+  public static function post_is_live( $post ): bool {
+    $post = get_post( $post );
+    return $post ? self::status_is_live( (string) $post->post_status, (int) $post->post_parent ) : false;
+  }
+
+  private static function drafts_only_explanation(): string {
+    return 'This key is drafts-only: it can create and edit drafts and pending posts, but it cannot publish, schedule, '
+      . 'make private, edit, delete or unpublish a post that is live, or edit or delete media that is not attached to a draft. '
+      . 'That covers posts, their custom fields, terms and featured image, and attached media; comments, taxonomy terms, users and options are outside this setting. '
+      . 'Ask an administrator to make the change, or use a key that is not drafts-only.';
+  }
+
+  /**
+  * Whether a drafts-only caller may write to this existing post, and the sentence to refuse
+  * with when it may not.
+  *
+  * A policy about the OBJECT, like commerce_post_guard(): every tool that writes a post or
+  * its meta, terms or thumbnail asks this one question, and a net of WordPress hooks
+  * (below) asks it again underneath for writers that do not, so a tool added later, or a
+  * third-party plugin's, cannot be the one that was missed. The tools ask first so the
+  * refusal is a clear sentence and nothing is half written; the net is the backstop.
+  *
+  * Live means the post is publish, future or private now, OR the write would make it so.
+  * Unpublishing is refused as well as publishing: taking a page down is a change to the
+  * site the public sees.
+  *
+  * @param string $new_status The status the write would leave the post in, or '' if it
+  *                           does not change it.
+  * @param bool   $removing   Deleting rather than editing. Media is judged harder, because an
+  *                           unattached attachment can be the featured image of a live post.
+  * @return true|string True when the write is allowed, otherwise the refusal.
+  */
+  public static function drafts_only_guard( int $post_id, string $verb = 'Changing', string $new_status = '', bool $removing = false ) {
+    if ( !self::$drafts_only || $post_id <= 0 ) {
+      return true;
+    }
+    $post = get_post( $post_id );
+    if ( !$post ) {
+      return true;
+    }
+    $new_status = sanitize_key( $new_status );
+    if ( self::post_is_live( $post ) ) {
+      return $verb . ' post #' . $post_id . ' is refused: it is live (status "' . $post->post_status . '"). ' . self::drafts_only_explanation();
+    }
+    if ( $new_status !== '' && self::status_is_live( $new_status, (int) $post->post_parent ) ) {
+      return $verb . ' post #' . $post_id . ' with status "' . $new_status . '" is refused: that would put it in front of the public. ' . self::drafts_only_explanation();
+    }
+    if ( $removing && $post->post_type === 'attachment' && ( (int) $post->post_parent <= 0 ) ) {
+      return $verb . ' media #' . $post_id . ' is refused: it is not attached to a draft, so a live page may be using it. ' . self::drafts_only_explanation();
+    }
+    return true;
+  }
+
+  /**
+  * The same question for content that does not exist yet: may this key create something
+  * with this status?
+  *
+  * @return true|string
+  */
+  public static function drafts_only_status_guard( string $status, string $verb = 'Creating content' ) {
+    if ( !self::$drafts_only ) {
+      return true;
+    }
+    $status = sanitize_key( $status );
+    if ( $status !== '' && self::status_is_live( $status ) ) {
+      return $verb . ' with status "' . $status . '" is refused: that would put it in front of the public. ' . self::drafts_only_explanation();
+    }
+    return true;
+  }
+
+  /**
+  * The one question for the generic post and meta writes: the commerce policy first, then
+  * the drafts-only one. Both are policies about the post, so both are asked here rather
+  * than in whichever tool happens to be writing.
+  *
+  * @return true|string
+  */
+  public static function post_write_guard( int $post_id, string $verb = 'Changing', string $new_status = '' ) {
+    $commerce = self::commerce_post_guard( $post_id, $verb );
+    if ( $commerce !== true ) {
+      return $commerce;
+    }
+    return self::drafts_only_guard( $post_id, $verb, $new_status );
+  }
+
+  /**
+  * Turn the restriction on for this request, and install the net underneath the tools.
+  *
+  * The tool-level guards above give a clear refusal. This is what makes "no writer is
+  * missed" true rather than hoped: every route to a post row that goes through WordPress,
+  * which is every tool in this plugin and every plugin a tool calls into (Elementor, Yoast,
+  * ACF, WooCommerce, the generated REST tools, menu items, the change journal's undo),
+  * passes through one of these hooks, and each throws before anything is written.
+  *
+  * It throws rather than returning false. A pre-filter that short-circuits with false
+  * makes update_post_meta() report failure quietly and the caller carry on as though it had
+  * worked, which is a tool answering success over a write that did not happen. An
+  * exception reaches execute_tool(), which turns it into an isError reply the audit log
+  * records as a refusal.
+  *
+  * What it cannot see: a plugin writing the posts table with $wpdb directly. None of this
+  * plugin's tools does that for content, and a drafts-only key is held to the write level,
+  * which excludes the tool groups (Elementor, Yoast, ACF, menus, options) that reach such code.
+  */
+  public static function restrict_caller_to_drafts(): void {
+    self::$drafts_only = true;
+    if ( self::$drafts_net_installed ) {
+      return;
+    }
+    self::$drafts_net_installed = true;
+
+    // The status the row is about to be stored with, after every other plugin has had its
+    // say, which is why this runs last. Covers wp_insert_post and wp_update_post, and so
+    // everything built on them.
+    add_filter( 'wp_insert_post_data', [ __CLASS__, 'net_insert' ], PHP_INT_MAX, 4 );
+    // Attachments are filtered through their own hook instead of that one, so media
+    // uploads, edits and re-parenting would otherwise walk straight past the net.
+    add_filter( 'wp_insert_attachment_data', [ __CLASS__, 'net_insert' ], PHP_INT_MAX, 4 );
+
+    // Meta, added, changed or removed, through every route including by meta id.
+    foreach ( [ 'add', 'update', 'delete' ] as $op ) {
+      add_filter( $op . '_post_metadata', [ __CLASS__, 'net_meta' ], PHP_INT_MIN, 3 );
+    }
+    add_filter( 'update_post_metadata_by_mid', [ __CLASS__, 'net_meta_by_mid' ], PHP_INT_MIN, 2 );
+    add_filter( 'delete_post_metadata_by_mid', [ __CLASS__, 'net_meta_by_mid' ], PHP_INT_MIN, 2 );
+
+    // Trash, restore and permanent deletion. These fire before anything is touched.
+    foreach ( [ 'pre_delete_post', 'pre_delete_attachment', 'pre_trash_post', 'pre_untrash_post' ] as $hook ) {
+      add_filter( $hook, [ __CLASS__, 'net_remove' ], PHP_INT_MIN, 2 );
+    }
+    // Restoring from the trash goes back to the status the post held before, which on
+    // WordPress older than 5.6 was publish. A restore is always a draft for this caller.
+    add_filter( 'wp_untrash_post_status', function ( $status ) {
+      return self::status_is_live( (string) $status ) ? 'draft' : $status;
+    }, PHP_INT_MAX );
+
+    // Category, tag and any other taxonomy assignment, fired before the row is written.
+    add_action( 'add_term_relationship', [ __CLASS__, 'net_terms' ], PHP_INT_MIN, 3 );
+    add_action( 'delete_term_relationships', [ __CLASS__, 'net_terms' ], PHP_INT_MIN, 3 );
+  }
+
+  private static function net_refuse( string $message ): void {
+    throw new GMCP_Drafts_Only_Refusal( $message );
+  }
+
+  public static function net_insert( $data, $postarr = [], $unsanitized = [], $update = false ) {
+    if ( !self::$drafts_only || !is_array( $data ) ) {
+      return $data;
+    }
+    $id = (int) ( $postarr['ID'] ?? 0 );
+    if ( $update && $id > 0 ) {
+      $why = self::drafts_only_guard( $id, 'Updating', (string) ( $data['post_status'] ?? '' ) );
+      if ( $why !== true ) {
+        self::net_refuse( $why );
+      }
+      return $data;
+    }
+    $why = self::drafts_only_status_guard( (string) ( $data['post_status'] ?? '' ), 'Creating a post' );
+    if ( $why === true && self::status_is_live( (string) ( $data['post_status'] ?? '' ), (int) ( $data['post_parent'] ?? 0 ) ) ) {
+      // inherit under a live parent: new media or a revision attached to a live page.
+      $why = 'Creating a post attached to a live post is refused. ' . self::drafts_only_explanation();
+    }
+    if ( $why !== true ) {
+      self::net_refuse( $why );
+    }
+    return $data;
+  }
+
+  public static function net_meta( $check, $object_id = 0, $meta_key = '' ) {
+    if ( self::$drafts_only ) {
+      $why = self::drafts_only_guard( (int) $object_id, 'Writing meta on' );
+      if ( $why !== true ) {
+        self::net_refuse( $why );
+      }
+    }
+    return $check;
+  }
+
+  public static function net_meta_by_mid( $check, $meta_id = 0 ) {
+    if ( self::$drafts_only ) {
+      $row = function_exists( 'get_metadata_by_mid' ) ? get_metadata_by_mid( 'post', (int) $meta_id ) : null;
+      if ( $row && !empty( $row->post_id ) ) {
+        $why = self::drafts_only_guard( (int) $row->post_id, 'Writing meta on' );
+        if ( $why !== true ) {
+          self::net_refuse( $why );
+        }
+      }
+    }
+    return $check;
+  }
+
+  public static function net_remove( $check, $post = null ) {
+    if ( self::$drafts_only && $post instanceof WP_Post ) {
+      $why = self::drafts_only_guard( (int) $post->ID, 'Removing', '', true );
+      if ( $why !== true ) {
+        self::net_refuse( $why );
+      }
+    }
+    return $check;
+  }
+
+  public static function net_terms( $object_id = 0, $unused = null, $taxonomy = '' ) {
+    if ( !self::$drafts_only ) {
+      return;
+    }
+    // The action also fires for objects that are not posts, and a user or a link can share
+    // a post's numeric id. Only a taxonomy that belongs to the post's own type is a post write.
+    $post = get_post( (int) $object_id );
+    $tax = $post ? get_taxonomy( (string) $taxonomy ) : null;
+    if ( !$post || !$tax || !in_array( $post->post_type, (array) $tax->object_type, true ) ) {
+      return;
+    }
+    $why = self::drafts_only_guard( (int) $post->ID, 'Changing the terms of' );
+    if ( $why !== true ) {
+      self::net_refuse( $why );
+    }
+  }
+
+  #endregion
+
+  #region Deletion by another name
+
+  /**
+  * Post statuses a tool may not write. Both are DELETIONS that wait for a daily job.
+  *
+  * 'trash': wp_scheduled_delete() permanently deletes every post that carries a
+  * _wp_trash_meta_time older than EMPTY_TRASH_DAYS, and a generic meta writer could stamp
+  * that key with a date in 1970. So "set post_status to trash" plus one meta write was a
+  * permanent delete with no approval and no two steps, reached from the write level, which
+  * the README defines as "no destructive tools".
+  *
+  * 'auto-draft': wp_delete_auto_drafts() force-deletes every auto-draft whose post_date is
+  * more than seven days old, and post_date is an ordinary field. Same outcome, no meta
+  * needed.
+  *
+  * Refused rather than routed to the delete tool or held by argument. The tool that does
+  * this honestly is wp_delete_post, which the approval gate holds by its name, and a second
+  * door that merely behaves like it would have to be found and held again by every future
+  * tool that takes a status. A refusal is closed by construction.
+  *
+  * @return string|null The refusal, or null when the status is fine to write.
+  */
+  public static function status_write_refusal( $status, string $noun = 'post' ): ?string {
+    if ( !is_scalar( $status ) ) {
+      return null;
+    }
+    $status = strtolower( trim( (string) $status ) );
+    if ( $status === 'trash' ) {
+      return 'Setting a status of "trash" is refused here: a trashed ' . $noun . ' is deleted for good by WordPress\'s daily clean-up, so this is a deletion by another name and the write level does not delete. Use wp_delete_' . $noun . ', which says whether the result can be restored and is held for approval where that is switched on.';
+    }
+    if ( $status === 'auto-draft' ) {
+      return 'Setting a status of "auto-draft" is refused here: WordPress deletes old auto-drafts for good in its daily clean-up, so this is a deletion by another name. Use wp_delete_' . $noun . '.';
+    }
+    // A comment marked spam is permanently deleted once it is old enough by any anti-spam
+    // plugin that purges its spam queue: Akismet, which ships with WordPress, deletes every
+    // 'spam' comment older than fifteen days from a daily event it registers unconditionally.
+    // Measured: an old comment moved to spam was gone the next run, while the same comment left
+    // approved, and a recent one moved to spam, both survived. So 'spam' on a comment is the
+    // comment's version of 'trash'. Marking spam is a moderation decision for a person in
+    // wp-admin; wp_delete_comment is the tool that says it is a deletion.
+    if ( $noun === 'comment' && $status === 'spam' ) {
+      return 'Setting a comment to "spam" is refused here: anti-spam plugins permanently delete old spam in their daily clean-up (Akismet does, after fifteen days), so this is a deletion by another name and the write level does not delete. A person can mark spam in wp-admin; wp_delete_comment is the tool that says what it does and is held for approval where that is switched on.';
+    }
+    return null;
+  }
+
+  /**
+  * Meta keys core uses to decide what to delete, which no tool may write.
+  *
+  * The _wp_trash_meta_ family is the schedule wp_scheduled_delete() reads (see
+  * status_write_refusal()). Only core's own wp_trash_post() and wp_untrash_post() may touch
+  * it, and trash_meta_net() lets exactly those through. Matched case-insensitively and
+  * ignoring trailing spaces, because the meta_key column compares that way: "_WP_TRASH_META_TIME "
+  * is the same row to every query WordPress runs.
+  *
+  * Not on the list, and why: _edit_lock only says who is editing, _wp_desired_post_slug only
+  * names the slug an untrash restores and _wp_old_slug only adds a redirect from a slug the
+  * writer could already have set directly. Each is reachable by an ordinary content edit and
+  * none of them removes anything.
+  *
+  * @return string|null The refusal, or null when the key is fine.
+  */
+  public static function protected_meta_refusal( $key ): ?string {
+    if ( !is_string( $key ) ) {
+      return null;
+    }
+    $needle = strtolower( rtrim( $key ) );
+    if ( strncmp( $needle, '_wp_trash_meta_', 15 ) === 0 ) {
+      return 'The meta key "' . $key . '" is refused: WordPress deletes posts and comments for good on the schedule these keys hold, so writing one is a deletion by another name. Use wp_delete_post.';
+    }
+    return null;
+  }
+
+  /**
+  * The posts core is trashing, untrashing or deleting right now, whose own bookkeeping may be
+  * written. A set, not one id: deleting a post deletes its revisions from inside the call, so
+  * two deletions are open at once and the outer one still has meta to clear after the inner
+  * one has finished.
+  *
+  * @var array<int,true>
+  */
+  private static $trash_meta_posts = [];
+
+  /**
+  * The same refusal for every writer, not only the tools that remember to ask.
+  *
+  * An ACF field, an Elementor save or another plugin's tool writes meta through the same
+  * three functions, so the tool-level refusal alone would be a policy about one tool. Active
+  * only while a tool call is in flight, so wp-admin, cron and wp-cli are untouched.
+  */
+  public static function install_trash_meta_net(): void {
+    foreach ( [ 'add', 'update', 'delete' ] as $op ) {
+      add_filter( $op . '_post_metadata', [ __CLASS__, 'trash_meta_net' ], PHP_INT_MIN, 3 );
+    }
+    add_filter( 'update_post_metadata_by_mid', [ __CLASS__, 'trash_meta_net_by_mid' ], PHP_INT_MIN, 4 );
+    add_filter( 'delete_post_metadata_by_mid', [ __CLASS__, 'trash_meta_net_by_mid' ], PHP_INT_MIN, 2 );
+    // Core's own trash, untrash and permanent delete write or clear the key in between these
+    // pairs (wp_delete_post() removes it before it removes the row). Scoped to the one post, so
+    // it is not a window for anything else.
+    foreach ( [ 'wp_trash_post', 'untrash_post', 'before_delete_post' ] as $hook ) {
+      add_action( $hook, function ( $post_id ) {
+        self::$trash_meta_posts[ (int) $post_id ] = true;
+      }, PHP_INT_MIN );
+    }
+    // wp_delete_attachment() clears the key before it fires any action, so the only door in
+    // front of it is its pre-filter. Last, and only when nobody short-circuited the delete.
+    add_filter( 'pre_delete_attachment', function ( $check, $post = null ) {
+      if ( $check === null && $post instanceof WP_Post ) {
+        self::$trash_meta_posts[ (int) $post->ID ] = true;
+      }
+      return $check;
+    }, PHP_INT_MAX, 2 );
+    foreach ( [ 'trashed_post', 'untrashed_post', 'deleted_post' ] as $hook ) {
+      add_action( $hook, function ( $post_id ) {
+        unset( self::$trash_meta_posts[ (int) $post_id ] );
+      }, PHP_INT_MAX );
+    }
+  }
+
+  /** Whether a tool call has started and not yet finished in this request. */
+  public static function tool_in_flight(): bool {
+    return did_action( 'gmcp_tool_start' ) > did_action( 'gmcp_tool_called' );
+  }
+
+  public static function trash_meta_net( $check, $object_id = 0, $meta_key = '' ) {
+    if ( self::tool_in_flight() && !isset( self::$trash_meta_posts[ (int) $object_id ] ) ) {
+      $why = self::protected_meta_refusal( $meta_key );
+      if ( $why !== null ) {
+        throw new GMCP_Policy_Refusal( $why );
+      }
+    }
+    return $check;
+  }
+
+  public static function trash_meta_net_by_mid( $check, $meta_id = 0, $meta_value = null, $meta_key = false ) {
+    if ( self::tool_in_flight() ) {
+      $row = function_exists( 'get_metadata_by_mid' ) ? get_metadata_by_mid( 'post', (int) $meta_id ) : null;
+      $on = $row ? (int) $row->post_id : 0;
+      if ( !isset( self::$trash_meta_posts[ $on ] ) ) {
+        foreach ( [ $meta_key, $row->meta_key ?? null ] as $candidate ) {
+          $why = self::protected_meta_refusal( $candidate );
+          if ( $why !== null ) {
+            throw new GMCP_Policy_Refusal( $why );
+          }
+        }
+      }
+    }
+    return $check;
+  }
+
+  #endregion
+
+  /**
+  * Post types that are form submissions, which the generic post READERS must not return.
+  *
+  * Flamingo (the message store behind Contact Form 7) and Ninja Forms keep a submission as a
+  * post, with the answers, and for Flamingo the visitor's IP address and user agent, in post
+  * meta. wp_get_post_meta is a read-level tool that returns any key on any post, so without
+  * this the admin-level submission tools of the forms group would stand beside a read-level
+  * door to the same rows, and "personal data is admin level" would be a sentence about the
+  * tool and not about the data. As elsewhere in this class, the policy belongs to the post
+  * type and is asked by each reader.
+  *
+  * The names are Flamingo's and Ninja Forms' own post types (UNVERIFIED: written from memory
+  * of their source). A site with another form store that uses posts adds its type through
+  * gmcp_personal_data_post_types.
+  *
+  * Reads only. Writing one of these rows is not what this guards, and no tool in this plugin
+  * writes a submission.
+  *
+  * @return string[]
+  */
+  public static function personal_data_post_types(): array {
+    return (array) apply_filters( 'gmcp_personal_data_post_types', [
+      'flamingo_inbound', 'flamingo_contact', 'flamingo_outbound', 'nf_sub',
+    ] );
+  }
+
+  /**
+  * @param int    $post_id The post a read is aimed at.
+  * @param string $type    A post type named directly, for a listing that names no post.
+  * @return true|string True when the read is allowed, otherwise the refusal.
+  */
+  public static function personal_data_post_guard( int $post_id, string $type = '' ) {
+    if ( $type === '' ) {
+      $type = $post_id > 0 ? (string) get_post_type( $post_id ) : '';
+    }
+    if ( $type === '' || !in_array( $type, self::personal_data_post_types(), true ) ) {
+      return true;
+    }
+    return 'A ' . $type . ' is a form submission: personal data a member of the public typed, stored as a post. The generic post readers do not return it, because they are available to a read-only key and a submission is admin-level data. '
+      . 'Use the form tools for that plugin (cf7_, fluentform_ or ninjaform_), which return it at admin level, never return passwords, file uploads, IP addresses or user agents, and report whether the store is there at all.';
+  }
+
+  /**
+  * The two read policies about a post, asked together: a form submission is never returned by
+  * a generic reader, and a commerce post is returned only at admin level.
+  *
+  * Asked by every tool that takes a post id and COPIES from it or otherwise carries what it
+  * holds somewhere else. Those are reads wearing a write's name. wp_copy_post_meta guarded
+  * only the post it wrote to, so a readwrite key copied every meta key of a Flamingo message
+  * (its _meta holds the visitor's IP address and user agent) or of an order onto its own draft
+  * and read the draft back with wp_get_post_meta, which is a read the guards above would have
+  * refused on the original.
+  *
+  * @return true|string True when the post may be read through a generic tool, otherwise the refusal.
+  */
+  public static function post_read_guard( int $post_id ) {
+    $held = self::personal_data_post_guard( $post_id );
+    if ( $held !== true ) {
+      return $held;
+    }
+    return self::commerce_post_read_guard( $post_id );
+  }
+
+  /**
+  * A post may not be retyped out of, or into, a form-submission type.
+  *
+  * Retyping is the other way to make a read guard about a post type stop applying: the guard
+  * is asked "what type is this post", so a message retyped to "post" is an ordinary post whose
+  * body wp_get_post returns, and Flamingo builds that body from the submission's fields,
+  * consent and meta, the visitor's IP address and user agent among them. Retyping INTO one
+  * is refused for the same family of reasons as creating one (a forged submission that the
+  * form tools then report as received), and costs a legitimate caller nothing.
+  *
+  * A retype of a commerce post is refused by commerce_post_guard(), which refuses every
+  * generic write to one.
+  *
+  * @param int    $post_id     The post being changed, or 0 for a creation.
+  * @param string $target_type The post type the write would leave it with.
+  * @return true|string
+  */
+  public static function personal_data_retype_guard( int $post_id, string $target_type, string $verb = 'Updating' ) {
+    $target = strtolower( trim( $target_type ) );
+    $current = $post_id > 0 ? strtolower( (string) get_post_type( $post_id ) ) : '';
+    if ( $target === $current ) {
+      return true;
+    }
+    $held = array_map( 'strtolower', array_map( 'strval', self::personal_data_post_types() ) );
+    $from = $current !== '' && in_array( $current, $held, true );
+    $to = $target !== '' && in_array( $target, $held, true );
+    if ( !$from && !$to ) {
+      return true;
+    }
+    return ( $post_id > 0 ? $verb . ' a post to change its type ' . ( $from ? 'from' : 'to' ) . ' ' . ( $from ? $current : $target ) : 'Creating a ' . $target )
+      . ' is refused: ' . ( $from ? $current : $target ) . ' is a form submission, personal data that the generic post tools never return. '
+      . 'Retyping a submission would make it an ordinary post those tools read, and a submission made by hand is not one a visitor sent. The form tools read submissions; nothing here writes one.';
+  }
+
   /**
   * Whether a post is an Elementor library template something still renders, and the
   * sentence to refuse with.
@@ -1018,6 +1580,19 @@ class GMCP_Core {
   }
 
   /**
+  * A preview link's token, cut out of a string.
+  *
+  * A link made by wp_create_preview_link is a bearer credential for an unpublished post, and
+  * it travels in a URL, so no field NAME says it is secret: it is a value under "url" or
+  * inside a reply. The one place that can recognise it is the parameter it rides in. Used by
+  * redact() for every string leaf (which is what the audit log and the debug log both ask)
+  * and by the audit log for the reply text it keeps.
+  */
+  public static function scrub_preview_tokens( string $text ): string {
+    return GMCP_Diag_Util::scrub_preview_tokens( $text );
+  }
+
+  /**
   * A copy of a value with anything credential-shaped replaced.
   *
   * Unlike holds_credential() above, which refuses the whole value if any part of it
@@ -1028,13 +1603,23 @@ class GMCP_Core {
   * Walks arrays and objects. Does not try to parse strings: a JSON blob under an
   * innocuous field name is left whole, and callers that care should test it with
   * field_looks_secret() on the field it arrived under.
+  *
+  * $scrub_preview is for what is WRITTEN DOWN (the audit log, the debug log), where a
+  * preview link's token must never land, and defaults to on so a new logging caller is
+  * safe without knowing about it. A caller that is answering a tool call with a value the
+  * site stores (a theme mod, an ACF field, a Kirki setting) passes false: the reply is the
+  * data, and a stored string that happens to contain "gmcp_preview=" is the site's own
+  * text, which was being returned as "gmcp_preview=[redacted]".
   */
-  public static function redact( $value, int $depth = 0 ) {
+  public static function redact( $value, int $depth = 0, bool $scrub_preview = true ) {
     if ( $depth > 8 ) {
       return '[too deeply nested to record]';
     }
     if ( is_object( $value ) ) {
       $value = get_object_vars( $value );
+    }
+    if ( is_string( $value ) ) {
+      return $scrub_preview ? self::scrub_preview_tokens( $value ) : $value;
     }
     if ( !is_array( $value ) ) {
       return $value;
@@ -1045,7 +1630,7 @@ class GMCP_Core {
         $out[ $key ] = '[redacted]';
         continue;
       }
-      $out[ $key ] = self::redact( $inner, $depth + 1 );
+      $out[ $key ] = self::redact( $inner, $depth + 1, $scrub_preview );
     }
     return $out;
   }
@@ -1183,6 +1768,12 @@ class GMCP_Core {
       new GMCP_Audit();
     }
 
+    // The queue of calls waiting for a person. Booted unconditionally, like the table check
+    // in the audit log: the mode can be switched to 'never' while requests are still open,
+    // and the screen has to be able to answer them and the daily event to lapse them.
+    GMCP_Approvals::boot();
+    GMCP_Core::install_trash_meta_net();
+
     // How to put back what changed.
     if ( $this->get_option( 'mcp_change_journal' ) ) {
       new GMCP_Journal();
@@ -1205,6 +1796,9 @@ class GMCP_Core {
 
     if ( $this->get_option( 'mcp_tools_admin' ) ) {
       new GMCP_Tools_Admin( $this );
+      // Same switch, and the preview-link check it carries runs on the public front end, so
+      // turning the group off ends every link it ever issued rather than leaving them live.
+      new GMCP_Tools_Diagnostics( $this );
     }
 
     if ( $this->get_option( 'mcp_tools_rest' ) ) {
@@ -1305,6 +1899,30 @@ class GMCP_Core {
     if ( $this->get_option( 'mcp_tools_wp_activity_log' ) ) {
       new GMCP_Tools_Wsal();
     }
+
+    // Redirection and Polylang. Constructed whenever the switch is on and not gated on the
+    // plugin having loaded, like the groups above: the per-call check in each handle_call()
+    // answers "this plugin is not loaded", which is a different statement from "there are
+    // none" and the one an operator needs.
+    if ( $this->get_option( 'mcp_tools_redirection' ) ) {
+      new GMCP_Tools_Redirection();
+    }
+    if ( $this->get_option( 'mcp_tools_polylang' ) ) {
+      new GMCP_Tools_Polylang();
+    }
+    // Rank Math and All in One SEO. Each tool is offered only while its plugin is loaded
+    // (checked at listing and again per call in GMCP_Tools_Seo), so switching the group on
+    // for a site with neither registers nothing rather than four tools that can only fail.
+    if ( $this->get_option( 'mcp_tools_seo' ) ) {
+      new GMCP_Tools_Seo();
+    }
+
+    // Form submissions, read only. Same per-plugin registration as the SEO group, and the
+    // generic post readers refuse the post types Flamingo and Ninja Forms store submissions
+    // under (GMCP_Core::personal_data_post_guard()), whether or not this switch is on.
+    if ( $this->get_option( 'mcp_tools_forms' ) ) {
+      new GMCP_Tools_Forms();
+    }
   }
 
   /**
@@ -1359,6 +1977,10 @@ class GMCP_Core {
 
     $token = bin2hex( random_bytes( 8 ) );
     set_transient( $key, $token, 2 * MINUTE_IN_SECONDS );
+    // Said out loud for the approval queue: this call changed nothing and handed back a
+    // token, so an approval it ran under has not been spent on an effect. @see
+    // GMCP_Approvals::finish().
+    self::$gate_withheld = true;
 
     // The backup situation belongs in the summary rather than in a gate. Whoever reads
     // this is about to approve something irreversible, and "the last backup finished
@@ -1453,4 +2075,20 @@ class GMCP_Core {
   }
 
   #endregion
+}
+
+/**
+* Thrown by the drafts-only net under the tools, before anything is written.
+*
+* Its own class so a caller that must tell a policy refusal from a bug can, and so the
+* journal's undo can answer with the sentence instead of a stack of "failed".
+*/
+class GMCP_Drafts_Only_Refusal extends RuntimeException {
+}
+
+/**
+* Thrown by a net under the tools when a write is refused by a policy that is not the
+* drafts-only one (the deletion-by-another-name meta keys).
+*/
+class GMCP_Policy_Refusal extends RuntimeException {
 }

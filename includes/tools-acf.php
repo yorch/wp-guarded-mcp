@@ -493,7 +493,7 @@ class GMCP_Tools_Acf {
       } catch ( Throwable $e ) {
         return $this->error( $r, 'get_field() threw an exception: ' . $e->getMessage() );
       }
-      $value = GMCP_Core::redact( $value );
+      $value = GMCP_Core::redact( $value, 0, false );
     }
 
     return $this->json( $r, [ 'field' => $field, 'value' => $value, 'formatted' => $format ] );
@@ -684,7 +684,7 @@ class GMCP_Tools_Acf {
       if ( $protected_row || GMCP_Core::field_looks_secret( (string) $name ) || GMCP_Core::field_looks_secret( (string) ( $field['name'] ?? '' ) ) ) {
         $value = '[redacted]';
       } else {
-        $value = GMCP_Core::redact( $value );
+        $value = GMCP_Core::redact( $value, 0, false );
       }
       $result[ $name ] = [
         'key'   => $field['key'] ?? '',
