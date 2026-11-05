@@ -314,9 +314,10 @@ class GMCP_Audit {
     // Free text as well as names: wp_update_post's content, excerpt and title are strings
     // that start with a tag or a word, so redact() above, which judges field names, keeps
     // them whole, and a body with {"api_key":"..."} or a pasted define('DB_PASSWORD', ...) in
-    // it was written to this table verbatim. Only the first MAX_ARGS bytes of a leaf are
-    // scanned because no more than that can be stored: the encoded call is capped there.
-    $redacted = GMCP_Core::blank_credential_strings( $redacted, 0, self::MAX_ARGS );
+    // it was written to this table verbatim. What is replaced is the credential, not the
+    // string: a decoy at the end of a post body used to blank the whole of it. Leaves were cut
+    // to what can be stored above, so the scan reads no more than that.
+    $redacted = GMCP_Core::redact_credential_spans( $redacted );
     $json = wp_json_encode( $redacted, JSON_UNESCAPED_SLASHES );
     if ( $json === false ) {
       return '{"__gmcp":"arguments could not be encoded"}';
@@ -503,6 +504,25 @@ class GMCP_Audit {
   }
 
   /**
+  * An event's arguments as the table may keep them: read as text for credentials the same way a
+  * call's are (spans blanked, the rest kept), except that "caller" is kept as it is.
+  *
+  * The caller is who asked, named by a key's id or label ("key:3"): an identity, shown to the
+  * administrator who answers the request, and not a secret. It is neither judged nor blanked,
+  * where the assignment scrub that used to run over every string stored it as "key:[redacted]".
+  */
+  public static function event_args( array $given ): array {
+    $caller = isset( $given['caller'] ) && is_scalar( $given['caller'] ) ? mb_substr( (string) $given['caller'], 0, 191 ) : null;
+    unset( $given['caller'] );
+    $unused = 0;
+    $args = GMCP_Core::redact_credential_spans( GMCP_Core::redact( GMCP_Core::cut_leaves( $given, self::MAX_ARGS + 1024, $unused ) ) );
+    if ( $caller !== null ) {
+      $args['caller'] = $caller;
+    }
+    return $args;
+  }
+
+  /**
   * Write a row that is not a tool call.
   *
   * The approval queue has events no tool call describes: a person approving a request
@@ -526,7 +546,7 @@ class GMCP_Audit {
       return;
     }
     $actor = (int) ( $fields['actor'] ?? 0 );
-    $args = GMCP_Core::blank_credential_strings( GMCP_Core::redact( is_array( $fields['args'] ?? null ) ? $fields['args'] : [] ), 0, self::MAX_ARGS );
+    $args = self::event_args( is_array( $fields['args'] ?? null ) ? $fields['args'] : [] );
     $json = wp_json_encode( $args, JSON_UNESCAPED_SLASHES );
     self::append( [
       'ts' => gmdate( 'Y-m-d H:i:s' ),

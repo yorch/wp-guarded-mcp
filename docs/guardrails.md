@@ -429,12 +429,16 @@ something that looks harmless and is not, so each says what it cannot promise.
   `gmcp[preview]`, percent-encoded characters in the name or the `=`) out of every
   string it is handed on the logging paths, which is what the audit log's
   arguments and the debug trace both use, and the audit log applies the same
-  scrub to the reply it keeps. On those same paths a credential written as an
-  assignment inside a string is blanked as well: a name that field_looks_secret()
-  flags, followed by `=`, `:` or `=>` (plain or percent-encoded), so `smtp_pwd=...`
-  in a query or a message, and a `Bearer` or `Basic` credential whatever it is
-  named. It is structural, not a guess about content: a bare token with no key in
-  front of it is not recognised, and nothing says it is. It does not scrub what a
+  scrub to the reply it keeps. A credential written as an assignment inside a
+  string is handled by channel, because the right answer differs. The debug log
+  blanks any value after a name that field_looks_secret() flags (see below): over-
+  redacting a log is acceptable. The audit log and the journal do not use that rule,
+  because it turned `To reset your password: click the link we sent. Our author:
+  Jane Doe.` into `password: [redacted] the link we sent. Our author: [redacted] Doe.`
+  in a record of what a post said. They use `GMCP_Credential_Scan`, which flags an
+  assignment only when its VALUE looks like a credential, and the audit arguments
+  blank just the span it found. It is structural, not a guess about content: a bare token with no key in
+  front of it and no known prefix is not recognised, and nothing says it is. It does not scrub what a
   tool returns to its caller: a stored theme mod or field that happens to contain
   the text is the site's own
   data, and the readers pass `scrub_preview = false` so it comes back as stored. The

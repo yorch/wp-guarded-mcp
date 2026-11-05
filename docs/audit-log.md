@@ -55,13 +55,28 @@ Names are not the only signal. A post body, an excerpt or a title is a string th
 begins with a tag or a word, so `redact()` keeps it whole, and a body with a pasted
 `{"api_key": "..."}`, a `define( 'DB_PASSWORD', '...' )` line or an Authorization
 header in it used to be stored verbatim. Every string leaf of the arguments is now
-also read as text (`GMCP_Credential_Scan`) and replaced by `[redacted]` when it holds
-one, as are the target column, the first thousand characters of the reply the entry
-keeps (which then reads as withheld) and the short values and post label of the change
-summary. It is a heuristic: it finds the shapes people paste, such as quoted
-`name = value` pairs under a secret-ended name, bearer headers, private key blocks
-and the common key prefixes, and it does not find a secret that is a bare word.
-Ordinary prose that mentions a password is recorded as written.
+also read as text (`GMCP_Credential_Scan`), and what is replaced by `[redacted]` is the
+credential and not the string: the scanner reports where each one is, so a post body
+that holds one define() line records everything around it. (Blanking the whole string
+let a short decoy at the end of a body, `<!-- define("DB_PASSWORD","abcd") -->`, erase
+a script tag in front of it from the log; the changes column describes anything over
+120 characters by its size alone, so nothing else would have shown it.) A string that
+is a JSON or serialized blob with a secret-named field inside cannot be taken apart and
+is still blanked whole. The target column, the first thousand characters of the reply
+the entry keeps (which then reads as withheld) and the short values and post label of
+the change summary are not cut up: each is replaced whole when it holds one, and for
+those short columns the test is wider than the arguments' (see below). It is a
+heuristic: it finds the shapes people paste, such as quoted `name = value` pairs under a
+secret-ended name, unquoted ones whose value looks like a token (six characters or more
+with a digit, or sixteen without), bearer and basic headers, URL user information, private
+key blocks and the common key prefixes, and it does not find a secret that is a bare word,
+or an unquoted lowercase word under a secret-named key with no digit in it. The debug log
+does take that last one; see `docs/guardrails.md`. A value that is plainly what a template
+writes where a secret goes (`password_here`, `YOUR_TOKEN_HERE`, `********`, `<token>`,
+`${DB_PASS}`, `user:pass@host`) is not a credential, so WordPress's own sample config line
+does not cost a post its undo. Ordinary prose that mentions a password is recorded as
+written, and so is a caller named by a key id: the approval events' `caller` is an
+identity, not a secret, and is never blanked.
 
 One credential has no field name to give it away: a draft preview link, whose
 token rides in a URL. `redact()` therefore also scrubs the `gmcp_preview`

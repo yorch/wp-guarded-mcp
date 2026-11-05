@@ -1964,6 +1964,42 @@ check "the row names the option, and says the arguments were cut and how large t
 wpe 'update_option("blogdescription", '"$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$PAD_WAS")"');$o=get_option("gmcp_options",[]);$o["mcp_activity_log"]=('"$PAD_A_WAS"'===1);update_option("gmcp_options",$o,false);' >/dev/null
 check "put back: the description is as it was" "$(wpe 'wp_cache_flush(); echo get_option("blogdescription");')" "$PAD_WAS"
 
+echo "-- audit arguments: ordinary text is recorded as written, and a decoy does not wipe the value --"
+# The audit log's arguments are a record of what a call SAID. An assignment scrub that blanked any
+# value after a word like "password" or "author" stored "To reset your password: [redacted] the link
+# we sent. Our author: [redacted] Doe." for an ordinary post, and approval events recorded their
+# caller as "key:[redacted]". And a short define() comment at the end of a body turned the WHOLE
+# body, script tag included, into "[redacted]". Asserted on the stored rows.
+AR_A_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_activity_log"] ?? 0 ? 1 : 0;')
+wpe '$o=get_option("gmcp_options",[]);$o["mcp_activity_log"]=true;update_option("gmcp_options",$o,false);' >/dev/null
+AR_FIRST=$(wpe 'global $wpdb; echo (int) $wpdb->get_var("SELECT COALESCE(MAX(id),0) FROM " . GMCP_Audit::table());')
+AR_PROSE='To reset your password: click the link we sent. Our author: Jane Doe.'
+AR_DECOY='<script src="https://evil.example/x.js"></script><p>AR Hello</p><!-- define("DB_PASSWORD","arabcd") -->'
+for AR_BODY in "$AR_PROSE" "$AR_DECOY"; do
+  python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"AR probe","post_status":"draft","post_content":sys.argv[1]}}}))' "$AR_BODY" > "$OUT/ar.json"
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d @"$OUT/ar.json" -o "$OUT/ar_resp"
+done
+ar_args() { # ar_args <which, 1 = oldest of the two> -> the stored args of that wp_create_post row
+  wpe 'global $wpdb; echo (string) $wpdb->get_var( "SELECT args FROM " . GMCP_Audit::table() . " WHERE id > '"$AR_FIRST"' AND tool = \"wp_create_post\" ORDER BY id ASC LIMIT 1 OFFSET '"$(( $1 - 1 ))"'" );'
+}
+AR_ROW1=$(ar_args 1)
+AR_ROW2=$(ar_args 2)
+check "CONTROL: both posts were created (the probes ran)" "$(wpe 'echo count( get_posts( [ "title" => "AR probe", "post_status" => "draft", "numberposts" => -1 ] ) );')" "2"
+check "CONTROL: both calls left a row" "$([ -n "$AR_ROW1" ] && [ -n "$AR_ROW2" ] && echo yes || echo no)" "yes"
+check "ordinary prose that mentions a password and an author is recorded as written" "$(printf %s "$AR_ROW1" | grep -c 'To reset your password: click the link we sent. Our author: Jane Doe.')" "1"
+check "the decoy's script tag and paragraph are recorded" "$(printf %s "$AR_ROW2" | grep -c 'evil.example/x.js.*AR Hello')" "1"
+check "the decoy's password is not" "$(printf %s "$AR_ROW2" | grep -c 'arabcd')" "0"
+check "the decoy's argument is not blanked whole" "$(printf %s "$AR_ROW2" | grep -c '"post_content":"\[redacted\]"')" "0"
+check "what stands where the password was is the marker" "$(printf %s "$AR_ROW2" | grep -c 'DB_PASSWORD.*\[redacted\]')" "1"
+wpe 'GMCP_Audit::record_event( [ "tool" => "approval:probe", "actor" => 1, "args" => [ "request" => 7, "caller" => "key:12", "note" => "smtp_pwd=arhunter2x9" ] ] );' >/dev/null
+AR_EV=$(wpe 'global $wpdb; echo (string) $wpdb->get_var( "SELECT args FROM " . GMCP_Audit::table() . " WHERE tool = \"approval:probe\" ORDER BY id DESC LIMIT 1" );')
+check "CONTROL: the event row was written" "$([ -n "$AR_EV" ] && echo yes || echo no)" "yes"
+check "an event keeps its caller as the key id it is" "$(printf %s "$AR_EV" | grep -c '"caller":"key:12"')" "1"
+check "an event still blanks a credential in another argument" "$(printf %s "$AR_EV" | grep -c 'arhunter2x9')" "0"
+wpe 'foreach ( get_posts( [ "title" => "AR probe", "post_status" => "any", "numberposts" => -1 ] ) as $p ) { wp_delete_post( $p->ID, true ); } $o=get_option("gmcp_options",[]);$o["mcp_activity_log"]=('"$AR_A_WAS"'===1);update_option("gmcp_options",$o,false);' >/dev/null
+check "put back: the probe posts are gone" "$(wpe 'echo count( get_posts( [ "title" => "AR probe", "post_status" => "any", "numberposts" => -1 ] ) );')" "0"
+
 echo "-- a form submission and a credential in one call: the withholding comes first --"
 # The change record for a personal-data post is withheld whole before anything else judges it, and
 # an ordinary post edited in the same call still gets the credential scan. Asserted on what the

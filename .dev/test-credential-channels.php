@@ -220,5 +220,99 @@ foreach ( glob( __DIR__ . '/../includes/*.php' ) as $file ) {
 check( 'CONTROL: the lint saw the plugin\'s error_log() calls (it can find a present one)', $statements > 40, true );
 check( 'no error_log() in includes/ prints request-derived text without log_text()', $violations, [] );
 
+/* ------------------------------------------------------------------------------------------
+ * The audit log's arguments: the credential is replaced, the rest of the value is recorded
+ * ---------------------------------------------------------------------------------------- */
+echo "-- audit arguments: only the matched spans are replaced --\n";
+function audit_arg( $value ) {
+  $json = GMCP_Audit::storable_args( [ 'post_content' => $value ] );
+  $row = json_decode( $json, true );
+  return is_array( $row ) ? ( $row['post_content'] ?? null ) : null;
+}
+// The decoy. A short define() comment at the end of a body used to turn the WHOLE body into
+// "[redacted]", script tag included, and the changes column describes anything over 120 characters
+// by its size alone, so the script left no trace anywhere in the log.
+$decoy = '<script src="https://evil.example/x.js"></script><p>Hello</p><!-- define("DB_PASSWORD","abcd") -->';
+$kept = audit_arg( $decoy );
+check( 'CONTROL: the decoy is credential-shaped (the scanner flags it)', GMCP_Credential_Scan::text_holds( $decoy ), true );
+check( 'the script tag and the paragraph are recorded', [ strpos( (string) $kept, '<script src="https://evil.example/x.js"></script>' ) !== false, strpos( (string) $kept, '<p>Hello</p>' ) !== false ], [ true, true ] );
+check( 'the password in the comment is not', strpos( (string) $kept, 'abcd' ), false );
+check( 'the argument is not wiped whole', $kept === '[redacted]', false );
+check( 'what stands where the secret was is the marker', strpos( (string) $kept, 'define("DB_PASSWORD","[redacted]")' ) !== false, true );
+// Spans in the original's coordinates when the text had to be unescaped to be read.
+$escaped = 'before {\"access_token\":\"abcd1234efgh\"} after';
+check( 'a secret inside escaped JSON is replaced and the text around it is kept', audit_arg( $escaped ), 'before {\"access_token\":\"[redacted]\"} after' );
+$entities = 'a &quot;client_secret&quot;:&quot;zzzz1234&quot; b';
+check( 'a secret inside entity-encoded quotes likewise', audit_arg( $entities ), 'a &quot;client_secret&quot;:&quot;[redacted]&quot; b' );
+check( 'two secrets in one string are both replaced and the middle is kept',
+  audit_arg( 'x smtp_pwd=hunter2x9 middle define("AUTH_KEY","k3v!x9Zq77abcdEF") y' ), 'x smtp_pwd=[redacted] middle define("AUTH_KEY","[redacted]") y' );
+check( 'a private key block is replaced from its first line to its end marker and what follows is kept',
+  audit_arg( "key:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\nafter" ), "key:\n[redacted]\nafter" );
+check( 'a key block with no end marker takes the rest of the text', audit_arg( "k\n-----BEGIN PRIVATE KEY-----\nMIIEow" ), "k\n[redacted]" );
+check( 'user information in a URL: the user and password go, the host stays', audit_arg( 'see https://deploy:Zq8x7Lm2@host.example/x' ), 'see https://[redacted]@host.example/x' );
+check( 'a JSON string argument with a secret-named field inside is still blanked whole (it cannot be taken apart)',
+  audit_arg( '{"smtp":{"pass":"hunter2"}}' ), '[redacted]' );
+check( 'every span returned lies inside the text and none overlap', ( function () use ( $decoy, $escaped, $entities ) {
+  foreach ( [ $decoy, $escaped, $entities, 'smtp_pwd=hunter2x9 define("AUTH_KEY","k3v!x9Zq77abcdEF")' ] as $t ) {
+    $end = 0;
+    foreach ( GMCP_Credential_Scan::spans( $t ) as [ $from, $len ] ) {
+      if ( $from < $end || $len <= 0 || $from + $len > strlen( $t ) ) {
+        return false;
+      }
+      $end = $from + $len;
+    }
+  }
+  return true;
+} )(), true );
+check( 'a scan that fails answers with the whole text, never with nowhere', ( function () {
+  $was = [ ini_get( 'pcre.backtrack_limit' ), ini_get( 'pcre.jit' ) ];
+  ini_set( 'pcre.jit', '0' );
+  ini_set( 'pcre.backtrack_limit', '1' );
+  $text = 'a define("X_PASSWORD","hunter2zz") and some words ' . str_repeat( 'filler ', 40 );
+  $spans = GMCP_Credential_Scan::spans( $text );
+  $holds = GMCP_Credential_Scan::text_holds( $text );
+  ini_set( 'pcre.backtrack_limit', $was[0] );
+  ini_set( 'pcre.jit', $was[1] );
+  return [ $spans === [ [ 0, strlen( $text ) ] ], $holds ];
+} )(), [ true, true ] );
+
+echo "-- audit arguments: ordinary text is recorded as written --\n";
+$prose = 'To reset your password: click the link we sent. Our author: Jane Doe.';
+check( 'CONTROL: the debug log, which is the aggressive channel, does change this text', GMCP_Core::log_text( $prose ) !== $prose, true );
+check( 'prose that mentions a password and an author is recorded verbatim', audit_arg( $prose ), $prose );
+check( 'redact() leaves a string that is not a preview link as it is', GMCP_Core::redact( [ 'm' => $prose ] ), [ 'm' => $prose ] );
+check( 'CONTROL: redact() still removes a preview token from a string',
+  strpos( (string) GMCP_Core::redact( [ 'm' => 'https://x.test/?p=1&gmcp_preview=0123456789abcdef0123456789abcdef01234567' ] )['m'], '0123456789abcdef' ), false );
+$ev = GMCP_Audit::event_args( [ 'request' => 12, 'tool' => 'wp_delete_post', 'caller' => 'key:3' ] );
+check( 'an approval event keeps the caller as the key id it is', $ev, [ 'request' => 12, 'tool' => 'wp_delete_post', 'caller' => 'key:3' ] );
+check( 'CONTROL: the same event still blanks a credential in another argument',
+  GMCP_Audit::event_args( [ 'request' => 12, 'note' => 'smtp_pwd=hunter2x9', 'caller' => 'key:3' ] )['note'], 'smtp_pwd=[redacted]' );
+
+/* ------------------------------------------------------------------------------------------
+ * The matrix: the same inputs through each channel that records text
+ * ---------------------------------------------------------------------------------------- */
+echo "-- the matrix: inputs by channel --\n";
+// What the aggressive scrub (assignment text, any value) used to cover in the audit log, and
+// what covers it now. Each row: [ label, text, the secret in it, whether the audit log's precise
+// scanner must hide it (false = a documented gap the debug log still covers) ].
+$matrix = [
+  [ 'an assignment with a digit', 'a smtp_pwd=hunter2x9 b', 'hunter2x9', true ],
+  [ 'a define() line', "see define('DB_PASSWORD','h8Kq2xLm9pQ') here", 'h8Kq2xLm9pQ', true ],
+  [ 'JSON in a body', 'cfg {"api_key":"sk_live_abcdef1234567890"} end', 'abcdef1234567890', true ],
+  [ 'an Authorization header', 'Authorization: Bearer abcdefghijklmnop12345678 x', 'abcdefghijklmnop12345678', true ],
+  [ 'a short Bearer token (8 characters, a digit)', 'send Bearer abc12345 now', 'abc12345', true ],
+  [ 'a Basic credential, base64', 'Authorization is Basic dXNlcjpwYXNzd29yZA== ok', 'dXNlcjpwYXNzd29yZA==', true ],
+  [ 'a bare vendor key', 'key sk_' . 'live_4eC39HqLyjWDarjtT1zdp7dc' . ' ok', '4eC39HqLyjWDarjtT1zdp7dc', true ],
+  [ 'user information in a URL', 'at https://deploy:Zq8x7Lm2@host.example/x', 'Zq8x7Lm2', true ],
+  [ 'KNOWN GAP: a six-letter lowercase value with no digit', 'a smtp_pwd=hunter b', 'hunter', false ],
+  [ 'KNOWN GAP: a three-letter value', 'a token=abc b', 'abc', false ],
+];
+foreach ( $matrix as [ $label, $text, $secret, $audit_hides ] ) {
+  check( "CONTROL: $label: the text holds the secret", strpos( $text, $secret ) !== false, true );
+  $in_audit = (string) audit_arg( $text );
+  check( "audit args: $label", strpos( $in_audit, $secret ) === false, $audit_hides );
+  check( "debug log: $label is hidden", strpos( GMCP_Core::log_text( $text ), $secret ), false );
+}
+
 echo "\n$total checks, $fails failed\n";
 exit( min( 255, $fails ) );

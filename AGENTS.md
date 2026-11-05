@@ -142,7 +142,13 @@ only values that begin as JSON or serialized data, so a post body with `{"api_ke
 `define('DB_PASSWORD', ...)` line in the middle of it passed. `GMCP_Credential_Scan` is the text
 test, and the journal (`unsafe_to_keep()`, `post_previous()`, `label()`), `GMCP_Changes::describe()`,
 the audit log's arguments, target and reply, `redact_reversible()` and the approval queue's stored and
-printed view of a call (`GMCP_Approvals::view_value()`, per string value) all ask it. A post field that
+printed view of a call (`GMCP_Approvals::view_value()`, per string value) all ask it. It also says
+WHERE (`spans()`), and the audit log's arguments blank only those spans, so a decoy cannot wipe a
+whole value from the log; the journal keeps its whole-field drop, because a partly blanked value
+cannot be restored. The aggressive assignment scrub (any value after a secret-named key) belongs to
+the debug log only: in a record of what a call said it blanked ordinary prose. A value that is a
+documented placeholder (`password_here`, `YOUR_TOKEN_HERE`, `********`, `${VAR}`, `user:pass@`) is not
+a credential, with a counterpart test for each that a real-looking value under the same name still is. A post field that
 fails is left out of `previous` and named in `redacted_fields`; a placeholder is never stored, because
 undo would write it over live content. Tune it against false positives as hard as against misses: an
 ordinary body that says "password" must stay undoable, and `.dev/journal-pure.php` holds that control.

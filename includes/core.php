@@ -2118,7 +2118,12 @@ class GMCP_Core {
   *
   * Walks arrays and objects. Does not try to parse strings: a JSON blob under an
   * innocuous field name is left whole, and callers that care should test it with
-  * field_looks_secret() on the field it arrived under.
+  * field_looks_secret() on the field it arrived under. A string leaf gets the preview-link
+  * rule and nothing more: the assignment scrub that used to run here blanked ordinary text
+  * ("To reset your password: click the link" became "password: [redacted] the link") in a
+  * record whose job is to say what was written. Free text is judged as text by
+  * redact_credential_spans() for the audit log, and by log_line() for the debug log, which
+  * is the channel that takes the aggressive rule.
   *
   * $scrub_preview is for what is WRITTEN DOWN (the audit log, the debug log), where a
   * preview link's token must never land, and defaults to on so a new logging caller is
@@ -2135,7 +2140,7 @@ class GMCP_Core {
       $value = get_object_vars( $value );
     }
     if ( is_string( $value ) ) {
-      return $scrub_preview ? self::scrub_written_text( $value ) : $value;
+      return $scrub_preview ? self::scrub_preview_tokens( $value ) : $value;
     }
     if ( !is_array( $value ) ) {
       return $value;
@@ -2253,6 +2258,38 @@ class GMCP_Core {
     }
     foreach ( $value as $k => $inner ) {
       $value[ $k ] = self::cut_leaves( $inner, $max, $removed, $depth + 1 );
+    }
+    return $value;
+  }
+
+  /**
+  * A copy of a value in which each credential inside a string is replaced by the marker and
+  * everything around it is kept. What the audit log writes for a call's arguments.
+  *
+  * blank_credential_strings() replaces a flagged string whole, which is the right answer when the
+  * string cannot be taken apart (a JSON or serialized blob with a secret-named field in it, and
+  * the journal's undo record, where a partly blanked value could not be restored). For a record
+  * of what a call SAID it is the wrong one, in two ways. A short decoy turned the whole of a post
+  * body into "[redacted]", so a body that began with a script tag and ended with a stray
+  * define('DB_PASSWORD', ...) comment left no trace of the script. And it recorded less than it
+  * knew: the scanner has already found where the secret is.
+  *
+  * So a string that holds_credential() flags structurally (a blob) is still blanked whole, and
+  * any other string has only the spans GMCP_Credential_Scan found replaced. A field name that
+  * looks secret is already blanked by redact(), before this runs.
+  */
+  public static function redact_credential_spans( $value, int $depth = 0 ) {
+    if ( $depth > 8 ) {
+      return $value;
+    }
+    if ( is_string( $value ) ) {
+      return self::holds_credential( $value ) ? self::REDACTION_MARKER : GMCP_Credential_Scan::redact_spans( $value, self::REDACTION_MARKER );
+    }
+    if ( !is_array( $value ) ) {
+      return $value;
+    }
+    foreach ( $value as $k => $inner ) {
+      $value[ $k ] = self::redact_credential_spans( $inner, $depth + 1 );
     }
     return $value;
   }

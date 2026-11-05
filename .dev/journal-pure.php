@@ -438,7 +438,7 @@ echo "-- the text scanner: what it finds and, as much, what it leaves alone --\n
 $scan_cases = [
   'a JSON snippet in the middle of a body'    => [ '<p>Config:</p>{"api_key":"sk_live_abcdefgh12345"}', true ],
   'a define() of a password constant'         => [ "<pre>define('DB_PASSWORD','hunter2x');</pre>", true ],
-  'a define() of a salt in double quotes'     => [ 'define( "AUTH_KEY", "put your unique phrase here" );', true ],
+  'a define() of a salt in double quotes'     => [ 'define( "AUTH_KEY", "k3v!x9Zq77abcdEF-salt" );', true ],
   'an Authorization header'                   => [ 'Send header Authorization: Bearer abcdefghijklmnop1234', true ],
   'a bare bearer token'                       => [ 'use Bearer eyabcdefghijklmnopqrstuv', true ],
   'an env-style assignment'                   => [ "DB_PASSWORD=s3cretpass99\nDB_HOST=localhost", true ],
@@ -464,6 +464,37 @@ $scan_cases = [
 foreach ( $scan_cases as $label => [ $text, $want ] ) {
   check( "scanner: $label", GMCP_Credential_Scan::text_holds( $text ), $want );
 }
+// What a sample or a template writes where a secret goes is not a credential, and losing undo over it
+// costs an ordinary edit. Each placeholder row has a counterpart that LOOKS real under the same name
+// and is still flagged, so the list cannot have grown into "anything under a secret-named key".
+$placeholder_cases = [
+  [ "WordPress's own sample DB_PASSWORD line", "define( 'DB_PASSWORD', 'password_here' );", "define( 'DB_PASSWORD', 'h8Kq2xLm9pQz' );" ],
+  [ 'the sample salt phrase', 'define( "AUTH_KEY", "put your unique phrase here" );', 'define( "AUTH_KEY", "k3v!x9Zq77abcdEF-salt" );' ],
+  [ 'a const with YOUR_TOKEN_HERE', 'const token = "YOUR_TOKEN_HERE";', 'const token = "tk_9f8e7d6c5b4a3210";' ],
+  [ 'a row of asterisks', 'password: "********"', 'password: "Tr0ub4dor&3"' ],
+  [ 'a schema type name', '"password": "string"', '"password": "s3cr3tValue!"' ],
+  [ 'an export with a hint', 'export API_KEY=your-api-key-here', 'export API_KEY=9f8e7d6c5b4a3210ff' ],
+  [ 'sample user information in a URL', 'https://user:pass@host.example/x', 'https://deploy:Zq8x7Lm2@host.example/x' ],
+  [ 'an angle-bracket placeholder', 'password: "<your-password>"', 'password: "p4ss-w0rd-real"' ],
+  [ 'a shell variable', 'DB_PASSWORD=${DB_PASS}', 'DB_PASSWORD=Zq8x7Lm2Pw' ],
+  [ 'a run of x', 'api_key = "xxxxxxxx"', 'api_key = "xK9xxQ4x7xx"' ],
+  [ '"example"', 'token: "example"', 'token: "example7Zq9"' ],
+  [ '"your_" with a digit is a real secret that starts that way', 'token: "your_token_9f8e7d6c"', null ],
+];
+foreach ( $placeholder_cases as [ $label, $placeholder, $real ] ) {
+  if ( $real === null ) {
+    check( "scanner: $label is still flagged", GMCP_Credential_Scan::text_holds( $placeholder ), true );
+    continue;
+  }
+  check( "scanner: placeholder, $label, is not a credential", GMCP_Credential_Scan::text_holds( $placeholder ), false );
+  check( "CONTROL: the same shape with a real-looking value, $label, is", GMCP_Credential_Scan::text_holds( $real ), true );
+}
+check( 'scanner: type="password" and passwordLabel stay unflagged, as before',
+  [ GMCP_Credential_Scan::text_holds( '<input type="password" name="pwd">' ), GMCP_Credential_Scan::text_holds( '{"passwordLabel":"Your password"}' ) ], [ false, false ] );
+check( 'scanner: a Basic credential of base64 with padding is flagged, the word "Basic" in prose is not',
+  [ GMCP_Credential_Scan::text_holds( 'Authorization is Basic dXNlcjpwYXNzd29yZA==' ), GMCP_Credential_Scan::text_holds( 'Basic information and Bearer of good news' ) ], [ true, false ] );
+check( 'scanner: a short Bearer token with a digit is flagged (the audit log used to blank it by a looser rule)',
+  GMCP_Credential_Scan::text_holds( 'send Bearer abc12345 now' ), true );
 check( 'scanner: a camelCase name is split, so apiKey is a secret outright and passwordLabel only weakly one',
   [ GMCP_Credential_Scan::name_strength( 'apiKey' ), GMCP_Credential_Scan::name_strength( 'passwordLabel' ), GMCP_Credential_Scan::name_strength( 'title' ) ], [ 2, 1, 0 ] );
 check( 'scanner: holds() walks arrays and objects to a string leaf',
