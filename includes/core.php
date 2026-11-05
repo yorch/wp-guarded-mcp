@@ -825,6 +825,13 @@ class GMCP_Core {
         'owner' => 'WPForms',
         'why' => 'the whole form — its fields, its notification recipients and its confirmation redirects — is one JSON document in the post content',
       ],
+      // A saved user template: registered on Lite (measured on 2.0.4), and the plugin reads its
+      // post_content through the same wpforms_decode() as a form's and builds new forms from
+      // it, so the recipients and redirects sit in it exactly as they do in a form.
+      'wpforms-template' => [
+        'owner' => 'WPForms',
+        'why' => 'a saved template is the same JSON document as a form — its fields, its notification recipients and its confirmation redirects — and new forms are made from it',
+      ],
       'wp_stream_alerts' => [
         'owner' => 'Stream',
         'why' => 'an alert rule is a post whose status decides whether that alert fires at all',
@@ -1029,15 +1036,17 @@ class GMCP_Core {
 
   /**
   * Post types a SQL query that reads posts for the current caller must leave out: the
-  * form-submission types always, the commerce types below admin. For a query that cannot ask
-  * a guard row by row. Lowercased; empty is possible only if both filters empty the lists.
+  * form-submission types always, the commerce types and the types that hold another plugin's
+  * configuration below admin. For a query that cannot ask a guard row by row, so it has to say
+  * what commerce_post_read_guard() says. Lowercased; empty is possible only if the filters
+  * empty the lists.
   *
   * @return string[]
   */
   public static function read_excluded_post_types(): array {
     $types = array_map( 'strtolower', array_map( 'strval', self::personal_data_post_types() ) );
     if ( self::caller_access_level() !== 'admin' ) {
-      $types = array_merge( $types, self::commerce_post_types() );
+      $types = array_merge( $types, self::commerce_post_types(), array_map( 'strtolower', array_map( 'strval', array_keys( self::plugin_config_post_types() ) ) ) );
     }
     return array_values( array_unique( $types ) );
   }

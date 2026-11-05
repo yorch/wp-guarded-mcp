@@ -144,7 +144,8 @@ class GMCP_Tools_Rest {
 
   /**
   * Whether a REST resource name belongs to a post type the generic post tools must not
-  * read or write: a form submission type, or a commerce type.
+  * read or write: a form submission type, a commerce type, or a type that holds another
+  * plugin's configuration.
   *
   * Both lists, whatever the caller's level, because the tools are generated once and cached
   * for every key. An order type is then also unavailable to an admin key here, which costs
@@ -153,7 +154,8 @@ class GMCP_Tools_Rest {
   private function resource_is_guarded( string $resource ): bool {
     $guarded = array_merge(
       array_map( 'strtolower', array_map( 'strval', GMCP_Core::personal_data_post_types() ) ),
-      GMCP_Core::commerce_post_types()
+      GMCP_Core::commerce_post_types(),
+      array_map( 'strtolower', array_map( 'strval', array_keys( GMCP_Core::plugin_config_post_types() ) ) )
     );
     foreach ( get_post_types( [ 'show_in_rest' => true ], 'objects' ) as $type ) {
       $base = $type->rest_base ? (string) $type->rest_base : (string) $type->name;

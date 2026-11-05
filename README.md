@@ -231,7 +231,12 @@ can exercise. The briefing names its source for every count, because "no submiss
 post content is one JSON document holding the fields, the notification recipients and the
 confirmation redirects, so `wpforms_get_form` counts those settings and never returns them —
 and the generic post tools are refused on that post type, below admin for reads and for every
-write, because otherwise the withholding would be decoration.
+write, because otherwise the withholding would be decoration. A saved user template is the same
+document under a second post type, `wpforms-template` (measured on Lite 2.0.4: registered
+there, and read through `wpforms_decode()` like a form), so it is refused the same way. The
+SQL readers ask the same list below admin (`read_excluded_post_types()`), so a listing does not
+depend on the per-row check alone, and a REST route one of these types takes over is not turned
+into tools.
 
 **Advanced Custom Fields**, off by default, and the switch only appears when ACF is
 installed: custom field discovery, value get/set through `update_field`/`get_field` with

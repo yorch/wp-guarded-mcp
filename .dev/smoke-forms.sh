@@ -263,6 +263,13 @@ add_filter( 'gmcp_personal_data_post_types', function ( $types ) {
   }
   return $types;
 } );
+// The same for the list of post types that hold another plugin's configuration.
+add_filter( 'gmcp_plugin_config_post_types', function ( $types ) {
+  if ( get_option( 'gmcp_smoke_cfg_pages' ) ) {
+    $types['page'] = [ 'owner' => 'Smoke', 'why' => 'a stand-in for a configuration type' ];
+  }
+  return $types;
+} );
 function gmcp_smoke_seed( $m ) {
   $out = [];
   foreach ( [ 'sub' => 'flamingo_inbound', 'ctl' => 'post', 'ord' => 'shop_order' ] as $k => $type ) {
@@ -570,6 +577,18 @@ wpe 'delete_option("gmcp_smoke_guard_pages");delete_transient(GMCP_Tools_Rest::C
 callas "$RO" t8 '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 check "CONTROL: with the option removed the pages tools are back" \
   "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"list_pages","get_pages"}-n) or "present")' t8)" "present"
+# The same for a type that holds another plugin's configuration: its route is not turned into
+# tools either, whatever the caller's level.
+wpe 'update_option("gmcp_smoke_cfg_pages",1);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null
+callas "$RO" t9 '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+check "when the page type is a configuration type, no tool is generated for the pages route" \
+  "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"list_pages","get_pages"}&n) or "none")' t9)" "none"
+check "CONTROL: and the posts route still is" \
+  "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"list_posts","get_posts"}-n) or "present")' t9)" "present"
+wpe 'delete_option("gmcp_smoke_cfg_pages");delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null
+callas "$RO" t10 '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+check "CONTROL: with the option removed the pages tools are back" \
+  "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"list_pages","get_pages"}-n) or "present")' t10)" "present"
 if [ "$REST_WAS" = unset ]; then
   wpe '$o=get_option("gmcp_options",[]);unset($o["mcp_tools_rest"]);update_option("gmcp_options",$o,false);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null
 else
@@ -1305,6 +1324,52 @@ if docker compose exec -T cli wp plugin is-active wpforms-lite >/dev/null 2>&1; 
     check "a readwrite key cannot read the form's content" "$(verdict wpf_rw)" "error"
     call wpf_adm "$(tc wp_get_post '{"ID":'"$WFORM"'}')"
     check "CONTROL: an admin key still reads it, so the refusal above is the rule" "$(verdict wpf_adm)" "ok"
+
+    # A saved user template is the same document under a second post type. Measured on Lite
+    # 2.0.4: `wpforms-template` is registered, and the plugin reads its post_content through
+    # wpforms_decode() exactly as it reads a form's, so the notification recipients and the
+    # confirmation redirects live in it too, and a template is what a new form is made from.
+    # A rule that names `wpforms` alone leaves the same document one post type away.
+    WPT_TITLE="Probe template $WPF_MARK"
+    WTPL=$(wpe '
+      wp_set_current_user( 1 );
+      $content = [ "fields" => [ [ "id" => "0", "type" => "email", "label" => "Email" ] ],
+        "settings" => [ "notifications" => [ "1" => [ "email" => "'"$WPF_SECRET"'" ] ] ] ];
+      echo wp_insert_post( [ "post_type" => "wpforms-template", "post_status" => "publish", "post_title" => "'"$WPT_TITLE"'", "post_content" => wp_slash( wp_json_encode( $content ) ) ] );')
+    if [ -z "$WTPL" ] || [ "$WTPL" = "0" ]; then
+      echo "  FAIL  seeding: the template was not created (the seed, not the guard, is suspect)"; fail=$((fail+1))
+    else
+      check "CONTROL: the template is stored as a wpforms-template post" "$(wpe 'echo get_post_type( '"$WTPL"' );')" "wpforms-template"
+      check "CONTROL: and its content holds the recipient" \
+        "$(wpe 'echo strpos( (string) get_post_field( "post_content", '"$WTPL"' ), "secret-wpformsmark" ) !== false ? "yes" : "no";')" "yes"
+      callas "$RW" wpt_rw "$(tc wp_get_post '{"ID":'"$WTPL"'}')"
+      check "a readwrite key cannot read a template's content" "$(verdict wpt_rw)" "error"
+      check "and the reply does not carry the recipient" "$(has wpt_rw "$WPF_SECRET")" "no"
+      call wpt_adm "$(tc wp_get_post '{"ID":'"$WTPL"'}')"
+      check "CONTROL: an admin key still reads it, so the refusal above is the rule" "$(verdict wpt_adm)" "ok"
+      call wpt_w "$(tc wp_update_post '{"ID":'"$WTPL"',"post_title":"changed by a generic tool"}')"
+      check "a generic post write to a template is refused" "$(verdict wpt_w)" "error"
+      check "stored: the template's title is unchanged" "$(wpe 'echo get_the_title( '"$WTPL"' );')" "$WPT_TITLE"
+      WPT_BEFORE=$(wpe 'echo count( get_posts( [ "post_type" => "wpforms-template", "post_status" => "any", "numberposts" => -1, "fields" => "ids" ] ) );')
+      call wpt_c "$(tc wp_create_post '{"post_type":"wpforms-template","post_title":"made by a generic tool"}')"
+      check "creating a template through the generic tools is refused" "$(verdict wpt_c)" "error"
+      check "stored: no template was added" \
+        "$(wpe 'echo count( get_posts( [ "post_type" => "wpforms-template", "post_status" => "any", "numberposts" => -1, "fields" => "ids" ] ) );')" "$WPT_BEFORE"
+      wpe 'wp_delete_post( '"$WTPL"', true );' >/dev/null
+    fi
+
+    # The SQL readers (listings, REST lists, comment queries) ask read_excluded_post_types()
+    # rather than the guard row by row, so it has to say the same thing the guard says: below
+    # admin a configuration row is not read, at admin it is. shop_order is the positive
+    # control, because an empty answer and a broken probe look the same.
+    check "CONTROL: below admin the SQL readers' exclusion list names a commerce type" \
+      "$(wpe 'add_filter( "gmcp_caller_access_level", function () { return "readonly"; } ); echo in_array( "shop_order", GMCP_Core::read_excluded_post_types(), true ) ? "yes" : "no";')" "yes"
+    check "below admin the SQL readers' exclusion list names the form type" \
+      "$(wpe 'add_filter( "gmcp_caller_access_level", function () { return "readonly"; } ); echo in_array( "wpforms", GMCP_Core::read_excluded_post_types(), true ) ? "yes" : "no";')" "yes"
+    check "and the template type" \
+      "$(wpe 'add_filter( "gmcp_caller_access_level", function () { return "readonly"; } ); echo in_array( "wpforms-template", GMCP_Core::read_excluded_post_types(), true ) ? "yes" : "no";')" "yes"
+    check "at admin the list does not name either, as the guard does not" \
+      "$(wpe 'echo in_array( "wpforms", GMCP_Core::read_excluded_post_types(), true ) || in_array( "wpforms-template", GMCP_Core::read_excluded_post_types(), true ) ? "yes" : "no";')" "no"
 
     wpe 'wp_set_current_user( 1 ); wpforms()->obj( "form" )->delete( '"$WFORM"' );' >/dev/null
     check "put back: the form is gone" "$(wpe 'echo get_post( '"$WFORM"' ) ? "present" : "gone";')" "gone"

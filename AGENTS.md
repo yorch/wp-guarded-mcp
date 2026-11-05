@@ -43,7 +43,15 @@ point every future submission at an address it chose, on a plugin that stores no
 at all. The guard is wired into the two existing ones (`commerce_post_guard` for writes,
 `commerce_post_read_guard` for non-admin reads) rather than a third pair of call sites, and it
 covers creating or retyping into the type. Stream's alert rules (`wp_stream_alerts`) are listed
-for the same reason: a rule set to a disabled status stops that alert firing.
+for the same reason: a rule set to a disabled status stops that alert firing. So is
+`wpforms-template`, a saved user template: the plugin registers it on Lite, reads its
+`post_content` through the same `wpforms_decode()` as a form's, and makes new forms from it, so
+a list naming `wpforms` alone left the same document one post type away. The reads are asked
+twice: `commerce_post_read_guard()` follows the post's parents (a revision of a form holds the
+form's JSON), and `read_excluded_post_types()` carries the same types below admin for the SQL
+readers that cannot ask a guard row by row, and `resource_is_guarded()` reads the same list so a
+REST route one of them takes over is not turned into tools (none of the three is `show_in_rest`
+today, so that one is a guard for a future registration, measured only with a stand-in type).
 
 **A drafts-only key is held by the post, not by the tool.** `GMCP_Core::drafts_only_guard()`
 (through `post_write_guard()` for the generic writers) is asked by every tool that writes a
