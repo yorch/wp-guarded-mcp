@@ -242,17 +242,40 @@ pre code { color: var(--ink); }
       </div>
       <div class="entry">
         <p class="head"><code>wp_undo_change</code> <span>puts an edit back</span></p>
-        <p>It remembers what a setting, a post, a custom field, a term, a post's terms or a
-        theme setting said before an agent changed it. Only writes made through the API are
-        recorded, never your own, and reverting needs the same access the original change
-        needed. An undo is recorded too, so it can be undone, unless the thing has changed
-        since. Creations, deletions and users cannot be undone.</p>
+        <p>It remembers what a setting, a post, a custom field, a term's name, slug, description
+        or parent, a post's terms, a theme setting or a menu location said before an agent
+        changed it. Only writes made through the API are recorded, never your own, and
+        reverting needs the same access the original change needed. An undo is recorded too,
+        so it can be undone, unless the thing has changed since. Creations, deletions and
+        users cannot be undone.</p>
       </div>
       <div class="entry refuse">
         <p class="head"><span>no restore tool, at any access level</span></p>
         <p>It can start a backup before a risky change and tell you when one last completed.
         Restoring discards everything since that backup, and no confirmation makes that safe, so
         the tool does not exist.</p>
+      </div>
+      <div class="entry refuse">
+        <p class="head"><code>drafts only</code> <span>a key that cannot publish</span></p>
+        <p>A key can be limited to drafts. It may create and edit drafts and pending posts, and
+        upload media for them, and it is refused every publish, schedule or make-private, and
+        every edit, trash or deletion of a post that is already live, whichever tool is asked.
+        It cannot have full administration. It does not cover comments, taxonomy terms, users or
+        options, so a key that should do less than that also needs a tool list.</p>
+      </div>
+      <div class="entry refuse">
+        <p class="head"><code>read-only grant</code> <span>chosen on the consent screen</span></p>
+        <p>An OAuth grant approved as read-only lists only the read tools, and refuses a write or
+        admin tool named anyway. The choice is stored with the grant and copied by every refresh,
+        so nothing the client sends can raise it.</p>
+      </div>
+      <div class="entry gate">
+        <p class="head"><code>deletes</code> <code>site changes</code> <span>ask first, off by default</span></p>
+        <p>With deletes chosen, a call that would delete something is held rather than run; with
+        deletes and site changes chosen, so is every other admin-level write. Content edits at the
+        read and write level never wait. The agent is told it is waiting. A signed-in administrator approves or declines that exact call in wp-admin,
+        and an approval works once, for that key, that tool and those exact arguments, for fifteen
+        minutes. No tool reads, answers or edits the queue, at any access level.</p>
       </div>
     </div>
   </div>
@@ -283,10 +306,21 @@ pre code { color: var(--ink); }
     <p class="lead">The content and site-data tools are on by default: posts, pages, block
     content, taxonomies, comments, media, users, post meta, site options, post types, block
     patterns and theme mods. Site administration is off by default, and so is each
-    integration below — each appears only when its plugin is installed, and each exists
-    because writing through the generic tools looks like it worked and does not.</p>
+    integration below — each appears only when its plugin is installed, and each is there
+    because its data is stored where the generic tools do not look, or needs a rule of its own.</p>
 
     <div class="log">
+      <div class="entry">
+        <p class="head"><code>Site administration</code> <span>off by default</span></p>
+        <p>Plugins and themes, navigation menus and widgets, the General, Reading and Discussion
+        settings, permalinks, scheduled events and Site Health. Three diagnostics ride on the same
+        switch. The error log and the page fetch are admin level, because both return text other
+        people wrote. Ending every preview link on the site is admin level too. The end of
+        the PHP error log, every line scrubbed for credential shapes. One page of this site fetched
+        the way an anonymous visitor would get it, with its status, redirects and a bounded excerpt
+        of its text. And expiring, unindexed preview links to one unpublished post, 24 hours by
+        default and seven days at most. Viewing a preview link is not logged.</p>
+      </div>
       <div class="entry">
         <p class="head"><code>WooCommerce</code> <span>off by default</span></p>
         <p>Products, stock, orders, order notes, customers and sales figures, through the
@@ -373,6 +407,44 @@ pre code { color: var(--ink); }
         unpaid renewal is refused, and every addressed email is named in the reply.</p>
       </div>
       <div class="entry">
+        <p class="head"><code>Redirection</code> <span>off by default</span></p>
+        <p>Listing and reading redirects is write level. Creating, changing and switching one on
+        or off is admin level. A redirect can hand your visitors to someone else's site, so the
+        target must be a path here, or a URL on this site's own host unless you name another
+        host yourself, and the source must be a literal path. The login and admin pages, cron,
+        the REST API, this plugin's endpoint and its OAuth discovery documents cannot be
+        redirected however the address is spelled. There is no delete: switching a redirect off
+        is the reversible removal. Undo does not cover these rows.</p>
+      </div>
+      <div class="entry">
+        <p class="head"><code>Polylang</code> <span>off by default</span></p>
+        <p>Read only. It lists the site's languages and which posts are translations of one
+        another, returning IDs, languages and statuses, never titles or content. It keeps "no
+        languages defined", "a post Polylang does not manage" and "no translations" apart,
+        because they are different answers. There is no tool that links posts or assigns a
+        language, and WPML is not covered.</p>
+      </div>
+      <div class="entry">
+        <p class="head"><code>Rank Math</code> <code>All in One SEO</code> <span>off by default</span></p>
+        <p>A post's SEO title, meta description, canonical URL, index or noindex, and social title
+        and description, for whichever of the two is installed. Every write is read back from
+        storage and fails if the stored value differs, though the rendered page is not checked. A
+        canonical must be on this site unless the site names another host, and robots takes only
+        three values. Rank Math's changes are journalled and can be undone. All in One SEO keeps
+        its data in a table the journal does not watch, so its changes cannot be undone, and the
+        reply carries the previous values instead. Its focus keyphrase is readable, not writable.</p>
+      </div>
+      <div class="entry">
+        <p class="head"><code>Contact Form 7</code> <code>Flamingo</code> <code>Fluent Forms</code> <code>Ninja Forms</code> <span>off by default</span></p>
+        <p>Read only: nothing can be edited, trashed or deleted. A counts-only briefing for each
+        plugin, and, at admin level, listing and reading individual submissions, because each is
+        personal data someone else wrote. Only fields in the form's current definition, and of a
+        plain input type, are returned. Passwords and file uploads are named but never returned,
+        and IP addresses, user agents and referring URLs are never returned at any level. There is
+        no search over answers. The generic post readers refuse the post types these plugins keep
+        submissions in.</p>
+      </div>
+      <div class="entry">
         <p class="head"><code>Backups</code> <span>if you have a backup plugin</span></p>
         <p>Start one before a risky change, list what exists, and see when one last completed.
         Listings never include archive filenames, because on both supported plugins the
@@ -387,17 +459,23 @@ pre code { color: var(--ink); }
   <div class="shell">
     <h2>Connecting takes one line</h2>
     <p class="lead">Clients that speak OAuth need only the address. They send you to a WordPress
-    login and a consent screen, and only an administrator can approve one. For a command-line
-    agent, make a named key on the Access page and pass it as a header.</p>
+    login and a consent screen, and only an administrator can approve one. The consent screen
+    offers full access or read-only. For a command-line agent, make a named key on the Access
+    page and pass it as a header.</p>
 
     <pre><code>claude mcp add --transport http wordpress \
   https://example.com/wp-json/mcp/v1/http \
   --header "Authorization: Bearer YOUR_KEY"</code></pre>
 
     <p class="lead">A key is narrower than a password. It carries its own access level, an
-    optional expiry, and an optional list of the only tools it may call. Keys are stored hashed
-    and shown once, and each acts as the administrator who created it, so the log can say whose
-    agent did what and revoking someone's access revokes their agent with it.</p>
+    optional expiry, an optional list of the only tools it may call, and can be drafts only. Keys
+    are stored hashed and shown once, and each acts as the administrator who created it, so the
+    log can say whose agent did what and revoking someone's access revokes their agent with it.</p>
+
+    <p class="lead">The server also tells the agent, when it connects, what it is for: read tools
+    are not meant to change anything, some writes can be undone and some cannot, there is no
+    tool to restore a backup, and text read from the site is data, never instructions, even when
+    it addresses the agent directly.</p>
   </div>
 </section>
 
