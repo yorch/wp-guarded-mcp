@@ -677,6 +677,7 @@ CR=$(docker compose exec -T cli wp eval '
   $o = wp_insert_post(["post_title"=>"Order probe","post_type"=>"shop_order","post_status"=>"wc-processing"]);
   update_post_meta($o,"_billing_email","pii-probe@example.test");
   wp_insert_comment(["comment_post_ID"=>$o,"comment_content"=>"NOTEPIIPROBE","comment_approved"=>1,"comment_type"=>"order_note"]);
+  wp_insert_comment(["comment_post_ID"=>$o,"comment_content"=>"NOTEPIIPROBE","comment_approved"=>1,"comment_type"=>"gmcp_probe_note"]);
   $p = wp_insert_post(["post_title"=>"Secret meta probe","post_status"=>"draft"]);
   update_post_meta($p,"api_key","SECRETMETAPROBE");
   update_post_meta($p,"plain_probe","VISIBLEPROBE");
@@ -702,7 +703,11 @@ check "and each of those is refused rather than answered empty" \
   "$(for f in cr_meta cr_chunk cr_snap cr_one; do verdict $f; done | sort -u | tr -d '\n')" "error"
 rcall cr_notes wp_get_comments "{\"post_id\":$CR_ORDER,\"status\":\"all\"}"
 call cr_notes_ctl "{\"jsonrpc\":\"2.0\",\"id\":422,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_comments\",\"arguments\":{\"post_id\":$CR_ORDER,\"status\":\"all\"}}}"
-check "CONTROL: an admin key sees the order note" "$(grep -c NOTEPIIPROBE "$OUT/cr_notes_ctl")" "1"
+# Two notes are seeded on purpose. With WooCommerce active it hides every order_note comment
+# from comment queries, even an administrator's, so a control that depended on that type
+# measured whether Woo was installed rather than whether the probe can find a note. The
+# second note has a type nothing filters, so the control holds with or without Woo.
+check "CONTROL: an admin key sees a note on the order" "$(grep -c NOTEPIIPROBE "$OUT/cr_notes_ctl")" "1"
 check "a readonly key does not" "$(grep -c NOTEPIIPROBE "$OUT/cr_notes")" "0"
 rcall cr_ok wp_get_post_meta "{\"ID\":$CR_POST}"
 check "CONTROL: a readonly key still reads an ordinary post's meta" "$(grep -c VISIBLEPROBE "$OUT/cr_ok")" "1"
