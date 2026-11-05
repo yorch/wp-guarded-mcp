@@ -368,6 +368,25 @@ call self_upd '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"w
 check "cannot update itself" "$(verdict self_upd)" "error"
 check "and says that is why" "$(refusal self_upd | grep -c 'Refusing to update the MCP plugin itself')" "1"
 
+# The watcher guard, which the option policy alone did not cover: an agent could rewrite no
+# setting at all and still stop the recording with one deactivation. Stream is the fixture
+# because it is the watcher this suite can rely on being active (Wordfence makes every call
+# on this stack wait on an outbound timeout, so the other suites run with it off).
+echo "-- cannot switch off what watches the site --"
+if docker compose exec -T cli wp plugin is-active stream >/dev/null 2>&1; then
+  call watch_off '{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"wp_deactivate_plugin","arguments":{"plugin":"stream/stream.php"}}}'
+  check "cannot deactivate an activity log" "$(verdict watch_off)" "error"
+  check "and says an agent could confirm its own silence" "$(refusal watch_off | grep -c 'confirm its own silence')" "1"
+  check "and it is still active" \
+    "$(docker compose exec -T cli wp plugin is-active stream >/dev/null 2>&1 && echo yes || echo no)" "yes"
+  call watch_del '{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"stream/stream.php"}}}'
+  check "cannot delete an activity log either" "$(verdict watch_del)" "error"
+else
+  echo "  ....  watcher guard not checked: Stream is not active on this site"
+fi
+# The control is further down in the plugins block, which deactivates a plugin that watches
+# nothing: without it these refusals would also pass on a broken deactivation tool.
+
 echo "-- install source restriction --"
 call url_inst '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"wp_install_plugin","arguments":{"url":"https://example.invalid/x.zip"}}}'
 check "arbitrary ZIP URL refused" "$(verdict url_inst)" "error"
@@ -2662,7 +2681,7 @@ try:
     t = json.load(sys.stdin)['result']['tools']
 except Exception:
     print('unreadable'); raise SystemExit
-print(len([x for x in t if not x['name'].startswith('elementor_') and not x['name'].startswith('kirki_') and not x['name'].startswith('yoast_') and not x['name'].startswith('acf_') and not x['name'].startswith('wsal_') and not x['name'].startswith('gf_') and not x['name'].startswith('ld_') and not x['name'].startswith('rankmath_') and not x['name'].startswith('aioseo_') and not x['name'].startswith('cf7_') and not x['name'].startswith('fluentform_') and not x['name'].startswith('ninjaform_') and not x['name'].startswith('redirection_') and not x['name'].startswith('pll_')]))"
+print(len([x for x in t if not x['name'].startswith('elementor_') and not x['name'].startswith('kirki_') and not x['name'].startswith('yoast_') and not x['name'].startswith('acf_') and not x['name'].startswith('wsal_') and not x['name'].startswith('gf_') and not x['name'].startswith('ld_') and not x['name'].startswith('rankmath_') and not x['name'].startswith('aioseo_') and not x['name'].startswith('cf7_') and not x['name'].startswith('fluentform_') and not x['name'].startswith('ninjaform_') and not x['name'].startswith('redirection_') and not x['name'].startswith('pll_') and not x['name'].startswith('wpforms_') and not x['name'].startswith('wf_') and not x['name'].startswith('stream_')]))"
 }
 # The expected numbers come from the table itself, so the check fails whichever side moved.
 tc_doc() { # tc_doc <level> <column index, 1-3>

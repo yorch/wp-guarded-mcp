@@ -433,6 +433,91 @@ else
   wpe 'Ninja_Forms()->form('"$NFORM"')->delete();' >/dev/null
 fi
 
+# ---- WPForms ---------------------------------------------------------------------------
+# WPForms is in this group because it is a form plugin, and the shape of its support differs
+# from the other three: on Lite it stores no submission rows at all. Measured on 2.0.3.1:
+# wpforms()->obj('entry') is null, there is no src/Entries, and none of wpforms_entries,
+# wpforms_entry_fields or wpforms_entry_meta exist. So there is no entry tool for it, and the
+# briefing's job is to say which storage state this site is in rather than report a bare zero.
+if docker compose exec -T cli wp plugin is-active wpforms-lite >/dev/null 2>&1; then
+  echo "-- WPForms: schema and counts, with the source named --"
+  WPF_MARK="wpformsmark$(date +%s)"
+  WPF_SECRET="secret-${WPF_MARK}@example.test"
+  WFORM=$(wpe '
+    wp_set_current_user( 1 );
+    $fields = [
+      [ "id" => "0", "type" => "name", "label" => "Name", "format" => "simple", "required" => "1" ],
+      [ "id" => "1", "type" => "email", "label" => "Email", "required" => "1" ],
+      [ "id" => "2", "type" => "select", "label" => "Topic", "choices" => [ [ "label" => "Sales", "value" => "sales" ], [ "label" => "Support", "value" => "support" ] ] ],
+      [ "id" => "3", "type" => "textarea", "label" => "Message", "required" => "1" ],
+    ];
+    $content = [
+      "fields" => $fields,
+      "settings" => [
+        "notifications" => [ "1" => [ "email" => "'"$WPF_SECRET"'", "subject" => "probe" ] ],
+        "confirmations" => [ "1" => [ "message" => "thanks", "redirect" => "https://example.test/x" ] ],
+      ],
+    ];
+    $id = wpforms()->obj( "form" )->add( "Probe form '"$WPF_MARK"'", [ "post_content" => wp_json_encode( $content ) ] );
+    echo $id;')
+  if [ -z "$WFORM" ] || [ "$WFORM" = "0" ]; then
+    echo "  FAIL  seeding: the form was not created (the seed, not the tool, is suspect)"; fail=$((fail+1))
+  else
+    echo "  Form $WFORM"
+    # The control: the recipient really is stored, so its absence from the reply means something.
+    check "CONTROL: the notification recipient is stored in the form" \
+      "$(wpe 'echo strpos( (string) get_post_field( "post_content", '"$WFORM"' ), "secret-wpformsmark" ) !== false ? "yes" : "no";')" "yes"
+    check "CONTROL: the plugin's own decode sees four fields" \
+      "$(wpe 'echo count( (array) ( wpforms_decode( get_post_field( "post_content", '"$WFORM"' ) )["fields"] ?? [] ) );')" "4"
+
+    call wpf_b "$(tc wpforms_briefing '{}')"
+    check "the briefing answers" "$(verdict wpf_b)" "ok"
+    check "it reports the storage state" "$(jget wpf_b log_state.plugin_loaded)" "true"
+    check "the count source is named, not implied" "$(jget wpf_b log_state.count_source)" "counter"
+    check "and the reply says nothing is storing submissions" "$(has wpf_b "no WPForms entry storage")" "yes"
+
+    call wpf_f "$(tc wpforms_get_form '{"id":'"$WFORM"'}')"
+    check "the form schema answers" "$(verdict wpf_f)" "ok"
+    check "four fields are returned" "$(jget wpf_f form.field_count)" "4"
+    check "field types are the stored ones" "$(jget wpf_f form.fields.2.type)" "select"
+    # Structured, not a substring of the reply: a substring search passes on a field LABEL
+    # that happens to contain the word, and fails if the reply is worded differently while the
+    # data is right. The choice list is the claim.
+    check "choice labels are returned" "$(jget wpf_f form.fields.2.choices.1)" "Support"
+    check "the notification is counted" "$(jget wpf_f form.notifications_count)" "1"
+    check "the recipient address is NOT returned" "$(has wpf_f "$WPF_SECRET")" "no"
+    check "the confirmation redirect is NOT returned" "$(has wpf_f "example.test/x")" "no"
+
+    # The counter, through the plugin's own read path: present means the plugin counted one.
+    wpe 'update_post_meta( '"$WFORM"', "wpforms_entries_count", 7 );' >/dev/null
+    check "CONTROL: the counter is stored" \
+      "$(wpe 'echo (int) get_post_meta( '"$WFORM"', "wpforms_entries_count", true );')" "7"
+    call wpf_b2 "$(tc wpforms_briefing '{"form_id":'"$WFORM"'}')"
+    check "the tool reports the stored counter" "$(jget wpf_b2 counts.total)" "7"
+    check "and says the counter is present" "$(jget wpf_b2 counts.by_form.0.counter_present)" "true"
+    wpe 'delete_post_meta( '"$WFORM"', "wpforms_entries_count" );' >/dev/null
+    call wpf_b3 "$(tc wpforms_briefing '{"form_id":'"$WFORM"'}')"
+    check "an absent counter is reported as absent, not as a bare zero" "$(jget wpf_b3 counts.by_form.0.counter_present)" "false"
+
+    # The form is a post, and the generic post tools must not reach it: the whole document,
+    # recipient addresses included, is one post content field.
+    call wpf_w "$(tc wp_update_post '{"ID":'"$WFORM"',"post_title":"changed by a generic tool"}')"
+    check "a generic post write to a form is refused" "$(verdict wpf_w)" "error"
+    check "and the refusal names WPForms" "$(has wpf_w "WPForms")" "yes"
+    call wpf_c "$(tc wp_create_post '{"post_type":"wpforms","post_title":"made by a generic tool"}')"
+    check "creating a form through the generic tools is refused too" "$(verdict wpf_c)" "error"
+    callas "$RW" wpf_rw "$(tc wp_get_post '{"ID":'"$WFORM"'}')"
+    check "a readwrite key cannot read the form's content" "$(verdict wpf_rw)" "error"
+    call wpf_adm "$(tc wp_get_post '{"ID":'"$WFORM"'}')"
+    check "CONTROL: an admin key still reads it, so the refusal above is the rule" "$(verdict wpf_adm)" "ok"
+
+    wpe 'wp_set_current_user( 1 ); wpforms()->obj( "form" )->delete( '"$WFORM"' );' >/dev/null
+    check "put back: the form is gone" "$(wpe 'echo get_post( '"$WFORM"' ) ? "present" : "gone";')" "gone"
+  fi
+else
+  echo "  ....  WPForms block skipped: wpforms-lite is not active"
+fi
+
 echo "-- the group switch --"
 setopt false
 call sw_off "$(tc cf7_messages_briefing '{}')"
@@ -441,6 +526,8 @@ call sw_off2 "$(tc fluentform_briefing '{}')"
 check "switched off, a fluentform tool is refused" "$(verdict sw_off2)" "error"
 call sw_off3 "$(tc ninjaform_briefing '{}')"
 check "switched off, a ninjaform tool is refused" "$(verdict sw_off3)" "error"
+call sw_off4 "$(tc wpforms_briefing '{}')"
+check "switched off, a wpforms tool is refused" "$(verdict sw_off4)" "error"
 callas "$RO" sw_gen "$(tc wp_get_post_meta "{\"ID\":$NF}")"
 check "and the generic readers still refuse submission posts with the group off" "$(verdict sw_gen)" "error"
 

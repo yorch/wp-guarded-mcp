@@ -354,6 +354,8 @@ class GMCP_Settings {
       'mcp_tools_polylang' => 'bool',
       'mcp_tools_seo' => 'bool',
       'mcp_tools_forms' => 'bool',
+      'mcp_tools_wordfence' => 'bool',
+      'mcp_tools_stream' => 'bool',
       'mcp_approval_mode' => 'approval_mode',
       'mcp_debug_mode' => 'bool',
       'mcp_activity_log' => 'bool',
@@ -1290,6 +1292,12 @@ class GMCP_Settings {
     // function a tool here calls. WC_Subscription alone is not enough: a gateway bundling
     // the subscriptions core library provides it without WooCommerce Subscriptions.
     $wcs = class_exists( 'WC_Subscriptions' ) && class_exists( 'WC_Subscription' ) && function_exists( 'wcs_get_subscription' );
+    // Wordfence: the version constant plus the two classes every reader calls, the same
+    // per-call signal the group itself uses.
+    $wordfence = defined( 'WORDFENCE_VERSION' ) && class_exists( 'wfConfig' ) && class_exists( 'wfScanner' );
+    // Stream defines no version constant in 4.4.0, so presence is the namespaced plugin
+    // class plus the global accessor a reader here would call.
+    $stream = class_exists( '\WP_Stream\Plugin' ) && function_exists( 'wp_stream_get_instance' );
 
     // Only the groups actually rendered are declared to the save. A checkbox that was
     // never on screen must keep its stored value rather than read as unticked, which is
@@ -1339,6 +1347,12 @@ class GMCP_Settings {
     }
     if ( $forms ) {
       $keys[] = 'mcp_tools_forms';
+    }
+    if ( $wordfence ) {
+      $keys[] = 'mcp_tools_wordfence';
+    }
+    if ( $stream ) {
+      $keys[] = 'mcp_tools_stream';
     }
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'Which groups of tools an agent is offered. A group that is off is not merely hidden: its tools are refused if asked for by name.', 'guarded-mcp' ); ?></p>
@@ -1444,7 +1458,19 @@ class GMCP_Settings {
               <?php if ( $forms ) : ?>
                 <label>
                   <input type="checkbox" name="mcp_tools_forms" value="1" <?php checked( !empty( $options['mcp_tools_forms'] ) ); ?>>
-                  <?php esc_html_e( 'Form submissions, read only (Contact Form 7 with Flamingo, Fluent Forms, Ninja Forms)', 'guarded-mcp' ); ?>
+                  <?php esc_html_e( 'Form submissions, read only (Contact Form 7 with Flamingo, Fluent Forms, Ninja Forms, WPForms)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
+              <?php if ( $wordfence ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_wordfence" value="1" <?php checked( !empty( $options['mcp_tools_wordfence'] ) ); ?>>
+                  <?php esc_html_e( 'Wordfence (firewall mode, scan history, issue counts, and blocks by type)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
+              <?php if ( $stream ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_stream" value="1" <?php checked( !empty( $options['mcp_tools_stream'] ) ); ?>>
+                  <?php esc_html_e( 'Stream (read the site\'s activity log: event counts, and the records themselves at admin level)', 'guarded-mcp' ); ?>
                 </label>
               <?php endif; ?>
               <label>
@@ -1518,6 +1544,16 @@ class GMCP_Settings {
             <?php if ( $forms ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The form tools only read. They answer how many submissions exist at read level, and return individual submissions at admin level, because a submission is personal data a member of the public wrote. Password and file-upload answers, IP addresses and user agents are never returned, there is no search over answers, and nothing can be edited or deleted. Every reply says whether the store is there at all, so "none arrived" is not confused with "nothing is being kept".', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $wordfence ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The Wordfence tools only read, and they answer a different question from the activity log: is anything watching, and is the watching working. There is deliberately no tool that dismisses an issue, whitelists an address, changes a firewall mode or starts a scan, because each is a way to make the watcher quieter and an agent that can quiet it and read it back can confirm its own silence. A count of zero findings is always reported next to whether a scan has ever run, since on a fresh install it means nothing has looked rather than that the site is clean.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $stream ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The Stream tools only read, for the same reason the WP Activity Log tools do: an audit log an agent can shorten or switch off is not an audit log. Individual records are admin level because a record names a person, IP addresses are never returned at any level, and the metadata is filtered by an allowlist because Stream stores a person\'s data under names that give nothing away. Stream\'s own settings are refused to every writer here, and switching the plugin off is refused too.', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
             <p class="description">

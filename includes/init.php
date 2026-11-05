@@ -32,6 +32,8 @@ spl_autoload_register( function ( $class ) {
     'GMCP_Tools_Polylang' => '/includes/tools-polylang.php',
     'GMCP_Tools_Seo' => '/includes/tools-seo.php',
     'GMCP_Tools_Forms' => '/includes/tools-forms.php',
+    'GMCP_Tools_Wordfence' => '/includes/tools-wordfence.php',
+    'GMCP_Tools_Stream' => '/includes/tools-stream.php',
     'GMCP_Tools_Admin' => '/includes/tools-admin.php',
     'GMCP_Tools_Diagnostics' => '/includes/tools-diagnostics.php',
     'GMCP_Diag_Util' => '/includes/diagnostics-util.php',

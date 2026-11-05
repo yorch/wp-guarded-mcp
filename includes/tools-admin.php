@@ -215,6 +215,26 @@ class GMCP_Tools_Admin {
   }
 
   /**
+  * The refusal for switching off something that watches this site, or true.
+  *
+  * The option policy refuses rewriting an activity log's settings, and that was only half of
+  * the promise: the same agent could switch the plugin off with one call, which stops the
+  * recording just as effectively and never touches an option. Measured on this stack, Stream,
+  * Wordfence and WP Activity Log were each deactivatable through this group while the README
+  * said a log an agent can switch off is not a log.
+  *
+  * Refused for deletion and update as well as deactivation, because both have the same effect
+  * on what gets recorded, and an update is the quieter of the three: it can replace a working
+  * watcher with one whose tables or settings this site has not migrated to.
+  */
+  private function watcher_refusal( string $plugin, string $what ) {
+    if ( !\GMCP_Core::is_watcher_plugin( $plugin ) ) {
+      return true;
+    }
+    return 'Refusing to ' . $what . ' "' . $plugin . '": it is what records or watches what happens on this site, and an agent that can switch the watch off and then read it back can confirm its own silence. A site can extend the list with the gmcp_watcher_plugin_files filter. ' . ucfirst( $what ) . ' it from wp-admin if that is really what you want.';
+  }
+
+  /**
   * Plugins on THIS site's own active list, as opposed to network-active ones.
   *
   * is_plugin_active() answers true for both, which is the right question for "is its
@@ -1220,6 +1240,10 @@ class GMCP_Tools_Admin {
     if ( $plugin === $this->self_plugin_file() ) {
       return $this->error( $r, 'Refusing to deactivate the MCP plugin itself: that would close this connection mid-call and leave no way to undo it. Deactivate it from wp-admin if that is really what you want.' );
     }
+    $watcher = $this->watcher_refusal( $plugin, 'deactivate' );
+    if ( $watcher !== true ) {
+      return $this->error( $r, $watcher );
+    }
     if ( !is_plugin_active( $plugin ) && !is_plugin_active_for_network( $plugin ) ) {
       return $this->text( $r, "\"{$plugin}\" is already inactive." );
     }
@@ -1259,6 +1283,10 @@ class GMCP_Tools_Admin {
     }
     if ( $plugin === $this->self_plugin_file() ) {
       return $this->error( $r, 'Refusing to delete the MCP plugin itself.' );
+    }
+    $watcher = $this->watcher_refusal( $plugin, 'delete' );
+    if ( $watcher !== true ) {
+      return $this->error( $r, $watcher );
     }
     if ( is_plugin_active( $plugin ) || is_plugin_active_for_network( $plugin ) ) {
       return $this->error( $r, "\"{$plugin}\" is active. Deactivate it first with wp_deactivate_plugin." );
@@ -1309,6 +1337,10 @@ class GMCP_Tools_Admin {
     // from outside a call it is serving, which is where that belongs.
     if ( $plugin === $this->self_plugin_file() ) {
       return $this->error( $r, 'Refusing to update the MCP plugin itself from inside one of its own calls: the update replaces the code serving this request, and if the new version failed to load there would be no way back in. Update it from wp-admin, with WP-CLI, or let WordPress auto-update it.' );
+    }
+    $watcher = $this->watcher_refusal( $plugin, 'update' );
+    if ( $watcher !== true ) {
+      return $this->error( $r, $watcher );
     }
 
     $checked = $this->refresh_update_data( 'plugin' );

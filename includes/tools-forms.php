@@ -135,6 +135,35 @@ class GMCP_Tools_Forms {
     return defined( 'WPCF7_VERSION' ) && class_exists( 'WPCF7_ContactForm' );
   }
 
+  /**
+  * WPForms. A form is a `wpforms` post whose post_content is one JSON document; on Lite the
+  * plugin stores no submission rows at all (measured on 2.0.3.1: wpforms()->obj('entry') is
+  * null, there is no src/Entries, and none of wpforms_entries, wpforms_entry_fields or
+  * wpforms_entry_meta exist). Lite counts submissions in form meta and emails them.
+  *
+  * So there is no entry tool for WPForms, deliberately: on the free plugin there would be
+  * nothing to read, and on Pro the tables have never been measured from here, which is not a
+  * good enough footing for personal-data handling that no test can exercise. What is here is
+  * the form schema and the counts, each saying which source it came from.
+  */
+  const WPFORMS_FORM_CPT = 'wpforms';
+
+  /** The meta key WPForms' own report class reads for a submission count. */
+  const WPFORMS_COUNT_META = 'wpforms_entries_count';
+
+  /** The tables a Pro install creates for entries, without a prefix. */
+  const WPFORMS_ENTRY_TABLES = [ 'wpforms_entries', 'wpforms_entry_fields', 'wpforms_entry_meta' ];
+
+  /** Field types whose choices are site content worth returning. */
+  const WPFORMS_CHOICE_TYPES = [ 'select', 'radio', 'checkbox', 'payment-select', 'payment-multiple', 'payment-checkbox' ];
+
+  private function wpforms_loaded(): bool {
+    return defined( 'WPFORMS_VERSION' )
+      && function_exists( 'wpforms' )
+      && is_object( wpforms() )
+      && method_exists( wpforms(), 'obj' );
+  }
+
   private function flamingo_loaded(): bool {
     return defined( 'FLAMINGO_VERSION' ) && post_type_exists( self::FLAMINGO_TYPE );
   }
@@ -252,6 +281,26 @@ class GMCP_Tools_Forms {
         ],
         'accessLevel' => 'admin',
       ],
+
+      'wpforms_briefing' => [
+        'name' => 'wpforms_briefing',
+        'description' => 'Count WPForms submissions, and say what is doing the counting. Every reply carries a log_state block first: whether WPForms is loaded, whether its entries component exists, whether Pro\'s entry tables exist, and therefore whether the numbers are rows in a table or a counter kept in form meta. That block is the part worth reading first, because "no submissions" and "nothing is storing submissions" look identical as a number and are not the same answer: measured on WPForms Lite 2.0.3.1, the free plugin stores no submission rows at all — the entries component is not registered and no entry tables exist — so on a free site a zero is a counter that says nothing has been submitted, and no tool here can read an individual submission from that site. Read level: counts are not personal data.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [ 'form_id' => [ 'type' => 'integer', 'description' => 'Only this form. Omit to count every form.' ] ],
+        ],
+        'accessLevel' => 'read',
+      ],
+      'wpforms_get_form' => [
+        'name' => 'wpforms_get_form',
+        'description' => 'Read one WPForms form\'s schema: its id, title, status, the fields it asks in order, and for each field its id, type, label, whether it is required, and for choice fields the labels a visitor picks from. This is the same JSON the form builder edits, decoded through the plugin\'s own decoder rather than by hand. Form SETTINGS are summarised, not returned: the reply says how many notifications and confirmations the form has and never what they contain, because a notification holds recipient addresses and a confirmation holds a redirect URL that can carry a token — the generic post tools are refused on this post type for exactly that reason. Read level: a form definition is site configuration, not personal data.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [ 'id' => [ 'type' => 'integer', 'description' => 'The form id, as returned by wpforms_briefing.' ] ],
+          'required' => [ 'id' ],
+        ],
+        'accessLevel' => 'read',
+      ],
     ];
   }
 
@@ -275,6 +324,8 @@ class GMCP_Tools_Forms {
         case 'ninjaform_briefing':       $r = $this->ninja_briefing( $args, $r ); break;
         case 'ninjaform_list_entries':   $r = $this->ninja_list( $args, $r ); break;
         case 'ninjaform_get_entry':      $r = $this->ninja_get( $args, $r ); break;
+        case 'wpforms_briefing':         $r = $this->wpforms_briefing( $args, $r ); break;
+        case 'wpforms_get_form':         $r = $this->wpforms_get_form( $args, $r ); break;
         default:
           return $this->error( $r, 'Unknown tool', -32601 );
       }
@@ -285,6 +336,248 @@ class GMCP_Tools_Forms {
   }
 
   #region Shared reading
+
+  // ---- WPForms -------------------------------------------------------------------------
+  //
+  // Two tools, and no entry tool, because there are no entries to read on the plugin most
+  // sites run. The block below is where that decision is enforced rather than asserted: the
+  // storage state is checked, and the reply says which of the three states this site is in.
+
+  /**
+  * Where submission counts come from on this site, and whether there is storage at all.
+  *
+  * Three states, checked rather than assumed, because they are indistinguishable from a
+  * count: an entries component (Pro registers one), entry tables without the component, or
+  * neither — which is what a Lite install is, and where the only record is the plugin's own
+  * counter in post meta. Measured on 2.0.3.1: wpforms()->obj('entry') is null, no
+  * src/Entries, and none of the three tables exist.
+  */
+  private function wpforms_storage_state(): array {
+    $state = [
+      'plugin_loaded' => $this->wpforms_loaded(),
+      'version' => defined( 'WPFORMS_VERSION' ) ? (string) WPFORMS_VERSION : null,
+      'entry_component' => false,
+      'tables' => [ 'present' => [], 'missing' => [] ],
+      'count_source' => 'none',
+      'readable' => false,
+    ];
+    if ( !$state['plugin_loaded'] ) {
+      $state['note'] = 'WPForms is not loaded, so nothing is recording submissions on this site. A zero would mean "no submissions", which is a different fact.';
+      return $state;
+    }
+
+    try {
+      $entry = wpforms()->obj( 'entry' );
+      $state['entry_component'] = is_object( $entry );
+    } catch ( \Throwable $e ) {
+      $state['component_error'] = $e->getMessage();
+    }
+
+    global $wpdb;
+    foreach ( self::WPFORMS_ENTRY_TABLES as $suffix ) {
+      if ( $this->table_exists( $wpdb->prefix . $suffix ) ) {
+        $state['tables']['present'][] = $suffix;
+      } else {
+        $state['tables']['missing'][] = $suffix;
+      }
+    }
+
+    $state['readable'] = true;
+    if ( $state['entry_component'] || $state['tables']['present'] ) {
+      $state['count_source'] = 'rows';
+      $state['note'] = 'This site has WPForms entry storage, so the total below is a row count. Per-form numbers are the counter WPForms keeps in form meta, which is a different measurement and may not add up to it.';
+      return $state;
+    }
+
+    $state['count_source'] = 'counter';
+    $state['note'] = 'This site has no WPForms entry storage: the entries component is not registered and none of the entry tables exist (' . implode( ', ', $state['tables']['missing'] ) . '). That is what WPForms Lite looks like — measured on 2.0.3.1 — so no submission rows exist to read. The counts are the counter WPForms keeps in form meta, which is the value its own reports screen reads. "No submissions" and "nothing is storing submissions" are different answers here, and this is the second.';
+    return $state;
+  }
+
+  /** Counts by form, with the source of each number named. */
+  private function wpforms_briefing( array $args, array $r ): array {
+    $state = $this->wpforms_storage_state();
+    if ( !$state['readable'] ) {
+      return $this->json( $r, [ 'log_state' => $state, 'counts' => null, 'note' => 'No counts are reported, because WPForms is not recording submissions here. A zero would read as "nothing arrived".' ] );
+    }
+
+    $form_id = isset( $args['form_id'] ) ? (int) $args['form_id'] : 0;
+    if ( $form_id > 0 ) {
+      $post = get_post( $form_id );
+      if ( !$post || $post->post_type !== self::WPFORMS_FORM_CPT ) {
+        return $this->json( $r, [ 'log_state' => $state, 'counts' => null, 'note' => 'No WPForms form with id ' . $form_id . ' exists on this site.' ] );
+      }
+      $ids = [ $form_id ];
+    } else {
+      $ids = array_map( 'intval', get_posts( [
+        'post_type'   => self::WPFORMS_FORM_CPT,
+        'post_status' => $this->wpforms_status_list( 'any' ),
+        'numberposts' => -1,
+        'fields'      => 'ids',
+      ] ) );
+    }
+
+    $by_form = [];
+    $total = 0;
+    foreach ( $ids as $id ) {
+      $count = $this->wpforms_count_for_form( $id );
+      $by_form[] = [ 'form_id' => $id, 'title' => (string) get_the_title( $id ) ] + $count;
+      if ( isset( $count['count'] ) && is_int( $count['count'] ) ) {
+        $total += $count['count'];
+      }
+    }
+
+    $out = [
+      'log_state' => $state,
+      'counts' => [ 'total' => $total, 'by_form' => $by_form, 'source' => $state['count_source'] ],
+      'note' => $state['note'],
+    ];
+
+    // When entry rows exist, the row count is the authoritative TOTAL and the per-form
+    // numbers are the plugin's counter. Reported separately and labelled, because dividing
+    // one table total across forms — or repeating it for each — would be a number that is
+    // wrong per form while looking precise. A bare COUNT(*), because the columns inside the
+    // Pro table are unverified from here: a wrong column name would fail as a wrong number.
+    //
+    // Only when no single form was asked for: with form_id set, the table total is not the
+    // answer to the question, and the first version overwrote the per-form number with it.
+    if ( $state['count_source'] === 'rows' && $form_id < 1 ) {
+      $rows_total = $this->wpforms_table_total();
+      $out['counts']['total'] = is_int( $rows_total ) ? $rows_total : null;
+      $out['counts']['total_source'] = 'rows';
+      $out['counts']['per_form_source'] = 'counter';
+      if ( !is_int( $rows_total ) ) {
+        $out['counts']['rows_error'] = $rows_total;
+      }
+    }
+
+    return $this->json( $r, $out );
+  }
+
+  /** One form's schema: the fields, and settings counted rather than returned. */
+  private function wpforms_get_form( array $args, array $r ): array {
+    if ( !$this->wpforms_loaded() ) {
+      return $this->error( $r, 'WPForms is not loaded on this site, so its forms cannot be read.', -32603 );
+    }
+    $id = isset( $args['id'] ) ? (int) $args['id'] : 0;
+    if ( $id < 1 ) {
+      return $this->error( $r, 'A form id is required.' );
+    }
+    $post = get_post( $id );
+    if ( !$post || $post->post_type !== self::WPFORMS_FORM_CPT ) {
+      return $this->json( $r, [ 'log_state' => $this->wpforms_storage_state(), 'form' => null, 'note' => 'No WPForms form with id ' . $id . ' exists on this site.' ] );
+    }
+
+    $data = $this->wpforms_form_data( $id );
+    $fields = [];
+    foreach ( (array) ( $data['fields'] ?? [] ) as $field ) {
+      if ( is_array( $field ) ) {
+        $fields[] = $this->wpforms_field_shape( $field );
+      }
+    }
+    $settings = is_array( $data['settings'] ?? null ) ? $data['settings'] : [];
+
+    return $this->json( $r, [
+      'log_state' => $this->wpforms_storage_state(),
+      'form' => [
+        'id' => $id,
+        'title' => (string) $post->post_title,
+        'status' => (string) $post->post_status,
+        'modified' => (string) $post->post_modified_gmt,
+        'field_count' => count( $fields ),
+        'fields' => $fields,
+        'submissions' => $this->wpforms_count_for_form( $id ),
+        // Counts, never contents. A notification is a list of recipient addresses and a
+        // confirmation is a redirect URL that can carry a token; neither belongs in a reply
+        // this plugin copies into its own audit log, and the generic post tools are refused
+        // on this post type for the same reason.
+        'notifications_count' => is_array( $settings['notifications'] ?? null ) ? count( $settings['notifications'] ) : 0,
+        'confirmations_count' => is_array( $settings['confirmations'] ?? null ) ? count( $settings['confirmations'] ) : 0,
+        'settings_note' => 'Notifications and confirmations are counted, not returned: a notification holds recipient addresses and a confirmation holds a redirect URL that can carry a token.',
+      ],
+    ] );
+  }
+
+  /**
+  * One form's count from the counter, with whether the row was there at all.
+  *
+  * Through get_post_meta(), the same call WPForms' own report class makes, so a missing row
+  * and a zero stay distinguishable: the plugin writes the key when a submission happens, and
+  * get_post_meta returns '' for absent.
+  */
+  private function wpforms_count_for_form( int $form_id ): array {
+    $raw = get_post_meta( $form_id, self::WPFORMS_COUNT_META, true );
+    if ( $raw === '' || $raw === null || $raw === false ) {
+      return [ 'count' => 0, 'source' => 'counter', 'counter_present' => false ];
+    }
+    return [ 'count' => (int) $raw, 'source' => 'counter', 'counter_present' => true ];
+  }
+
+  /** The whole entries table counted, or the error as a string. */
+  private function wpforms_table_total() {
+    global $wpdb;
+    $table = $wpdb->prefix . 'wpforms_entries';
+    if ( !$this->table_exists( $table ) ) {
+      return 'the entries table does not exist';
+    }
+    $wpdb->last_error = '';
+    $n = $wpdb->get_var( 'SELECT COUNT(*) FROM `' . $table . '`' );
+    if ( $wpdb->last_error !== '' ) {
+      return $wpdb->last_error;
+    }
+    return $n === null ? 'the count returned nothing and reported no rows' : (int) $n;
+  }
+
+  /**
+  * A form's stored data, decoded by the plugin's own decoder.
+  *
+  * WPForms keeps a form as a wpforms post whose post_content is JSON. wpforms_decode() is the
+  * function the plugin's own editor and front end use, so going through it means this reader
+  * sees what they see; a hand-written json_decode() would miss the plugin's handling of older
+  * formats and produce an empty schema that reads like an empty form.
+  */
+  private function wpforms_form_data( int $form_id ): array {
+    $raw = (string) get_post_field( 'post_content', $form_id );
+    if ( $raw === '' ) {
+      return [];
+    }
+    $decoded = function_exists( 'wpforms_decode' ) ? wpforms_decode( $raw ) : json_decode( $raw, true );
+    return is_array( $decoded ) ? $decoded : [];
+  }
+
+  /** One field, shaped for a reply. Choices are labels only. */
+  private function wpforms_field_shape( array $field ): array {
+    $out = [
+      'id' => isset( $field['id'] ) ? (int) $field['id'] : null,
+      'type' => isset( $field['type'] ) ? (string) $field['type'] : '',
+      'label' => isset( $field['label'] ) ? (string) $field['label'] : '',
+      'required' => !empty( $field['required'] ),
+    ];
+    if ( in_array( $out['type'], self::WPFORMS_CHOICE_TYPES, true ) && is_array( $field['choices'] ?? null ) ) {
+      $labels = [];
+      foreach ( $field['choices'] as $choice ) {
+        if ( is_array( $choice ) && isset( $choice['label'] ) && is_scalar( $choice['label'] ) ) {
+          $labels[] = (string) $choice['label'];
+        }
+      }
+      $out['choices'] = $labels;
+    }
+    return $out;
+  }
+
+  /**
+  * The post statuses a caller's status argument means.
+  *
+  * 'any' is expanded explicitly rather than passed through: WordPress's 'any' excludes
+  * trash, so a description promising trash and a query using 'any' disagree, and only one of
+  * them can be right.
+  */
+  private function wpforms_status_list( string $status ): array {
+    if ( $status === 'any' ) {
+      return [ 'publish', 'draft', 'pending', 'private', 'future', 'trash' ];
+    }
+    return [ $status ];
+  }
 
   /** Rows as arrays, or the database error as a string. A failed query is never read as empty. */
   private function rows( string $sql, array $params = [] ) {

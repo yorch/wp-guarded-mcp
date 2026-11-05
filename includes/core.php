@@ -87,6 +87,17 @@ class GMCP_Core {
     // READ ONLY. Submissions are personal data a member of the public wrote, so the tools
     // that return one are admin and the briefings are counts at read.
     'mcp_tools_forms' => false,
+    // Wordfence: read the security plugin's own state — firewall mode, scan history, issue
+    // counts and blocks — because "is this site being watched" is a different question from
+    // "what happened", and a count of zero findings means nothing without it. Read-only: the
+    // firewall, the scanner and the issue list are the watcher, and an agent that can quiet
+    // the watcher and then read it back can confirm its own silence.
+    'mcp_tools_wordfence' => false,
+    // Stream: a second third-party activity log, read from its own tables. Its own switch for
+    // the same reason WP Activity Log has one, and read-only for the same reason: an audit log
+    // an agent can shorten the retention of is not an audit log, so wp_stream is refused by
+    // option_write_policy() (see audit_log_option_prefixes()).
+    'mcp_tools_stream' => false,
     // Out-of-band human approval. 'never' | 'deletes' | 'site': which tool calls are held
     // until a logged-in administrator approves them on the Approvals screen. Global rather
     // than per key, so that a key, an OAuth grant and a key minted next week are all
@@ -454,7 +465,36 @@ class GMCP_Core {
   * protection without this list being edited.
   */
   public static function audit_log_option_prefixes(): array {
-    return (array) apply_filters( 'gmcp_audit_log_prefixes', [ 'wsal_' ] );
+    return (array) apply_filters( 'gmcp_audit_log_prefixes', [ 'wsal_', 'wp_stream' ] );
+  }
+
+  /**
+  * Plugin files whose deactivation, deletion or update is refused.
+  *
+  * The option policy stops an agent rewriting an activity log's settings, and that turned out
+  * to be only half of the promise: the same agent could switch the plugin off entirely with one
+  * wp_deactivate_plugin call, which stops the recording just as effectively and is not an
+  * option write at all. Measured on this stack before the rule existed: Stream, Wordfence and
+  * WP Activity Log were each deactivatable through the admin group, while the README said a log
+  * an agent can switch off is not a log.
+  *
+  * By basename, because that is what the plugin tools resolve to and what plugin_basename()
+  * returns. Filterable, because the category is "the thing that watches", not these three
+  * plugins: a site running a different logger adds its own file.
+  *
+  * @return string[] plugin basenames.
+  */
+  public static function watcher_plugin_files(): array {
+    return array_map( 'strval', (array) apply_filters( 'gmcp_watcher_plugin_files', [
+      'wordfence/wordfence.php',
+      'stream/stream.php',
+      'wp-security-audit-log/wp-security-audit-log.php',
+    ] ) );
+  }
+
+  /** Whether this plugin file is one whose removal would stop the site being watched. */
+  public static function is_watcher_plugin( string $plugin_file ): bool {
+    return in_array( strtolower( $plugin_file ), array_map( 'strtolower', self::watcher_plugin_files() ), true );
   }
 
   /**
@@ -744,6 +784,63 @@ class GMCP_Core {
   }
 
   /**
+  * Post types that hold another plugin's CONFIGURATION rather than site content.
+  *
+  * Separate from commerce_post_types() and from personal_data_post_types() because the reason
+  * differs even though the rule is the same shape. A WooCommerce order carries money; a form
+  * submission is a person's data; these carry the settings that decide what happens to both.
+  *
+  * Measured on WPForms Lite 2.0.3.1: a form is a `wpforms` post whose post_content is one JSON
+  * document holding the fields, the notification recipients and the confirmation redirects.
+  * So a readwrite key could rewrite a notification's address through wp_update_post and every
+  * future submission would go to an address the agent chose, with nothing on the site
+  * recording that it changed — and on Lite, which stores no submissions at all, that email is
+  * the only copy. The wpforms tools count those settings and never return them, which would be
+  * decoration if the generic post tools returned them instead.
+  *
+  * Stream's alert rules are posts too (wp_stream_alerts), and a rule set to a disabled status
+  * stops that alert firing: the same silencing, reached through post status.
+  *
+  * @return array<string,array{owner:string,why:string}> post type => who owns it and why.
+  */
+  public static function plugin_config_post_types(): array {
+    return (array) apply_filters( 'gmcp_plugin_config_post_types', [
+      'wpforms' => [
+        'owner' => 'WPForms',
+        'why' => 'the whole form — its fields, its notification recipients and its confirmation redirects — is one JSON document in the post content',
+      ],
+      'wp_stream_alerts' => [
+        'owner' => 'Stream',
+        'why' => 'an alert rule is a post whose status decides whether that alert fires at all',
+      ],
+    ] );
+  }
+
+  /**
+  * The refusal for reading or writing a post type another plugin owns, or true.
+  *
+  * One function so the two directions cannot drift apart on the wording, and so a caller that
+  * only has a type (a creation, a retype, a listing filter) gets the same answer as one that
+  * has a post.
+  */
+  private static function plugin_config_post_refusal( string $type, string $verb, bool $read ) {
+    $types = self::plugin_config_post_types();
+    $key = strtolower( $type );
+    if ( !isset( $types[ $key ] ) ) {
+      return true;
+    }
+    $owner = (string) ( $types[ $key ]['owner'] ?? $key );
+    $why = (string) ( $types[ $key ]['why'] ?? 'it holds that plugin\'s own settings' );
+    if ( $read ) {
+      return 'Reading a ' . $key . ' through the generic post tools needs an admin-level key, because ' . $owner
+        . ' keeps settings in that row rather than content: ' . $why . '.';
+    }
+    return $verb . ' a ' . $key . ' through the generic post tools is refused because ' . $owner . ' owns it. '
+      . 'That row is configuration, not content: ' . $why . ', so a generic write changes behaviour without the plugin validating anything and nothing on the site records that it changed. '
+      . 'Use ' . $owner . '\'s own screen in wp-admin. A site can extend this list with the gmcp_plugin_config_post_types filter.';
+  }
+
+  /**
   * Whether a generic post or meta write may touch this post, and the refusal if not.
   *
   * An order and a subscription are posts when WooCommerce's high-performance order storage
@@ -779,6 +876,15 @@ class GMCP_Core {
   */
   public static function commerce_post_guard( int $post_id, string $verb = 'Changing', ?string $target_type = null ) {
     $type = $post_id > 0 ? get_post_type( $post_id ) : false;
+    // Another plugin's configuration row first, because the sentence differs and so does the
+    // reason. Asked for the target type as well as the existing one: creating or retyping into
+    // one of these types is the same defect reached from the other side.
+    foreach ( array_filter( [ $type, $target_type === null ? '' : trim( $target_type ) ] ) as $candidate ) {
+      $held = self::plugin_config_post_refusal( (string) $candidate, $verb, false );
+      if ( $held !== true ) {
+        return $held;
+      }
+    }
     if ( !$type || !self::is_commerce_post_type( $type ) ) {
       if ( $target_type === null || !self::is_commerce_post_type( trim( $target_type ) ) ) {
         return true;
@@ -845,7 +951,9 @@ class GMCP_Core {
       $type = $post;
     }
     if ( !self::is_commerce_post_type( $type ) ) {
-      return true;
+      // Another plugin's configuration row: below admin it is not returned either, for the
+      // reason the write guard gives one function up.
+      return self::plugin_config_post_refusal( (string) $type, 'Changing', true );
     }
     return 'Reading a ' . strtolower( (string) $type ) . ' through the generic post tools needs an admin-level key. '
       . 'Orders and subscriptions carry customers\' names, email addresses, phone numbers, postal addresses and IP addresses in their meta, '
@@ -1922,6 +2030,22 @@ class GMCP_Core {
     // under (GMCP_Core::personal_data_post_guard()), whether or not this switch is on.
     if ( $this->get_option( 'mcp_tools_forms' ) ) {
       new GMCP_Tools_Forms();
+    }
+
+    // Wordfence: the security plugin's own state, read from the outside. Registered whenever
+    // its switch is on and NOT gated on Wordfence having loaded, for the reason the Elementor
+    // Pro group is not: wf_status is written to answer "Wordfence is not loaded", which is the
+    // answer an operator needs at exactly the moment nothing is watching, and a gate inside a
+    // class that is never constructed cannot run.
+    if ( $this->get_option( 'mcp_tools_wordfence' ) ) {
+      new GMCP_Tools_Wordfence();
+    }
+
+    // Stream: a second activity log, read from its own tables. Registered unconditionally
+    // within its switch so the briefing can answer "the log is not loaded", which is a
+    // different answer from "the log is empty".
+    if ( $this->get_option( 'mcp_tools_stream' ) ) {
+      new GMCP_Tools_Stream();
     }
   }
 
