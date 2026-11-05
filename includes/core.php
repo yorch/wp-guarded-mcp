@@ -1078,6 +1078,72 @@ class GMCP_Core {
   }
 
   /**
+  * Runs $run() with the readable-only SQL on every WP_Query that does not suppress filters, and
+  * takes it off again, so a listing's paging happens in the database.
+  *
+  * A listing that skipped unreadable rows in PHP could only page by loading every row up to its
+  * offset: measured with 50,000 posts and a read-only key, `limit 5` took 0.6 seconds and
+  * `limit 5, offset 40000` took 13 seconds and 210 MB, because each row up to the offset was built
+  * into a WP_Post and had its parent chain walked, and an offset of ten million ran for over a
+  * minute. Put in the query instead, the offset is an ordinary SQL offset over rows already
+  * filtered. The query must run with suppress_filters false, or WordPress does not apply
+  * posts_join and posts_where at all.
+  *
+  * @see unreadable_post_clauses() for the SQL, which the REST listings and the scans use too.
+  *
+  * @return mixed Whatever $run() returns.
+  */
+  public static function with_readable_posts_sql( callable $run ) {
+    $join = static function ( $join ) {
+      global $wpdb;
+      return $join . self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l' )['join'];
+    };
+    $where = static function ( $where ) {
+      global $wpdb;
+      $c = self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l' );
+      return $c['where'] === '' ? $where : $where . ' AND ' . $c['where'];
+    };
+    add_filter( 'posts_join', $join, PHP_INT_MAX );
+    add_filter( 'posts_where', $where, PHP_INT_MAX );
+    try {
+      return $run();
+    }
+    finally {
+      remove_filter( 'posts_join', $join, PHP_INT_MAX );
+      remove_filter( 'posts_where', $where, PHP_INT_MAX );
+    }
+  }
+
+  /**
+  * The same for a comment query: a comment is read as the post it is on, so a comment on a
+  * post the caller may not read is left out by the query, and the offset is a SQL offset.
+  * WP_Comment_Query applies comments_clauses whatever the arguments.
+  *
+  * A comment with no post, or whose post is gone, is readable, as the PHP check has it.
+  *
+  * @return mixed Whatever $run() returns.
+  */
+  public static function with_readable_comments_sql( callable $run ) {
+    $clauses = static function ( $clauses ) {
+      global $wpdb;
+      $c = self::unreadable_post_clauses( "COALESCE(gmcp_cp.post_type,'')", 'gmcp_cp.post_parent', 'gmcp_cc' );
+      if ( !is_array( $clauses ) || $c['where'] === '' ) {
+        return $clauses;
+      }
+      $clauses['join'] = ( $clauses['join'] ?? '' ) . " LEFT JOIN {$wpdb->posts} gmcp_cp ON gmcp_cp.ID = {$wpdb->comments}.comment_post_ID" . $c['join'];
+      $clauses['where'] = ( ( $clauses['where'] ?? '' ) !== '' ? $clauses['where'] . ' AND ' : '' ) . $c['where'];
+      return $clauses;
+    };
+    add_filter( 'comments_clauses', $clauses, PHP_INT_MAX );
+    try {
+      return $run();
+    }
+    finally {
+      remove_filter( 'comments_clauses', $clauses, PHP_INT_MAX );
+    }
+  }
+
+  /**
   * Rows a listing may return, collected until the page is full.
   *
   * A listing that fetches a page and then drops what the caller may not read returns a short
@@ -1085,18 +1151,24 @@ class GMCP_Core {
   * says the newest row is one the caller may not see. So the unreadable rows are skipped as
   * the page is filled, and a hidden row changes nothing a caller can count.
   *
-  * Bounded, so a window of nothing but unreadable rows cannot run a query forever; past the
-  * bound the page can come back short, which the guardrails page states.
+  * The listings leave the unreadable rows out in SQL (with_readable_posts_sql(),
+  * with_readable_comments_sql()), which is where their offset is applied, so this is the backstop
+  * for a row the SQL let through and the guard would not: it asks the guard row by row.
+  *
+  * Bounded, so a window of nothing but unreadable rows cannot run a query forever. The bound is
+  * on rows looked at, $max_scan of them in all, and counts the rows passed over for $skip as well:
+  * an offset buys no extra work (it used to extend the bound, and an offset of ten million
+  * loaded every row below it). Past the bound the page can come back short, which the
+  * guardrails page states. Callers give the database their offset and pass no $skip.
   *
   * @param callable $fetch (int $offset, int $size): array, the next raw rows in listing order.
   * @param callable $keep  (mixed $row): bool, whether the caller may see the row.
-  * @param int      $skip  Readable rows to pass over first, the caller's offset.
+  * @param int      $skip  Readable rows to pass over first, counted against $max_scan.
   */
   public static function collect_readable( callable $fetch, callable $keep, int $limit, int $skip = 0, int $max_scan = 5000 ): array {
     $out = [];
     $raw = 0;
     $scanned = 0;
-    $max_scan += $skip;
     $size = max( 50, min( 500, $limit * 2 ) );
     while ( $scanned < $max_scan ) {
       $rows = $fetch( $raw, $size );

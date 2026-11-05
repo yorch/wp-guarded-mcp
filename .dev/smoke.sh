@@ -2309,6 +2309,52 @@ wpe 'foreach ( [ '"$MK_SUB"', '"$MK_ATT"', '"$MK_OK"', '"$MK_PG"', '"$MK_PG2"', 
 check "put back: the fixtures are gone" "$(wpe 'echo count( get_posts( [ "post_type" => "any", "post_status" => "any", "numberposts" => -1, "s" => "MK " ] ) );')" "0"
 fi
 
+echo "-- a listing pages in the database: more than the scan bound of unreadable rows, and an offset that costs nothing --"
+# The listings used to skip the rows a key may not read in PHP, a window at a time, so a run of more than
+# 5000 consecutive unreadable rows at the head left a short page, and an offset was paid for by loading every
+# row up to it (measured with 50,000 posts and a read-only key: 13 seconds and 210 MB for offset 40,000, over
+# a minute for ten million). They are left out in SQL now, so the offset is the database's. The unreadable
+# rows are 5,200 uploads and comments that hang from a form submission, newest first, so they sit at the head
+# of every listing; three ordinary uploads and comments sit behind them.
+PG_N=5200
+PG_SUB=$(wpe 'echo wp_insert_post( [ "post_type" => "flamingo_inbound", "post_status" => "publish", "post_title" => "PGB submission" ] );')
+PG_POST=$(wpe 'echo wp_insert_post( [ "post_type" => "post", "post_status" => "publish", "post_title" => "PGB ordinary post" ] );')
+wpe 'foreach ( [ 1, 2, 3 ] as $i ) { $d = "2001-01-0$i 00:00:00"; $a = wp_insert_post( [ "post_type" => "attachment", "post_status" => "inherit", "post_title" => "PGB ordinary upload $i", "post_mime_type" => "image/png", "post_date" => $d, "post_date_gmt" => $d, "guid" => home_url( "/pgb-ordinary-$i.png" ) ] ); wp_insert_comment( [ "comment_post_ID" => '"$PG_POST"', "comment_content" => "PGB ordinary comment $i", "comment_approved" => 1, "comment_date" => $d, "comment_date_gmt" => $d ] ); }' >/dev/null
+# Every column named, because a hand-built row that leaves out a NOT NULL column reads back differently on the
+# other engine, and 5,200 wp_insert_post calls take ten minutes on a site with tens of thousands of posts.
+PG_MADE=$(wpe 'global $wpdb; $n = 0; for ( $i = 0; $i < '"$PG_N"'; $i++ ) { $d = gmdate( "Y-m-d H:i:s", 4102444800 - $i ); $n += (int) $wpdb->insert( $wpdb->posts, [ "post_author" => 1, "post_date" => $d, "post_date_gmt" => $d, "post_content" => "", "post_title" => "PGB submission upload $i", "post_excerpt" => "", "post_status" => "inherit", "comment_status" => "closed", "ping_status" => "closed", "post_password" => "", "post_name" => "pgb-submission-upload-$i", "to_ping" => "", "pinged" => "", "post_modified" => $d, "post_modified_gmt" => $d, "post_content_filtered" => "", "post_parent" => '"$PG_SUB"', "guid" => "", "menu_order" => 0, "post_type" => "attachment", "post_mime_type" => "image/png", "comment_count" => 0 ] ); $wpdb->insert( $wpdb->comments, [ "comment_post_ID" => '"$PG_SUB"', "comment_author" => "a", "comment_author_email" => "", "comment_author_url" => "", "comment_author_IP" => "", "comment_date" => $d, "comment_date_gmt" => $d, "comment_content" => "PGB submission comment $i", "comment_karma" => 0, "comment_approved" => "1", "comment_agent" => "", "comment_type" => "comment", "comment_parent" => 0, "user_id" => 0 ] ); } wp_cache_flush(); echo $n;')
+check "CONTROL: $PG_N uploads and $PG_N comments hang from the submission, all newer than the ordinary ones" "$PG_MADE" "$PG_N"
+PG_RO=$(wpe '$a=GMCP_Tokens::create("pg readonly","readonly",0,[]);echo $a["secret"];')
+check "CONTROL: the three ordinary uploads and comments exist" "$(wpe 'global $wpdb; echo (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_title LIKE \"PGB ordinary upload %\"" ), "/", (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_content LIKE \"PGB ordinary comment %\"" );')" "3/3"
+occurrences() { grep -o "$1" "$OUT/$2" | wc -l | tr -d ' '; } # the reply is one JSON line, so grep -c would count lines
+n_rows() { py 'import json,sys;print(len(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])))' "$1"; }
+callk pg1 "$PG_RO" "$(tool_json 1 wp_get_media '{"limit":3,"search":"PGB"}')"
+check "wp_get_media: a page of three behind $PG_N unreadable rows is the three ordinary uploads" "$(n_rows pg1)/$(occurrences 'PGB ordinary upload' pg1)" "3/3"
+check "and none of the submission's" "$(occurrences 'PGB submission upload' pg1)" "0"
+callk pg2 "$PG_RO" "$(tool_json 2 wp_get_posts '{"post_type":"attachment","post_status":"inherit","limit":3,"search":"PGB"}')"
+check "wp_get_posts of attachments: the same" "$(n_rows pg2)/$(occurrences 'PGB ordinary upload' pg2)/$(occurrences 'PGB submission upload' pg2)" "3/3/0"
+callk pg3 "$PG_RO" "$(tool_json 3 wp_get_posts '{"post_type":"attachment","post_status":"inherit","limit":1,"offset":1,"search":"PGB"}')"
+callk pg3a "$PG_RO" "$(tool_json 4 wp_get_posts '{"post_type":"attachment","post_status":"inherit","limit":3,"search":"PGB"}')"
+check "an offset still counts readable rows: offset 1 is the second row of the full list (and is a row: an empty page on both sides would agree)" \
+  "$(n_rows pg3)/$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0]["ID"])' pg3)" \
+  "1/$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[1]["ID"])' pg3a)"
+callk pg4 "$PG_RO" "$(tool_json 5 wp_get_comments '{"limit":3,"status":"all","search":"PGB"}')"
+check "wp_get_comments: a page of three behind $PG_N comments on a submission is the three ordinary comments" "$(n_rows pg4)/$(occurrences 'PGB ordinary comment' pg4)/$(occurrences 'PGB submission comment' pg4)" "3/3/0"
+callk pg5 "$PG_RO" "$(tool_json 6 wp_get_comments '{"limit":1,"offset":1,"status":"all","search":"PGB"}')"
+callk pg5a "$PG_RO" "$(tool_json 7 wp_get_comments '{"limit":3,"status":"all","search":"PGB"}')"
+check "a comment offset counts readable rows too" \
+  "$(n_rows pg5)/$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0]["comment_ID"])' pg5)" \
+  "1/$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[1]["comment_ID"])' pg5a)"
+PG_T0=$(date +%s)
+callk pg6 "$PG_RO" "$(tool_json 8 wp_get_posts '{"post_type":"any","limit":5,"offset":10000000}')"
+PG_T1=$(date +%s)
+check "an offset of ten million answers an empty page, not an error" "$(verdict pg6)/$(n_rows pg6)" "ok/0"
+check "and quickly (took $((PG_T1-PG_T0))s, under 20)" "$([ $((PG_T1-PG_T0)) -lt 20 ] && echo yes || echo no)" "yes"
+callk pg7 "$PG_RO" "$(tool_json 9 wp_get_comments '{"limit":3,"offset":10000000}')"
+check "wp_get_comments with an offset of ten million answers an empty page" "$(verdict pg7)/$(n_rows pg7)" "ok/0"
+wpe 'global $wpdb; $wpdb->query( "DELETE FROM {$wpdb->posts} WHERE post_title LIKE \"PGB %\"" ); $wpdb->query( "DELETE FROM {$wpdb->comments} WHERE comment_content LIKE \"PGB %\"" ); wp_cache_flush(); foreach ( GMCP_Tokens::all() as $t ) { if ( $t["label"] === "pg readonly" ) { GMCP_Tokens::revoke( $t["id"] ); } }' >/dev/null
+check "put back: the seeded rows are gone" "$(wpe 'global $wpdb; echo (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_title LIKE \"PGB %\"" ) + (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_content LIKE \"PGB %\"" );')" "0"
+
 # Put the site back: the fixtures, the keys, the grants. A guard test must not leave them.
 wpe 'foreach(get_posts(["post_status"=>"any","post_type"=>["post","page","attachment"],"numberposts"=>-1,"s"=>"DO "]) as $p){ if(strpos($p->post_title,"DO ")===0){wp_delete_post($p->ID,true);} } foreach(wp_get_nav_menus() as $m){ if($m->name==="DO net menu"){wp_delete_nav_menu($m->term_id);} } foreach(GMCP_Tokens::all() as $t){ if(in_array($t["label"],["drafts only writer","plain writer","drafts only admin","pre-flag writer","do admin"],true)){GMCP_Tokens::revoke($t["id"]);} } global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_tokens WHERE client_id IN (SELECT client_id FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\")"); $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\"");' >/dev/null
 

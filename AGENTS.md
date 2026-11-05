@@ -71,7 +71,11 @@ submissions and which hang from one; a tool that has its own "not found" wording
 function for both. A listing never fetches a page and then drops rows: it skips what the caller
 may not read while it fills the page (`collect_readable()`), or judges the chain in SQL
 (`unreadable_post_clauses()`, joins and not nested subqueries: the SQLite driver overflows its
-parser on seven nested `EXISTS`). The change records go through `GMCP_Changes::record()` and
+parser on seven nested `EXISTS`), through `with_readable_posts_sql()` and
+`with_readable_comments_sql()` for the listing tools so the offset is the database's (measured:
+offset 40,000 of 50,000 posts took 13 s and 210 MB when the offset was paid for in PHP), and keeps
+`collect_readable()` as the row-by-row backstop, bounded in rows looked at independently of the
+offset. The change records go through `GMCP_Changes::record()` and
 carry a submission as an id with `[withheld]` values, judged on the state before the write as
 well as after it, because `wp_list_changes` is a read-level tool and names a post by its title.
 A new reader of any of these asks the guard; `smoke-forms.sh` block 0c seeds a submission with a

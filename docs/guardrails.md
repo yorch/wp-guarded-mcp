@@ -1406,10 +1406,26 @@ re-read.
     (none either; the comment tool asks the guard itself, and `wp_new_comment()` is covered). And
     anything outside a tool call: a person deleting a submission in wp-admin hands its uploads
     to the deleted post's parent, as WordPress does, and they are ordinary media from then on.
-  - A listing fills its page by skipping what the caller may not read, and stops after 5000
-    rows (plus the offset) have been looked at, so a window of more than that many consecutive
-    unreadable rows can still return a short page. The REST listings and the scans judge the
-    chain in SQL and have no such bound.
+  - `wp_get_posts`, `wp_get_media` and `wp_get_comments` leave what the caller may not read out
+    **in SQL** (`with_readable_posts_sql()` through `posts_join` and `posts_where`, and
+    `with_readable_comments_sql()` through `comments_clauses`; the same clauses as the REST
+    listings), and the offset and `paged` are the database's offset over those rows. Before, they
+    fetched a window, dropped the rows the guard refused in PHP and counted the offset in PHP, so
+    an offset loaded every row below it as an object and walked its parents (measured, 50,000
+    posts, read-only key: `limit 5` 0.6 s, `limit 5, offset 40000` 13.2 s and 210 MB, offset
+    10,000,000 over a minute; the same calls now take 0.1 to 0.5 s and no more memory than the
+    page). The guard is still asked of every row that comes back, as the backstop, and what it
+    refuses is skipped while the page is filled; that PHP pass looks at no more than 5000 rows in
+    all, and the offset is not part of that count (it used to extend it). So the work is bounded by
+    the database's own cost of an offset (an index walk, not objects) plus at most 5000 rows judged,
+    and a short page is possible only if more than 5000 consecutive rows the SQL let through are
+    ones the guard refuses, which the two should never disagree about. The listings run with
+    `suppress_filters` off, as the REST listings do, so other plugins' query filters (a language
+    filter, for instance) now apply to them. The briefing's latest-post probe and the resource
+    still use the PHP pass alone with the 5000 bound, and for a window of more than 5000 unreadable
+    rows at the head of a listing they can still answer short. Rows with identical dates may come
+    back in another order than before, because the join changes the plan and `post_date` is the
+    only sort key.
   - A taxonomy shared between a submission type and an ordinary type is listed by
     `wp_get_terms`, and the same applies to its terms on an ordinary post.
   - Every route to the database that is not a post reader, and the optional groups' own stores
