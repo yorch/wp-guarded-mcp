@@ -251,6 +251,16 @@ t=json.load(sys.stdin)["result"]["content"][0]["text"]
 print("yes" if re.search(r"O:\d+:\\\"|s:\d+:\\\"|a:\d+:\{",t) else "no")' "" list)" "no"
 check "no row in the reply carries an email address" "$(has list "$EMAIL")" "no"
 check "no row in the reply carries the attempted username" "$(has list "$SECRET_USER")" "no"
+# The thing to be withheld has to exist, or "no IP in the reply" is true of a reader that returns
+# the column and of one that does not alike. WP Activity Log stores the caller's address on every
+# row it writes (client_ip), so the window the listing reads must hold rows that carry one, and
+# the listing's own rows must be among them. The check below was the suite's only intermittent
+# failure and its absence-check had no such control.
+LISTED_MIN=$(py 'import json,sys
+t=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])
+print(min(e["id"] for e in t["events"]) if t["events"] else 0)' "" list)
+check "CONTROL: the rows the listing returned are stored with a client IP (the column to be withheld is populated)" \
+  "$(sqlhas "SELECT COUNT(*) FROM wp_wsal_occurrences WHERE id >= ${LISTED_MIN:-0} AND client_ip REGEXP '^[0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}$'")" "yes"
 check "no row in the reply carries a client IP" \
   "$(has_ip list)" "no"
 
