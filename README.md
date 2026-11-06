@@ -165,7 +165,10 @@ and a database question, not a content scan: a secret in a file with an ordinary
 list does not name is archived, and the form plugins' directory names were read from the source of
 their free releases (the table in `docs/guardrails.md` says which are verified and which, such as
 Gravity Forms and the paid add-ons, are not; extend them with `gmcp_export_private_directories` and `gmcp_export_private_names`).
-A tree whose every entry is withheld has nothing to archive and the pull says so.
+A form submission's uploads are found through the submission they hang from, so once core deletes
+the submission (which makes its attachments unattached) they are archived like any other media file
+unless they sit in a directory the list names; `docs/guardrails.md` says what the download tool does
+about the same file. A tree whose every entry is withheld has nothing to archive and the pull says so.
 
 **Site administration**, off by default: installing, activating, updating and deleting
 plugins and themes; navigation menus and their items; widgets and widget areas; the

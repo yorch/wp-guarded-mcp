@@ -1791,6 +1791,24 @@ one-time URL.
   shop, backup and generic names are still written from memory and not checked. Files in
   `plugins`, `themes` and `mu-plugins` are matched by file name only, since a directory called
   `logs` there is usually code.
+- **A deleted submission releases its uploads, and the guard cannot follow them.** Every guard that
+  protects a visitor's upload finds it by walking `post_parent` up to a form-submission type
+  (`post_read_guard()`, `unreadable_post_clauses()`, `personal_upload_paths()`). When core deletes
+  the submission, `wp_delete_post()` points its attachments at the deleted post's own parent, which
+  for a submission is 0 (measured: parent 1525 before, 0 after, the attachment row and its file
+  untouched). From then on the upload is an unattached media file: the tree test no longer finds
+  it, `wp_export_request` archives it unless it sits in a directory the name list withholds, and an
+  admin-level `wp_download_request` serves it. A key below admin is still refused by the download
+  tool, because that tool wants a published parent and an unattached file has none ("not attached to a
+  post at all"); the media listings, however, no longer hold the row back. A flag recorded on
+  `before_delete_post` (the ids of the attachments in the submission's tree, kept as meta and
+  read by the guards) would close it, and was not built: it would have to be read by every one of
+  those walks, by the SQL joins that page the listings and by the write guards, and a flag read by
+  some of them and not the rest would document a protection that some readers do not have, which is
+  worse than the plain statement. What helps today: the directory list above (a plugin that keeps
+  its uploads in its own folder stays withheld after the submission is gone), and deleting the
+  upload together with the submission, which the form plugin may or may not do. The suite pins the
+  gap (`smoke-export.sh`, "KNOWN LIMIT"), so a change that closes it has to update this paragraph.
 - **Where the form plugins put their files: measured from source, per plugin.** The list in
   `GMCP_Tools_Export::PRIVATE_UPLOAD_DIRS` was written from memory and was wrong in both
   directions. The free releases were downloaded from wordpress.org into a scratch directory and

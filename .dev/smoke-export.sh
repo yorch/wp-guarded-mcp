@@ -588,6 +588,16 @@ check "the submission's own file is not an entry" \
   "$(python3 -c 'import zipfile,sys; print("no" if sys.argv[2] in zipfile.ZipFile(sys.argv[1]).namelist() else "yes")' "$OUT/sub.zip" "$MARK-visitor.png")" "yes"
 check "its generated size's bytes are not in the archive" "$(zip_has "$OUT/sub.zip" "SUBMISSION-THUMB-$MARK")" "no"
 check "its converted copy's bytes are not in the archive" "$(zip_has "$OUT/sub.zip" "SUBMISSION-WEBP-$MARK")" "no"
+# KNOWN LIMIT, pinned so that fixing it forces the sentence in docs/guardrails.md to change: core's
+# wp_delete_post() points a deleted post's attachments at the post's own parent (0 for a
+# submission), after which nothing links the upload to the submission and the tree test cannot find
+# it. If this check starts to fail, the guard has learned to follow an upload after its submission is
+# gone; update the "deleted submission" paragraph and make this expect personal_data_upload.
+wpq 'wp_delete_post('"$SUB"', true);' >/dev/null
+check "CONTROL: the submission is deleted and the upload is still a row" \
+  "$(wpq 'echo get_post('"$SUB"') ? "submission" : "gone", "/", (int) get_post('"$SUBATT"')->post_parent, "/", get_post_type('"$SUBATT"');')" "gone/0/attachment"
+call "$TOK" sub_man2 "$(tc wp_export_request '{"root":"uploads","path":"'"$SUBDIR"'"}')"
+check "KNOWN LIMIT: after core deletes the submission its upload is no longer withheld" "$(excl_reason sub_man2 "$MARK-visitor.png")" "-"
 
 echo "-- a pull of a tree with nothing to archive says so, and leaves nothing behind --"
 dc cli sh -c "mkdir -p '$UPLOADS/export-nothing-$MARK' && printf 'x\n' > '$UPLOADS/export-nothing-$MARK/.env'" >/dev/null 2>&1
