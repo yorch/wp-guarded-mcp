@@ -1,7 +1,11 @@
 # Changelog
 
-## [1.2.1](https://github.com/yorch/wp-guarded-mcp/compare/v1.2.0...v1.2.1) (2026-11-06)
+## [1.3.0](https://github.com/yorch/wp-guarded-mcp/compare/v1.2.0...v1.3.0) (2026-11-06)
 
+
+### Features
+
+* create Beaver Builder pages from a typed schema ([#54](https://github.com/yorch/wp-guarded-mcp/issues/54)) ([dbe5eec](https://github.com/yorch/wp-guarded-mcp/commit/dbe5eec))
 
 ### Bug Fixes
 
