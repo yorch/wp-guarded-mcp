@@ -1587,6 +1587,16 @@ re-read.
       may then be wrong, and nothing here claims otherwise.
       A statement the database was given and answered with rows that a later `posts_results` or
       `the_posts` filter changed is not a paging problem and is left to the row check.
+    - *Results are cached per guard.* `WP_Comment_Query` keys its cache on its arguments and not on
+      the SQL the filters made of them, so one cache domain for every access level served an
+      admin's page (with the order notes in it) to a read-only key, and a read-only key's page to an
+      admin, who then missed the rows it had left out (measured with an in-process object cache
+      standing in for a persistent one: the read-only page shifted by the admin's hidden rows, and
+      the admin's page lacked two comments). The listings now cache under a domain made of the
+      caller's level and a hash of the guard's SQL (`listing_scope()`), and the post listings put
+      the same value in their query arguments, which `WP_Query` includes in its key (it also keys
+      on the finished SQL, which differs by level, so that one was not shared, but did not rely on
+      it staying so).
     - *Completeness is not the guard's to keep, and is documented rather than fixed.* A listing
       shows what the site's own query layer returns, so a filter another plugin applies to every
       query (a language filter, a membership plugin's or a "hide from admin" plugin's `posts_where`)

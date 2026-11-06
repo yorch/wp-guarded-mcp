@@ -97,7 +97,9 @@ each query's own `request` must carry the guard as the server reads it with comm
 then the database's offset counts hidden rows. The REST list tools judge the finished rows by id
 AFTER `rest_do_request()` returns (`judge_post_rows()`, asking the controller for `id` when `_fields`
 omits it), because no hook registered during the dispatch can run behind code that runs after it, and
-re-page in PHP the same way when the query is in doubt. `smoke-listing-filters.sh` attacks all of that with a read-only key and a
+re-page in PHP the same way when the query is in doubt. Listing results are cached under a domain
+that names the level and the guard (`listing_scope()`): `WP_Comment_Query` keys on its arguments
+alone. `smoke-listing-filters.sh` attacks all of that with a read-only key and a
 test-only mu-plugin of foreign filters. The change records go through `GMCP_Changes::record()` and
 carry a submission as an id with `[withheld]` values, judged on the state before the write as
 well as after it, because `wp_list_changes` is a read-level tool and names a post by its title.

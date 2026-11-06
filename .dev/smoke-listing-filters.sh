@@ -103,14 +103,25 @@ $c = function ( $k, $post, $text, $sec ) use ( &$ids ) {
 $c( "C1", $ids["A"], "GMCPFF-COMMENT-1", 3 );
 $c( "CS", $ids["SUB"], "GMCPFF-SUBCOMMENT", 2 );
 $c( "C2", $ids["A"], "GMCPFF-COMMENT-2", 1 );
+// Two rows a read-only key may not read and an admin may: an order, and a comment on it. They make a
+// listing answer depend on the level, which the cache block needs. The order is a bare row, and the
+// comment is an ordinary one: an order NOTE would do, but WooCommerce, where it is installed, hides
+// notes from every comment query, for an admin too.
+global $wpdb;
+$wpdb->insert( $wpdb->posts, [ "post_title" => "GMCPFF-ORDER", "post_type" => "shop_order", "post_status" => "wc-processing",
+  "post_date" => "2031-03-04 12:00:09", "post_date_gmt" => "2031-03-04 12:00:09", "post_modified" => "2031-03-04 12:00:09", "post_modified_gmt" => "2031-03-04 12:00:09" ] );
+$ids["ORDER"] = $wpdb->insert_id;
+$c( "NOTE", $ids["ORDER"], "GMCPFF-ORDERCOMMENT", 2 );
 echo wp_json_encode( $ids );')
 jid() { python3 -c 'import json,sys;print(json.loads(sys.argv[1])[sys.argv[2]])' "$SEED" "$1"; }
 A=$(jid A); B=$(jid B); SUB=$(jid SUB); KID=$(jid KID); UP=$(jid UP); M1=$(jid M1); M2=$(jid M2); M3=$(jid M3)
-C1=$(jid C1); CS=$(jid CS); C2=$(jid C2)
+C1=$(jid C1); CS=$(jid CS); C2=$(jid C2); NOTE=$(jid NOTE); ORDER=$(jid ORDER)
 check "CONTROL: the upload is stored as an attachment of the submission" \
   "$(wpe 'echo get_post_type('"$UP"') . ":" . wp_get_post_parent_id('"$UP"') . ":" . get_post_type('"$SUB"');')" "attachment:$SUB:nf_sub"
 check "CONTROL: the comment on the submission is stored on it" "$(wpe 'echo get_comment('"$CS"')->comment_post_ID;')" "$SUB"
 check "CONTROL: the page is stored as a child of the submission" "$(wpe 'echo wp_get_post_parent_id('"$KID"');')" "$SUB"
+check "CONTROL: the comment is stored on the order, which is a shop_order row" \
+  "$(wpe 'echo get_comment('"$NOTE"')->comment_post_ID . ":" . get_post_type('"$ORDER"');')" "$ORDER:shop_order"
 check "CONTROL: no foreign filter mode is set yet" "$(wpe 'echo get_option("gmcp_test_filter_mode","") === "" ? "none" : "set";')" "none"
 
 SECRETS="GMCPFF-SUBMISSION GMCPFF-UPLOAD GMCPFF-SUBCOMMENT GMCPFF-CHILDPAGE"
@@ -369,6 +380,40 @@ check "a row with no id added behind everything is dropped" "$(has f4 GMCPFF-UPL
 check "CONTROL: the filter added it" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
 setmode ""
 
+echo "== Block 8: results are cached per guard =="
+# The object cache of one wp-cli process stands in for a persistent one (Redis, Memcached) shared by
+# requests: every call below sees what an earlier one stored. WP_Comment_Query keys its cache on its
+# arguments alone, so a listing that used one cache domain for every level served one level's page to
+# another. The level is set the way the server sets it, through gmcp_caller_access_level.
+cachecase() { wpe '
+$GLOBALS["lvl"] = "admin";
+add_filter( "gmcp_caller_access_level", function () { return $GLOBALS["lvl"]; }, 99 );
+$com = function ( $level, $limit, $skip ) { $GLOBALS["lvl"] = $level; return implode( ",", array_map( function ( $c ) { return $c->comment_ID; },
+  GMCP_Core::readable_comments_page( [ "status" => "all", "search" => "GMCPFF" ], $limit, $skip ) ) ); };
+$ord = function ( $level ) { $GLOBALS["lvl"] = $level; return implode( ",", array_map( function ( $p ) { return $p->ID; },
+  GMCP_Core::readable_posts_page( [ "post_type" => "shop_order", "post_status" => "any", "s" => "GMCPFF", "suppress_filters" => false ], 50, 0 ) ) ); };
+$case = "'"$1"'";
+wp_cache_flush();
+if ( $case === "ro-then-admin" ) { echo $com( "readonly", 50, 0 ) . "|" . $com( "admin", 50, 0 ); }
+if ( $case === "admin-then-ro" ) { echo $com( "admin", 50, 0 ) . "|" . $com( "readonly", 50, 0 ); }
+if ( $case === "admin-then-ro-page" ) { echo $com( "admin", 1, 1 ) . "|" . $com( "readonly", 1, 1 ); }
+if ( $case === "ro-admin-ro-page" ) { echo $com( "readonly", 1, 1 ) . "|" . $com( "admin", 1, 1 ) . "|" . $com( "readonly", 1, 1 ); }
+if ( $case === "admin-ro-admin-page" ) { echo $com( "admin", 1, 1 ) . "|" . $com( "readonly", 1, 1 ) . "|" . $com( "admin", 1, 1 ); }
+if ( $case === "orders-ro-then-admin" ) { echo $ord( "readonly" ) . "|" . $ord( "admin" ); }
+if ( $case === "orders-admin-then-ro" ) { echo $ord( "admin" ) . "|" . $ord( "readonly" ); }'; }
+# Newest first: C1 (sec 3), NOTE (sec 2, on an order: admin only; the id breaks the tie with CS), CS (sec 2, on the submission, hidden at every level), C2 (sec 1).
+check "CONTROL: a fresh cache, read-only: the ordinary comments, none on the order" "$(wpe 'wp_cache_flush(); add_filter("gmcp_caller_access_level", function () { return "readonly"; }, 99); echo implode( ",", wp_list_pluck( GMCP_Core::readable_comments_page( [ "status" => "all", "search" => "GMCPFF" ], 50, 0 ), "comment_ID" ) );')" "$C1,$C2"
+check "CONTROL: a fresh cache, admin: the comment on the order too" "$(wpe 'wp_cache_flush(); add_filter("gmcp_caller_access_level", function () { return "admin"; }, 99); echo implode( ",", wp_list_pluck( GMCP_Core::readable_comments_page( [ "status" => "all", "search" => "GMCPFF" ], 50, 0 ), "comment_ID" ) );')" "$C1,$NOTE,$C2"
+check "read-only then admin, same arguments: admin still gets the comment on the order" "$(cachecase ro-then-admin)" "$C1,$C2|$C1,$NOTE,$C2"
+check "admin then read-only, same arguments: read-only still gets none on the order" "$(cachecase admin-then-ro)" "$C1,$NOTE,$C2|$C1,$C2"
+check "admin then read-only, one row at offset 1: the page is not shifted by the admin's extra comment" "$(cachecase admin-then-ro-page)" "$NOTE|$C2"
+# Three readers in a row: a result served from the cache is in doubt and is paged again in PHP, under
+# a second domain, which must be scoped as well or the second round serves the first reader the page of the other.
+check "read-only, admin, read-only again, one row at offset 1: each gets its own page" "$(cachecase ro-admin-ro-page)" "$C2|$NOTE|$C2"
+check "admin, read-only, admin again, one row at offset 1: each gets its own page" "$(cachecase admin-ro-admin-page)" "$NOTE|$C2|$NOTE"
+check "orders (posts): read-only then admin" "$(cachecase orders-ro-then-admin)" "|$ORDER"
+check "orders (posts): admin then read-only" "$(cachecase orders-admin-then-ro)" "$ORDER|"
+
 echo "== Block 7: the SQL reader =="
 check "a comment inside a quoted string is not a comment, one outside is" "$(wpe '
 $a = GMCP_Core::scan_sql( "SELECT \x27a /* b \x27 /* c */ d" );
@@ -388,7 +433,9 @@ docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-test-f
 docker compose exec -T cli wp eval '
 foreach ( [ "gmcp_test_filter_mode", "gmcp_test_filter_arg", "gmcp_test_filter_ids", "gmcp_test_filter_hits", "gmcp_test_filter_marker" ] as $o ) { delete_option( $o ); }
 foreach ( json_decode( '"'"''"$SEED"''"'"', true ) as $k => $id ) {
-  if ( in_array( $k, [ "C1", "CS", "C2" ], true ) ) { wp_delete_comment( $id, true ); } else { wp_delete_post( $id, true ); }
+  if ( in_array( $k, [ "C1", "CS", "C2", "NOTE" ], true ) ) { wp_delete_comment( $id, true ); }
+  elseif ( $k === "ORDER" ) { global $wpdb; $wpdb->delete( $wpdb->posts, [ "ID" => $id ] ); }
+  else { wp_delete_post( $id, true ); }
 }
 $o = get_option( "gmcp_options", [] ); $was = json_decode( '"'"''"$OPTS_WAS"''"'"', true ) ?: [];
 foreach ( [ "mcp_tools_core", "mcp_tools_rest" ] as $k ) { if ( array_key_exists( $k, $was ) ) { $o[$k] = $was[$k]; } else { unset( $o[$k] ); } }

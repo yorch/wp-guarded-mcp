@@ -1419,6 +1419,20 @@ class GMCP_Core {
   }
 
   /**
+  * A short name for the guard a listing runs under: the caller's level and the guard's own SQL.
+  * Listings put it in the key their results are cached under. WP_Comment_Query keys its cache on
+  * its arguments alone, not on the SQL the filters made of them, so two callers with different
+  * guards and the same arguments shared one entry in a persistent object cache: an admin's page
+  * (with the order notes in it) was served to a read-only key, and a read-only key's page to an
+  * admin, who then missed the rows it had left out (measured, with an object cache standing in
+  * for Redis). WP_Query keys on the finished SQL and so was not shared, but is given the same
+  * argument, so that does not rest on the SQL staying different.
+  */
+  private static function listing_scope( array $guard ): string {
+    return substr( md5( self::caller_access_level() . "\n" . $guard['where'] . "\n" . $guard['join'] ), 0, 12 );
+  }
+
+  /**
   * Runs $run() with the readable-only SQL on every WP_Query that does not suppress filters, and
   * takes it off again, so a listing's paging happens in the database.
   *
@@ -1644,7 +1658,8 @@ class GMCP_Core {
     $keep = static function ( $row ) {
       return self::post_read_guard( (int) $row->ID ) === true;
     };
-    $base = [ 'suppress_filters' => false, 'no_found_rows' => true ];
+    // The scope is a query argument and so part of the key WP_Query caches under.
+    $base = [ 'suppress_filters' => false, 'no_found_rows' => true, 'gmcp_scope' => self::listing_scope( self::post_listing_guard() ) ];
     $held = true;
     $rows = self::with_readable_posts_sql( static function () use ( $query, $limit, $skip, $keep, $base ) {
       return self::collect_readable(
@@ -1673,6 +1688,10 @@ class GMCP_Core {
   /**
   * The same for comments. A comment is read as the post it is on.
   *
+  * The results are cached under a domain that names the guard (listing_scope()): the cache key of
+  * a comment query does not include the SQL, so a shared domain served one level's page to
+  * another.
+  *
   * @param array $args  get_comments() arguments, without offset, paged or number.
   * @return WP_Comment[]
   */
@@ -1683,11 +1702,12 @@ class GMCP_Core {
       }
       return !( (int) $row->comment_post_ID > 0 && self::post_read_guard( (int) $row->comment_post_ID ) !== true );
     };
+    $scope = self::listing_scope( self::comment_listing_guard() );
     $held = true;
-    $rows = self::with_readable_comments_sql( static function () use ( $args, $limit, $skip, $keep ) {
+    $rows = self::with_readable_comments_sql( static function () use ( $args, $limit, $skip, $keep, $scope ) {
       return self::collect_readable(
-        static function ( int $from, int $size ) use ( $args, $skip ) {
-          return get_comments( [ 'offset' => $skip + $from, 'number' => $size, 'cache_domain' => 'gmcp_readable' ] + $args );
+        static function ( int $from, int $size ) use ( $args, $skip, $scope ) {
+          return get_comments( [ 'offset' => $skip + $from, 'number' => $size, 'cache_domain' => 'gmcp_readable_' . $scope ] + $args );
         },
         $keep,
         $limit
@@ -1696,10 +1716,10 @@ class GMCP_Core {
     if ( $held ) {
       return $rows;
     }
-    return self::with_readable_comments_sql( static function () use ( $args, $limit, $skip, $keep ) {
+    return self::with_readable_comments_sql( static function () use ( $args, $limit, $skip, $keep, $scope ) {
       return self::collect_readable(
-        static function ( int $from, int $size ) use ( $args ) {
-          return get_comments( [ 'offset' => $from, 'number' => $size, 'cache_domain' => 'gmcp_readable_php' ] + $args );
+        static function ( int $from, int $size ) use ( $args, $scope ) {
+          return get_comments( [ 'offset' => $from, 'number' => $size, 'cache_domain' => 'gmcp_readable_php_' . $scope ] + $args );
         },
         $keep,
         $limit,
