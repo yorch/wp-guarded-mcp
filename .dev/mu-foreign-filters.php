@@ -7,6 +7,8 @@
 */
 $gmcp_ff_mode = get_option( 'gmcp_test_filter_mode', '' );
 $gmcp_ff_arg = (int) get_option( 'gmcp_test_filter_arg', 0 );
+// What the shapes that answer from "their own index" look for in titles and comments.
+$gmcp_ff_marker = (string) get_option( 'gmcp_test_filter_marker', 'GMCPFF' );
 if ( $gmcp_ff_mode === '' ) {
   return;
 }
@@ -25,6 +27,32 @@ register_shutdown_function( function () {
     update_option( 'gmcp_test_filter_hits', (int) get_option( 'gmcp_test_filter_hits', 0 ) + $GLOBALS['gmcp_ff_hits'], false );
   }
 } );
+
+// Takes the guard out of a finished SQL text or a clause, wherever it stands (the plugin puts it
+// first in the WHERE, and a hostile filter must not depend on that): the joins it adds, the
+// NOT (...) group that holds the held types, and the order-note condition. Used by the "late"
+// shapes below, which run behind the guard.
+function gmcp_ff_remove_guard( $sql ) {
+  $sql = preg_replace( '/\s+LEFT JOIN\s+\S+\s+gmcp_\w+\s+ON\s+\S+\s*=\s*\S+/', ' ', (string) $sql );
+  while ( ( $pos = stripos( $sql, 'NOT (LOWER(' ) ) !== false ) {
+    $depth = 0;
+    $end = false;
+    for ( $i = $pos + 4; $i < strlen( $sql ); $i++ ) {
+      if ( $sql[ $i ] === '(' ) {
+        $depth++;
+      }
+      elseif ( $sql[ $i ] === ')' && --$depth === 0 ) {
+        $end = $i;
+        break;
+      }
+    }
+    if ( $end === false ) {
+      break;
+    }
+    $sql = substr( $sql, 0, $pos ) . '1=1' . substr( $sql, $end + 1 );
+  }
+  return preg_replace( '/[\w.`]*comment_type NOT IN \([^)]*\)/', '1=1', $sql );
+}
 global $wpdb;
 switch ( $gmcp_ff_mode ) {
   case 'where_exclude': // benign: a visibility plugin hiding one post
@@ -158,5 +186,112 @@ switch ( $gmcp_ff_mode ) {
       }
       return $comments;
     } );
+    break;
+
+  // ---- Shapes that run BEHIND the guard: registered from inside pre_get_posts / pre_get_comments
+  // ---- at PHP_INT_MAX, so at the guard's own priority but later in the hook's order.
+  case 'late_the_posts': // adds one chosen post to every result of a post query, behind the row judge
+    add_action( 'pre_get_posts', function () use ( $gmcp_ff_arg ) {
+      add_filter( 'the_posts', function ( $posts ) use ( $gmcp_ff_arg ) {
+        if ( !is_array( $posts ) ) {
+          return $posts;
+        }
+        foreach ( $posts as $p ) {
+          if ( (int) $p->ID === $gmcp_ff_arg ) {
+            return $posts;
+          }
+        }
+        $p = get_post( $gmcp_ff_arg );
+        if ( $p ) {
+          $GLOBALS['gmcp_ff_hits']++;
+          array_unshift( $posts, $p );
+        }
+        return $posts;
+      }, PHP_INT_MAX );
+    }, PHP_INT_MAX );
+    break;
+  case 'late_rest_inject': // adds a row naming a chosen post to the REST response at the last filter of the dispatch, behind everything
+  case 'late_rest_inject_noid': // the same row with no id in it
+    add_action( 'pre_get_posts', function () use ( $gmcp_ff_arg, $gmcp_ff_mode ) {
+      add_filter( 'rest_request_after_callbacks', function ( $result ) use ( $gmcp_ff_arg, $gmcp_ff_mode ) {
+        $data = $result instanceof WP_HTTP_Response ? $result->get_data() : null;
+        if ( !is_array( $data ) || !wp_is_numeric_array( $data ) ) {
+          return $result;
+        }
+        $row = [ 'title' => [ 'rendered' => get_the_title( $gmcp_ff_arg ) ] ];
+        if ( $gmcp_ff_mode === 'late_rest_inject' ) {
+          $row = [ 'id' => $gmcp_ff_arg ] + $row;
+        }
+        $GLOBALS['gmcp_ff_hits']++;
+        array_unshift( $data, $row );
+        $result->set_data( $data );
+        return $result;
+      }, PHP_INT_MAX );
+    }, PHP_INT_MAX );
+    break;
+  case 'late_pre_query_index': // answers attachment queries from its own index, behind the guard's check
+    add_action( 'pre_get_posts', function () use ( $wpdb, $gmcp_ff_marker ) {
+      add_filter( 'posts_pre_query', function ( $posts, $q ) use ( $wpdb, $gmcp_ff_marker ) {
+        if ( $posts !== null || $q->get( 'post_type' ) !== 'attachment' ) {
+          return $posts;
+        }
+        $GLOBALS['gmcp_ff_hits']++;
+        $ids = $wpdb->get_col( $wpdb->prepare(
+          "SELECT ID FROM {$wpdb->posts} WHERE post_type = 'attachment' AND post_title LIKE %s ORDER BY post_date DESC, ID DESC LIMIT %d, %d",
+          '%' . $gmcp_ff_marker . '%', (int) $q->get( 'offset' ), max( 1, (int) $q->get( 'posts_per_page' ) )
+        ) );
+        return array_values( array_filter( array_map( 'get_post', $ids ) ) );
+      }, PHP_INT_MAX, 2 );
+    }, PHP_INT_MAX );
+    break;
+  case 'late_request_strip': // takes the guard out of the finished SQL, behind the guard's check
+    add_action( 'pre_get_posts', function () {
+      add_filter( 'posts_request', function ( $sql ) {
+        $new = gmcp_ff_remove_guard( $sql );
+        if ( $new !== $sql ) {
+          $GLOBALS['gmcp_ff_hits']++;
+        }
+        return $new;
+      }, PHP_INT_MAX );
+    }, PHP_INT_MAX );
+    break;
+  case 'where_comment_tail': // an unterminated comment at the end of its WHERE fragment, normal priority
+    gmcp_ff_add( 'posts_where', function ( $w ) {
+      return $w . ' ) OR 1=1 /*';
+    } );
+    break;
+  case 'orderby_comment_tail': // an unterminated comment at the end of its ORDER BY, which swallows the LIMIT
+    gmcp_ff_add( 'posts_orderby', function ( $o ) use ( $wpdb ) {
+      return $o . ' /*';
+    } );
+    break;
+  case 'late_comments_strip': // takes the guard out of the comment clauses, behind the guard
+    add_action( 'pre_get_comments', function () {
+      add_filter( 'comments_clauses', function ( $c ) {
+        $new = gmcp_ff_remove_guard( (string) $c['where'] );
+        $join = preg_replace( '/\s+LEFT JOIN\s+\S+\s+gmcp_\w+\s+ON\s+\S+\s*=\s*\S+/', ' ', (string) $c['join'] );
+        if ( $new !== $c['where'] || $join !== $c['join'] ) {
+          $GLOBALS['gmcp_ff_hits']++;
+          $c['where'] = $new;
+          $c['join'] = $join;
+        }
+        return $c;
+      }, PHP_INT_MAX );
+    }, PHP_INT_MAX );
+    break;
+  case 'late_comments_index': // answers comment queries from its own index, behind the guard's check
+    add_action( 'pre_get_comments', function () use ( $wpdb, $gmcp_ff_marker ) {
+      add_filter( 'comments_pre_query', function ( $answer, $q ) use ( $wpdb, $gmcp_ff_marker ) {
+        if ( $answer !== null ) {
+          return $answer;
+        }
+        $GLOBALS['gmcp_ff_hits']++;
+        $ids = $wpdb->get_col( $wpdb->prepare(
+          "SELECT comment_ID FROM {$wpdb->comments} WHERE comment_content LIKE %s ORDER BY comment_date_gmt DESC, comment_ID DESC LIMIT %d, %d",
+          '%' . $gmcp_ff_marker . '%', (int) $q->query_vars['offset'], max( 1, (int) $q->query_vars['number'] )
+        ) );
+        return array_values( array_filter( array_map( 'get_comment', $ids ) ) );
+      }, PHP_INT_MAX, 2 );
+    }, PHP_INT_MAX );
     break;
 }

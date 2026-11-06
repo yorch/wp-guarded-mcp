@@ -1528,26 +1528,75 @@ re-read.
       row (`posts_pre_query`, `posts_results`, `the_posts`) was held by that row check; the REST
       tools had no such check.
     - *Now:* the guard is added at `posts_clauses_request` (the last hook that sees the clauses as
-      parts) and `comments_clauses`, both at `PHP_INT_MAX`, and the other plugin's WHERE is wrapped,
-      not extended (`AND ( 1=1 <theirs>` + a newline + `) AND <guard>`; the newline is so that a `-- `
-      comment at the end of their fragment cannot swallow the parenthesis). The REST tools also drop,
-      at `the_posts` at `PHP_INT_MAX`, every row `post_read_guard()` refuses, and every query inside
-      a listing runs with filters on whatever `pre_get_posts` asks for, because a plugin that sets
-      `suppress_filters` there took the guard's SQL and the row check with it (measured, another
-      leak). Each of those is asserted under twenty filter shapes, with a control that the
+      parts) and `comments_clauses`, both at `PHP_INT_MAX`, and it stands FIRST in the WHERE, ahead of
+      the other plugin's text, which is wrapped, not extended, and made safe to wrap: its comments
+      are taken out (a `/*` or `-- ` at the end of its fragment would otherwise comment out the
+      parenthesis and the guard behind it, and on SQLite the `LIMIT` too: measured with a
+      `posts_where` that returned `$w . ' ) OR 1=1 /*'`), a `(` is put in front for each `)` it
+      closes without having opened, and a `)` behind for each `(` it never closed, so whatever it
+      wrote is one parenthesised expression that cannot reach the guard. Comments are also taken out
+      of the join, group, order and limit pieces, for the same reason (an `ORDER BY ... /*`
+      swallows the `LIMIT` and with it the offset). A fragment this cannot repair (a quote that
+      never closes) makes the statement fail, because the guard stands in front of it: it cannot
+      widen the query. The REST list tools also judge the finished rows, by id, **after** the
+      dispatch returns, in the tool's own code (`judge_post_rows()`): a callback another plugin
+      registers while the query runs (from `pre_get_posts`, at `PHP_INT_MAX`) runs at the same
+      priority as the `the_posts` row check inside the query, but later, and added rows behind it
+      (measured: `list_media`, `list_posts` and `list_pages` returned a file attached to a form
+      submission, an order's file and a post that shares an order's id to a read-only key), and
+      nothing registered during the dispatch can run behind code that runs after it. The tool asks
+      the controller for `id` when the caller's `_fields` leaves it out, and takes it out of the
+      reply again, so the rows can be judged by something that is not shaped away; a row with no
+      `id` is not a row the controller made and is dropped; the route must be a post type's
+      (users, terms and comments have ids that are not post ids and are not judged). Every query
+      inside a listing runs with filters on whatever `pre_get_posts` asks for, because a plugin
+      that sets `suppress_filters` there took the guard's SQL and the row check with it (measured,
+      another leak). Each of those is asserted under twenty-nine filter shapes, with a control that the
       filter ran and, where it widens the query, a control that the widening was visible.
     - *What a filter can still do, detected and not prevented:* rewrite the finished SQL
       (`posts_request`), or answer without asking the database (`posts_pre_query`,
-      `comments_pre_query`: a search plugin that serves queries from its own index does this). The
-      finished text is checked for the guard's own SQL and the answer for having come from the
-      database, and when either is not so the guard's hold on the SQL is reported lost. A listing
-      that pages then does it in PHP (offset 0, the rows before the offset counted as they are
-      read, inside the 5000-row bound), because the database's offset counted rows the guard would
-      have left out: measured, a hidden file between two others moved every later page by one
-      (`1, 2, 2, 3` for `1, 2, 3`). The price is that an offset past 5000 rows then gives a short or
-      empty page, and only then. The REST tools cannot be re-run that way, so there the row check
-      keeps the content out and the page can be short, which says a row was left out. The rows
-      themselves are held in every case by the row check; the SQL is for the paging.
+      `comments_pre_query`: a search plugin that serves queries from its own index does this),
+      and do it from a callback it registered while the query ran, which at the same priority
+      runs behind every check the guard installed before the query. So the decision is not made
+      by a hook: when the run is over, each `WP_Query` and `WP_Comment_Query` it made is asked,
+      from its own finished `request`, whether the guard's WHERE and JOIN are in it **as the
+      server reads it** (a guard inside a comment is not found, and a comment anywhere in
+      WordPress-built SQL is not trusted), and whether that exact statement is among the SELECTs
+      the database was actually given (recorded at the `query` filter). A statement that was built
+      and never sent is a query that was answered some other way, or served from the object cache.
+      Either way the guard's hold is reported lost ("in doubt") and a listing that pages then does
+      it in PHP (offset 0, the rows before the offset counted as they are read, inside the
+      5000-row bound), because the database's offset may have counted rows the guard would have
+      left out: measured, a hidden file between two others moved every later page by one
+      (`1, 2, 2, 3` for `1, 2, 3`), and a late filter that stripped the guard from the finished
+      SQL or answered from its own index did the same while the earlier check reported the guard
+      held. The price is that an offset past 5000 rows then gives a short or empty page, and only
+      then; and on a site with a persistent object cache a listing that is served from the cache
+      is in doubt by this rule, so it pages in PHP too (the cached windows make that cheap, and the
+      bound is the same). The REST tools do the same when the controller's own query is in doubt:
+      the page is built again in windows of 100 rows from offset 0 with the caller's offset passed
+      over row by row (`page_in_php()`), inside the same bound, so a hidden row no longer
+      shortens a page or shifts the ones after it, and a page the controller would have called out
+      of range (it counted pages from rows another plugin supplied) is answered. The rows
+      themselves are held in every case by the row check: the listings ask the guard of every row,
+      and the REST tools judge the finished response. What the finished-state check does **not**
+      see: a filter on `query` (the string handed to the database) that rewrites the statement
+      and runs AFTER the guard's recording of it (one registered at the highest priority from inside
+      the run, behind the guard's own); one that runs before it is seen, because the recorded text
+      then differs from the query's `request`. Its rows are still held by the row check, but the offset
+      may then be wrong, and nothing here claims otherwise.
+      A statement the database was given and answered with rows that a later `posts_results` or
+      `the_posts` filter changed is not a paging problem and is left to the row check.
+    - *Results are cached per guard.* `WP_Comment_Query` keys its cache on its arguments and not on
+      the SQL the filters made of them, so one cache domain for every access level served an
+      admin's page (with the order notes in it) to a read-only key, and a read-only key's page to an
+      admin, who then missed the rows it had left out (measured with an in-process object cache
+      standing in for a persistent one: the read-only page shifted by the admin's hidden rows, and
+      the admin's page lacked two comments). The listings now cache under a domain made of the
+      caller's level and a hash of the guard's SQL (`listing_scope()`), and the post listings put
+      the same value in their query arguments, which `WP_Query` includes in its key (it also keys
+      on the finished SQL, which differs by level, so that one was not shared, but did not rely on
+      it staying so).
     - *Completeness is not the guard's to keep, and is documented rather than fixed.* A listing
       shows what the site's own query layer returns, so a filter another plugin applies to every
       query (a language filter, a membership plugin's or a "hide from admin" plugin's `posts_where`)

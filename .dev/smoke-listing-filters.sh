@@ -103,14 +103,25 @@ $c = function ( $k, $post, $text, $sec ) use ( &$ids ) {
 $c( "C1", $ids["A"], "GMCPFF-COMMENT-1", 3 );
 $c( "CS", $ids["SUB"], "GMCPFF-SUBCOMMENT", 2 );
 $c( "C2", $ids["A"], "GMCPFF-COMMENT-2", 1 );
+// Two rows a read-only key may not read and an admin may: an order, and a comment on it. They make a
+// listing answer depend on the level, which the cache block needs. The order is a bare row, and the
+// comment is an ordinary one: an order NOTE would do, but WooCommerce, where it is installed, hides
+// notes from every comment query, for an admin too.
+global $wpdb;
+$wpdb->insert( $wpdb->posts, [ "post_title" => "GMCPFF-ORDER", "post_type" => "shop_order", "post_status" => "wc-processing",
+  "post_date" => "2031-03-04 12:00:09", "post_date_gmt" => "2031-03-04 12:00:09", "post_modified" => "2031-03-04 12:00:09", "post_modified_gmt" => "2031-03-04 12:00:09" ] );
+$ids["ORDER"] = $wpdb->insert_id;
+$c( "NOTE", $ids["ORDER"], "GMCPFF-ORDERCOMMENT", 2 );
 echo wp_json_encode( $ids );')
 jid() { python3 -c 'import json,sys;print(json.loads(sys.argv[1])[sys.argv[2]])' "$SEED" "$1"; }
 A=$(jid A); B=$(jid B); SUB=$(jid SUB); KID=$(jid KID); UP=$(jid UP); M1=$(jid M1); M2=$(jid M2); M3=$(jid M3)
-C1=$(jid C1); CS=$(jid CS); C2=$(jid C2)
+C1=$(jid C1); CS=$(jid CS); C2=$(jid C2); NOTE=$(jid NOTE); ORDER=$(jid ORDER)
 check "CONTROL: the upload is stored as an attachment of the submission" \
   "$(wpe 'echo get_post_type('"$UP"') . ":" . wp_get_post_parent_id('"$UP"') . ":" . get_post_type('"$SUB"');')" "attachment:$SUB:nf_sub"
 check "CONTROL: the comment on the submission is stored on it" "$(wpe 'echo get_comment('"$CS"')->comment_post_ID;')" "$SUB"
 check "CONTROL: the page is stored as a child of the submission" "$(wpe 'echo wp_get_post_parent_id('"$KID"');')" "$SUB"
+check "CONTROL: the comment is stored on the order, which is a shop_order row" \
+  "$(wpe 'echo get_comment('"$NOTE"')->comment_post_ID . ":" . get_post_type('"$ORDER"');')" "$ORDER:shop_order"
 check "CONTROL: no foreign filter mode is set yet" "$(wpe 'echo get_option("gmcp_test_filter_mode","") === "" ? "none" : "set";')" "none"
 
 SECRETS="GMCPFF-SUBMISSION GMCPFF-UPLOAD GMCPFF-SUBCOMMENT GMCPFF-CHILDPAGE"
@@ -125,6 +136,8 @@ readers() {
     'list_posts|{"search":"GMCPFF","status":"any","per_page":100,"_fields":"id,title"}' \
     'list_pages|{"search":"GMCPFF","status":"any","per_page":100,"_fields":"id,title"}' \
     'list_media|{"search":"GMCPFF","per_page":100,"_fields":"id,title"}' \
+    'list_media|{"search":"GMCPFF","per_page":100,"_fields":"title"}' \
+    'list_posts|{"search":"GMCPFF","status":"any","per_page":100,"_fields":"title"}' \
     'list_media|{"per_page":100,"_fields":"id"}'
 }
 # Which of the submission's markers came back from any reader, naming the reader.
@@ -163,7 +176,10 @@ for spec in \
   "request_rewrite|0||yes" "pre_get_posts_suppress|0||no" "pre_query_index|0||no" \
   "results_inject|$UP||no" "the_posts_inject|$UP||no" "pre_query_inject|$UP||no" \
   "comments_exclude|$C2||no" "comments_reset|0||no" "comments_or1|0||no" \
-  "comments_results_inject|$CS||no" "comments_pre_query_ids|0|$CS,$C1,$C2|no"; do
+  "comments_results_inject|$CS||no" "comments_pre_query_ids|0|$CS,$C1,$C2|no" \
+  "late_the_posts|$UP||no" "late_rest_inject|$UP||no" "late_rest_inject_noid|$UP||no" \
+  "late_pre_query_index|0||no" "late_request_strip|0||no" "where_comment_tail|0||no" "orderby_comment_tail|0||no" \
+  "late_comments_strip|0||no" "late_comments_index|0||no"; do
   IFS='|' read -r mode arg ids widens <<< "$spec"
   setmode "$mode" "$arg" "$ids"
   check "$mode: no reader returns the submission's tree" "$(leaks)" ""
@@ -207,6 +223,40 @@ setmode "comments_pre_query_ids" 0 "$CS,$C1"
 check "comments_pre_query_ids: comments guard lost (answered without a query)" "$(cheld)" "lost"
 setmode ""
 
+# Filters that run BEHIND the guard: registered from inside pre_get_posts / pre_get_comments at
+# PHP_INT_MAX, so a hook the guard added before the query ran sees the query first. The decision is
+# made from the finished state, so each is reported lost, or held with the raw rows clean. Each
+# line also says whether the RAW rows (before any row check) held the hidden row: that is the
+# control that the filter did what it was written to do, and that "held" is not a probe that
+# cannot see.
+rawheld() { wpe '
+$held = null;
+$ids = GMCP_Core::with_readable_posts_sql( function () { return wp_list_pluck( get_posts( [ "post_type" => "attachment", "post_status" => "inherit", "s" => "GMCPFF",
+  "suppress_filters" => false, "no_found_rows" => true, "posts_per_page" => 50, "cache_results" => false ] ), "ID" ); }, $held );
+echo ( $held ? "held" : "lost" ) . ":" . ( in_array( '"$UP"', array_map( "intval", $ids ), true ) ? "raw-has-hidden" : "raw-clean" );'; }
+crawheld() { wpe '
+$held = null;
+$ids = GMCP_Core::with_readable_comments_sql( function () { return wp_list_pluck( get_comments( [ "number" => 50, "status" => "all", "search" => "GMCPFF",
+  "cache_domain" => "gmcp_held_probe_" . mt_rand() ] ), "comment_ID" ); }, $held );
+echo ( $held ? "held" : "lost" ) . ":" . ( in_array( '"$CS"', array_map( "intval", $ids ), true ) ? "raw-has-hidden" : "raw-clean" );'; }
+setmode ""
+check "no filter: posts guard held, raw rows clean" "$(rawheld)" "held:raw-clean"
+check "no filter: comments guard held, raw rows clean" "$(crawheld)" "held:raw-clean"
+for spec in "late_pre_query_index|lost:raw-has-hidden" "late_request_strip|lost:raw-has-hidden" \
+  "where_comment_tail|held:raw-clean" "orderby_comment_tail|held:raw-clean" "late_the_posts|held:raw-has-hidden"; do
+  IFS='|' read -r mode want <<< "$spec"
+  setmode "$mode" "$UP"
+  check "$mode: posts guard and raw rows are $want" "$(rawheld)" "$want"
+  check "CONTROL: $mode: the filter ran" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+done
+for spec in "late_comments_strip|lost:raw-has-hidden" "late_comments_index|lost:raw-has-hidden" "comments_reset|held:raw-clean" "comments_or1|held:raw-clean"; do
+  IFS='|' read -r mode want <<< "$spec"
+  setmode "$mode" 0
+  check "$mode: comments guard and raw rows are $want" "$(crawheld)" "$want"
+  check "CONTROL: $mode: the filter ran" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+done
+setmode ""
+
 echo "== Block 3: the guard's hooks are taken off again =="
 HOOKS='foreach ( [ "posts_clauses_request", "posts_request", "posts_request_ids", "posts_pre_query", "the_posts", "pre_get_posts", "comments_clauses", "comments_pre_query" ] as $h ) { $n[$h] = isset( $GLOBALS["wp_filter"][$h] ) ? array_sum( array_map( "count", $GLOBALS["wp_filter"][$h]->callbacks ) ) : 0; } echo wp_json_encode( $n );'
 BEFORE=$(wpe "$HOOKS")
@@ -246,6 +296,45 @@ setmode "comments_pre_query_ids" 0 "$C1,$CS,$C2"
 check "comments answered without a query: wp_get_comments gives the same pages" \
   "$(page_titles wp_get_comments ',"status":"all"')" "GMCPFF-COMMENT-1,GMCPFF-COMMENT-2,,,"
 check "CONTROL: that filter ran" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+# Filters that run behind the guard's own checks (registered from inside pre_get_posts). The pager
+# decides from the finished state, so each gives the pages it would give with no hidden row.
+rest_titles() {
+  local out="" pg
+  for pg in 1 2 3 4; do
+    callro list_media "{\"search\":\"GMCPFF\",\"per_page\":1,\"page\":$pg,\"_fields\":\"id,title\"}" rp
+    out="$out$(rows rp | sed 's/UNPARSEABLE//'),"
+  done
+  echo "$out"
+}
+setmode ""
+REST_BASE=$(rest_titles)
+check "no filter: list_media (one row per page) pages over the hidden upload" "$REST_BASE" "GMCPFF-FILE-1,GMCPFF-FILE-2,GMCPFF-FILE-3,,"
+for mode in late_pre_query_index late_request_strip orderby_comment_tail; do
+  setmode "$mode" "$UP"
+  check "$mode: wp_get_posts pages as with no hidden row" \
+    "$(page_titles wp_get_posts ',"post_type":"attachment","post_status":"inherit"')" "GMCPFF-FILE-1,GMCPFF-FILE-2,GMCPFF-FILE-3,,"
+  check "$mode: list_media pages as with no hidden row (no short or shifted page)" "$(rest_titles)" "$REST_BASE"
+  check "CONTROL: $mode: the filter ran" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+done
+# A fragment ending ") OR 1=1 /*" widens the query like "OR 1=1" does (the other plugin's doing, and
+# every later page is of the widened query), but it must not take the guard or the LIMIT with it:
+# the pages are those of the plain "OR 1=1", the upload is not among them, and nothing is shifted.
+setmode "where_or1" 0
+WIDE_POSTS=$(page_titles wp_get_posts ',"post_type":"attachment","post_status":"inherit"')
+WIDE_REST=$(rest_titles)
+setmode "where_comment_tail" 0
+check "where_comment_tail: wp_get_posts pages as plain OR 1=1 does (guard and LIMIT intact)" \
+  "$(page_titles wp_get_posts ',"post_type":"attachment","post_status":"inherit"')" "$WIDE_POSTS"
+check "where_comment_tail: list_media pages as plain OR 1=1 does" "$(rest_titles)" "$WIDE_REST"
+check "CONTROL: the widened pages start with the three ordinary files, and hold no upload" \
+  "$(case "$WIDE_POSTS" in GMCPFF-FILE-1,GMCPFF-FILE-2,GMCPFF-FILE-3,*) case "$WIDE_POSTS" in *UPLOAD*) echo upload;; *) echo ok;; esac;; *) echo other;; esac)" "ok"
+check "CONTROL: that filter ran" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+for mode in late_comments_strip late_comments_index; do
+  setmode "$mode" 0
+  check "$mode: wp_get_comments pages as with no hidden row" "$(page_titles wp_get_comments ',"status":"all"')" "GMCPFF-COMMENT-1,GMCPFF-COMMENT-2,,,"
+  check "CONTROL: $mode: the filter ran" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+done
+setmode ""
 setmode "where_exclude" "$M2"
 check "a benign filter hiding one file: the pages skip it and nothing else (its omission is the other plugin's)" \
   "$(page_titles wp_get_posts ',"post_type":"attachment","post_status":"inherit"')" "GMCPFF-FILE-1,GMCPFF-FILE-3,,,"
@@ -272,12 +361,81 @@ done
 setmode ""
 
 # ---------------------------------------------------------------------------------------------
+echo "== Block 6: the REST rows are judged by id after the response is built =="
+setmode ""
+callro list_media '{"search":"GMCPFF","per_page":100,"_fields":"title"}' f1
+check "_fields without id: the rows carry no id (it was asked for to judge by, and taken out)" \
+  "$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]));j=json.loads(d["result"]["content"][0]["text"])
+print("noid" if j and all("id" not in x for x in j) else "id-present-or-empty")' "$OUT/f1")" "noid"
+callro list_media '{"search":"GMCPFF","per_page":100,"_fields":"id,title"}' f2
+check "_fields with id: the rows carry it" "$(hasid f2 "$M1")" "yes"
+callro list_media '{"search":"GMCPFF","per_page":100,"_fields":"title"}' f3
+check "CONTROL: the id-less reply still holds the ordinary files" "$(has f3 GMCPFF-FILE-1)$(has f3 GMCPFF-FILE-3)" "yesyes"
+check "CONTROL: and not the upload" "$(has f3 GMCPFF-UPLOAD)" "no"
+# Without the judge after the response, a row added at the last filter of the dispatch is returned.
+setmode "late_rest_inject_noid" "$UP"
+callro list_media '{"search":"GMCPFF","per_page":100,"_fields":"id,title"}' f4
+check "a row with no id added behind everything is dropped" "$(has f4 GMCPFF-UPLOAD)" "no"
+check "CONTROL: the filter added it" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+setmode ""
+
+echo "== Block 8: results are cached per guard =="
+# The object cache of one wp-cli process stands in for a persistent one (Redis, Memcached) shared by
+# requests: every call below sees what an earlier one stored. WP_Comment_Query keys its cache on its
+# arguments alone, so a listing that used one cache domain for every level served one level's page to
+# another. The level is set the way the server sets it, through gmcp_caller_access_level.
+cachecase() { wpe '
+$GLOBALS["lvl"] = "admin";
+add_filter( "gmcp_caller_access_level", function () { return $GLOBALS["lvl"]; }, 99 );
+$com = function ( $level, $limit, $skip ) { $GLOBALS["lvl"] = $level; return implode( ",", array_map( function ( $c ) { return $c->comment_ID; },
+  GMCP_Core::readable_comments_page( [ "status" => "all", "search" => "GMCPFF" ], $limit, $skip ) ) ); };
+$ord = function ( $level ) { $GLOBALS["lvl"] = $level; return implode( ",", array_map( function ( $p ) { return $p->ID; },
+  GMCP_Core::readable_posts_page( [ "post_type" => "shop_order", "post_status" => "any", "s" => "GMCPFF", "suppress_filters" => false ], 50, 0 ) ) ); };
+$case = "'"$1"'";
+wp_cache_flush();
+if ( $case === "ro-then-admin" ) { echo $com( "readonly", 50, 0 ) . "|" . $com( "admin", 50, 0 ); }
+if ( $case === "admin-then-ro" ) { echo $com( "admin", 50, 0 ) . "|" . $com( "readonly", 50, 0 ); }
+if ( $case === "admin-then-ro-page" ) { echo $com( "admin", 1, 1 ) . "|" . $com( "readonly", 1, 1 ); }
+if ( $case === "ro-admin-ro-page" ) { echo $com( "readonly", 1, 1 ) . "|" . $com( "admin", 1, 1 ) . "|" . $com( "readonly", 1, 1 ); }
+if ( $case === "admin-ro-admin-page" ) { echo $com( "admin", 1, 1 ) . "|" . $com( "readonly", 1, 1 ) . "|" . $com( "admin", 1, 1 ); }
+if ( $case === "orders-ro-then-admin" ) { echo $ord( "readonly" ) . "|" . $ord( "admin" ); }
+if ( $case === "orders-admin-then-ro" ) { echo $ord( "admin" ) . "|" . $ord( "readonly" ); }'; }
+# Newest first: C1 (sec 3), NOTE (sec 2, on an order: admin only; the id breaks the tie with CS), CS (sec 2, on the submission, hidden at every level), C2 (sec 1).
+check "CONTROL: a fresh cache, read-only: the ordinary comments, none on the order" "$(wpe 'wp_cache_flush(); add_filter("gmcp_caller_access_level", function () { return "readonly"; }, 99); echo implode( ",", wp_list_pluck( GMCP_Core::readable_comments_page( [ "status" => "all", "search" => "GMCPFF" ], 50, 0 ), "comment_ID" ) );')" "$C1,$C2"
+check "CONTROL: a fresh cache, admin: the comment on the order too" "$(wpe 'wp_cache_flush(); add_filter("gmcp_caller_access_level", function () { return "admin"; }, 99); echo implode( ",", wp_list_pluck( GMCP_Core::readable_comments_page( [ "status" => "all", "search" => "GMCPFF" ], 50, 0 ), "comment_ID" ) );')" "$C1,$NOTE,$C2"
+check "read-only then admin, same arguments: admin still gets the comment on the order" "$(cachecase ro-then-admin)" "$C1,$C2|$C1,$NOTE,$C2"
+check "admin then read-only, same arguments: read-only still gets none on the order" "$(cachecase admin-then-ro)" "$C1,$NOTE,$C2|$C1,$C2"
+check "admin then read-only, one row at offset 1: the page is not shifted by the admin's extra comment" "$(cachecase admin-then-ro-page)" "$NOTE|$C2"
+# Three readers in a row: a result served from the cache is in doubt and is paged again in PHP, under
+# a second domain, which must be scoped as well or the second round serves the first reader the page of the other.
+check "read-only, admin, read-only again, one row at offset 1: each gets its own page" "$(cachecase ro-admin-ro-page)" "$C2|$NOTE|$C2"
+check "admin, read-only, admin again, one row at offset 1: each gets its own page" "$(cachecase admin-ro-admin-page)" "$NOTE|$C2|$NOTE"
+check "orders (posts): read-only then admin" "$(cachecase orders-ro-then-admin)" "|$ORDER"
+check "orders (posts): admin then read-only" "$(cachecase orders-admin-then-ro)" "$ORDER|"
+
+echo "== Block 7: the SQL reader =="
+check "a comment inside a quoted string is not a comment, one outside is" "$(wpe '
+$a = GMCP_Core::scan_sql( "SELECT \x27a /* b \x27 /* c */ d" );
+echo json_encode( [ $a["text"], $a["comment"], $a["broken"] ] );')" '["SELECT '"'"'a \/* b '"'"'   d",true,false]'
+check "an unclosed block comment is broken and drops what follows" "$(wpe '
+$a = GMCP_Core::scan_sql( "x /* guard" ); echo json_encode( [ $a["text"], $a["broken"] ] );')" '["x  ",true]'
+check "the guard text inside a comment is not found, outside it is" "$(wpe '
+echo json_encode( [ GMCP_Core::sql_carries( "A /* GUARD */", "GUARD", "" ), GMCP_Core::sql_carries( "A GUARD", "GUARD", "" ), GMCP_Core::sql_carries( "A GUARD /* x", "GUARD", "" ), GMCP_Core::sql_carries( "A -- \nGUARD", "GUARD", "" ) ] );')" "[false,true,false,false]"
+check "a fragment that closes the wrapper and opens a comment is made one balanced expression" "$(wpe '
+$w = GMCP_Core::wrap_foreign_where( " AND x ) OR 1=1 /*" ); $a = GMCP_Core::scan_sql( $w );
+echo json_encode( [ $a["depth"], $a["excess"], $a["comment"], $a["broken"], strpos( $w, "/*" ) === false ] );')" "[0,0,false,false,true]"
+check "CONTROL: an ordinary fragment keeps its meaning" "$(wpe 'echo trim( preg_replace( "/\s+/", " ", GMCP_Core::wrap_foreign_where( " AND post_title <> \x27a)\x27 " ) ) );')" "( 1=1 AND post_title <> 'a)' )"
+
+# ---------------------------------------------------------------------------------------------
 echo "== Cleanup =="
 docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-test-foreign-filters.php >/dev/null 2>&1
 docker compose exec -T cli wp eval '
-foreach ( [ "gmcp_test_filter_mode", "gmcp_test_filter_arg", "gmcp_test_filter_ids", "gmcp_test_filter_hits" ] as $o ) { delete_option( $o ); }
+foreach ( [ "gmcp_test_filter_mode", "gmcp_test_filter_arg", "gmcp_test_filter_ids", "gmcp_test_filter_hits", "gmcp_test_filter_marker" ] as $o ) { delete_option( $o ); }
 foreach ( json_decode( '"'"''"$SEED"''"'"', true ) as $k => $id ) {
-  if ( in_array( $k, [ "C1", "CS", "C2" ], true ) ) { wp_delete_comment( $id, true ); } else { wp_delete_post( $id, true ); }
+  if ( in_array( $k, [ "C1", "CS", "C2", "NOTE" ], true ) ) { wp_delete_comment( $id, true ); }
+  elseif ( $k === "ORDER" ) { global $wpdb; $wpdb->delete( $wpdb->posts, [ "ID" => $id ] ); }
+  else { wp_delete_post( $id, true ); }
 }
 $o = get_option( "gmcp_options", [] ); $was = json_decode( '"'"''"$OPTS_WAS"''"'"', true ) ?: [];
 foreach ( [ "mcp_tools_core", "mcp_tools_rest" ] as $k ) { if ( array_key_exists( $k, $was ) ) { $o[$k] = $was[$k]; } else { unset( $o[$k] ); } }

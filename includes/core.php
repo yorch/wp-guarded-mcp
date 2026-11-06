@@ -1261,6 +1261,229 @@ class GMCP_Core {
   }
 
   /**
+  * Reads SQL text the way a database does for quotes and comments, so a guard can be judged on
+  * what the server will execute and not on what the string says.
+  *
+  * A fragment from another plugin can end in `/*` or `-- `, and a text search for the guard in
+  * the finished SQL then finds the guard inside the comment it was swallowed by. This walks the
+  * text once, keeps quoted strings and backticked names whole (a backslash and the character after
+  * it count as one inside a quote, a doubled quote is an escaped one), and replaces every comment
+  * (`/* *\/`, `-- `, `#`) with a space or a line break. A line comment is taken to start at any
+  * `--`, not only one followed by a space as MySQL has it, and at `#`, which SQLite does not read
+  * as one: over-reading a comment can only make a caller doubt a query that was fine.
+  *
+  * @return array{text: string, comment: bool, broken: bool, depth: int, excess: int}
+  *   text: the SQL with comments replaced. comment: whether there was one. broken: a quote or a
+  *   block comment that never closes (what follows an unclosed block comment is dropped, as the
+  *   server drops it). depth: parentheses opened and never closed. excess: parentheses closed that
+  *   were never opened.
+  */
+  public static function scan_sql( string $sql ): array {
+    $out = '';
+    $n = strlen( $sql );
+    $comment = false;
+    $broken = false;
+    $depth = 0;
+    $excess = 0;
+    for ( $i = 0; $i < $n; $i++ ) {
+      // A run of characters that start nothing is copied in one piece: a query can be long (a
+      // post__in of tens of thousands of ids), and this is asked of every query a listing runs.
+      $run = strcspn( $sql, "'\"`/#-()", $i );
+      if ( $run > 0 ) {
+        $out .= substr( $sql, $i, $run );
+        $i += $run;
+        if ( $i >= $n ) {
+          break;
+        }
+      }
+      $ch = $sql[ $i ];
+      if ( $ch === "'" || $ch === '"' || $ch === '`' ) {
+        $j = $i + 1;
+        while ( $j < $n ) {
+          if ( $sql[ $j ] === '\\' && $ch !== '`' ) {
+            $j += 2;
+            continue;
+          }
+          if ( $sql[ $j ] === $ch ) {
+            if ( $j + 1 < $n && $sql[ $j + 1 ] === $ch ) {
+              $j += 2;
+              continue;
+            }
+            break;
+          }
+          $j++;
+        }
+        if ( $j >= $n ) {
+          $broken = true;
+          $out .= substr( $sql, $i );
+          break;
+        }
+        $out .= substr( $sql, $i, $j - $i + 1 );
+        $i = $j;
+        continue;
+      }
+      $next = $i + 1 < $n ? $sql[ $i + 1 ] : '';
+      if ( $ch === '/' && $next === '*' ) {
+        $comment = true;
+        $out .= ' ';
+        $end = strpos( $sql, '*/', $i + 2 );
+        if ( $end === false ) {
+          $broken = true;
+          break;
+        }
+        $i = $end + 1;
+        continue;
+      }
+      if ( $ch === '#' || ( $ch === '-' && $next === '-' ) ) {
+        $comment = true;
+        $out .= "\n";
+        $i += strcspn( $sql, "\r\n", $i ) - 1;
+        continue;
+      }
+      if ( $ch === '(' ) {
+        $depth++;
+      }
+      elseif ( $ch === ')' ) {
+        if ( $depth > 0 ) {
+          $depth--;
+        }
+        else {
+          $excess++;
+        }
+      }
+      $out .= $ch;
+    }
+    return [ 'text' => $out, 'comment' => $comment, 'broken' => $broken, 'depth' => $depth, 'excess' => $excess ];
+  }
+
+  /** The SQL without its comments. @see scan_sql() */
+  public static function sql_without_comments( string $sql ): string {
+    $scan = self::scan_sql( $sql );
+    return $scan['comment'] ? $scan['text'] : $sql;
+  }
+
+  /**
+  * Another plugin's WHERE fragment, made safe to put inside parentheses of ours.
+  *
+  * The fragment is text from outside: `) OR 1=1 /*` closes the parenthesis the guard put around it
+  * and comments out the guard behind it (measured on SQLite, where the finished query then ran with
+  * no guard and no LIMIT). So the comments are taken out, a `(` is put in front for each `)` that
+  * has no opener, and a `)` behind for each `(` that is never closed. Whatever it wrote, the result
+  * is one parenthesised expression that cannot reach outside its own parentheses, and the guard
+  * stands before it, so a fragment this cannot repair (an unclosed quote) makes the query fail, not
+  * widen. The meaning of a well-formed fragment is unchanged.
+  *
+  * @param string $lead  What opens the expression: ' 1=1 ' for a WHERE that begins with AND (a
+  *                      post query), '' for one that does not (a comment query).
+  */
+  public static function wrap_foreign_where( string $fragment, string $lead = ' 1=1 ' ): string {
+    $scan = self::scan_sql( $fragment );
+    return '(' . str_repeat( '(', $scan['excess'] ) . $lead . $scan['text'] . str_repeat( ')', $scan['depth'] ) . "\n)";
+  }
+
+  /**
+  * Whether a finished query still carries the guard, read the way the server reads it: the guard's
+  * WHERE and its JOIN have to be in the text after the comments are taken out, and a query with a
+  * comment in it at all, or a quote or comment that never closes, is not trusted (WordPress writes
+  * none). A plain search for the text found it inside a comment.
+  */
+  public static function sql_carries( $sql, string $where, string $join ): bool {
+    if ( $where === '' ) {
+      return true;
+    }
+    if ( !is_string( $sql ) ) {
+      return false;
+    }
+    $scan = self::scan_sql( $sql );
+    if ( $scan['comment'] || $scan['broken'] ) {
+      return false;
+    }
+    return strpos( $scan['text'], $where ) !== false && ( $join === '' || strpos( $scan['text'], $join ) !== false );
+  }
+
+  /**
+  * Whether any query that ran for a listing cannot be trusted to have been the database's answer
+  * to a statement that carried the guard. Judged from the finished state, after every filter has
+  * had its say, and not from a hook that a later filter can run behind:
+  * the query's own `request` (what WordPress built and, after the filters, would send) has to carry
+  * the guard as sql_carries() reads it, and has to be among the SELECTs the database was actually
+  * given. A query that was answered without one (`posts_pre_query`, `comments_pre_query` registered
+  * from inside `pre_get_posts` to run after ours) has a request that was never sent, and so has one
+  * served from the object cache; neither is the database counting its offset over the guarded rows,
+  * so both are doubt, and doubt means the caller pages in PHP.
+  *
+  * @param object[]            $queries  The WP_Query / WP_Comment_Query objects that ran.
+  * @param array<string,true>  $sent     md5 of every SELECT the database was given meanwhile.
+  */
+  private static function listing_in_doubt( array $queries, array $sent, string $where, string $join ): bool {
+    global $wpdb;
+    if ( $where === '' ) {
+      return false;
+    }
+    foreach ( $queries as $query ) {
+      $sql = $query->request ?? null;
+      if ( !is_string( $sql ) || trim( $sql ) === '' ) {
+        return true;
+      }
+      if ( !self::sql_carries( $sql, $where, $join ) ) {
+        return true;
+      }
+      if ( !isset( $sent[ md5( trim( $wpdb->remove_placeholder_escape( $sql ) ) ) ] ) ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The guard of a post listing: SQL that leaves out held types and what hangs from them. */
+  private static function post_listing_guard(): array {
+    global $wpdb;
+    return self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l', "{$wpdb->posts}.ID" );
+  }
+
+  /**
+  * The guard of a comment listing. A comment is read as the post it is on; an order note is the
+  * order's own record, so it is held with the order wherever it hangs from and whether or not
+  * WooCommerce is there to hide it from comment queries (it does, with a filter of its own that a
+  * deactivated plugin takes with it). Below admin only, like the post types. @see order_note_types()
+  *
+  * @return array{where: string, join: string} Both empty when nothing is held.
+  */
+  private static function comment_listing_guard(): array {
+    global $wpdb;
+    $c = self::unreadable_post_clauses( "COALESCE(gmcp_cp.post_type,'')", 'gmcp_cp.post_parent', 'gmcp_cc', "{$wpdb->comments}.comment_post_ID" );
+    $conds = [];
+    $join = '';
+    if ( self::caller_access_level() !== 'admin' ) {
+      $notes = implode( ',', array_map( static function ( $type ) {
+        return "'" . esc_sql( $type ) . "'";
+      }, self::order_note_types() ) );
+      if ( $notes !== '' ) {
+        $conds[] = "{$wpdb->comments}.comment_type NOT IN ({$notes})";
+      }
+    }
+    if ( $c['where'] !== '' ) {
+      $join = " LEFT JOIN {$wpdb->posts} gmcp_cp ON gmcp_cp.ID = {$wpdb->comments}.comment_post_ID" . $c['join'];
+      $conds[] = $c['where'];
+    }
+    return [ 'where' => implode( ' AND ', $conds ), 'join' => $join ];
+  }
+
+  /**
+  * A short name for the guard a listing runs under: the caller's level and the guard's own SQL.
+  * Listings put it in the key their results are cached under. WP_Comment_Query keys its cache on
+  * its arguments alone, not on the SQL the filters made of them, so two callers with different
+  * guards and the same arguments shared one entry in a persistent object cache: an admin's page
+  * (with the order notes in it) was served to a read-only key, and a read-only key's page to an
+  * admin, who then missed the rows it had left out (measured, with an object cache standing in
+  * for Redis). WP_Query keys on the finished SQL and so was not shared, but is given the same
+  * argument, so that does not rest on the SQL staying different.
+  */
+  private static function listing_scope( array $guard ): string {
+    return substr( md5( self::caller_access_level() . "\n" . $guard['where'] . "\n" . $guard['join'] ), 0, 12 );
+  }
+
+  /**
   * Runs $run() with the readable-only SQL on every WP_Query that does not suppress filters, and
   * takes it off again, so a listing's paging happens in the database.
   *
@@ -1273,56 +1496,66 @@ class GMCP_Core {
   * the clause filters at all.
   *
   * The clauses go in at `posts_clauses_request` at PHP_INT_MAX, which is the last hook that sees
-  * the clauses as parts, and the WHERE the other plugins built is wrapped in parentheses, not
-  * appended to. Both matter: the guard used to be appended at `posts_where`, so a filter that
-  * ran later and replaced the clause set (`posts_clauses`) dropped it, and one that appended
-  * `OR 1=1` turned `a AND b OR 1=1 AND guard` into "anything the guard allows, or anything that
-  * matches a AND b" (measured: the REST list tools returned a file attached to a form
-  * submission under both). A newline precedes the closing parenthesis so that a `-- ` comment
-  * at the end of another plugin's fragment cannot swallow it.
+  * the clauses as parts, and the guard stands FIRST in the WHERE, ahead of the other plugins' text,
+  * which is wrapped (wrap_foreign_where()) so it cannot close the parenthesis around it, and has
+  * its comments taken out. Both matter: the guard used to be appended at `posts_where`, so a
+  * filter that ran later and replaced the clause set (`posts_clauses`) dropped it, and one that
+  * appended `OR 1=1` turned `a AND b OR 1=1 AND guard` into "anything the guard allows, or
+  * anything that matches a AND b" (measured: the REST list tools returned a file attached to a
+  * form submission under both); and one that ended its fragment with `) OR 1=1 /*` closed the
+  * wrapper and commented the guard and the LIMIT out (measured on SQLite). Behind the guard, a
+  * fragment that still breaks the statement makes it fail and not widen.
   *
   * What a filter can still do is rewrite the finished SQL (`posts_request`) or answer without
-  * a query (`posts_pre_query`). Those are detected,
-  * not prevented: the request is checked for the guard's own text, and $held is false when any
-  * query inside $run() did not carry it. A caller that pages must then page in PHP, because
-  * the database's offset counted rows the guard would have left out. $judge_rows adds the row
-  * check as a `the_posts` filter at PHP_INT_MAX, for a caller (the REST dispatch) whose rows are
-  * not walked by the caller afterwards.
+  * a query (`posts_pre_query`), including from a callback it registered while the query ran, at
+  * the same priority as ours and so behind ours. Those are detected, not prevented, and detected
+  * from the finished state: when $run() returns, every WP_Query it ran is asked whether its
+  * `request` still carries the guard as the server would read it, with comments taken out
+  * (sql_carries()), and whether that request is among the SELECTs the database was given
+  * (listing_in_doubt()). $held is false when any query is in doubt: the database's offset may then
+  * have counted rows the guard would have left out, and a caller that pages must page in PHP.
+  * $judge_rows adds a row check as a `the_posts` filter at PHP_INT_MAX; a caller that must not
+  * trust even that to run last judges the rows it is given itself, afterwards (the REST dispatch
+  * does).
   *
   * @see unreadable_post_clauses() for the SQL, which the REST listings and the scans use too.
   *
   * @param callable  $run         The queries.
-  * @param bool|null $held        Set to whether every query carried the guard.
+  * @param bool|null $held        Set to whether every query carried the guard and was answered by the database.
   * @param bool      $judge_rows  Also drop, from each result, the posts post_read_guard() refuses.
   * @return mixed Whatever $run() returns.
   */
   public static function with_readable_posts_sql( callable $run, ?bool &$held = null, bool $judge_rows = false ) {
-    global $wpdb;
-    $c = self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l', "{$wpdb->posts}.ID" );
-    $state = (object) [ 'lost' => false, 'checked' => false ];
+    $c = self::post_listing_guard();
+    $state = (object) [ 'lost' => false, 'checked' => false, 'queries' => [], 'sent' => [] ];
     $clauses = static function ( $parts ) use ( $c ) {
       if ( !is_array( $parts ) || $c['where'] === '' ) {
         return $parts;
       }
+      // Comments in the pieces that follow the WHERE would swallow the LIMIT (and the offset the
+      // pager relies on) on a server that tolerates an unclosed one.
+      foreach ( [ 'join', 'groupby', 'orderby', 'limits' ] as $piece ) {
+        if ( isset( $parts[ $piece ] ) && is_string( $parts[ $piece ] ) ) {
+          $parts[ $piece ] = self::sql_without_comments( $parts[ $piece ] );
+        }
+      }
       $parts['join'] = ( $parts['join'] ?? '' ) . $c['join'];
-      $parts['where'] = ' AND ( 1=1 ' . ( $parts['where'] ?? '' ) . "\n) AND " . $c['where'];
+      $parts['where'] = ' AND ' . $c['where'] . ' AND ' . self::wrap_foreign_where( (string) ( $parts['where'] ?? '' ) );
       return $parts;
     };
     // The finished text, after every other plugin has had its say, must still hold the guard.
-    $holds = static function ( $sql ) use ( $c ) {
-      return $c['where'] === '' || ( is_string( $sql ) && strpos( $sql, $c['where'] ) !== false && strpos( $sql, $c['join'] ) !== false );
-    };
-    $request = static function ( $sql ) use ( $holds, $state ) {
+    // An early look: the final one is made when the run is over.
+    $request = static function ( $sql ) use ( $c, $state ) {
       $state->checked = true;
-      if ( !$holds( $sql ) ) {
+      if ( !self::sql_carries( $sql, $c['where'], $c['join'] ) ) {
         $state->lost = true;
       }
       return $sql;
     };
     // A big query is split: the ids are asked for by a second text, which is checked too, but
     // does not count as the check of the next query.
-    $request_ids = static function ( $sql ) use ( $holds, $state ) {
-      if ( !$holds( $sql ) ) {
+    $request_ids = static function ( $sql ) use ( $c, $state ) {
+      if ( !self::sql_carries( $sql, $c['where'], $c['join'] ) ) {
         $state->lost = true;
       }
       return $sql;
@@ -1354,11 +1587,25 @@ class GMCP_Core {
         $query->set( 'suppress_filters', false );
       }
     };
+    // The finished state is read from the queries themselves and from what the database was given.
+    $capture = static function ( $query ) use ( $state ) {
+      if ( $query instanceof WP_Query ) {
+        $state->queries[] = $query;
+      }
+    };
+    $log = static function ( $sql ) use ( $state ) {
+      if ( is_string( $sql ) && count( $state->sent ) < 20000 && stripos( ltrim( $sql ), 'SELECT' ) === 0 ) {
+        $state->sent[ md5( trim( $sql ) ) ] = true;
+      }
+      return $sql;
+    };
     add_action( 'pre_get_posts', $force, PHP_INT_MAX );
+    add_action( 'pre_get_posts', $capture, PHP_INT_MAX );
     add_filter( 'posts_clauses_request', $clauses, PHP_INT_MAX );
     add_filter( 'posts_request', $request, PHP_INT_MAX );
     add_filter( 'posts_request_ids', $request_ids, PHP_INT_MAX );
     add_filter( 'posts_pre_query', $pre, PHP_INT_MAX );
+    add_filter( 'query', $log, PHP_INT_MAX );
     if ( $judge_rows ) {
       add_filter( 'the_posts', $judge, PHP_INT_MAX );
     }
@@ -1367,12 +1614,14 @@ class GMCP_Core {
     }
     finally {
       remove_action( 'pre_get_posts', $force, PHP_INT_MAX );
+      remove_action( 'pre_get_posts', $capture, PHP_INT_MAX );
       remove_filter( 'posts_clauses_request', $clauses, PHP_INT_MAX );
       remove_filter( 'posts_request', $request, PHP_INT_MAX );
       remove_filter( 'posts_request_ids', $request_ids, PHP_INT_MAX );
       remove_filter( 'posts_pre_query', $pre, PHP_INT_MAX );
+      remove_filter( 'query', $log, PHP_INT_MAX );
       remove_filter( 'the_posts', $judge, PHP_INT_MAX );
-      $held = !$state->lost;
+      $held = !$state->lost && !self::listing_in_doubt( $state->queries, $state->sent, $c['where'], $c['join'] );
     }
   }
 
@@ -1380,42 +1629,32 @@ class GMCP_Core {
   * The same for a comment query: a comment is read as the post it is on, so a comment on a
   * post the caller may not read is left out by the query, and the offset is a SQL offset.
   * WP_Comment_Query applies comments_clauses whatever the arguments, and nothing after it
-  * touches the SQL, so the guard at PHP_INT_MAX is the last word; the WHERE is wrapped as in
-  * with_readable_posts_sql(). $held is false when a `comments_pre_query` filter answered
-  * without a query.
+  * touches the SQL, so the guard at PHP_INT_MAX is the last word of the clause hooks; the WHERE
+  * is placed and wrapped as in with_readable_posts_sql(). A filter registered from inside
+  * `pre_get_comments` runs behind the guard at the same priority, and so can strip it from the
+  * clauses or answer through `comments_pre_query`; both are found from the finished state, as
+  * there: $held is false when a query's `request` no longer carries the guard, or was never
+  * built or never sent (answered without a query, or from the object cache).
   *
   * A comment with no post, or whose post is gone, is readable, as the PHP check has it.
   *
   * @return mixed Whatever $run() returns.
   */
   public static function with_readable_comments_sql( callable $run, ?bool &$held = null ) {
-    global $wpdb;
-    $c = self::unreadable_post_clauses( "COALESCE(gmcp_cp.post_type,'')", 'gmcp_cp.post_parent', 'gmcp_cc', "{$wpdb->comments}.comment_post_ID" );
-    $state = (object) [ 'lost' => false ];
-    // An order note is the order's own record, so it is held with the order wherever it hangs
-    // from and whether or not WooCommerce is there to hide it from comment queries (it does,
-    // with a filter of its own that a deactivated plugin takes with it). Below admin only,
-    // like the post types. @see order_note_types()
-    $notes = '';
-    if ( self::caller_access_level() !== 'admin' ) {
-      $notes = implode( ',', array_map( static function ( $type ) {
-        return "'" . esc_sql( $type ) . "'";
-      }, self::order_note_types() ) );
-    }
-    $clauses = static function ( $parts ) use ( $c, $wpdb, $notes ) {
-      if ( !is_array( $parts ) || ( $c['where'] === '' && $notes === '' ) ) {
+    $g = self::comment_listing_guard();
+    $state = (object) [ 'lost' => false, 'queries' => [], 'sent' => [] ];
+    $clauses = static function ( $parts ) use ( $g ) {
+      if ( !is_array( $parts ) || $g['where'] === '' ) {
         return $parts;
       }
-      $conds = [];
-      if ( $notes !== '' ) {
-        $conds[] = "{$wpdb->comments}.comment_type NOT IN ({$notes})";
+      foreach ( [ 'join', 'groupby', 'orderby', 'limits' ] as $piece ) {
+        if ( isset( $parts[ $piece ] ) && is_string( $parts[ $piece ] ) ) {
+          $parts[ $piece ] = self::sql_without_comments( $parts[ $piece ] );
+        }
       }
-      if ( $c['where'] !== '' ) {
-        $parts['join'] = ( $parts['join'] ?? '' ) . " LEFT JOIN {$wpdb->posts} gmcp_cp ON gmcp_cp.ID = {$wpdb->comments}.comment_post_ID" . $c['join'];
-        $conds[] = $c['where'];
-      }
+      $parts['join'] = ( $parts['join'] ?? '' ) . $g['join'];
       $had = trim( (string) ( $parts['where'] ?? '' ) );
-      $parts['where'] = ( $had !== '' ? '( ' . $had . "\n) AND " : '' ) . implode( ' AND ', $conds );
+      $parts['where'] = $g['where'] . ( $had !== '' ? ' AND ' . self::wrap_foreign_where( $had, '' ) : '' );
       return $parts;
     };
     $pre = static function ( $answer ) use ( $state ) {
@@ -1424,15 +1663,30 @@ class GMCP_Core {
       }
       return $answer;
     };
+    $capture = static function ( $query ) use ( $state ) {
+      if ( $query instanceof WP_Comment_Query ) {
+        $state->queries[] = $query;
+      }
+    };
+    $log = static function ( $sql ) use ( $state ) {
+      if ( is_string( $sql ) && count( $state->sent ) < 20000 && stripos( ltrim( $sql ), 'SELECT' ) === 0 ) {
+        $state->sent[ md5( trim( $sql ) ) ] = true;
+      }
+      return $sql;
+    };
+    add_action( 'pre_get_comments', $capture, PHP_INT_MAX );
     add_filter( 'comments_clauses', $clauses, PHP_INT_MAX );
     add_filter( 'comments_pre_query', $pre, PHP_INT_MAX );
+    add_filter( 'query', $log, PHP_INT_MAX );
     try {
       return $run();
     }
     finally {
+      remove_action( 'pre_get_comments', $capture, PHP_INT_MAX );
       remove_filter( 'comments_clauses', $clauses, PHP_INT_MAX );
       remove_filter( 'comments_pre_query', $pre, PHP_INT_MAX );
-      $held = !$state->lost;
+      remove_filter( 'query', $log, PHP_INT_MAX );
+      $held = !$state->lost && !self::listing_in_doubt( $state->queries, $state->sent, $g['where'], $g['join'] );
     }
   }
 
@@ -1440,12 +1694,13 @@ class GMCP_Core {
   * One page of the posts a query matches that the caller may read, for a listing tool.
   *
   * The unreadable rows are left out in SQL, and the offset is the database's, while the guard
-  * is also asked of every row that comes back (collect_readable()). When another plugin's
-  * filters took the guard's SQL out of the query, the database's offset would count rows the
-  * guard leaves out, so the page is built again with the offset passed over in PHP, row by row
-  * and inside the 5000 rows collect_readable() looks at: slow for a large offset, and short past
-  * it, which the guardrails page states. A short page there is the price of not trusting a
-  * query another plugin rewrote.
+  * is also asked of every row that comes back (collect_readable()). When the finished state of a
+  * query is in doubt (another plugin's filters took the guard's SQL out of it, or answered it
+  * without the database, or it came from the object cache: @see with_readable_posts_sql()), the
+  * database's offset may count rows the guard leaves out, so the page is built again with the
+  * offset passed over in PHP, row by row and inside the 5000 rows collect_readable() looks at:
+  * slow for a large offset, and short past it, which the guardrails page states. A short page
+  * there is the price of not trusting a query another plugin rewrote.
   *
   * @param array $query  WP_Query arguments, without offset, paged or posts_per_page.
   * @return WP_Post[]
@@ -1454,7 +1709,8 @@ class GMCP_Core {
     $keep = static function ( $row ) {
       return self::post_read_guard( (int) $row->ID ) === true;
     };
-    $base = [ 'suppress_filters' => false, 'no_found_rows' => true ];
+    // The scope is a query argument and so part of the key WP_Query caches under.
+    $base = [ 'suppress_filters' => false, 'no_found_rows' => true, 'gmcp_scope' => self::listing_scope( self::post_listing_guard() ) ];
     $held = true;
     $rows = self::with_readable_posts_sql( static function () use ( $query, $limit, $skip, $keep, $base ) {
       return self::collect_readable(
@@ -1483,6 +1739,10 @@ class GMCP_Core {
   /**
   * The same for comments. A comment is read as the post it is on.
   *
+  * The results are cached under a domain that names the guard (listing_scope()): the cache key of
+  * a comment query does not include the SQL, so a shared domain served one level's page to
+  * another.
+  *
   * @param array $args  get_comments() arguments, without offset, paged or number.
   * @return WP_Comment[]
   */
@@ -1493,11 +1753,12 @@ class GMCP_Core {
       }
       return !( (int) $row->comment_post_ID > 0 && self::post_read_guard( (int) $row->comment_post_ID ) !== true );
     };
+    $scope = self::listing_scope( self::comment_listing_guard() );
     $held = true;
-    $rows = self::with_readable_comments_sql( static function () use ( $args, $limit, $skip, $keep ) {
+    $rows = self::with_readable_comments_sql( static function () use ( $args, $limit, $skip, $keep, $scope ) {
       return self::collect_readable(
-        static function ( int $from, int $size ) use ( $args, $skip ) {
-          return get_comments( [ 'offset' => $skip + $from, 'number' => $size, 'cache_domain' => 'gmcp_readable' ] + $args );
+        static function ( int $from, int $size ) use ( $args, $skip, $scope ) {
+          return get_comments( [ 'offset' => $skip + $from, 'number' => $size, 'cache_domain' => 'gmcp_readable_' . $scope ] + $args );
         },
         $keep,
         $limit
@@ -1506,10 +1767,10 @@ class GMCP_Core {
     if ( $held ) {
       return $rows;
     }
-    return self::with_readable_comments_sql( static function () use ( $args, $limit, $skip, $keep ) {
+    return self::with_readable_comments_sql( static function () use ( $args, $limit, $skip, $keep, $scope ) {
       return self::collect_readable(
-        static function ( int $from, int $size ) use ( $args ) {
-          return get_comments( [ 'offset' => $from, 'number' => $size, 'cache_domain' => 'gmcp_readable_php' ] + $args );
+        static function ( int $from, int $size ) use ( $args, $scope ) {
+          return get_comments( [ 'offset' => $from, 'number' => $size, 'cache_domain' => 'gmcp_readable_php_' . $scope ] + $args );
         },
         $keep,
         $limit,
