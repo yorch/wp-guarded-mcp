@@ -166,28 +166,6 @@ class GMCP_Tools_Rest {
     return false;
   }
 
-  /**
-  * A WHERE fragment, for WP_Query, that leaves out what the caller may not read: posts of the
-  * excluded types, and posts hanging from one at any depth post_chain_types() walks (a media
-  * row, a revision or a child of a submission or an order).
-  *
-  * Installed around the REST dispatch of a list call. The listing is built by WordPress's own
-  * query, and its rows are filtered by what _fields leaves in them, so an id-based filter on
-  * the rows afterwards would miss every call that does not ask for the id. The SQL is the one
-  * the other listings and scans use. @see GMCP_Core::unreadable_post_clauses()
-  */
-  public function exclude_unreadable_posts( $where ) {
-    global $wpdb;
-    $c = GMCP_Core::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_r' );
-    return $c['where'] === '' ? $where : $where . ' AND ' . $c['where'];
-  }
-
-  /** The parents the WHERE above judges, joined. @see exclude_unreadable_posts() */
-  public function join_unreadable_posts( $join ) {
-    global $wpdb;
-    return $join . GMCP_Core::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_r' )['join'];
-  }
-
   private function build_schema_from_args( $args ) {
     $schema = [
       'type' => 'object',
@@ -418,13 +396,13 @@ class GMCP_Tools_Rest {
       $request->set_body_params( $args );
     }
 
-    // A listing is filtered where it is built. Only for GET, and only for the lifetime of this
-    // one dispatch.
+    // A listing is filtered where it is built, and its rows are judged once more when they come
+    // back: the rows are shaped by _fields, which can leave the id out, so the page cannot be
+    // judged afterwards, and another plugin's query filter can widen the SQL (measured: with
+    // `OR 1=1` appended to the WHERE, list_media returned a file attached to a form submission
+    // to a read-only key). Only for GET, and only for the lifetime of this one dispatch.
+    // @see GMCP_Core::with_readable_posts_sql()
     $listing = $method === 'GET' && $action === 'list';
-    if ( $listing ) {
-      add_filter( 'posts_join', [ $this, 'join_unreadable_posts' ] );
-      add_filter( 'posts_where', [ $this, 'exclude_unreadable_posts' ] );
-    }
     // Rows a create makes, so one the net refuses AFTER it was inserted can be taken back out.
     $made = [];
     $track = static function ( $post_id, $post = null, $update = false ) use ( &$made ) {
@@ -436,7 +414,11 @@ class GMCP_Tools_Rest {
       add_action( 'wp_insert_post', $track, 0, 3 );
     }
     try {
-      $response = rest_do_request( $request );
+      $response = $listing
+        ? GMCP_Core::with_readable_posts_sql( static function () use ( $request ) {
+          return rest_do_request( $request );
+        }, $sql_held, true )
+        : rest_do_request( $request );
     }
     catch ( GMCP_Policy_Refusal | GMCP_Drafts_Only_Refusal $refusal ) {
       // The controller inserts, then applies the featured image, terms and meta, and the net throws
@@ -466,10 +448,6 @@ class GMCP_Tools_Rest {
     finally {
       if ( $action === 'create' ) {
         remove_action( 'wp_insert_post', $track, 0 );
-      }
-      if ( $listing ) {
-        remove_filter( 'posts_where', [ $this, 'exclude_unreadable_posts' ] );
-        remove_filter( 'posts_join', [ $this, 'join_unreadable_posts' ] );
       }
     }
 

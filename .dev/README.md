@@ -104,6 +104,7 @@ docker compose exec -T cli wp plugin install beaver-builder-lite-version --activ
 
 ./smoke-download.sh   # the one-time download endpoint; needs nothing beyond the plugin
 ./smoke-export.sh     # the site-file manifest, the approval-gated archive and its one-time endpoint
+./smoke-listing-filters.sh  # the listing tools under another plugin's query filters; needs nothing beyond the plugin
 ```
 
 Wordfence makes every CLI invocation on this stack slow: it checks in with its own servers

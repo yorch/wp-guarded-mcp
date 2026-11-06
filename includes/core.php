@@ -1096,60 +1096,232 @@ class GMCP_Core {
   * into a WP_Post and had its parent chain walked, and an offset of ten million ran for over a
   * minute. Put in the query instead, the offset is an ordinary SQL offset over rows already
   * filtered. The query must run with suppress_filters false, or WordPress does not apply
-  * posts_join and posts_where at all.
+  * the clause filters at all.
+  *
+  * The clauses go in at `posts_clauses_request` at PHP_INT_MAX, which is the last hook that sees
+  * the clauses as parts, and the WHERE the other plugins built is wrapped in parentheses, not
+  * appended to. Both matter: the guard used to be appended at `posts_where`, so a filter that
+  * ran later and replaced the clause set (`posts_clauses`) dropped it, and one that appended
+  * `OR 1=1` turned `a AND b OR 1=1 AND guard` into "anything the guard allows, or anything that
+  * matches a AND b" (measured: the REST list tools returned a file attached to a form
+  * submission under both). A newline precedes the closing parenthesis so that a `-- ` comment
+  * at the end of another plugin's fragment cannot swallow it.
+  *
+  * What a filter can still do is rewrite the finished SQL (`posts_request`) or answer without
+  * a query (`posts_pre_query`). Those are detected,
+  * not prevented: the request is checked for the guard's own text, and $held is false when any
+  * query inside $run() did not carry it. A caller that pages must then page in PHP, because
+  * the database's offset counted rows the guard would have left out. $judge_rows adds the row
+  * check as a `the_posts` filter at PHP_INT_MAX, for a caller (the REST dispatch) whose rows are
+  * not walked by the caller afterwards.
   *
   * @see unreadable_post_clauses() for the SQL, which the REST listings and the scans use too.
   *
+  * @param callable  $run         The queries.
+  * @param bool|null $held        Set to whether every query carried the guard.
+  * @param bool      $judge_rows  Also drop, from each result, the posts post_read_guard() refuses.
   * @return mixed Whatever $run() returns.
   */
-  public static function with_readable_posts_sql( callable $run ) {
-    $join = static function ( $join ) {
-      global $wpdb;
-      return $join . self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l' )['join'];
+  public static function with_readable_posts_sql( callable $run, ?bool &$held = null, bool $judge_rows = false ) {
+    global $wpdb;
+    $c = self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l' );
+    $state = (object) [ 'lost' => false, 'checked' => false ];
+    $clauses = static function ( $parts ) use ( $c ) {
+      if ( !is_array( $parts ) || $c['where'] === '' ) {
+        return $parts;
+      }
+      $parts['join'] = ( $parts['join'] ?? '' ) . $c['join'];
+      $parts['where'] = ' AND ( 1=1 ' . ( $parts['where'] ?? '' ) . "\n) AND " . $c['where'];
+      return $parts;
     };
-    $where = static function ( $where ) {
-      global $wpdb;
-      $c = self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l' );
-      return $c['where'] === '' ? $where : $where . ' AND ' . $c['where'];
+    // The finished text, after every other plugin has had its say, must still hold the guard.
+    $holds = static function ( $sql ) use ( $c ) {
+      return $c['where'] === '' || ( is_string( $sql ) && strpos( $sql, $c['where'] ) !== false && strpos( $sql, $c['join'] ) !== false );
     };
-    add_filter( 'posts_join', $join, PHP_INT_MAX );
-    add_filter( 'posts_where', $where, PHP_INT_MAX );
+    $request = static function ( $sql ) use ( $holds, $state ) {
+      $state->checked = true;
+      if ( !$holds( $sql ) ) {
+        $state->lost = true;
+      }
+      return $sql;
+    };
+    // A big query is split: the ids are asked for by a second text, which is checked too, but
+    // does not count as the check of the next query.
+    $request_ids = static function ( $sql ) use ( $holds, $state ) {
+      if ( !$holds( $sql ) ) {
+        $state->lost = true;
+      }
+      return $sql;
+    };
+    // Applied to every query, even one run with filters off, which never reaches the check
+    // above: a query that arrives here unchecked never had the guard, and an answer given before
+    // the query ran is not the database's.
+    $pre = static function ( $posts ) use ( $state ) {
+      if ( $posts !== null || !$state->checked ) {
+        $state->lost = true;
+      }
+      $state->checked = false;
+      return $posts;
+    };
+    $judge = static function ( $posts ) {
+      if ( !is_array( $posts ) ) {
+        return $posts;
+      }
+      return array_values( array_filter( $posts, static function ( $post ) {
+        return !( $post instanceof WP_Post ) || self::post_read_guard( (int) $post->ID ) === true;
+      } ) );
+    };
+    // The clause filters do not run on a query that suppresses them, and another plugin can set
+    // that from pre_get_posts (measured: the REST list tools then returned a submission's upload,
+    // with no SQL guard and no row check, since `the_posts` is gated the same way). So inside
+    // the run every query runs with them on, set last.
+    $force = static function ( $query ) {
+      if ( $query instanceof WP_Query ) {
+        $query->set( 'suppress_filters', false );
+      }
+    };
+    add_action( 'pre_get_posts', $force, PHP_INT_MAX );
+    add_filter( 'posts_clauses_request', $clauses, PHP_INT_MAX );
+    add_filter( 'posts_request', $request, PHP_INT_MAX );
+    add_filter( 'posts_request_ids', $request_ids, PHP_INT_MAX );
+    add_filter( 'posts_pre_query', $pre, PHP_INT_MAX );
+    if ( $judge_rows ) {
+      add_filter( 'the_posts', $judge, PHP_INT_MAX );
+    }
     try {
       return $run();
     }
     finally {
-      remove_filter( 'posts_join', $join, PHP_INT_MAX );
-      remove_filter( 'posts_where', $where, PHP_INT_MAX );
+      remove_action( 'pre_get_posts', $force, PHP_INT_MAX );
+      remove_filter( 'posts_clauses_request', $clauses, PHP_INT_MAX );
+      remove_filter( 'posts_request', $request, PHP_INT_MAX );
+      remove_filter( 'posts_request_ids', $request_ids, PHP_INT_MAX );
+      remove_filter( 'posts_pre_query', $pre, PHP_INT_MAX );
+      remove_filter( 'the_posts', $judge, PHP_INT_MAX );
+      $held = !$state->lost;
     }
   }
 
   /**
   * The same for a comment query: a comment is read as the post it is on, so a comment on a
   * post the caller may not read is left out by the query, and the offset is a SQL offset.
-  * WP_Comment_Query applies comments_clauses whatever the arguments.
+  * WP_Comment_Query applies comments_clauses whatever the arguments, and nothing after it
+  * touches the SQL, so the guard at PHP_INT_MAX is the last word; the WHERE is wrapped as in
+  * with_readable_posts_sql(). $held is false when a `comments_pre_query` filter answered
+  * without a query.
   *
   * A comment with no post, or whose post is gone, is readable, as the PHP check has it.
   *
   * @return mixed Whatever $run() returns.
   */
-  public static function with_readable_comments_sql( callable $run ) {
-    $clauses = static function ( $clauses ) {
-      global $wpdb;
-      $c = self::unreadable_post_clauses( "COALESCE(gmcp_cp.post_type,'')", 'gmcp_cp.post_parent', 'gmcp_cc' );
-      if ( !is_array( $clauses ) || $c['where'] === '' ) {
-        return $clauses;
+  public static function with_readable_comments_sql( callable $run, ?bool &$held = null ) {
+    global $wpdb;
+    $c = self::unreadable_post_clauses( "COALESCE(gmcp_cp.post_type,'')", 'gmcp_cp.post_parent', 'gmcp_cc' );
+    $state = (object) [ 'lost' => false ];
+    $clauses = static function ( $parts ) use ( $c, $wpdb ) {
+      if ( !is_array( $parts ) || $c['where'] === '' ) {
+        return $parts;
       }
-      $clauses['join'] = ( $clauses['join'] ?? '' ) . " LEFT JOIN {$wpdb->posts} gmcp_cp ON gmcp_cp.ID = {$wpdb->comments}.comment_post_ID" . $c['join'];
-      $clauses['where'] = ( ( $clauses['where'] ?? '' ) !== '' ? $clauses['where'] . ' AND ' : '' ) . $c['where'];
-      return $clauses;
+      $parts['join'] = ( $parts['join'] ?? '' ) . " LEFT JOIN {$wpdb->posts} gmcp_cp ON gmcp_cp.ID = {$wpdb->comments}.comment_post_ID" . $c['join'];
+      $had = trim( (string) ( $parts['where'] ?? '' ) );
+      $parts['where'] = ( $had !== '' ? '( ' . $had . "\n) AND " : '' ) . $c['where'];
+      return $parts;
+    };
+    $pre = static function ( $answer ) use ( $state ) {
+      if ( $answer !== null ) {
+        $state->lost = true;
+      }
+      return $answer;
     };
     add_filter( 'comments_clauses', $clauses, PHP_INT_MAX );
+    add_filter( 'comments_pre_query', $pre, PHP_INT_MAX );
     try {
       return $run();
     }
     finally {
       remove_filter( 'comments_clauses', $clauses, PHP_INT_MAX );
+      remove_filter( 'comments_pre_query', $pre, PHP_INT_MAX );
+      $held = !$state->lost;
     }
+  }
+
+  /**
+  * One page of the posts a query matches that the caller may read, for a listing tool.
+  *
+  * The unreadable rows are left out in SQL, and the offset is the database's, while the guard
+  * is also asked of every row that comes back (collect_readable()). When another plugin's
+  * filters took the guard's SQL out of the query, the database's offset would count rows the
+  * guard leaves out, so the page is built again with the offset passed over in PHP, row by row
+  * and inside the 5000 rows collect_readable() looks at: slow for a large offset, and short past
+  * it, which the guardrails page states. A short page there is the price of not trusting a
+  * query another plugin rewrote.
+  *
+  * @param array $query  WP_Query arguments, without offset, paged or posts_per_page.
+  * @return WP_Post[]
+  */
+  public static function readable_posts_page( array $query, int $limit, int $skip = 0 ): array {
+    $keep = static function ( $row ) {
+      return self::post_read_guard( (int) $row->ID ) === true;
+    };
+    $base = [ 'suppress_filters' => false, 'no_found_rows' => true ];
+    $held = true;
+    $rows = self::with_readable_posts_sql( static function () use ( $query, $limit, $skip, $keep, $base ) {
+      return self::collect_readable(
+        static function ( int $from, int $size ) use ( $query, $skip, $base ) {
+          return get_posts( [ 'offset' => $skip + $from, 'posts_per_page' => $size ] + $base + $query );
+        },
+        $keep,
+        $limit
+      );
+    }, $held );
+    if ( $held ) {
+      return $rows;
+    }
+    return self::with_readable_posts_sql( static function () use ( $query, $limit, $skip, $keep, $base ) {
+      return self::collect_readable(
+        static function ( int $from, int $size ) use ( $query, $base ) {
+          return get_posts( [ 'offset' => $from, 'posts_per_page' => $size ] + $base + $query );
+        },
+        $keep,
+        $limit,
+        $skip
+      );
+    } );
+  }
+
+  /**
+  * The same for comments. A comment is read as the post it is on.
+  *
+  * @param array $args  get_comments() arguments, without offset, paged or number.
+  * @return WP_Comment[]
+  */
+  public static function readable_comments_page( array $args, int $limit, int $skip = 0 ): array {
+    $keep = static function ( $row ) {
+      return !( (int) $row->comment_post_ID > 0 && self::post_read_guard( (int) $row->comment_post_ID ) !== true );
+    };
+    $held = true;
+    $rows = self::with_readable_comments_sql( static function () use ( $args, $limit, $skip, $keep ) {
+      return self::collect_readable(
+        static function ( int $from, int $size ) use ( $args, $skip ) {
+          return get_comments( [ 'offset' => $skip + $from, 'number' => $size, 'cache_domain' => 'gmcp_readable' ] + $args );
+        },
+        $keep,
+        $limit
+      );
+    }, $held );
+    if ( $held ) {
+      return $rows;
+    }
+    return self::with_readable_comments_sql( static function () use ( $args, $limit, $skip, $keep ) {
+      return self::collect_readable(
+        static function ( int $from, int $size ) use ( $args ) {
+          return get_comments( [ 'offset' => $from, 'number' => $size, 'cache_domain' => 'gmcp_readable_php' ] + $args );
+        },
+        $keep,
+        $limit,
+        $skip
+      );
+    } );
   }
 
   /**

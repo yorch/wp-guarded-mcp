@@ -689,7 +689,7 @@ docker run --rm -v "$PWD":/app -w /app php:8.1-cli sh -c 'for f in includes/*.ph
 ```
 
 A throwaway WordPress for testing lives in `.dev/` (see that directory's README). It carries
-twenty-one suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
+twenty-three suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
 previews; `smoke-admin.sh` for the administration tools, the change journal, named keys and
 every guard around them, which rebuilds `.htaccess` partway through and is the destructive
 one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor tools;
@@ -701,11 +701,12 @@ WP Activity Log tools; `smoke-redirection.sh` for the Redirection tools; `smoke-
 for the Polylang tools; `smoke-seo.sh` for the Rank Math and All in One SEO tools;
 `smoke-forms.sh` for the form-submission tools; `smoke-wordfence.sh` for the Wordfence tools;
 `smoke-stream.sh` for the Stream tools; `smoke-beaver.sh` for the Beaver Builder tools;
-`smoke-download.sh` for the one-time download endpoint; and `smoke-export.sh` for the site
-files manifest, the approval-gated archive and its one-time endpoint. `smoke-seo.sh`,
+`smoke-download.sh` for the one-time download endpoint; `smoke-export.sh` for the site
+files manifest, the approval-gated archive and its one-time endpoint; and `smoke-listing-filters.sh`
+for the listing tools under another plugin's query filters. `smoke-seo.sh`,
 `smoke-forms.sh`, `smoke-polylang.sh` and `smoke-redirection.sh` were written without a
 running stack and have not been run. The plugin-specific suites need their plugin installed;
-`smoke-download.sh` and `smoke-export.sh` need only this plugin.
+`smoke-download.sh`, `smoke-export.sh` and `smoke-listing-filters.sh` need only this plugin.
 
 Wordfence makes every call on a stack slow: it checks in with its own servers when it loads,
 and with no outbound route each request waits for that to time out — measured at 0.3s per

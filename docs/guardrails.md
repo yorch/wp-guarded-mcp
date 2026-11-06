@@ -1365,11 +1365,14 @@ re-read.
   returned and, for `update_media`, retitled a file attached to a seeded submission. Now every
   tool that takes an `id` asks `post_read_guard()` first (below admin the id is dispatched as
   one that names nothing, so the answer is the controller's own answer for a missing id); a list
-  call runs with `posts_join` and `posts_where` filters that leave out the guarded types and posts
+  call runs with a join and a WHERE that leave out the guarded types and posts
   hanging from them to the same depth the guards walk (the row and seven parents,
   `GMCP_Core::unreadable_post_clauses()`, joins because seven nested subqueries overflow the
   SQLite driver's parser), so rows are removed where the query is built and not afterwards,
-  because `_fields` can leave the id out of the rows and a page filtered afterwards is short; a
+  because `_fields` can leave the id out of the rows and a page filtered afterwards is short; the
+  clauses are added last and wrap what other plugins built, and the rows are judged once more as
+  they come back (see "Another plugin's query filters" below, which is where the REST tools had a
+  hole); a
   write that moves a row into or out of a tree (`update_media` with `post`, `update_pages` with
   `parent`) is refused by the net under `wp_insert_post_data`; and a route whose post type is a
   guarded type (a plugin registering one with `show_in_rest` and a `rest_base` of `posts`,
@@ -1471,13 +1474,65 @@ re-read.
     all, and the offset is not part of that count (it used to extend it). So the work is bounded by
     the database's own cost of an offset (an index walk, not objects) plus at most 5000 rows judged,
     and a short page is possible only if more than 5000 consecutive rows the SQL let through are
-    ones the guard refuses, which the two should never disagree about. The listings run with
-    `suppress_filters` off, as the REST listings do, so other plugins' query filters (a language
-    filter, for instance) now apply to them. The briefing's latest-post probe and the resource
-    still use the PHP pass alone with the 5000 bound, and for a window of more than 5000 unreadable
-    rows at the head of a listing they can still answer short. Rows with identical dates may come
-    back in another order than before, because the join changes the plan and `post_date` is the
-    only sort key.
+    ones the guard refuses, which the two should never disagree about. The briefing's latest-post
+    probe and the resource still use the PHP pass alone with the 5000 bound, and for a window of
+    more than 5000 unreadable rows at the head of a listing they can still answer short. Rows with
+    identical dates may come back in another order than before, because the join changes the plan
+    and `post_date` is the only sort key.
+  - **Another plugin's query filters, and the guard** (`.dev/smoke-listing-filters.sh`, which installs
+    a test-only plugin that filters in benign and hostile ways and attacks with a read-only key).
+    The listings above and the REST list tools must run with query filters on, because that is how
+    the guard's SQL gets into the query, so every filter another plugin registered applies to them
+    too. What that does, measured:
+    - *The guard could be defeated, in the REST list tools, and that was a defect.* The clauses used
+      to be appended at `posts_where` and `posts_join`, so a filter that appended `OR 1=1`
+      (`a AND b OR 1=1 AND guard` is "the guard, or a AND b"), replaced the clause set at
+      `posts_clauses`, or ran after the guard at the highest priority, dropped them. `list_media`,
+      `list_posts` and `list_pages` then returned a file attached to a form submission and a page
+      hanging from one to a read-only key (eleven of the twenty filter shapes the suite uses leaked, and the
+      reply held ids and titles). `wp_get_posts`, `wp_get_media` and `wp_get_comments` did not leak under any of them,
+      because they judge each returned row, and a filter that answers a query itself or injects a
+      row (`posts_pre_query`, `posts_results`, `the_posts`) was held by that row check; the REST
+      tools had no such check.
+    - *Now:* the guard is added at `posts_clauses_request` (the last hook that sees the clauses as
+      parts) and `comments_clauses`, both at `PHP_INT_MAX`, and the other plugin's WHERE is wrapped,
+      not extended (`AND ( 1=1 <theirs>` + a newline + `) AND <guard>`; the newline is so that a `-- `
+      comment at the end of their fragment cannot swallow the parenthesis). The REST tools also drop,
+      at `the_posts` at `PHP_INT_MAX`, every row `post_read_guard()` refuses, and every query inside
+      a listing runs with filters on whatever `pre_get_posts` asks for, because a plugin that sets
+      `suppress_filters` there took the guard's SQL and the row check with it (measured, another
+      leak). Each of those is asserted under twenty filter shapes, with a control that the
+      filter ran and, where it widens the query, a control that the widening was visible.
+    - *What a filter can still do, detected and not prevented:* rewrite the finished SQL
+      (`posts_request`), or answer without asking the database (`posts_pre_query`,
+      `comments_pre_query`: a search plugin that serves queries from its own index does this). The
+      finished text is checked for the guard's own SQL and the answer for having come from the
+      database, and when either is not so the guard's hold on the SQL is reported lost. A listing
+      that pages then does it in PHP (offset 0, the rows before the offset counted as they are
+      read, inside the 5000-row bound), because the database's offset counted rows the guard would
+      have left out: measured, a hidden file between two others moved every later page by one
+      (`1, 2, 2, 3` for `1, 2, 3`). The price is that an offset past 5000 rows then gives a short or
+      empty page, and only then. The REST tools cannot be re-run that way, so there the row check
+      keeps the content out and the page can be short, which says a row was left out. The rows
+      themselves are held in every case by the row check; the SQL is for the paging.
+    - *Completeness is not the guard's to keep, and is documented rather than fixed.* A listing
+      shows what the site's own query layer returns, so a filter another plugin applies to every
+      query (a language filter, a membership plugin's or a "hide from admin" plugin's `posts_where`)
+      removes rows from these listings that `wp_get_post` still returns by id, and `pre_get_posts`
+      can change what a query is about. Measured: a `posts_where` hiding one post removes it from
+      `wp_get_posts` and the REST lists while `wp_get_post` reads it; a `posts_clauses` that joins
+      a meta table and requires a row in it lists only the posts that have one. A plugin that scopes
+      its filter to the main query or to the front end does not touch them. Stripping other plugins'
+      filters for the length of a call was considered and not done: it would rewrite global hook
+      state in the middle of a request and would show posts a site's visibility plugin hides from
+      every other query layer. An agent that cannot find a post it expects should read it by id
+      before concluding it does not exist, and none of the listings returns a total, so there is no
+      total for a filter to make wrong.
+    - *Totals.* The one total these tools compute from a query is `wp_count_media` with a date bound
+      (`after`/`before`), which counted with the query filters on and so followed another plugin's
+      (measured: 4 files counted as 258 under `OR 1=1`, 3 and 0 under two benign filters). It now
+      counts with them off, as WordPress's own undated count does. Counts are still not read-guarded
+      (see "What the guards do not cover"), so that figure includes a submission's upload.
   - A taxonomy shared between a submission type and an ordinary type is listed by
     `wp_get_terms`, and the same applies to its terms on an ordinary post.
   - Every route to the database that is not a post reader, and the optional groups' own stores

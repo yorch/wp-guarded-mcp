@@ -2936,17 +2936,7 @@ class GMCP_Tools_Core {
         $c_limit = (int) $args['number'];
         $c_skip = isset( $args['offset'] ) ? (int) $args['offset'] : ( isset( $args['paged'] ) ? ( (int) $args['paged'] - 1 ) * $c_limit : 0 );
         unset( $args['offset'], $args['paged'] );
-        foreach ( GMCP_Core::with_readable_comments_sql( function () use ( $args, $c_limit, $c_skip ) {
-          return GMCP_Core::collect_readable(
-            function ( int $from, int $size ) use ( $args, $c_skip ) {
-              return get_comments( [ 'offset' => $c_skip + $from, 'number' => $size, 'cache_domain' => 'gmcp_readable' ] + $args );
-            },
-            function ( $row ) {
-              return !( (int) $row->comment_post_ID > 0 && GMCP_Core::post_read_guard( (int) $row->comment_post_ID ) !== true );
-            },
-            $c_limit
-          );
-        } ) as $c ) {
+        foreach ( GMCP_Core::readable_comments_page( $args, $c_limit, $c_skip ) as $c ) {
           $list[] = [
             'comment_ID' => $c->comment_ID,
             'comment_post_ID' => $c->comment_post_ID,
@@ -3594,7 +3584,10 @@ class GMCP_Tools_Core {
           $total = (int) array_sum( array_map( 'intval', $by_type ) );
         }
         else {
-          $count_q = new WP_Query( $args + [ 'posts_per_page' => 1, 'no_found_rows' => false ] );
+          // Without other plugins' query filters (a language or membership filter would answer
+          // another number than the undated count above, which is WordPress's own). pre_get_posts
+          // still runs. Counts are not read-guarded; see "What the guards do not cover".
+          $count_q = new WP_Query( $args + [ 'posts_per_page' => 1, 'no_found_rows' => false, 'suppress_filters' => true ] );
           $total = (int) $count_q->found_posts;
         }
         $this->add_result_text( $r, (string) $total );
@@ -3685,21 +3678,11 @@ class GMCP_Tools_Core {
         // took 13 seconds and 210 MB for an offset of 40,000, and ran for over a minute for
         // ten million. The guard still judges each row that comes back, as the backstop, and
         // skips what it refuses while the page is filled so that a short page does not say
-        // a row was left out. @see GMCP_Core::with_readable_posts_sql(), collect_readable().
+        // a row was left out. @see GMCP_Core::readable_posts_page(), collect_readable().
         $list_limit = (int) $q['posts_per_page'];
         $list_skip = isset( $q['offset'] ) ? (int) $q['offset'] : ( isset( $q['paged'] ) ? ( (int) $q['paged'] - 1 ) * $list_limit : 0 );
         unset( $q['offset'], $q['paged'] );
-        foreach ( GMCP_Core::with_readable_posts_sql( function () use ( $q, $list_limit, $list_skip ) {
-          return GMCP_Core::collect_readable(
-            function ( int $from, int $size ) use ( $q, $list_skip ) {
-              return get_posts( [ 'offset' => $list_skip + $from, 'posts_per_page' => $size, 'suppress_filters' => false, 'no_found_rows' => true ] + $q );
-            },
-            function ( $row ) {
-              return GMCP_Core::post_read_guard( (int) $row->ID ) === true;
-            },
-            $list_limit
-          );
-        } ) as $p ) {
+        foreach ( GMCP_Core::readable_posts_page( $q, $list_limit, $list_skip ) as $p ) {
           $rows[] = [
             'ID' => $p->ID,
             'post_title' => $p->post_title,
@@ -5428,18 +5411,8 @@ class GMCP_Tools_Core {
         // A file attached to a form submission or an order is what a visitor uploaded, and
         // is judged as the post it hangs from. Media attached to nothing is ordinary. Left out in
         // SQL, then judged row by row as the backstop and skipped while the page is filled, so a
-        // short page does not say a row was left out. @see GMCP_Core::with_readable_posts_sql().
-        foreach ( GMCP_Core::with_readable_posts_sql( function () use ( $q ) {
-          return GMCP_Core::collect_readable(
-            function ( int $from, int $size ) use ( $q ) {
-              return get_posts( [ 'offset' => $from, 'posts_per_page' => $size, 'suppress_filters' => false, 'no_found_rows' => true ] + $q );
-            },
-            function ( $row ) {
-              return GMCP_Core::post_read_guard( (int) $row->ID ) === true;
-            },
-            (int) $q['posts_per_page']
-          );
-        } ) as $m ) {
+        // short page does not say a row was left out. @see GMCP_Core::readable_posts_page().
+        foreach ( GMCP_Core::readable_posts_page( $q, (int) $q['posts_per_page'] ) as $m ) {
           $list[] = [ 'ID' => $m->ID, 'title' => $m->post_title, 'url' => wp_get_attachment_url( $m->ID ) ];
         }
         $this->add_result_text( $r, wp_json_encode( $list, JSON_PRETTY_PRINT ) );

@@ -83,7 +83,15 @@ parser on seven nested `EXISTS`), through `with_readable_posts_sql()` and
 `with_readable_comments_sql()` for the listing tools so the offset is the database's (measured:
 offset 40,000 of 50,000 posts took 13 s and 210 MB when the offset was paid for in PHP), and keeps
 `collect_readable()` as the row-by-row backstop, bounded in rows looked at independently of the
-offset. The change records go through `GMCP_Changes::record()` and
+offset. Those clauses go in last and wrap what other plugins built: at `posts_clauses_request` and
+`comments_clauses`, at `PHP_INT_MAX`, with the other plugin's WHERE in parentheses, because
+appended at `posts_where` a foreign `OR 1=1` or a replaced clause set dropped them and the REST
+list tools returned a submission's upload (measured). The REST tools also judge each row at
+`the_posts`, every query inside a listing runs with filters on whatever `pre_get_posts` asks, and
+`readable_posts_page()` / `readable_comments_page()` re-page in PHP when the finished SQL no longer
+carries the guard or a filter answered without a query (`$held`), because then the database's offset
+counts hidden rows. `smoke-listing-filters.sh` attacks all of that with a read-only key and a
+test-only mu-plugin of foreign filters. The change records go through `GMCP_Changes::record()` and
 carry a submission as an id with `[withheld]` values, judged on the state before the write as
 well as after it, because `wp_list_changes` is a read-level tool and names a post by its title.
 A new reader of any of these asks the guard; `smoke-forms.sh` block 0c seeds a submission with a
@@ -328,15 +336,16 @@ All in One SEO tools, and `smoke-forms.sh` covers the form-submission tools (Con
 Flamingo, Fluent Forms, Ninja Forms, WPForms; its first block needs no form plugin).
 `smoke-wordfence.sh` covers the Wordfence tools, `smoke-stream.sh` covers the Stream tools,
 `smoke-beaver.sh` covers the Beaver Builder tools, `smoke-download.sh` covers the one-time
-download endpoint and `smoke-export.sh` covers the site-file manifest, the approval-gated
-archive and its one-time endpoint.
+download endpoint, `smoke-export.sh` covers the site-file manifest, the approval-gated
+archive and its one-time endpoint, and `smoke-listing-filters.sh` covers the listing tools under
+another plugin's query filters.
 Run all
-twenty-one before committing. The plugin-specific suites need
+twenty-three before committing. The plugin-specific suites need
 their plugin installed and say so and exit rather than reporting failures against a site that
-simply does not have it; `smoke-download.sh` and `smoke-export.sh` need only this plugin.
+simply does not have it; `smoke-download.sh`, `smoke-export.sh` and `smoke-listing-filters.sh` need only this plugin.
 (This sentence said fourteen while twelve suites existed and sixteen
 while seventeen did, which is the same drift the access-level table had: a count nothing checks
-moves on its own. It is twenty-one now, counted from `ls .dev/smoke*.sh`.)
+moves on its own. It is twenty-three now, counted from `ls .dev/smoke*.sh`.)
 
 **A test for a guard must not depend on that guard.** Read the value, make the hostile
 call, read it back, **put it back**, and only then compare. The first version of the
