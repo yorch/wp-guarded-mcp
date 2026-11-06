@@ -198,6 +198,11 @@ class GMCP_Core {
     $exact = apply_filters( 'gmcp_protected_options', $exact, $key );
     $patterns = apply_filters( 'gmcp_protected_option_patterns', $patterns, $key );
 
+    $switch = self::layout_switch_option_refusal( $key );
+    if ( $switch !== null ) {
+      return $switch;
+    }
+
     $needle = strtolower( $key );
     if ( in_array( $needle, array_map( 'strtolower', (array) $exact ), true ) ) {
       return "The option \"{$key}\" holds this plugin's own credentials and is not readable or writable through the API.";
@@ -385,6 +390,11 @@ class GMCP_Core {
     // This is the same shape as the option policies above it and lives in the same place for
     // the same reason: the settings tool, the generic option tool and the journal's undo all
     // write options, and a rule enforced in one of them is a rule two of them do not have.
+    $switch = self::layout_switch_option_refusal( $key );
+    if ( $switch !== null ) {
+      return $switch;
+    }
+
     foreach ( self::audit_log_option_prefixes() as $prefix ) {
       if ( $prefix !== '' && strpos( $key, strtolower( (string) $prefix ) ) === 0 ) {
         return 'This option configures an activity log that records what happens on this site. Changing it can stop events being recorded, shorten how long they are kept, or arm deleting the log on uninstall, and none of that can be undone from here. A log an agent can switch off is not a log. Change it on the plugin\'s own settings screen.';
@@ -392,6 +402,47 @@ class GMCP_Core {
     }
 
     return true;
+  }
+
+  /**
+  * Options (and the transient rows behind them) that switch on a page builder's layout editing
+  * outside its editor. Lowercased names.
+  *
+  * Beaver Builder registers a REST field that writes a layout's css and js while its debug
+  * transient `fl_debug_mode` is set, and the transient's value is also the token that turns its
+  * debug output on for any visitor who sends it. Flipping the flag through an option writer opened
+  * a write path to a layout that the layout meta rule closes everywhere else, so a writer that
+  * can set the flag has the layout's write access by another route, and a reader that can read
+  * it has the token. The transient is a row in the options table (`_transient_fl_debug_mode`
+  * and `_transient_timeout_fl_debug_mode`) unless an object cache holds it, and both the row and
+  * the transient name are covered. Filterable like layout_meta_keys().
+  *
+  * @return string[]
+  */
+  public static function layout_switch_options(): array {
+    return array_values( array_unique( array_map( static function ( $name ) {
+      return strtolower( trim( (string) $name ) );
+    }, (array) apply_filters( 'gmcp_layout_switch_options', [
+      'fl_debug_mode',
+      '_transient_fl_debug_mode',
+      '_transient_timeout_fl_debug_mode',
+      '_site_transient_fl_debug_mode',
+      '_site_transient_timeout_fl_debug_mode',
+    ] ) ) ) );
+  }
+
+  /**
+  * The refusal for an option that switches layout editing on, or null. Judged as the database
+  * compares the name (accents, case, trailing spaces), which is how a differently spelt row is
+  * the same row. Asked by the write and delete policies and by the read guard.
+  */
+  public static function layout_switch_option_refusal( string $key ): ?string {
+    foreach ( self::layout_switch_options() as $name ) {
+      if ( GMCP_Meta_Key::is( $key, $name ) ) {
+        return 'This option is the switch that lets a page builder\'s layout css and js be edited outside the builder (its debug transient, whose value is also the token that turns debug output on for any visitor). Setting it would open a write path to a layout that the generic tools refuse everywhere else, and reading it would hand over the token. Change it on the builder\'s own settings screen.';
+      }
+    }
+    return null;
   }
 
   /**
@@ -2520,7 +2571,158 @@ class GMCP_Core {
         }
       }
     }
+    // A field another plugin registered with register_rest_field() that stores a page builder's
+    // layout. The controller hands it to that plugin's own callback, which writes the layout key
+    // with update_post_meta() and so never meets the meta argument above.
+    foreach ( array_keys( $args ) as $name ) {
+      if ( in_array( strtolower( trim( (string) $name ) ), self::layout_rest_fields(), true ) ) {
+        return 'The field "' . $name . '" is a page builder\'s layout settings (css and js that run on every page using the layout) registered as a REST field, and the generic tools neither read nor write a layout. Use the builder\'s own tools to read the structure, or its editor in wp-admin to change it.';
+      }
+    }
     return null;
+  }
+
+  /**
+  * REST fields, registered by a plugin with register_rest_field(), that read or write a page
+  * builder's layout. Lowercased names.
+  *
+  * The generic meta tools refuse the layout keys (layout_meta_keys()), and a REST tool reaches the
+  * same rows by another door: Beaver Builder registers fl_builder_css_js on its post types when its
+  * debug transient is set or FL_ENABLE_META_CSS_EDIT is defined, and the field's callbacks read and
+  * write `_fl_builder_data_settings` (the layout's css and js, which the public page then loads).
+  * A named field is refused before the controller is asked and is neither accepted nor returned.
+  * Filterable, because the category is "a field that carries a layout", not one plugin. A field
+  * that is NOT on this list is still held by guard_rest_fields(), which stops its callbacks reading
+  * or writing a layout key through WordPress's meta functions.
+  *
+  * @return string[]
+  */
+  public static function layout_rest_fields(): array {
+    return array_values( array_unique( array_map( static function ( $name ) {
+      return strtolower( trim( (string) $name ) );
+    }, (array) apply_filters( 'gmcp_layout_rest_fields', [ 'fl_builder_css_js' ] ) ) ) );
+  }
+
+  /** Nesting depth of REST-field callbacks running now: [ 'get' => n, 'update' => n ]. */
+  private static $rest_field_depth = [ 'get' => 0, 'update' => 0 ];
+
+  /**
+  * Hold every REST field's callbacks away from a page builder's layout, for one dispatch.
+  *
+  * rest_write_refusal() names the fields it knows, and a field it does not know would still reach
+  * the layout, since the callback another plugin registered runs inside the controller. So the
+  * callbacks of every registered field are wrapped, and while one runs the WordPress meta
+  * functions answer for a layout key as the generic meta tools do: a write throws, a read finds
+  * nothing. A field on layout_rest_fields() has its callbacks removed, which the controller reads
+  * as "no such field", so it is neither accepted nor returned. The wrapping is of the global
+  * registry and is put back by the closure this returns, which the caller runs in a finally.
+  *
+  * What it does not see: a callback that reads the table with $wpdb, and a write made after the
+  * dispatch from a hook that fires later.
+  *
+  * @return callable Restores the registry and removes the hooks.
+  */
+  public static function guard_rest_fields(): callable {
+    global $wp_rest_additional_fields;
+    $saved = $wp_rest_additional_fields;
+    if ( !is_array( $wp_rest_additional_fields ) ) {
+      return static function () {};
+    }
+    $named = self::layout_rest_fields();
+    foreach ( $wp_rest_additional_fields as $type => $fields ) {
+      foreach ( (array) $fields as $name => $options ) {
+        if ( !is_array( $options ) ) {
+          continue;
+        }
+        if ( in_array( strtolower( trim( (string) $name ) ), $named, true ) ) {
+          $options['get_callback'] = null;
+          $options['update_callback'] = null;
+          $wp_rest_additional_fields[ $type ][ $name ] = $options;
+          continue;
+        }
+        foreach ( [ 'get', 'update' ] as $kind ) {
+          $original = $options[ $kind . '_callback' ] ?? null;
+          if ( !is_callable( $original ) ) {
+            continue;
+          }
+          $options[ $kind . '_callback' ] = static function ( ...$call_args ) use ( $original, $kind ) {
+            ++self::$rest_field_depth[ $kind ];
+            try {
+              return call_user_func_array( $original, $call_args );
+            }
+            finally {
+              --self::$rest_field_depth[ $kind ];
+            }
+          };
+        }
+        $wp_rest_additional_fields[ $type ][ $name ] = $options;
+      }
+    }
+    foreach ( [ 'add', 'update', 'delete' ] as $op ) {
+      add_filter( $op . '_post_metadata', [ __CLASS__, 'rest_field_meta_write_net' ], PHP_INT_MIN, 4 );
+    }
+    add_filter( 'update_post_metadata_by_mid', [ __CLASS__, 'rest_field_meta_by_mid_net' ], PHP_INT_MIN, 4 );
+    add_filter( 'delete_post_metadata_by_mid', [ __CLASS__, 'rest_field_meta_by_mid_net' ], PHP_INT_MIN, 2 );
+    add_filter( 'get_post_metadata', [ __CLASS__, 'rest_field_meta_read_net' ], PHP_INT_MIN, 4 );
+    return static function () use ( $saved ) {
+      global $wp_rest_additional_fields;
+      $wp_rest_additional_fields = $saved;
+      foreach ( [ 'add', 'update', 'delete' ] as $op ) {
+        remove_filter( $op . '_post_metadata', [ __CLASS__, 'rest_field_meta_write_net' ], PHP_INT_MIN );
+      }
+      remove_filter( 'update_post_metadata_by_mid', [ __CLASS__, 'rest_field_meta_by_mid_net' ], PHP_INT_MIN );
+      remove_filter( 'delete_post_metadata_by_mid', [ __CLASS__, 'rest_field_meta_by_mid_net' ], PHP_INT_MIN );
+      remove_filter( 'get_post_metadata', [ __CLASS__, 'rest_field_meta_read_net' ], PHP_INT_MIN );
+      self::$rest_field_depth = [ 'get' => 0, 'update' => 0 ];
+    };
+  }
+
+  public static function rest_field_meta_write_net( $check, $object_id = 0, $meta_key = '', $meta_value = null ) {
+    if ( self::$rest_field_depth['update'] > 0 ) {
+      $why = self::generic_writer_meta_refusal( $meta_key );
+      if ( $why !== null ) {
+        throw new GMCP_Policy_Refusal( $why );
+      }
+    }
+    return $check;
+  }
+
+  public static function rest_field_meta_by_mid_net( $check, $meta_id = 0, $meta_value = null, $meta_key = false ) {
+    if ( self::$rest_field_depth['update'] > 0 && function_exists( 'get_metadata_by_mid' ) ) {
+      $row = get_metadata_by_mid( 'post', (int) $meta_id );
+      $why = $row ? self::generic_writer_meta_refusal( $meta_key !== false ? $meta_key : $row->meta_key ) : null;
+      if ( $why !== null ) {
+        throw new GMCP_Policy_Refusal( $why );
+      }
+    }
+    return $check;
+  }
+
+  public static function rest_field_meta_read_net( $check, $object_id = 0, $meta_key = '', $single = false ) {
+    if ( self::$rest_field_depth['get'] <= 0 && self::$rest_field_depth['update'] <= 0 ) {
+      return $check;
+    }
+    if ( is_string( $meta_key ) && $meta_key !== '' ) {
+      if ( self::generic_writer_meta_refusal( $meta_key ) !== null ) {
+        return $single ? '' : [];
+      }
+      return $check;
+    }
+    // The whole meta of the post, which a callback may return as it is: serve it without the layout.
+    $cache = wp_cache_get( (int) $object_id, 'post_meta' );
+    if ( $cache === false ) {
+      update_meta_cache( 'post', [ (int) $object_id ] );
+      $cache = wp_cache_get( (int) $object_id, 'post_meta' );
+    }
+    if ( !is_array( $cache ) ) {
+      return $check;
+    }
+    foreach ( array_keys( $cache ) as $key ) {
+      if ( self::generic_writer_meta_refusal( (string) $key ) !== null ) {
+        unset( $cache[ $key ] );
+      }
+    }
+    return $cache;
   }
 
   private static $personal_net_installed = false;

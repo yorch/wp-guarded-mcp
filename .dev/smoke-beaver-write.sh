@@ -237,6 +237,92 @@ check "the layout rows it wrote are in the change journal, under this tool" "$(p
 t=json.load(sys.stdin)["result"]["content"][0]["text"]
 print("yes" if "beaver_create_page" in t and "_fl_builder_data" in t else "no")' "" j1)" "yes"
 
+echo "-- a REST field is not a door around the layout rule --"
+# Beaver registers fl_builder_css_js on its pages while its debug transient is set, and the field's
+# callbacks write `_fl_builder_data_settings` (css and js the public page then loads). The generated
+# REST tools passed it straight through. A second field, registered here by a test plugin under a
+# name nothing lists, stands for any other plugin's field that reaches the same rows.
+REST_WAS=$(wpc eval '$o=get_option("gmcp_options",[]); echo !empty($o["mcp_tools_rest"]) ? 1 : 0;')
+wpc eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_rest"]=true;update_option("gmcp_options",$o,false);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null 2>&1
+docker compose exec -T cli mkdir -p /var/www/html/wp-content/mu-plugins 2>/dev/null
+docker compose exec -T cli bash -c 'cat > /var/www/html/wp-content/mu-plugins/smoke-bw-rest-door.php' <<'MUPHP'
+<?php
+add_action( 'rest_api_init', function () {
+  register_rest_field( 'page', 'gmcp_door_layout', [
+    'get_callback' => function ( $post ) { $d = get_post_meta( $post['id'], '_fl_builder_data_settings', true ); return is_object( $d ) ? (string) ( $d->js ?? '' ) : ''; },
+    'update_callback' => function ( $value, $post ) { $d = get_post_meta( $post->ID, '_fl_builder_data_settings', true ); $d = is_object( $d ) ? $d : new stdClass(); $d->js = (string) $value; update_post_meta( $post->ID, '_fl_builder_data_settings', $d ); return true; },
+    'schema' => [ 'type' => 'string' ],
+  ] );
+  register_rest_field( 'page', 'gmcp_door_benign', [
+    'get_callback' => function ( $post ) { return (string) get_post_meta( $post['id'], 'gmcp_bw_benign', true ); },
+    'update_callback' => function ( $value, $post ) { update_post_meta( $post->ID, 'gmcp_bw_benign', (string) $value ); return true; },
+    'schema' => [ 'type' => 'string' ],
+  ] );
+} );
+MUPHP
+RWK=$(gmcp_make_key_level "smoke beaver write door rw" readwrite)
+ROK=$(gmcp_make_key_level "smoke beaver write door ro" readonly)
+call d0 "$(tc beaver_create_page '{"title":"BWD '"$MARK"'","modules":[{"type":"heading","text":"door"}]}')"
+PIDD=$(jget d0 ID)
+check "CONTROL: the victim page is created" "$(verdict d0)" "ok"
+LIST_TOK="$TOK"; TOK="$RWK"
+call d1 '{"jsonrpc":"2.0","id":7,"method":"tools/list"}'
+TOK="$LIST_TOK"
+check "CONTROL: the generated update_pages tool is offered to a readwrite key" "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["tools"];print(len([x for x in t if x["name"]=="update_pages"]))' "" d1)" "1"
+check "and its schema does not offer the layout field" "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["tools"];x=[y for y in t if y["name"]=="update_pages"][0];print("fl_builder_css_js" in json.dumps(x))' "" d1)" "False"
+DMARK="doormark$MARK"
+layout_js() { dbq "SELECT IF(meta_value LIKE '%$DMARK%', 'planted', 'clean') FROM wp_postmeta WHERE post_id=$PIDD AND meta_key='_fl_builder_data_settings'"; }
+reset_layout() { wpc eval '$d=new stdClass();$d->css="";$d->js="";update_post_meta('"$PIDD"',"_fl_builder_data_settings",$d);update_post_meta('"$PIDD"',"_fl_builder_draft_settings",$d);' >/dev/null 2>&1; }
+reset_layout
+check "CONTROL: the probe finds a planted value (so 'clean' below means something)" "$(wpc eval '$d=new stdClass();$d->js="'"$DMARK"'";update_post_meta('"$PIDD"',"_fl_builder_data_settings",$d);' >/dev/null; layout_js)" "planted"
+reset_layout
+check "CONTROL: and finds it clean again after the reset" "$(layout_js)" "clean"
+wpc eval 'set_transient("fl_debug_mode","gmcpdoor",3600);' >/dev/null 2>&1
+check "CONTROL: Beaver's field is registered while its debug transient is set" "$(wpc eval 'do_action("rest_api_init"); global $wp_rest_additional_fields; echo isset($wp_rest_additional_fields["page"]["fl_builder_css_js"]) ? "registered" : "absent";')" "registered"
+TOK="$RWK"
+call d2 "$(tc update_pages '{"id":'"$PIDD"',"fl_builder_css_js":{"css":"body{x:1}","js":"'"$DMARK"'"}}')"
+call d3 "$(tc update_pages '{"id":'"$PIDD"',"gmcp_door_layout":"'"$DMARK"'"}')"
+call d4 "$(tc update_pages '{"id":'"$PIDD"',"gmcp_door_benign":"benign'"$MARK"'"}')"
+TOK="$LIST_TOK"
+check "update_pages with fl_builder_css_js is refused" "$(verdict d2)" "error"
+check "and the STORED layout settings do not hold the value" "$(layout_js)" "clean"
+check "an unlisted field that writes the same row is refused" "$(verdict d3)" "error"
+check "and the STORED layout settings still do not hold the value" "$(layout_js)" "clean"
+check "CONTROL: a field that writes an ordinary meta key is accepted" "$(verdict d4)" "ok"
+check "and its STORED value is there" "$(wpc eval 'echo get_post_meta('"$PIDD"',"gmcp_bw_benign",true);')" "benign$MARK"
+wpc eval '$d=new stdClass();$d->css="";$d->js="'"$DMARK"'";update_post_meta('"$PIDD"',"_fl_builder_data_settings",$d);' >/dev/null 2>&1
+for who in "$RWK" "$ROK" "$TOK"; do
+  TOK="$who"
+  call g1 "$(tc get_pages '{"id":'"$PIDD"',"context":"edit"}')"
+  call g2 "$(tc list_pages '{"context":"edit","status":"any","per_page":100}')"
+  call g3 "$(tc get_pages '{"id":'"$PIDD"',"_fields":"id,title,gmcp_door_layout,fl_builder_css_js"}')"
+  TOK="$LIST_TOK"
+  check "a reply (get, list, _fields) never carries the layout's script [${who:0:9}]" "$(for f in g1 g2 g3; do grep -c "$DMARK" "$OUT/$f"; done | tr '\n' ' ')" "0 0 0 "
+  check "CONTROL: and the same replies are real pages [${who:0:9}]" "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["content"][0]["text"];print("title" in t or "id" in t)' "" g1)" "True"
+done
+reset_layout
+echo "-- and the switch that opens it is not an option any writer may set --"
+wpc eval 'delete_transient("fl_debug_mode");delete_option("fl_debug_mode");delete_option("_transient_fl_debug_mode");delete_option("_transient_timeout_fl_debug_mode");' >/dev/null 2>&1
+fl_rows() { dbq "SELECT COUNT(*) FROM wp_options WHERE option_name IN ('_transient_fl_debug_mode','_transient_timeout_fl_debug_mode','fl_debug_mode')"; }
+check "CONTROL: no flag row stands before the attempts" "$(fl_rows)" "0"
+for name in '_transient_fl_debug_mode' '_transient_timeout_fl_debug_mode' 'fl_debug_mode' '_TRANSIENT_FL_DEBUG_MODE' '_transient_fl_debug_mode '; do
+  call o1 "$(tc wp_update_option '{"key":"'"$name"'","value":"gmcpdoor"}')"
+  check "wp_update_option '$name' is refused" "$(verdict o1)" "error"
+done
+check "and no flag row was written, whatever the spelling" "$(fl_rows)" "0"
+check "and the Beaver field is still not registered" "$(wpc eval 'do_action("rest_api_init"); global $wp_rest_additional_fields; echo isset($wp_rest_additional_fields["page"]["fl_builder_css_js"]) ? "registered" : "absent";')" "absent"
+wpc eval 'set_transient("fl_debug_mode","gmcpdoor",3600);' >/dev/null 2>&1
+check "CONTROL: the probe finds the row once the flag is really set" "$(dbq "SELECT COUNT(*) FROM wp_options WHERE option_name='_transient_fl_debug_mode'")" "1"
+call o3 "$(tc wp_get_option '{"key":"_transient_fl_debug_mode"}')"
+check "the flag's value (also its debug token) is not readable" "$(grep -c gmcpdoor "$OUT/o3")" "0"
+call o4 "$(tc wp_delete_option '{"key":"_transient_fl_debug_mode"}')"
+check "and it is not deletable through the option tool either" "$(verdict o4)" "error"
+check "CONTROL: the row is still there after that attempt" "$(dbq "SELECT COUNT(*) FROM wp_options WHERE option_name='_transient_fl_debug_mode'")" "1"
+wpc eval 'delete_transient("fl_debug_mode");delete_option("fl_debug_mode");' >/dev/null 2>&1
+docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/smoke-bw-rest-door.php >/dev/null 2>&1
+[ "$REST_WAS" = "1" ] || wpc eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_rest"]=false;update_option("gmcp_options",$o,false);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null 2>&1
+for p in "$PIDD"; do wpc eval 'wp_delete_post('"${p:-0}"', true);' >/dev/null 2>&1; done
+
 echo "-- cleanup --"
 for p in "$PID" "$PID2" "$PIDE" "$PIDL" "$PIDF" "$PIDM" "$SUB" "$UPL" "$TXT" "$ATT"; do wpc eval 'wp_delete_post('"${p:-0}"', true);' >/dev/null 2>&1; done
 wpc eval 'foreach ((array) get_posts(["post_type"=>"any","post_status"=>"any","numberposts"=>-1,"fields"=>"ids","s"=>"'"$MARK"'"]) as $i) { wp_delete_post($i,true); }' >/dev/null 2>&1

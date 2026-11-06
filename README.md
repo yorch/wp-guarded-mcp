@@ -411,7 +411,12 @@ layout. So node types, counts and depth are returned, layout setting *names* are
 whether custom code is present is returned, and no value of either is. The layout keys are not
 readable through the generic meta tools either: `wp_get_post_meta` and `wp_get_post_snapshot` list
 them as withheld, and a key is judged the way the database compares it, so an accented or
-space-padded spelling is the same key. `beaver_layout` reports a post's title, type and status, so
+space-padded spelling is the same key. The generated REST tools (`update_pages` and the rest) do
+not read or write a layout either: a REST field another plugin registers for it (Beaver's
+`fl_builder_css_js`, which exists only while its debug flag is set) is refused, left out of replies
+and not offered in the tool's schema, a field that reaches the layout key through WordPress's meta
+functions is stopped while it runs, and the debug flag's option rows are not writable or readable
+through the option tools. `beaver_layout` reports a post's title, type and status, so
 it asks the same read policy the generic readers do: a form submission, and below admin an order
 or another plugin's configuration, answers as a post that does not exist. There is no tool that
 edits or replaces an existing layout, and none that accepts layout settings from the caller: it

@@ -159,6 +159,16 @@ policies before the controller is called (like `create_one_post()` does for `met
 inside the controller, and says so. A new create or update path that writes in two steps pre-checks
 the second step or undoes the first; `smoke-forms.sh` asserts the table, not the reply.
 
+**A REST field is a door to a layout, and a REST tool is generated from every field a plugin
+registers.** `GMCP_Core::layout_meta_keys()` is refused by the generic meta tools, and Beaver
+Builder registers `fl_builder_css_js` (while its `fl_debug_mode` transient is set) whose callbacks
+write `_fl_builder_data_settings` with `update_post_meta()`: `update_pages` with that field stored
+a script the public page loaded, and `get_pages` returned it to a readonly key. So
+`rest_write_refusal()` refuses the fields in `layout_rest_fields()`, `guard_rest_fields()` wraps
+every registered field's callbacks for the dispatch so an unlisted one cannot touch a layout key
+through the meta functions, and the debug transient is under `option_write_policy()` and
+`option_guard()`. A new plugin's field is held by the wrapper, not by a list; `$wpdb` is outside it.
+
 **A deletion is not always a delete tool.** WordPress deletes on markers it reads from
 ordinary rows: `wp_scheduled_delete()` removes every post with an old `_wp_trash_meta_time`
 and `wp_delete_auto_drafts()` every old auto-draft. So `GMCP_Core::status_write_refusal()`

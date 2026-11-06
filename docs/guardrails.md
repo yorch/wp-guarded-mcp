@@ -1660,6 +1660,29 @@ asks is written down here.
   write through it replaced the stored layout. Not covered: another plugin's own reader, a
   layout kept under a key a site has not added to the filter, and a builder other than the one
   listed.
+- **A registered REST field is a second door to the layout, and the generated REST tools shut it.**
+  Beaver Builder registers `fl_builder_css_js` on its post types while its debug transient
+  (`fl_debug_mode`) is set or `FL_ENABLE_META_CSS_EDIT` is defined, and the field's callbacks read
+  and write `_fl_builder_data_settings`, the css and js the public page loads from the builder's
+  cache. `update_pages` with that field stored attacker script under a readwrite key (measured),
+  and `get_pages` returned it to a readonly one. Now `GMCP_Core::rest_write_refusal()` refuses any
+  argument named in `GMCP_Core::layout_rest_fields()` (extendable through `gmcp_layout_rest_fields`)
+  before the controller is asked, the generated schemas do not offer it, and for a dispatch the
+  field's callbacks are removed so no reply carries it. For a field NOT on that list,
+  `GMCP_Core::guard_rest_fields()` wraps every registered field's callbacks for the dispatch and,
+  while one runs, the WordPress meta functions treat a layout key (and the attachment file key) as
+  the generic meta tools do: a write throws and a read finds nothing. That is a backstop and is
+  late: the controller applies the post's own fields before the registered ones, so a refusal from
+  there leaves earlier fields of the same update stored, and the reply says so. Not covered: a
+  field callback that reads or writes the table with `$wpdb`, and a layout kept under a key nobody
+  has listed. The debug transient itself is under `option_write_policy()` too
+  (`GMCP_Core::layout_switch_options()`: `fl_debug_mode`, its `_transient_` and
+  `_transient_timeout_` rows, extendable through `gmcp_layout_switch_options`), judged as the
+  database compares the name, and under `option_guard()` for reads, because its value is also the
+  token that turns the builder's debug output on for any visitor. `FL_ENABLE_META_CSS_EDIT` is a
+  constant in `wp-config.php` and nothing here can set it; a site that defines it has opened the
+  field on purpose, and the tools still refuse to use it. `smoke-beaver-write.sh` plants a value
+  through a stand-in field and through the real one, and asserts the stored row and the replies.
 - **`beaver_create_page` is the one tool that writes a layout, and it only creates.** It has no
   argument that names an existing post. The builder's writer (`FLBuilderModel::update_layout_data()`)
   applies no capability check, no kses and no `sanitize_settings()`, so the tool is the only
