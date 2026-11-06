@@ -84,16 +84,20 @@ parser on seven nested `EXISTS`), through `with_readable_posts_sql()` and
 offset 40,000 of 50,000 posts took 13 s and 210 MB when the offset was paid for in PHP), and keeps
 `collect_readable()` as the row-by-row backstop, bounded in rows looked at independently of the
 offset. Those clauses go in last and wrap what other plugins built: at `posts_clauses_request` and
-`comments_clauses`, at `PHP_INT_MAX`, with the other plugin's WHERE in parentheses, because
-appended at `posts_where` a foreign `OR 1=1` or a replaced clause set dropped them and the REST
-list tools returned a submission's upload (measured). The REST tools also judge each row at
-`the_posts` and then, by id, AFTER `rest_do_request()` returns (`judge_post_rows()`, asking the
-controller for `id` when `_fields` omits it), because no hook registered during the dispatch can run
-behind code that runs after it; every query inside a listing runs with filters on whatever
-`pre_get_posts` asks, and
-`readable_posts_page()` / `readable_comments_page()` re-page in PHP when the finished SQL no longer
-carries the guard or a filter answered without a query (`$held`), because then the database's offset
-counts hidden rows. `smoke-listing-filters.sh` attacks all of that with a read-only key and a
+`comments_clauses`, at `PHP_INT_MAX`, with the guard FIRST in the WHERE and the other plugin's WHERE
+after it, its comments taken out and its parentheses balanced (`wrap_foreign_where()`: a fragment
+ending `) OR 1=1 /*` commented out the guard and the LIMIT), because appended at `posts_where` a
+foreign `OR 1=1` or a replaced clause set dropped them and the REST list tools returned a submission's
+upload (measured). Every query inside a listing runs with filters on whatever `pre_get_posts` asks.
+Whether the guard held is decided from the FINISHED state, never from a hook, because a callback a
+plugin registers from inside `pre_get_posts` at `PHP_INT_MAX` runs behind every hook the guard added:
+each query's own `request` must carry the guard as the server reads it with comments taken out
+(`sql_carries()`) and must be among the SELECTs the database was given (`listing_in_doubt()`), and
+`readable_posts_page()` / `readable_comments_page()` re-page in PHP when it is not (`$held`), because
+then the database's offset counts hidden rows. The REST list tools judge the finished rows by id
+AFTER `rest_do_request()` returns (`judge_post_rows()`, asking the controller for `id` when `_fields`
+omits it), because no hook registered during the dispatch can run behind code that runs after it, and
+re-page in PHP the same way when the query is in doubt. `smoke-listing-filters.sh` attacks all of that with a read-only key and a
 test-only mu-plugin of foreign filters. The change records go through `GMCP_Changes::record()` and
 carry a submission as an id with `[withheld]` values, judged on the state before the write as
 well as after it, because `wp_list_changes` is a read-level tool and names a post by its title.

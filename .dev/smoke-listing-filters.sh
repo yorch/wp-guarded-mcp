@@ -166,7 +166,9 @@ for spec in \
   "results_inject|$UP||no" "the_posts_inject|$UP||no" "pre_query_inject|$UP||no" \
   "comments_exclude|$C2||no" "comments_reset|0||no" "comments_or1|0||no" \
   "comments_results_inject|$CS||no" "comments_pre_query_ids|0|$CS,$C1,$C2|no" \
-  "late_the_posts|$UP||no" "late_rest_inject|$UP||no" "late_rest_inject_noid|$UP||no" ; do
+  "late_the_posts|$UP||no" "late_rest_inject|$UP||no" "late_rest_inject_noid|$UP||no" \
+  "late_pre_query_index|0||no" "late_request_strip|0||no" "where_comment_tail|0||no" "orderby_comment_tail|0||no" \
+  "late_comments_strip|0||no" "late_comments_index|0||no"; do
   IFS='|' read -r mode arg ids widens <<< "$spec"
   setmode "$mode" "$arg" "$ids"
   check "$mode: no reader returns the submission's tree" "$(leaks)" ""
@@ -210,6 +212,39 @@ setmode "comments_pre_query_ids" 0 "$CS,$C1"
 check "comments_pre_query_ids: comments guard lost (answered without a query)" "$(cheld)" "lost"
 setmode ""
 
+# Filters that run BEHIND the guard: registered from inside pre_get_posts / pre_get_comments at
+# PHP_INT_MAX, so a hook the guard added before the query ran sees the query first. The decision is
+# made from the finished state, so each is reported lost, or held with the raw rows clean. Each
+# line also says whether the RAW rows (before any row check) held the hidden row: that is the
+# control that the filter did what it was written to do, and that "held" is not a probe that
+# cannot see.
+rawheld() { wpe '
+$held = null;
+$ids = GMCP_Core::with_readable_posts_sql( function () { return wp_list_pluck( get_posts( [ "post_type" => "attachment", "post_status" => "inherit", "s" => "GMCPFF",
+  "suppress_filters" => false, "no_found_rows" => true, "posts_per_page" => 50, "cache_results" => false ] ), "ID" ); }, $held );
+echo ( $held ? "held" : "lost" ) . ":" . ( in_array( '"$UP"', array_map( "intval", $ids ), true ) ? "raw-has-hidden" : "raw-clean" );'; }
+crawheld() { wpe '
+$held = null;
+$ids = GMCP_Core::with_readable_comments_sql( function () { return wp_list_pluck( get_comments( [ "number" => 50, "status" => "all", "search" => "GMCPFF",
+  "cache_domain" => "gmcp_held_probe_" . mt_rand() ] ), "comment_ID" ); }, $held );
+echo ( $held ? "held" : "lost" ) . ":" . ( in_array( '"$CS"', array_map( "intval", $ids ), true ) ? "raw-has-hidden" : "raw-clean" );'; }
+setmode ""
+check "no filter: posts guard held, raw rows clean" "$(rawheld)" "held:raw-clean"
+check "no filter: comments guard held, raw rows clean" "$(crawheld)" "held:raw-clean"
+for spec in "late_pre_query_index|lost:raw-has-hidden" "late_request_strip|lost:raw-has-hidden" \
+  "where_comment_tail|held:raw-clean" "orderby_comment_tail|held:raw-clean" "late_the_posts|held:raw-has-hidden"; do
+  IFS='|' read -r mode want <<< "$spec"
+  setmode "$mode" "$UP"
+  check "$mode: posts guard and raw rows are $want" "$(rawheld)" "$want"
+  check "CONTROL: $mode: the filter ran" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+done
+for spec in "late_comments_strip|lost:raw-has-hidden" "late_comments_index|lost:raw-has-hidden" "comments_reset|held:raw-clean" "comments_or1|held:raw-clean"; do
+  IFS='|' read -r mode want <<< "$spec"
+  setmode "$mode" 0
+  check "$mode: comments guard and raw rows are $want" "$(crawheld)" "$want"
+  check "CONTROL: $mode: the filter ran" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+done
+setmode ""
 
 echo "== Block 3: the guard's hooks are taken off again =="
 HOOKS='foreach ( [ "posts_clauses_request", "posts_request", "posts_request_ids", "posts_pre_query", "the_posts", "pre_get_posts", "comments_clauses", "comments_pre_query" ] as $h ) { $n[$h] = isset( $GLOBALS["wp_filter"][$h] ) ? array_sum( array_map( "count", $GLOBALS["wp_filter"][$h]->callbacks ) ) : 0; } echo wp_json_encode( $n );'
@@ -250,6 +285,45 @@ setmode "comments_pre_query_ids" 0 "$C1,$CS,$C2"
 check "comments answered without a query: wp_get_comments gives the same pages" \
   "$(page_titles wp_get_comments ',"status":"all"')" "GMCPFF-COMMENT-1,GMCPFF-COMMENT-2,,,"
 check "CONTROL: that filter ran" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+# Filters that run behind the guard's own checks (registered from inside pre_get_posts). The pager
+# decides from the finished state, so each gives the pages it would give with no hidden row.
+rest_titles() {
+  local out="" pg
+  for pg in 1 2 3 4; do
+    callro list_media "{\"search\":\"GMCPFF\",\"per_page\":1,\"page\":$pg,\"_fields\":\"id,title\"}" rp
+    out="$out$(rows rp | sed 's/UNPARSEABLE//'),"
+  done
+  echo "$out"
+}
+setmode ""
+REST_BASE=$(rest_titles)
+check "no filter: list_media (one row per page) pages over the hidden upload" "$REST_BASE" "GMCPFF-FILE-1,GMCPFF-FILE-2,GMCPFF-FILE-3,,"
+for mode in late_pre_query_index late_request_strip orderby_comment_tail; do
+  setmode "$mode" "$UP"
+  check "$mode: wp_get_posts pages as with no hidden row" \
+    "$(page_titles wp_get_posts ',"post_type":"attachment","post_status":"inherit"')" "GMCPFF-FILE-1,GMCPFF-FILE-2,GMCPFF-FILE-3,,"
+  check "$mode: list_media pages as with no hidden row (no short or shifted page)" "$(rest_titles)" "$REST_BASE"
+  check "CONTROL: $mode: the filter ran" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+done
+# A fragment ending ") OR 1=1 /*" widens the query like "OR 1=1" does (the other plugin's doing, and
+# every later page is of the widened query), but it must not take the guard or the LIMIT with it:
+# the pages are those of the plain "OR 1=1", the upload is not among them, and nothing is shifted.
+setmode "where_or1" 0
+WIDE_POSTS=$(page_titles wp_get_posts ',"post_type":"attachment","post_status":"inherit"')
+WIDE_REST=$(rest_titles)
+setmode "where_comment_tail" 0
+check "where_comment_tail: wp_get_posts pages as plain OR 1=1 does (guard and LIMIT intact)" \
+  "$(page_titles wp_get_posts ',"post_type":"attachment","post_status":"inherit"')" "$WIDE_POSTS"
+check "where_comment_tail: list_media pages as plain OR 1=1 does" "$(rest_titles)" "$WIDE_REST"
+check "CONTROL: the widened pages start with the three ordinary files, and hold no upload" \
+  "$(case "$WIDE_POSTS" in GMCPFF-FILE-1,GMCPFF-FILE-2,GMCPFF-FILE-3,*) case "$WIDE_POSTS" in *UPLOAD*) echo upload;; *) echo ok;; esac;; *) echo other;; esac)" "ok"
+check "CONTROL: that filter ran" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+for mode in late_comments_strip late_comments_index; do
+  setmode "$mode" 0
+  check "$mode: wp_get_comments pages as with no hidden row" "$(page_titles wp_get_comments ',"status":"all"')" "GMCPFF-COMMENT-1,GMCPFF-COMMENT-2,,,"
+  check "CONTROL: $mode: the filter ran" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+done
+setmode ""
 setmode "where_exclude" "$M2"
 check "a benign filter hiding one file: the pages skip it and nothing else (its omission is the other plugin's)" \
   "$(page_titles wp_get_posts ',"post_type":"attachment","post_status":"inherit"')" "GMCPFF-FILE-1,GMCPFF-FILE-3,,,"
@@ -294,6 +368,19 @@ callro list_media '{"search":"GMCPFF","per_page":100,"_fields":"id,title"}' f4
 check "a row with no id added behind everything is dropped" "$(has f4 GMCPFF-UPLOAD)" "no"
 check "CONTROL: the filter added it" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
 setmode ""
+
+echo "== Block 7: the SQL reader =="
+check "a comment inside a quoted string is not a comment, one outside is" "$(wpe '
+$a = GMCP_Core::scan_sql( "SELECT \x27a /* b \x27 /* c */ d" );
+echo json_encode( [ $a["text"], $a["comment"], $a["broken"] ] );')" '["SELECT '"'"'a \/* b '"'"'   d",true,false]'
+check "an unclosed block comment is broken and drops what follows" "$(wpe '
+$a = GMCP_Core::scan_sql( "x /* guard" ); echo json_encode( [ $a["text"], $a["broken"] ] );')" '["x  ",true]'
+check "the guard text inside a comment is not found, outside it is" "$(wpe '
+echo json_encode( [ GMCP_Core::sql_carries( "A /* GUARD */", "GUARD", "" ), GMCP_Core::sql_carries( "A GUARD", "GUARD", "" ), GMCP_Core::sql_carries( "A GUARD /* x", "GUARD", "" ), GMCP_Core::sql_carries( "A -- \nGUARD", "GUARD", "" ) ] );')" "[false,true,false,false]"
+check "a fragment that closes the wrapper and opens a comment is made one balanced expression" "$(wpe '
+$w = GMCP_Core::wrap_foreign_where( " AND x ) OR 1=1 /*" ); $a = GMCP_Core::scan_sql( $w );
+echo json_encode( [ $a["depth"], $a["excess"], $a["comment"], $a["broken"], strpos( $w, "/*" ) === false ] );')" "[0,0,false,false,true]"
+check "CONTROL: an ordinary fragment keeps its meaning" "$(wpe 'echo trim( preg_replace( "/\s+/", " ", GMCP_Core::wrap_foreign_where( " AND post_title <> \x27a)\x27 " ) ) );')" "( 1=1 AND post_title <> 'a)' )"
 
 # ---------------------------------------------------------------------------------------------
 echo "== Cleanup =="

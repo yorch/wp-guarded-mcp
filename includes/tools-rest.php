@@ -222,6 +222,64 @@ class GMCP_Tools_Rest {
     return $out;
   }
 
+  /**
+  * A page of a post listing built with the offset counted here and not by the database, for the
+  * case where the query's guard is in doubt (@see GMCP_Core::with_readable_posts_sql()). The
+  * controller is asked for windows of 100 rows from offset 0, each row is judged by its id as in
+  * judge_post_rows(), and the rows before the caller's offset are passed over as they are read,
+  * inside a bound of 5000 rows looked at, so a page past it is short, as for the other listings.
+  *
+  * @return array|null The rows, or null when the controller refused a window (the caller then
+  *                    keeps its own answer, which has been judged and so is safe).
+  */
+  private function page_in_php( WP_REST_Request $request, bool $strip_id ): ?array {
+    $per = max( 1, min( 100, (int) ( $request->get_param( 'per_page' ) ?: 10 ) ) );
+    $offset = $request->get_param( 'offset' );
+    $skip = $offset !== null && $offset !== '' ? max( 0, (int) $offset ) : ( max( 1, (int) ( $request->get_param( 'page' ) ?: 1 ) ) - 1 ) * $per;
+    $out = [];
+    $raw = 0;
+    $scanned = 0;
+    while ( $scanned < 5000 && count( $out ) < $per ) {
+      $window = clone $request;
+      $window->set_param( 'per_page', 100 );
+      $window->set_param( 'page', 1 );
+      $window->set_param( 'offset', $raw );
+      $held = null;
+      $response = GMCP_Core::with_readable_posts_sql( static function () use ( $window ) {
+        return rest_do_request( $window );
+      }, $held );
+      if ( is_wp_error( $response ) || $response->get_status() >= 400 ) {
+        return null;
+      }
+      $rows = $response->get_data();
+      if ( !is_array( $rows ) || !$rows ) {
+        break;
+      }
+      foreach ( $this->judge_post_rows( $rows, false ) as $row ) {
+        // judge_post_rows() leaves out what is refused, so what it returns is the readable rows.
+        if ( $skip > 0 ) {
+          $skip--;
+          continue;
+        }
+        $out[] = $row;
+        if ( count( $out ) >= $per ) {
+          break;
+        }
+      }
+      $scanned += count( $rows );
+      $raw += count( $rows );
+      if ( count( $rows ) < 100 ) {
+        break;
+      }
+    }
+    if ( $strip_id ) {
+      foreach ( $out as $i => $row ) {
+        unset( $out[ $i ]['id'] );
+      }
+    }
+    return $out;
+  }
+
   private function build_schema_from_args( $args ) {
     $schema = [
       'type' => 'object',
@@ -531,6 +589,19 @@ class GMCP_Tools_Rest {
     finally {
       if ( $action === 'create' ) {
         remove_action( 'wp_insert_post', $track, 0 );
+      }
+    }
+
+    // The SQL guard was in doubt for this listing (the finished query lost it, or was answered
+    // without the database): the controller's page and offset counted rows the caller may not read,
+    // so the page is built again with the offset passed over here, row by row. Otherwise a short
+    // page marked where a hidden row sits, and a page the controller took for out of range was an
+    // error. Also for an error, which the same doubt can cause (the controller counted the pages
+    // from rows another plugin supplied); a page_in_php() that cannot answer leaves the error as it was.
+    if ( $judge_ids && $sql_held === false ) {
+      $paged = $this->page_in_php( $request, $id_added );
+      if ( $paged !== null ) {
+        return $paged;
       }
     }
 
