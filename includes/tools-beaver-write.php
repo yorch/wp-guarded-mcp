@@ -164,6 +164,14 @@ class GMCP_Tools_Beaver_Write {
     if ( !in_array( $status, [ 'draft', 'publish' ], true ) ) {
       return $this->error( $r, 'Unknown status "' . $status . '". Use draft or publish.' );
     }
+    // The same question every other tool that creates a post asks before it writes: a key
+    // restricted to drafts may not publish.
+    // The net under wp_insert_post would stop it too, but only as an exception from inside
+    // WordPress; this says why in a sentence and leaves nothing behind.
+    $drafts = GMCP_Core::drafts_only_status_guard( $status, 'Creating a page' );
+    if ( $drafts !== true ) {
+      return $this->error( $r, $drafts, -32600 );
+    }
     // The transport's manage_options does not imply these for a custom role, and neither is a
     // capability the tool may assume. Checked before anything is created.
     if ( !current_user_can( 'edit_pages' ) ) {
@@ -207,9 +215,10 @@ class GMCP_Tools_Beaver_Write {
 
     $layout = $this->build_layout( $built );
 
-    // The layout keys are refused by GMCP_Core::protected_meta_refusal(), whose WordPress-level
-    // filter fires for every writer during a tool call. This scopes the permission to this
-    // callback and nothing else; it is a static depth counter, not a flag a caller can set.
+    // The layout keys are refused to the generic meta tools by generic_writer_meta_refusal(), and
+    // the WordPress-level net does not ask about them (the builder writes them from its own save
+    // hook). The permission is scoped to this callback anyway, so a later tightening of the net
+    // cannot break this tool; it is a static depth counter, not a flag a caller can set.
     $stored = GMCP_Core::with_layout_write( function () use ( $post_id, $layout ) {
       $previous = (int) \FLBuilderModel::get_post_id();
       try {
