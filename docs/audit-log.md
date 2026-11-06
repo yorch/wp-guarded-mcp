@@ -222,6 +222,41 @@ written: the old join at or below that mark, the canonical encoding above it.
 Old rows keep verifying, new rows are unambiguous, and nothing was rewritten to
 make either true.
 
+## Appends are serialised, and a lock that answers oddly is not "no lock"
+
+A row names the hash of the row before it, so two writers that read the same
+newest hash before either has inserted both chain to the same predecessor, and
+the second row fails its link: `verify()` calls that tampering in a log nobody
+touched, and it stays until the log is cleared. Parallel tool calls are
+ordinary client behaviour. The append therefore takes a named lock
+(`GET_LOCK`, one per database and table) around the read of the newest hash and
+the insert, and releases it explicitly.
+
+`GET_LOCK` answers `1` (taken) or `0` (not taken within five seconds). Anything
+else means the server has no usable lock: `NULL` from one that errors on the
+call, the string `1=1` from the SQLite drop-in, which reads the call as a
+comparison. The append used to treat that as "nothing to take" and carry on
+without a word, which on such a stack forks the chain under load (measured: eight
+processes writing forty rows each left 60 to 74 rows sharing a predecessor). It
+now writes one log line per request that names the answer (through the same
+redaction every debug line gets) and serialises with a lock row in the options
+table instead, taken with `INSERT IGNORE` on its unique name so exactly one
+writer holds it, released by deleting its own value, and taken over by
+compare-and-swap if it is older than thirty seconds because its holder died.
+If that lock cannot be had in five seconds either, the row is still written
+(unserialised, with a second log line), as it is when `GET_LOCK` answers `0`:
+an entry that might sit beside a fork is a better outcome than an entry that
+does not exist. A row is never dropped for want of a lock.
+
+What this does not cover: a server that answers `1` without holding the lock
+(a proxy that fakes it). The fallback was proved on MariaDB with the answer
+rewritten (`.dev/smoke-admin.sh`), and measured by hand on the SQLite drop-in,
+which answers `1=1` by itself: eight processes writing forty rows each left an
+intact chain twice with the fallback and a forked one (56 to 70 rows sharing a
+predecessor) without it. The suite does not run that on SQLite, and PHP's
+`usleep` between attempts is a polling wait, so under heavy contention a writer
+can take up to the five seconds before it writes past the lock.
+
 ## Two things the chain cannot do
 
 Stated here rather than left to be assumed. It cannot notice that the log has

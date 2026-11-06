@@ -1461,6 +1461,126 @@ check "and no two rows share a predecessor" \
 check "the chain lock is not left held" \
   "$(docker compose exec -T cli wp eval 'global $wpdb;$n="gmcp_audit_".md5(DB_NAME.GMCP_Audit::table());echo (int)$wpdb->get_var($wpdb->prepare("SELECT IS_FREE_LOCK(%s)",$n));' 2>/dev/null | tr -d '\r\n')" "1"
 
+# A LOCK THAT ANSWERS SOMETHING ELSE. GET_LOCK answers '1' or '0' on a server that has it. The SQLite
+# drop-in answers the string '1=1' (it reads the call as a comparison) and a server that errors on the
+# call answers null; the append used to treat either as "no lock to take" and carry on unserialised,
+# silently, so parallel calls forked the chain and verify() reported tampering. A mu-plugin rewrites
+# the query so a real server answers like that one, and the same sixty parallel calls then have to
+# chain through the fallback (a lock row in the options table), say so in the log, and leave no lock
+# behind. The control proves the rewrite is in place, so a passing run is not a run of the real lock.
+LOCK_PROBE='global $wpdb;$g=$wpdb->get_var("SELECT GET_LOCK(\"gmcp_probe\",1)");if($g==="1"){$wpdb->get_var("SELECT RELEASE_LOCK(\"gmcp_probe\")");}echo $g===null?"none":$g;'
+LOCK_REAL=$(docker compose exec -T cli wp eval "$LOCK_PROBE" 2>/dev/null | tr -d '\r\n')
+# Eight PHP processes of forty rows each: tool calls over HTTP arrive at most four at a time on a
+# php -S stack and the sixty above did not fork the chain even with the lock taken out (measured), so
+# this is the race that can tell the fallback from no lock at all (measured: 320 rows, 63 to 74
+# predecessors shared, without it).
+lock_race() { # lock_race -> "<rows> <intact|FORKED> <rows sharing a predecessor>"
+  docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+  seq 1 8 | xargs -P 8 -I% docker compose exec -T cli wp eval '$a=new GMCP_Audit();for($i=0;$i<40;$i++){$a->record(["tool"=>"race_%","status"=>"success","args"=>[],"user_id"=>1]);}' >/dev/null 2>&1
+  docker compose exec -T cli wp eval 'global $wpdb;$v=GMCP_Audit::verify("all");echo (int)$wpdb->get_var("SELECT COUNT(*) FROM ".GMCP_Audit::table()." WHERE tool LIKE \"race_%\"")," ",($v["ok"]?"intact":"FORKED")," ",(int)$wpdb->get_var("SELECT COUNT(*) FROM (SELECT prev_hash FROM ".GMCP_Audit::table()." GROUP BY prev_hash HAVING COUNT(*)>1) d");' 2>/dev/null | tr -d '\r\n'
+}
+if [ "$LOCK_REAL" = "1" ]; then
+  check "CONTROL: eight processes writing forty rows each under the server's own lock leave an intact chain" "$(lock_race)" "320 intact 0"
+else
+  echo "  ....  this stack has no GET_LOCK (it answers '$LOCK_REAL'), so the control race under a real lock is skipped"
+fi
+LOCK_MU=/var/www/html/wp-content/mu-plugins/gmcp-smoke-lock-answer.php
+docker compose exec -T cli sh -c "cat > $LOCK_MU" <<'PHP'
+<?php
+// Test only: the answer GET_LOCK gives is whatever the file named below holds ("null" for NULL).
+add_filter( 'query', function ( $q ) {
+  if ( strpos( $q, 'SELECT GET_LOCK(' ) === 0 ) {
+    $f = WP_CONTENT_DIR . '/gmcp-smoke-lock-answer.txt';
+    $a = is_readable( $f ) ? trim( (string) file_get_contents( $f ) ) : '';
+    if ( $a === 'null' ) {
+      return 'SELECT NULL';
+    }
+    if ( $a !== '' ) {
+      return "SELECT '" . str_replace( "'", '', $a ) . "'";
+    }
+  }
+  return $q;
+} );
+PHP
+LOCK_ANS=/var/www/html/wp-content/gmcp-smoke-lock-answer.txt
+lock_opt() { docker compose exec -T cli wp eval 'global $wpdb;$n="gmcp_audit_".md5(DB_NAME.GMCP_Audit::table());echo (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name=%s",$n));' 2>/dev/null | tr -d '\r\n'; }
+printf '1=1' | docker compose exec -T cli sh -c "cat > $LOCK_ANS"
+check "CONTROL: the rewrite is in place, GET_LOCK now answers 1=1" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo $wpdb->get_var("SELECT GET_LOCK(\"gmcp_probe\",1)");' 2>/dev/null | tr -d '\r\n')" "1=1"
+docker compose exec -T cli wp eval 'GMCP_Audit::clear();' >/dev/null 2>&1
+seq 1 60 | xargs -P 20 -I% sh -c 'curl -sS -o /dev/null -X POST "$URL" -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":%,\"method\":\"tools/call\",\"params\":{\"name\":\"mcp_ping\",\"arguments\":{}}}"'
+check "CONTROL (odd answer): every one of sixty parallel calls was recorded" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}gmcp_audit WHERE tool=\"mcp_ping\"");' 2>/dev/null | tr -d '\r\n')" "60"
+check "a lock that answers 1=1 does not fork the chain under sixty parallel calls" \
+  "$(docker compose exec -T cli wp eval '$v=GMCP_Audit::verify("all");echo $v["ok"]&&$v["complete"]&&$v["checked"]===60?"intact":"FORKED at ".var_export($v["broken_at"],true);' 2>/dev/null | tr -d '\r\n')" "intact"
+check "and no two rows share a predecessor" \
+  "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(*) FROM (SELECT prev_hash FROM {$wpdb->prefix}gmcp_audit GROUP BY prev_hash HAVING COUNT(*) > 1) d");' 2>/dev/null | tr -d '\r\n')" "0"
+check "the fallback lock row is not left behind" "$(lock_opt)" "0"
+check "eight processes writing forty rows each under a lock that answers 1=1 leave an intact chain, no shared predecessor" "$(lock_race)" "320 intact 0"
+check "and the fallback lock row is not left behind after the race" "$(lock_opt)" "0"
+
+# One process, so the log line and the odd answers can be read: error_log is pointed at a file for
+# the call. Each answer is a row written (never dropped), chained to the one before, and named once.
+LOCK_PHP=$(cat <<'PHP'
+global $wpdb;
+$log = tempnam( sys_get_temp_dir(), 'gmcplock' );
+ini_set( 'error_log', $log );
+$out = [];
+GMCP_Audit::clear();
+$a = new GMCP_Audit();
+foreach ( [ 'null', '1=1', 'password=hunter2pw' ] as $i => $answer ) {
+  file_put_contents( WP_CONTENT_DIR . '/gmcp-smoke-lock-answer.txt', $answer );
+  $a->record( [ 'tool' => 'lock_t_' . $i, 'status' => 'success', 'args' => [], 'user_id' => 1 ] );
+}
+$v = GMCP_Audit::verify( 'all' );
+$out[] = 'rows=' . (int) $wpdb->get_var( "SELECT COUNT(*) FROM " . GMCP_Audit::table() . " WHERE tool LIKE 'lock_t_%'" );
+$out[] = 'chain=' . ( $v['ok'] && $v['checked'] === 3 ? 'intact' : 'BROKEN' );
+$text = (string) file_get_contents( $log );
+$out[] = 'logged=' . substr_count( $text, 'GET_LOCK answered' );
+$out[] = 'named=' . ( strpos( $text, 'options table' ) !== false ? 'yes' : 'no' );
+$out[] = 'leak=' . ( strpos( $text, 'hunter2pw' ) !== false ? 'yes' : 'no' );
+unlink( $log );
+echo implode( ' ', $out );
+PHP
+)
+check "an odd answer is written, chained and logged (once per request), with the answer redacted" \
+  "$(docker compose exec -T cli wp eval "$LOCK_PHP" 2>/dev/null | tr -d '\r\n')" "rows=3 chain=intact logged=1 named=yes leak=no"
+
+# The fallback lock itself: a fresh lock held by someone else is waited for and then written past
+# (the row is kept and the timeout is logged); a dead holder's stale lock is taken over and removed.
+LOCK_PHP2=$(cat <<'PHP'
+global $wpdb;
+$name = 'gmcp_audit_' . md5( DB_NAME . GMCP_Audit::table() );
+$log = tempnam( sys_get_temp_dir(), 'gmcplock' );
+ini_set( 'error_log', $log );
+file_put_contents( WP_CONTENT_DIR . '/gmcp-smoke-lock-answer.txt', '1=1' );
+GMCP_Audit::clear();
+$a = new GMCP_Audit();
+$out = [];
+$wpdb->query( $wpdb->prepare( "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')", $name, ( time() - 100 ) . ':dead' ) );
+$a->record( [ 'tool' => 'lock_stale', 'status' => 'success', 'args' => [], 'user_id' => 1 ] );
+$out[] = 'stale_row=' . (int) $wpdb->get_var( "SELECT COUNT(*) FROM " . GMCP_Audit::table() . " WHERE tool='lock_stale'" );
+$out[] = 'stale_lock_left=' . (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name=%s", $name ) );
+$wpdb->query( $wpdb->prepare( "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')", $name, time() . ':alive' ) );
+$t = microtime( true );
+$a->record( [ 'tool' => 'lock_held', 'status' => 'success', 'args' => [], 'user_id' => 1 ] );
+$waited = microtime( true ) - $t;
+$out[] = 'held_row=' . (int) $wpdb->get_var( "SELECT COUNT(*) FROM " . GMCP_Audit::table() . " WHERE tool='lock_held'" );
+$out[] = 'waited=' . ( $waited >= 4.5 && $waited < 9 ? 'about5s' : round( $waited, 1 ) );
+$out[] = 'others_lock_kept=' . (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name=%s AND option_value LIKE %s", $name, '%:alive' ) );
+$out[] = 'timeout_logged=' . substr_count( (string) file_get_contents( $log ), 'options-table lock was not obtained' );
+$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name=%s", $name ) );
+unlink( $log );
+echo implode( ' ', $out );
+PHP
+)
+check "a stale fallback lock is taken over and removed; a live one is waited for, written past and logged" \
+  "$(docker compose exec -T cli wp eval "$LOCK_PHP2" 2>/dev/null | tr -d '\r\n')" "stale_row=1 stale_lock_left=0 held_row=1 waited=about5s others_lock_kept=1 timeout_logged=1"
+
+docker compose exec -T cli rm -f "$LOCK_MU" "$LOCK_ANS" >/dev/null 2>&1
+check "the rewrite is gone again: GET_LOCK answers as it did before" \
+  "$(docker compose exec -T cli wp eval "$LOCK_PROBE" 2>/dev/null | tr -d '\r\n')" "$LOCK_REAL"
+
 # AN EMPTY HASH IS ACCEPTED ONLY BEFORE THE FIRST SIGNED ROW. Rows carried over from the
 # option-based version are the oldest rows there are; an unsigned row after a signed one is
 # an edit, and when it is the newest row nothing after it contradicts the blanking.
@@ -2757,16 +2877,17 @@ tc_groups() { # tc_groups <admin 0|1> <woo 0|1>
     $o["mcp_tools_export"] = false;
     update_option( "gmcp_options", $o, false );' >/dev/null 2>&1
 }
-tc_unprefixed_groups() { # prints "<rest>,<subscriptions>" as stored: 1 when switched on
+tc_unprefixed_groups() { # prints "<rest>,<subscriptions>,<export>" as stored: 1 when switched on
   docker compose exec -T cli wp eval '
     $o = get_option( "gmcp_options", [] );
-    echo ( ! empty( $o["mcp_tools_rest"] ) ? 1 : 0 ), ",", ( ! empty( $o["mcp_tools_woo_subscriptions"] ) ? 1 : 0 );' 2>/dev/null | tr -d '\r\n'
+    echo ( ! empty( $o["mcp_tools_rest"] ) ? 1 : 0 ), ",", ( ! empty( $o["mcp_tools_woo_subscriptions"] ) ? 1 : 0 ), ",", ( ! empty( $o["mcp_tools_export"] ) ? 1 : 0 );' 2>/dev/null | tr -d '\r\n'
 }
-tc_restore_unprefixed() { # tc_restore_unprefixed <rest 0|1> <subscriptions 0|1>
+tc_restore_unprefixed() { # tc_restore_unprefixed <rest 0|1> <subscriptions 0|1> <export 0|1>
   docker compose exec -T cli wp eval '
     $o = get_option( "gmcp_options", [] );
     $o["mcp_tools_rest"] = '"$1"' ? true : false;
     $o["mcp_tools_woo_subscriptions"] = '"$2"' ? true : false;
+    $o["mcp_tools_export"] = '"$3"' ? true : false;
     update_option( "gmcp_options", $o, false );' >/dev/null 2>&1
 }
 # Optional groups are excluded by tool-name prefix, because the table counts only the groups
@@ -2816,13 +2937,19 @@ case "$(tc_doc admin 1)" in
   ''|'no such row') echo "  FAIL  the access-level table could not be parsed"; fail=$((fail+1));;
 esac
 
+# The export switch is forced ON for the snapshot, whatever the stack had, so that the restore at the
+# end of the block is measured: with it found off, "restored" and "left off" are the same state and the
+# check below could not tell them apart. The stack's own value is put back after that check.
+TC_UNPREFIXED_ORIG=$(tc_unprefixed_groups)
+tc_restore_unprefixed "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f1)" "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f2)" 1
 TC_UNPREFIXED_WAS=$(tc_unprefixed_groups)
+check "CONTROL: the export group is on before the count, so its restore can be told from leaving it off" "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f3)" "1"
 tc_groups 0 0
 # The precondition, asserted: the counts below are only the table's if neither group is on.
-check "precondition: the REST and Subscriptions groups are off while counting" "$(tc_unprefixed_groups)" "0,0"
+check "precondition: the REST, Subscriptions and export groups are off while counting" "$(tc_unprefixed_groups)" "0,0,0"
 # And a control that the probe sees the problem it guards against: with the REST group on,
 # the same counter must move off the documented number.
-tc_restore_unprefixed 1 0
+tc_restore_unprefixed 1 0 0
 check "control: with the REST group on the content-only count is not the documented one" \
   "$([ "$(tc_count "$TC_ADMIN")" != "$(tc_doc admin 1)" ] && echo moved || echo same)" "moved"
 tc_groups 0 0
@@ -2846,10 +2973,12 @@ else
   echo "  ....  WooCommerce column not checked: the plugin is not active on this site"
 fi
 tc_groups 1 0
-# Put the two groups back as this block found them, so the later blocks and the next suite
-# see the site the way it was.
-tc_restore_unprefixed "${TC_UNPREFIXED_WAS%%,*}" "${TC_UNPREFIXED_WAS##*,}"
-check "the REST and Subscriptions groups are as they were before the count" "$(tc_unprefixed_groups)" "$TC_UNPREFIXED_WAS"
+# Put the three groups back as this block found them, so the later blocks and the next suite
+# see the site the way it was. The export switch was left off by tc_groups() and not restored,
+# so a stack that had it on lost it for every suite after this one.
+tc_restore_unprefixed "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f1)" "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f2)" "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f3)"
+check "the REST, Subscriptions and export groups are as they were before the count" "$(tc_unprefixed_groups)" "$TC_UNPREFIXED_WAS"
+tc_restore_unprefixed "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f1)" "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f2)" "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f3)"
 gmcp_clear_other_keys "smoke suite"
 
 echo "-- scheduled events --"
@@ -4020,8 +4149,11 @@ if grep -q wordpress_logged_in "$AP_JAR"; then
   ap_eval 'delete_option("'"$AP_RACE_KEY"'");' >/dev/null
   # Eight requests at once write eight audit rows at once. The chain is serialised with a named
   # lock (GMCP_Audit, GET_LOCK), which a SQLite drop-in does not have: it answers null or a
-  # mangled "1=1" (measured), never "1", the rows fork the chain, and the verification further down reports a break that is the
-  # stack's and not the plugin's. Said out loud and cleared there; on MariaDB nothing is cleared.
+  # mangled "1=1" (measured), never "1". The append then serialises with a lock row in the options
+  # table instead (proved above on MariaDB by faking that answer, and measured by hand on a SQLite
+  # drop-in: eight processes x forty rows, intact with it, 56 to 70 shared predecessors without it),
+  # but this suite does not race on a SQLite stack, so the log is still cleared there rather than
+  # trusted; on MariaDB nothing is cleared.
   if [ "$(ap_eval 'global $wpdb; $g=$wpdb->get_var("SELECT GET_LOCK(\"gmcp_probe\",1)"); if($g==="1"){$wpdb->get_var("SELECT RELEASE_LOCK(\"gmcp_probe\")");} echo $g===null?"none":$g;')" != "1" ]; then
     echo "  ....  this stack has no GET_LOCK, so parallel audit writes fork the hash chain; clearing the log after the race"
     ap_eval 'GMCP_Audit::clear();' >/dev/null
