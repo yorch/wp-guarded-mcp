@@ -1318,7 +1318,7 @@ class GMCP_Tools_Core {
       ],
       'wp_create_comment' => [
         'name' => 'wp_create_comment',
-        'description' => 'Insert a comment. Requires post_id and comment_content. Optional author, author_email, author_url.',
+        'description' => 'Insert a comment. Requires post_id and comment_content. Optional author, author_email, author_url. A comment on an order is refused (an order note is added with wc_add_order_note).',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1335,7 +1335,7 @@ class GMCP_Tools_Core {
       ],
       'wp_update_comment' => [
         'name' => 'wp_update_comment',
-        'description' => 'Update a comment – pass comment_ID plus fields (comment_content, comment_approved). A comment_approved of "trash" or "spam" is refused, because both end in permanent deletion; use wp_delete_comment, and a person marks spam in wp-admin.',
+        'description' => 'Update a comment – pass comment_ID plus fields (comment_content, comment_approved). A comment_approved of "trash" or "spam" is refused, because both end in permanent deletion; use wp_delete_comment, and a person marks spam in wp-admin. Order notes, and comments on an order, are refused.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -1355,7 +1355,7 @@ class GMCP_Tools_Core {
       ],
       'wp_delete_comment' => [
         'name' => 'wp_delete_comment',
-        'description' => 'Delete a comment. Without force it goes to the trash IF this site has the trash enabled; a site with EMPTY_TRASH_DAYS set to 0 has no trash and the comment is destroyed either way. The reply says which happened. `force` true always destroys it. Set preview to true to be shown the comment and what would happen to its replies, without deleting it.',
+        'description' => 'Delete a comment. Without force it goes to the trash IF this site has the trash enabled; a site with EMPTY_TRASH_DAYS set to 0 has no trash and the comment is destroyed either way. The reply says which happened. `force` true always destroys it. Set preview to true to be shown the comment and what would happen to its replies, without deleting it. Order notes, and comments on an order, are refused.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -2662,10 +2662,16 @@ class GMCP_Tools_Core {
       // preview of an update prints the fields it would change, which for an order is the
       // customer's note and address, so previewing must not become the way round either
       // the write guard or the read guard.
-      if ( in_array( $tool, [ 'wp_update_post', 'wp_alter_post', 'wp_delete_post' ], true ) ) {
+      if ( in_array( $tool, [ 'wp_update_post', 'wp_alter_post', 'wp_delete_post', 'wp_delete_media' ], true ) ) {
         $commerce = GMCP_Core::commerce_post_guard( (int) ( $a['ID'] ?? 0 ), 'Previewing a change to' );
         if ( $commerce !== true ) {
           return $this->error( $r, $commerce, -32600 );
+        }
+      }
+      if ( $tool === 'wp_delete_comment' ) {
+        $comment_held = GMCP_Core::comment_write_guard( (int) ( $a['comment_ID'] ?? 0 ), null, 'Previewing a change to', true );
+        if ( $comment_held !== true ) {
+          return $this->error( $r, $comment_held, -32600 );
         }
       }
       return $this->preview( $tool, $a, $r );
@@ -2942,6 +2948,9 @@ class GMCP_Tools_Core {
               return get_comments( [ 'offset' => $c_skip + $from, 'number' => $size, 'cache_domain' => 'gmcp_readable' ] + $args );
             },
             function ( $row ) {
+              if ( GMCP_Core::caller_access_level() !== 'admin' && in_array( strtolower( (string) $row->comment_type ), GMCP_Core::order_note_types(), true ) ) {
+                return false;
+              }
               return !( (int) $row->comment_post_ID > 0 && GMCP_Core::post_read_guard( (int) $row->comment_post_ID ) !== true );
             },
             $c_limit
@@ -2965,7 +2974,7 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'post_id & comment_content required', -32602 );
           break;
         }
-        $comment_held = GMCP_Core::comment_write_guard( 0, intval( $a['post_id'] ), 'Creating' );
+        $comment_held = GMCP_Core::comment_write_guard( 0, intval( $a['post_id'] ), 'Creating', true );
         if ( $comment_held !== true ) {
           $r = $this->error( $r, $comment_held, -32600 );
           break;
@@ -3000,7 +3009,9 @@ class GMCP_Tools_Core {
         $comment_held = GMCP_Core::comment_write_guard(
           intval( $a['comment_ID'] ),
           ( !empty( $a['fields'] ) && is_array( $a['fields'] ) && isset( $a['fields']['comment_post_ID'] ) && is_scalar( $a['fields']['comment_post_ID'] ) ) ? (int) $a['fields']['comment_post_ID'] : null,
-          'Updating'
+          'Updating',
+          true,
+          ( !empty( $a['fields'] ) && is_array( $a['fields'] ) && isset( $a['fields']['comment_type'] ) && is_scalar( $a['fields']['comment_type'] ) ) ? (string) $a['fields']['comment_type'] : null
         );
         if ( $comment_held !== true ) {
           $r = $this->error( $r, $comment_held, -32600 );
@@ -3053,7 +3064,7 @@ class GMCP_Tools_Core {
           break;
         }
         $comment_id = intval( $a['comment_ID'] );
-        $comment_held = GMCP_Core::comment_write_guard( $comment_id, null, 'Deleting' );
+        $comment_held = GMCP_Core::comment_write_guard( $comment_id, null, 'Deleting', true );
         if ( $comment_held !== true ) {
           $r = $this->error( $r, $comment_held, -32600 );
           break;
@@ -5612,8 +5623,10 @@ class GMCP_Tools_Core {
           break;
         }
         // A file that hangs from a form submission is the visitor's upload, and nothing here
-        // edits it. @see GMCP_Core::personal_data_write_guard().
-        $upload_guard = GMCP_Core::personal_data_write_guard( intval( $a['ID'] ), 'Updating' );
+        // edits it. @see GMCP_Core::personal_data_write_guard(). Asked through the commerce
+        // guard, which asks that first, because an attachment can also share its id with an
+        // order, and deleting it deletes the comments on that id: the order's notes.
+        $upload_guard = GMCP_Core::commerce_post_guard( intval( $a['ID'] ), 'Updating' );
         if ( $upload_guard !== true ) {
           $r = $this->error( $r, $upload_guard, -32600 );
           break;
@@ -5664,7 +5677,7 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'No attachment with ID ' . $media_id . '. This tool deletes media only; use wp_delete_post for other posts.', -32602 );
           break;
         }
-        $upload_guard = GMCP_Core::personal_data_write_guard( $media_id, 'Deleting' );
+        $upload_guard = GMCP_Core::commerce_post_guard( $media_id, 'Deleting' );
         if ( $upload_guard !== true ) {
           $r = $this->error( $r, $upload_guard, -32600 );
           break;

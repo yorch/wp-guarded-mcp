@@ -178,14 +178,14 @@ class GMCP_Tools_Rest {
   */
   public function exclude_unreadable_posts( $where ) {
     global $wpdb;
-    $c = GMCP_Core::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_r' );
+    $c = GMCP_Core::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_r', "{$wpdb->posts}.ID" );
     return $c['where'] === '' ? $where : $where . ' AND ' . $c['where'];
   }
 
   /** The parents the WHERE above judges, joined. @see exclude_unreadable_posts() */
   public function join_unreadable_posts( $join ) {
     global $wpdb;
-    return $join . GMCP_Core::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_r' )['join'];
+    return $join . GMCP_Core::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_r', "{$wpdb->posts}.ID" )['join'];
   }
 
   private function build_schema_from_args( $args ) {
@@ -373,6 +373,17 @@ class GMCP_Tools_Rest {
         // exist and cannot differ from it.
         $row_id = 0;
         $args['id'] = 0;
+      }
+      // And the write policy, for a write: the read guard above is silent at admin level, and the
+      // controller only checks that the row is of the route's type, so an ordinary page or
+      // attachment that shares its id with an order (measured: delete_pages at admin trashed it,
+      // which hid every note of the order) was written and deleted through here while the generic
+      // post tools refused. @see GMCP_Core::hpos_order_type()
+      if ( $action !== 'get' && $row_id > 0 ) {
+        $write_held = GMCP_Core::commerce_post_guard( $row_id, $action === 'delete' ? 'Deleting' : 'Updating' );
+        if ( $write_held !== true ) {
+          return $this->error( $id, $write_held, -32600 );
+        }
       }
       $path .= '/' . $row_id;
     }

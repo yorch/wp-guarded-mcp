@@ -110,6 +110,22 @@ post, its meta, its terms or a comment asks the guard; the net is the backstop, 
 a test-only tool registered by its mu-plugin writes through WordPress with the net taken out to
 show that the change records hold when a writer asks nothing.
 
+**An order is judged by its id, and its notes are part of it.** Every commerce guard used to ask the
+post row's type, which is the whole truth only with the legacy storage. With High-Performance Order
+Storage the order is a row in `wc_orders` and `wp_posts` holds a `shop_order_placehold` at the id,
+or on a shop that enabled it early nothing, or a page that took the id. Order notes, items and
+download permissions are keyed on the id, not on a type, so WooCommerce acts on them for any post
+written, trashed or deleted under it (measured: trashing the colliding page marked every note of the
+order `post-trashed`). `GMCP_Core::hpos_order_type()` asks `wc_orders` directly, and
+`post_chain_types()`, `commerce_post_guard()` and the SQL in `unreadable_post_clauses()` (which now
+takes the column holding each row's own id, `$id_col`: a new caller of it passes one) ask it. An
+order note is a comment of type `order_note`; `comment_write_guard()` closes an order's tree and that
+type to the generic comment tools (`$commerce`), but not under the net, because WooCommerce writes
+its own notes while a tool call is in flight. `smoke-woo.sh` seeds the three shapes (placeholder,
+page at the id, no post row), attacks each with a read-write and an admin key and compares the
+stored rows before and after. An id collision cannot be made with WooCommerce's own writer, so the
+fixture retypes or deletes the placeholder row by SQL, which is how the shape arises on a real shop.
+
 **A policy about a meta key is about the key as the database compares it.** `wp_postmeta.meta_key`
 is compared by its collation, `utf8mb4_unicode_520_ci` on a stock WordPress, which ignores accents,
 case, combining marks, soft hyphens, zero-width and control characters and trailing spaces and
