@@ -667,10 +667,10 @@ foreach ( $flag3 as $label => [ $text, $secret ] ) {
 }
 $prose3 = [
   [ '<input type="submit" name="reset_password" value="Reset Password">', '<input type="text" name="reset_password" value="' . $S . '">' ],
-  [ '<input type="checkbox" name="remember_password" value="' . $S . '">', '<input type="text" name="remember_password" value="' . $S . '">' ],
+  [ '<input type="checkbox" name="remember_password" value="1" checked>', '<input type="checkbox" name="remember_password" value="' . $S . '">' ],
   [ '<input type="password" name="password" value="••••••••">', '<input type="password" name="password" value="' . $S . '">' ],
   [ '<input type="text" name="api_key" placeholder="Enter your API key" value="">', '<input type="text" name="api_key" placeholder="Enter your API key" value="' . $S . '">' ],
-  [ 'docker run -u 1000:1000 nginx', 'docker run -u deploy:' . $S . ' nginx' ],
+  [ 'docker run -u 1000:1000 nginx', 'curl -u deploy:' . $S . ' https://x.example/' ],
   [ 'podman run --user www-data:www-data php', 'curl --user www-data:' . $S . ' https://x.example/' ],
   [ 'curl --user admin:$WP_PASSWORD https://x.example/', 'curl --user admin:' . $S . ' https://x.example/' ],
   [ 'curl -u user:pass https://x.example/', 'curl -u deploy:' . $S . ' https://x.example/' ],
@@ -690,12 +690,84 @@ $prose3 = [
   [ 'Password: **hidden**', 'Password: Txmyfk%WbZBu' ],
   [ 'Password: *required* and API key: ~~revoked~~', 'password=!YAdnsyFJT^Q#' ],
   [ 'Account key: see the portal', 'AccountKey=' . $B64 ],
-  [ 'Session id: 4521 for the booking', 'sessionid=' . $S ],
+  [ 'Session id: 4521 for the booking', 'sessionid=' . $S . $S ],
 ];
 foreach ( $prose3 as $i => [ $harmless, $control ] ) {
   check( "scanner: third-review prose row $i is not flagged: " . substr( $harmless, 0, 50 ), GMCP_Credential_Scan::text_holds( $harmless ), false );
   check( "CONTROL: scanner: third-review prose row $i has a counterpart that is flagged: " . substr( $control, 0, 50 ), GMCP_Credential_Scan::text_holds( $control ), true );
 }
+// Fourth review (an independent reviewer measured each of these against the scanner after it was
+// widened). The first group are credentials the widening let through, the second ordinary text it
+// started to flag, and each prose row has a counterpart of the same shape that is a credential.
+$L24 = $S . $S;
+$KEY20 = '9fK2qLx8Rr0aZ1bC4dE5';
+$flag4 = [
+  'a default password in define()'              => [ "define( 'DB_PASSWORD', 'password' );", 'password' ],
+  'JWT_SECRET set to the word secret'           => [ "JWT_SECRET='secret'", 'secret' ],
+  'a JSON password of changeme'                 => [ '{"username":"admin","password":"changeme"}', 'changeme' ],
+  'curl -u elastic:changeme'                    => [ 'curl -u elastic:changeme https://localhost:9200', 'changeme' ],
+  'a token that is the word token (userinfo)'    => [ 'https://deploy:token@git.example.com/repo.git', 'deploy:token' ],
+  'a quoted password that begins like a lookup (this.)' => [ '{"password": "this.is.my.password1"}', 'this.is.my.password1' ],
+  'a quoted password that begins like a lookup (Self.)' => [ "define( 'DB_PASSWORD', 'Self.Made#2024' );", 'Self.Made#2024' ],
+  'a quoted password that begins like a lookup (Env[)'  => [ 'SMTP_PASSWORD="Env[prod]9xQ"', 'Env[prod]9xQ' ],
+  'a quoted password that begins like a lookup (options.)' => [ "'api_key' => 'options.Tr4der99xx'", 'options.Tr4der99xx' ],
+  'a quoted password that begins like a call'   => [ "'client_secret' => 'env(9fK2qLx8Rr0aZ1)'", 'env(9fK2qLx8Rr0aZ1)' ],
+  'an unquoted password that begins like a lookup' => [ 'DB_PASSWORD=this.Kx92mQ!', 'this.Kx92mQ!' ],
+  'a passphrase with spaces in a password field' => [ '<input type="password" name="password" value="correct horse battery 42">', 'correct horse battery 42' ],
+  'a ">" inside a password field value'         => [ '<input type="password" name="password" value="Ab3>xyz9!q">', 'Ab3>xyz9!q' ],
+  'a password field in a tag over 1000 bytes'   => [ '<input class="' . str_repeat( 'w-full ', 150 ) . '" type="password" name="password" value="Kx92mQ7zp">', 'Kx92mQ7zp' ],
+  'a checkbox called remember_token with a token' => [ '<input type="checkbox" name="remember_token" value="Kx92mQ7zpL0aa">', 'Kx92mQ7zpL0aa' ],
+  'an image input called api_key with a key'    => [ '<input type="image" name="api_key" value="Kx92mQ7zpL0">', 'Kx92mQ7zpL0' ],
+  'curl -u with the pair attached'              => [ 'curl -uadmin:Kx92mQ7zp https://api.example.com', 'Kx92mQ7zp' ],
+  'a key in the user slot with a one-letter password' => [ "curl -u $KEY20:X https://acme.freshdesk.com/api/v2/tickets", $KEY20 ],
+  'a key in the user slot with no password'     => [ "curl -u $KEY20: https://api.example.com/v1/charges", $KEY20 ],
+  'curl -u with a letters-only password'        => [ 'curl -u admin:Hunterxy https://api.example.com', 'Hunterxy' ],
+  'a password with a colon after an empty user' => [ 'redis://:Kx92:mQ7zp@cache:6379', ':Kx92:mQ7zp' ],
+  'an Azure storage key (a vendor settles the name)' => [ 'AZURE_STORAGE_KEY=' . $B64, $B64 ],
+  'a quoted shared key that is the shape of a key' => [ '"shared_key": "' . $B64 . '"', $B64 ],
+  'a bare pass= with a mixed-in digit'          => [ 'https://x.example/?pass=Kx92mQ7zp', 'Kx92mQ7zp' ],
+];
+foreach ( $flag4 as $label => [ $text, $secret ] ) {
+  check( "scanner: $label is flagged", GMCP_Credential_Scan::text_holds( $text ), true );
+  check( "CONTROL: scanner: the probe for $label really contains the secret exactly once", substr_count( $text, $secret ), 1 );
+  check( "scanner: $label: blanking the spans replaces exactly the secret and nothing else",
+    GMCP_Credential_Scan::redact_spans( $text, '[x]' ), str_replace( $secret, '[x]', $text ) );
+}
+$prose4 = [
+  [ "const STORAGE_KEY = 'todos-vuejs-2.0'", "const STORAGE_KEY = '$L24'" ],
+  [ 'self.primary_key = "product_code"', "self.primary_key = \"$L24\"" ],
+  [ '{"table": "orders", "primary_key": "order_id"}', "{\"table\": \"orders\", \"primary_key\": \"$L24\"}" ],
+  [ "const SESSION_KEY = 'user'", "const SESSION_KEY = '$L24'" ],
+  [ "'root_key' => 'menu'", "'root_key' => '$L24'" ],
+  [ '"service_key": "billing"', "\"service_key\": \"$L24\"" ],
+  [ '"shared_key": "none yet"', "\"shared_key\": \"$L24\"" ],
+  [ 'primary_key: order_id_2', "primary_key: $L24" ],
+  [ 'ssh_key: "~/.ssh/id_ed25519.pub"', "ssh_key: \"$L24\"" ],
+  [ 'PWD=/var/www/html/wp-content', "PWD=$L24" ],
+  [ '"session_id": "abcd"', '"session_id": "' . bin2hex( 'Zx9Qw3Lp7Rt2Zx9Q' ) . '"' ],
+  [ 'Buy here: https://park.example.com/buy?pass=annual2025', 'Buy here: https://park.example.com/buy?pass=' . $S ],
+  [ 'Username: admin, Password: YourPassword', 'Username: admin, Password: rzAnTNbJYjykXw' ],
+  [ 'Password: JavaScript (enable it)', 'Password: rzAnTNbJYjykXw (enable it)' ],
+  [ '{"pw":"full"}', '{"pw":"' . $S . '"}' ],
+  [ 'docker run --user deploy:www-data2 php:8.2-fpm', 'curl --user deploy:www-data2 https://x.example/' ],
+  [ 'docker run -u 1000:docker1 image', 'curl -u 1000:docker1 https://x.example/' ],
+  [ 'sudo -u www-data:wwwdata2 wp cache flush', 'sudo curl -u www-data:wwwdata2 https://x.example/' ],
+  [ 'DB_PASSWORD=config.db.password', 'DB_PASSWORD=this.Kx92mQ!' ],
+  [ '$token = $_POST[', '$token = Kx92mQ7zp.' ],
+  [ '<input type="checkbox" name="remember_token" value="remember">', '<input type="checkbox" name="remember_token" value="Kx92mQ7zpL0aa">' ],
+  [ '<input type="submit" name="regenerate_token" value="Regenerate-key">', '<input type="text" name="regenerate_token" value="Kx92mQ7zpL0aa">' ],
+  [ '<input type="text" name="secret" value="Not set">', '<input type="password" name="secret" value="Not set up yet 1">' ],
+];
+foreach ( $prose4 as $i => [ $harmless, $control ] ) {
+  check( "scanner: fourth-review prose row $i is not flagged: " . substr( $harmless, 0, 50 ), GMCP_Credential_Scan::text_holds( $harmless ), false );
+  check( "CONTROL: scanner: fourth-review prose row $i has a counterpart that is flagged: " . substr( $control, 0, 50 ), GMCP_Credential_Scan::text_holds( $control ), true );
+}
+check( 'scanner: a quoted value is data: only an UNQUOTED complete lookup is exempt (control for the rows above)',
+  [ GMCP_Credential_Scan::text_holds( 'password = process.env.DB_PASSWORD' ), GMCP_Credential_Scan::text_holds( "password = 'process.env.DB_PASSWORD'" ) ], [ false, true ] );
+// A passphrase in a tag opened with several quotes and a ">" must not make the search quadratic, and a
+// 50 KB tag is read.
+check( 'scanner: a password field in a tag of 50 KB is read', GMCP_Credential_Scan::text_holds( '<input class="' . str_repeat( 'w ', 25000 ) . '" type="password" name="password" value="Kx92mQ7zp">' ), true );
+
 // Documented gaps stay gaps until someone decides otherwise: the scanner does not claim these, and
 // the guardrails page lists them. A bare secret, a password said in a sentence, a name that does not
 // end in a secret word, and a short wordlike password after an unquoted name.
