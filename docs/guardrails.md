@@ -1398,11 +1398,14 @@ re-read.
   returned and, for `update_media`, retitled a file attached to a seeded submission. Now every
   tool that takes an `id` asks `post_read_guard()` first (below admin the id is dispatched as
   one that names nothing, so the answer is the controller's own answer for a missing id); a list
-  call runs with `posts_join` and `posts_where` filters that leave out the guarded types and posts
+  call runs with a join and a WHERE that leave out the guarded types and posts
   hanging from them to the same depth the guards walk (the row and seven parents,
   `GMCP_Core::unreadable_post_clauses()`, joins because seven nested subqueries overflow the
   SQLite driver's parser), so rows are removed where the query is built and not afterwards,
-  because `_fields` can leave the id out of the rows and a page filtered afterwards is short; a
+  because `_fields` can leave the id out of the rows and a page filtered afterwards is short; the
+  clauses are added last and wrap what other plugins built, and the rows are judged once more as
+  they come back (see "Another plugin's query filters" below, which is where the REST tools had a
+  hole); a
   write that moves a row into or out of a tree (`update_media` with `post`, `update_pages` with
   `parent`) is refused by the net under `wp_insert_post_data`; and a route whose post type is a
   guarded type (a plugin registering one with `show_in_rest` and a `rest_base` of `posts`,
@@ -1504,13 +1507,65 @@ re-read.
     all, and the offset is not part of that count (it used to extend it). So the work is bounded by
     the database's own cost of an offset (an index walk, not objects) plus at most 5000 rows judged,
     and a short page is possible only if more than 5000 consecutive rows the SQL let through are
-    ones the guard refuses, which the two should never disagree about. The listings run with
-    `suppress_filters` off, as the REST listings do, so other plugins' query filters (a language
-    filter, for instance) now apply to them. The briefing's latest-post probe and the resource
-    still use the PHP pass alone with the 5000 bound, and for a window of more than 5000 unreadable
-    rows at the head of a listing they can still answer short. Rows with identical dates may come
-    back in another order than before, because the join changes the plan and `post_date` is the
-    only sort key.
+    ones the guard refuses, which the two should never disagree about. The briefing's latest-post
+    probe and the resource still use the PHP pass alone with the 5000 bound, and for a window of
+    more than 5000 unreadable rows at the head of a listing they can still answer short. Rows with
+    identical dates may come back in another order than before, because the join changes the plan
+    and `post_date` is the only sort key.
+  - **Another plugin's query filters, and the guard** (`.dev/smoke-listing-filters.sh`, which installs
+    a test-only plugin that filters in benign and hostile ways and attacks with a read-only key).
+    The listings above and the REST list tools must run with query filters on, because that is how
+    the guard's SQL gets into the query, so every filter another plugin registered applies to them
+    too. What that does, measured:
+    - *The guard could be defeated, in the REST list tools, and that was a defect.* The clauses used
+      to be appended at `posts_where` and `posts_join`, so a filter that appended `OR 1=1`
+      (`a AND b OR 1=1 AND guard` is "the guard, or a AND b"), replaced the clause set at
+      `posts_clauses`, or ran after the guard at the highest priority, dropped them. `list_media`,
+      `list_posts` and `list_pages` then returned a file attached to a form submission and a page
+      hanging from one to a read-only key (eleven of the twenty filter shapes the suite uses leaked, and the
+      reply held ids and titles). `wp_get_posts`, `wp_get_media` and `wp_get_comments` did not leak under any of them,
+      because they judge each returned row, and a filter that answers a query itself or injects a
+      row (`posts_pre_query`, `posts_results`, `the_posts`) was held by that row check; the REST
+      tools had no such check.
+    - *Now:* the guard is added at `posts_clauses_request` (the last hook that sees the clauses as
+      parts) and `comments_clauses`, both at `PHP_INT_MAX`, and the other plugin's WHERE is wrapped,
+      not extended (`AND ( 1=1 <theirs>` + a newline + `) AND <guard>`; the newline is so that a `-- `
+      comment at the end of their fragment cannot swallow the parenthesis). The REST tools also drop,
+      at `the_posts` at `PHP_INT_MAX`, every row `post_read_guard()` refuses, and every query inside
+      a listing runs with filters on whatever `pre_get_posts` asks for, because a plugin that sets
+      `suppress_filters` there took the guard's SQL and the row check with it (measured, another
+      leak). Each of those is asserted under twenty filter shapes, with a control that the
+      filter ran and, where it widens the query, a control that the widening was visible.
+    - *What a filter can still do, detected and not prevented:* rewrite the finished SQL
+      (`posts_request`), or answer without asking the database (`posts_pre_query`,
+      `comments_pre_query`: a search plugin that serves queries from its own index does this). The
+      finished text is checked for the guard's own SQL and the answer for having come from the
+      database, and when either is not so the guard's hold on the SQL is reported lost. A listing
+      that pages then does it in PHP (offset 0, the rows before the offset counted as they are
+      read, inside the 5000-row bound), because the database's offset counted rows the guard would
+      have left out: measured, a hidden file between two others moved every later page by one
+      (`1, 2, 2, 3` for `1, 2, 3`). The price is that an offset past 5000 rows then gives a short or
+      empty page, and only then. The REST tools cannot be re-run that way, so there the row check
+      keeps the content out and the page can be short, which says a row was left out. The rows
+      themselves are held in every case by the row check; the SQL is for the paging.
+    - *Completeness is not the guard's to keep, and is documented rather than fixed.* A listing
+      shows what the site's own query layer returns, so a filter another plugin applies to every
+      query (a language filter, a membership plugin's or a "hide from admin" plugin's `posts_where`)
+      removes rows from these listings that `wp_get_post` still returns by id, and `pre_get_posts`
+      can change what a query is about. Measured: a `posts_where` hiding one post removes it from
+      `wp_get_posts` and the REST lists while `wp_get_post` reads it; a `posts_clauses` that joins
+      a meta table and requires a row in it lists only the posts that have one. A plugin that scopes
+      its filter to the main query or to the front end does not touch them. Stripping other plugins'
+      filters for the length of a call was considered and not done: it would rewrite global hook
+      state in the middle of a request and would show posts a site's visibility plugin hides from
+      every other query layer. An agent that cannot find a post it expects should read it by id
+      before concluding it does not exist, and none of the listings returns a total, so there is no
+      total for a filter to make wrong.
+    - *Totals.* The one total these tools compute from a query is `wp_count_media` with a date bound
+      (`after`/`before`), which counted with the query filters on and so followed another plugin's
+      (measured: 4 files counted as 258 under `OR 1=1`, 3 and 0 under two benign filters). It now
+      counts with them off, as WordPress's own undated count does. Counts are still not read-guarded
+      (see "What the guards do not cover"), so that figure includes a submission's upload.
   - A taxonomy shared between a submission type and an ordinary type is listed by
     `wp_get_terms`, and the same applies to its terms on an ordinary post.
   - Every route to the database that is not a post reader, and the optional groups' own stores
@@ -1906,11 +1961,13 @@ escaped quote is taken whole; text that was escaped for embedding is read as wel
 code block, and the spans are mapped back to the original text. `Basic` is a credential when the
 token is the base64 of `user:password` (decoded, printable, with a colon), `Bearer` when it is eight
 characters or more with a digit (or twenty or more letters) and not words joined by hyphens or
-slashes, and an `Authorization:` header is read whole. What it does not find: a value split across
+slashes, and an `Authorization:` header is read whole (the schemes `Basic`, `Bearer`, `Token`, `Digest`,
+`OAuth`, `ApiKey`, `Hawk`, `NTLM`, `Negotiate`, `Bot`, `Key` and `JWT`). What it does not find: a value split across
 several arguments or lines, a credential that is base64 or encrypted and has no name or prefix
 around it, a bare token, a `Basic` credential that is not standard base64 of `user:password`, a
 secret under a name that does not end in a secret word, and an unquoted value under `token`, `secret` or `key`
-that is nothing but short words and numbers joined by hyphens or slashes.
+that is nothing but short words and numbers joined by hyphens or slashes. The measured list, with what is
+fixed and what is not, is under "Measured misses" below.
 
 It is built to avoid the opposite failure as carefully, because a false positive
 costs an undo and the journal exists so that an ordinary edit can be put back. The
@@ -1941,6 +1998,71 @@ flagged and cannot be removed without losing real secrets: a Maps `?key=AIza...`
 is restricted by referrer, but the same prefix is a server secret on other Google services), a
 placeholder that is not on the list (`$Db_pass9`, `${db_pass}`), and any prose that really looks like
 `name=value` with a secret-ended name and a token-shaped value (`password=abc123`, said in a sentence).
+
+Measured misses, and false alarms again (`.dev/measure-credential-scan.php`). The placeholder and
+prose exemptions above were chosen by hand from the cases someone happened to see, so a generator now
+builds the evidence. It fills 180 templates (87 of credentials, 93 of ordinary text) with random names and values (the layouts a credential
+really arrives in: a code block in a post body, a `.env` file, a curl command, JSON, YAML, INI, a PHP
+array, a URL with user information, a log line, a form tag, an option setter, a cookie; and ordinary
+text: prose about passwords and keys, code that names a secret and holds none, forms and setters
+that hold no secret, hashes and ids, plain posts), 3,600 strings at the default size, wrapped in
+a post body half the time. A miss is a credential not found, or found with its bytes outside the
+blanked span (the audit log blanks only the span); a false alarm is ordinary text flagged. Vendor-shaped
+keys are assembled at run time, so the tree holds none, and the corpus is not written out unless
+asked (`--dump`), and must not be committed. Result, on the scanner before and after:
+
+| | credentials missed | ordinary text flagged |
+|---|---|---|
+| before | 584 of 1,740 (33.6%), 304 of them in shapes now fixed | 60 of 1,860 (3.2%) |
+| after | 260 of 1,740 (14.9%), all in the gaps listed below | 0 of 1,860 |
+
+The after row is the same at seven other seeds (5,220 credentials and 5,580 ordinary strings each). The
+ordinary-text side of that table is written by the author of the rules and is near zero because of
+it, so the independent check is the one above, made again: 2,723 documentation and source files on this
+machine (24.8 MB, 537,467 lines), line by line. The scanner flags 69 lines where the previous one
+flagged 127, and none that it did not flag before. The 58 that went were code that reads a secret from
+somewhere (`self.password`, `request.access_token`, `'Bearer ' + token`); what is left is RFC examples
+(correctly), quoted assignments of any value under a secret name (`consumer_secret="consumer.secret"`,
+by policy), and Python type annotations (`private_key: Ed25519PrivateKey`), which cannot be told from
+a value without parsing the language. Fixed because they were measured: `curl -u user:password`
+and `--user`; a URL with no user (`redis://:secret@host`); `<input name="api_key" value="...">` in either
+attribute order (a button's or a checkbox's value is a label, not a secret); `update_option`, `add_option`,
+`set_transient`, `set_theme_mod` and `setItem` with a secret-named key; a bare `pass=` (a log line or
+query string; `Hall pass=2nd-floor` stays prose); `db_pass` and `smtpPass` with a value of hyphenated
+words and digits; a password of mixed-case letters, or of letters and a symbol inside, with no digit
+(`Txmyfk%WbZBu`, ten letters with a capital inside); names ending `pw`, `secret_key_base`,
+`AccountKey`, `STORAGE_KEY`, `SSH_KEY`, `DEPLOY_KEY`, `STRIPE_KEY` and similar (a key is a secret when the
+word before it says what kind, and that list grew); session cookies (`sessionid`, `PHPSESSID`,
+`wordpress_logged_in_<hash>`); keys of other vendors by prefix (`whsec_`, `npm_`, `glpat-`, `shpat_`,
+`SG.`, `dop_v1_`, `hf_`, `key-<32 hex>`, `ya29.`, `xoxe`, a Telegram bot token) and a Slack or Discord
+webhook URL's secret path segment. Fixed false alarms: a value that reads a secret from the environment
+or a variable (`process.env.API_KEY`, `$this->token`, `encryption_algorithm.password`, lowercase
+words joined by underscores or dots after an unquoted name), `'Bearer ' . $token`, `docker run -u
+1000:1000` and `--user www-data:www-data`, `cvs://:pserver:anoncvs@host`, and the words a schema
+or a form puts where a secret would go (`required`, `optional`, `none`, `null`, `hidden`, `redacted`,
+`changeme`, and `password`, `secret`, `token` themselves) now joined the placeholders. The lists are still
+hand-made; what changed is that each entry now has a sample that fails without it.
+
+Still missed, measured, 260 of the 1,740, each pinned by a test that says it is a gap
+(`.dev/journal-pure.php`) so that closing one is a decision and not an accident:
+
+- A secret with no name and no prefix around it: `It is h4PyKX2JRJhpaHDmkXq3GVXdLtiuNLLf.`
+- A password said in a sentence: `The password is hunter49`, `Login with admin / hunter49`.
+- A value not next to its name: a label and an input, a table row (`| password | hunter49 |`), `Username:` and
+  `Password:` on separate lines when the password has a space in it.
+- A short or wordlike unquoted password: `password=letmein`, `DB_PASSWORD: root`. `password=required` is
+  prose and the two cannot be told apart without a dictionary. The same for a passphrase of lowercase
+  words joined by underscores or dots (`password=correct_horse_battery_staple`), which reads as a
+  variable.
+- A password of short hyphenated words and digits after a bare `pass` (`pass=gijn-mgmf-7430`), which has
+  the shape of `Hall pass=2nd-floor`.
+- A base64 or hex value under a name that is not a secret word: `signature=`, `hmac =`, `nonce_value:`.
+- A key of a vendor that is not in the prefix list, and a credential in a vendor's own layout (a
+  connection string that is not a URL and does not say `Password=`).
+
+What a miss costs differs by channel: the journal keeps the value for undo, the audit log records
+it, the approval screen shows it. None of them is a store of secrets by design, and none of this
+makes the scanner a guarantee.
 
 What a post entry does about it is per field. A field that holds one is left out of
 `previous` and named in `redacted_fields`; the other fields of the same edit stay

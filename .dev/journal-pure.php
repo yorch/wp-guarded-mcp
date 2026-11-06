@@ -622,6 +622,93 @@ foreach ( $prose_rows as $i => [ $harmless, $control ] ) {
   check( "scanner: prose row $i is not flagged: " . substr( $harmless, 0, 50 ), GMCP_Credential_Scan::text_holds( $harmless ), false );
   check( "CONTROL: scanner: prose row $i has a counterpart that is flagged: " . substr( $control, 0, 50 ), GMCP_Credential_Scan::text_holds( $control ), true );
 }
+echo "-- the text scanner, third review: misses and false alarms found by .dev/measure-credential-scan.php --\n";
+// Each row below was a measured miss (flagged rows) or a measured false alarm (prose rows) over a
+// generated corpus of 3,000+ strings. Vendor-shaped keys are assembled at run time.
+$S = 'Zx9Qw3Lp7Rt2';
+$H64 = '9e65a8a2fb5e93eeea1932a6deaecded96bc9e6455bd054d6b34e009347757d9';
+$B64 = 'kDZS1oFgzbLOQrSxe1dEQxCQ7a0FRU47Pbz' . '+AQz7xw0Hn2ba/Qw3Ep9Lm4Tr7Yv0Ac==';
+$flag3 = [
+  'curl -u user:password'                      => [ "curl -u deploy:$S https://example.com/api", $S ],
+  'curl --user= in quotes'                      => [ "curl --user=\"deploy:$S\" https://example.com/api", $S ],
+  'a URL with no user (redis; the pair is blanked, colon included)' => [ "REDIS_URL=redis://:$S@cache.example.com:6379/0", ':' . $S ],
+  'an <input> with the name first'              => [ '<input type="hidden" name="api_key" value="' . $S . '">', $S ],
+  'an <input> with the value first'             => [ "<input value='$S' type='text' name='smtp_password'>", $S ],
+  'update_option with a token name'             => [ "update_option( 'acme_token', '$S' );", $S ],
+  'set_transient with a key name'               => [ "set_transient( 'acme_api_key', \"$S\", 3600 );", $S ],
+  'localStorage.setItem'                        => [ "localStorage.setItem('auth-token', '$S')", $S ],
+  'a bare pass= in a log line'                  => [ 'login failed user=admin pass=' . $S, $S ],
+  'a qualified _pass with words, hyphens, digits' => [ 'DB_PASS: gijn-mgmf-7430', 'gijn-mgmf-7430' ],
+  'a password of letters mixed the way a generator mixes them' => [ 'smtp: AUTH failed, password: rzAnTNbJYjykXw', 'rzAnTNbJYjykXw' ],
+  'a password of letters and a symbol, no digit' => [ 'user_pass=Txmyfk%WbZBu', 'Txmyfk%WbZBu' ],
+  'the same with a trailing symbol'             => [ 'smtp: AUTH failed, password: RdCmYkaPEiSX!', 'RdCmYkaPEiSX!' ],
+  'a name ending in pw'                         => [ 'MYSQL_ROOT_PW=' . $S, $S ],
+  'secret_key_base'                             => [ 'secret_key_base=' . $H64, $H64 ],
+  'an Azure AccountKey'                         => [ 'DefaultEndpointsProtocol=https;AccountName=acme;AccountKey=' . $B64 . ';EndpointSuffix=core.windows.net', $B64 ],
+  'SSH_KEY and STORAGE_KEY'                     => [ 'SSH_KEY=' . $S . 'abcdef', $S . 'abcdef' ],
+  'a sessionid cookie'                          => [ 'Cookie: sessionid=' . $S . 'abcd; path=/; HttpOnly', $S . 'abcd' ],
+  'a WordPress login cookie'                    => [ 'Cookie: wordpress_logged_in_' . '0123456789abcdef' . '=' . $S . '%7C1700000000', $S . '%7C1700000000' ],
+  'Authorization: ApiKey'                       => [ 'Authorization: ApiKey ' . $S . 'abcd', $S . 'abcd' ],
+  'Authorization: OAuth'                        => [ 'Authorization: OAuth ' . $S . 'abcd', $S . 'abcd' ],
+  'a webhook signing secret'                    => [ 'the signing secret is ' . 'whs' . 'ec_' . 'Tsb1dkryWUz1jCU3PmCgiu69', 'whs' . 'ec_' . 'Tsb1dkryWUz1jCU3PmCgiu69' ],
+  'an npm token'                                => [ 'token ' . 'np' . 'm_' . 'L5My5RV3Sh23tmM94VtUSXzsR4IKC91tGsCZ' . ' leaked', 'np' . 'm_' . 'L5My5RV3Sh23tmM94VtUSXzsR4IKC91tGsCZ' ],
+  'a GitLab token'                              => [ 'use ' . 'glp' . 'at-' . 'abcdefghij1234567890', 'glp' . 'at-' . 'abcdefghij1234567890' ],
+  'a legacy Mailgun key'                        => [ 'api ' . 'key-' . '41bad7bd41722ede06c80afff11f3f15', 'key-' . '41bad7bd41722ede06c80afff11f3f15' ],
+  'a Shopify token'                             => [ 'x ' . 'sh' . 'pat_' . '41bad7bd41722ede06c80afff11f3f15', 'sh' . 'pat_' . '41bad7bd41722ede06c80afff11f3f15' ],
+  'a Telegram bot token'                        => [ 'bot ' . '1234567890:' . 'AA' . 'abcdefghij_klmnopqrstuvwxyz012345', '1234567890:' . 'AA' . 'abcdefghij_klmnopqrstuvwxyz012345' ],
+  'a Slack webhook URL'                         => [ 'https://hooks.' . 'slack.com/services/T0M7ZJHCT/B5Z5RFSQDY6/' . 'Ua2Cc0AZG8lCuE4oBcJjlg3j', 'Ua2Cc0AZG8lCuE4oBcJjlg3j' ],
+  'a Discord webhook URL'                       => [ 'https://discord' . '.com/api/webhooks/141439811760524679/' . str_repeat( 'lVZoCzNl', 7 ) . 'sfh7Wv', str_repeat( 'lVZoCzNl', 7 ) . 'sfh7Wv' ],
+];
+foreach ( $flag3 as $label => [ $text, $secret ] ) {
+  check( "scanner: $label is flagged", GMCP_Credential_Scan::text_holds( $text ), true );
+  check( "CONTROL: scanner: the probe for $label really contains the secret exactly once", substr_count( $text, $secret ), 1 );
+  check( "scanner: $label: blanking the spans replaces exactly the secret and nothing else",
+    GMCP_Credential_Scan::redact_spans( $text, '[x]' ), str_replace( $secret, '[x]', $text ) );
+}
+$prose3 = [
+  [ '<input type="submit" name="reset_password" value="Reset Password">', '<input type="text" name="reset_password" value="' . $S . '">' ],
+  [ '<input type="checkbox" name="remember_password" value="' . $S . '">', '<input type="text" name="remember_password" value="' . $S . '">' ],
+  [ '<input type="password" name="password" value="••••••••">', '<input type="password" name="password" value="' . $S . '">' ],
+  [ '<input type="text" name="api_key" placeholder="Enter your API key" value="">', '<input type="text" name="api_key" placeholder="Enter your API key" value="' . $S . '">' ],
+  [ 'docker run -u 1000:1000 nginx', 'docker run -u deploy:' . $S . ' nginx' ],
+  [ 'podman run --user www-data:www-data php', 'curl --user www-data:' . $S . ' https://x.example/' ],
+  [ 'curl --user admin:$WP_PASSWORD https://x.example/', 'curl --user admin:' . $S . ' https://x.example/' ],
+  [ 'curl -u user:pass https://x.example/', 'curl -u deploy:' . $S . ' https://x.example/' ],
+  [ 'const apiKey = process.env.API_KEY;', 'const apiKey = ' . $S . 'Zx9;' ],
+  [ "\$headers['Authorization'] = 'Bearer ' . \$token;", "\$headers['Authorization'] = 'Bearer $S';" ],
+  [ 'password = encryption_algorithm.password', 'password = ' . $S . 'enc' ],
+  [ "full_headers['Authorization'] = authorization_header", "full_headers['Authorization'] = " . $S . 'abc' ],
+  [ 'Mind the pass=1 and pass=true and ?pass=false', 'login failed pass=' . $S ],
+  [ 'Season-Pass: 2024-2025', 'DB_PASS: 2024-2025' ],
+  [ "update_option( 'acme_api_key', 'none' );", "update_option( 'acme_api_key', '$S' );" ],
+  [ "update_option( 'acme_token', \$token ); set_transient( 'acme_token_cache', \$data, 3600 );", "set_transient( 'acme_token', '$S', 3600 );" ],
+  [ '"password": "required"', '"password": "' . $S . '"' ],
+  [ "password: hidden\napi_key: optional", "password: $S" ],
+  [ 'cvs://:pserver:anoncvs@sources.example.com:/cvs/src', 'redis://:' . $S . '@cache.example.com' ],
+  [ 'secret_key_base: <%= ENV["SECRET_KEY_BASE"] %>', 'secret_key_base: ' . $H64 ],
+  [ 'Password: Administrator', 'password: rzAnTNbJYjykXw' ],
+  [ 'Password: **hidden**', 'Password: Txmyfk%WbZBu' ],
+  [ 'Password: *required* and API key: ~~revoked~~', 'password=!YAdnsyFJT^Q#' ],
+  [ 'Account key: see the portal', 'AccountKey=' . $B64 ],
+  [ 'Session id: 4521 for the booking', 'sessionid=' . $S ],
+];
+foreach ( $prose3 as $i => [ $harmless, $control ] ) {
+  check( "scanner: third-review prose row $i is not flagged: " . substr( $harmless, 0, 50 ), GMCP_Credential_Scan::text_holds( $harmless ), false );
+  check( "CONTROL: scanner: third-review prose row $i has a counterpart that is flagged: " . substr( $control, 0, 50 ), GMCP_Credential_Scan::text_holds( $control ), true );
+}
+// Documented gaps stay gaps until someone decides otherwise: the scanner does not claim these, and
+// the guardrails page lists them. A bare secret, a password said in a sentence, a name that does not
+// end in a secret word, and a short wordlike password after an unquoted name.
+foreach ( [
+  'a bare random string'                 => 'It is ' . 'h4PyKX2JRJhpaHDmkXq3GVXdLtiuNLLf' . '.',
+  'a password said in a sentence'        => 'The password is hunter49 so please change it.',
+  'a hash under an ordinary name'        => 'hmac = ' . $H64,
+  'a short wordlike unquoted password'   => 'password=letmein',
+  'a snake_case passphrase after an unquoted password name' => 'password=correct_horse_battery_staple',
+] as $label => $text ) {
+  check( "scanner: DOCUMENTED GAP, $label is not flagged", GMCP_Credential_Scan::text_holds( $text ), false );
+}
+
 // A 64-character name no longer matches only up to a bound, and a run of backslashes is one escape.
 check( 'scanner: a name past the old 63-character bound is judged by its last word, not skipped',
   GMCP_Credential_Scan::name_strength( str_repeat( 'a', 70 ) . '_password' ), 2 );
