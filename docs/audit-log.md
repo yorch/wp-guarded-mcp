@@ -234,9 +234,13 @@ an entry that might sit beside a fork is a better outcome than an entry that
 does not exist. A row is never dropped for want of a lock.
 
 What this does not cover: a server that answers `1` without holding the lock
-(a proxy that fakes it), and the SQLite drop-in's own concurrency, which was not
-measured with the fallback in place (the fallback was proved on MariaDB with the
-answer rewritten, in `.dev/smoke-admin.sh`).
+(a proxy that fakes it). The fallback was proved on MariaDB with the answer
+rewritten (`.dev/smoke-admin.sh`), and measured by hand on the SQLite drop-in,
+which answers `1=1` by itself: eight processes writing forty rows each left an
+intact chain twice with the fallback and a forked one (56 to 70 rows sharing a
+predecessor) without it. The suite does not run that on SQLite, and PHP's
+`usleep` between attempts is a polling wait, so under heavy contention a writer
+can take up to the five seconds before it writes past the lock.
 
 ## Two things the chain cannot do
 

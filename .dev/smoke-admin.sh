@@ -4150,9 +4150,10 @@ if grep -q wordpress_logged_in "$AP_JAR"; then
   # Eight requests at once write eight audit rows at once. The chain is serialised with a named
   # lock (GMCP_Audit, GET_LOCK), which a SQLite drop-in does not have: it answers null or a
   # mangled "1=1" (measured), never "1". The append then serialises with a lock row in the options
-  # table instead (proved above on MariaDB by faking that answer), but that fallback has not been
-  # measured on a SQLite stack, so the log is still cleared there rather than trusted; on MariaDB
-  # nothing is cleared.
+  # table instead (proved above on MariaDB by faking that answer, and measured by hand on a SQLite
+  # drop-in: eight processes x forty rows, intact with it, 56 to 70 shared predecessors without it),
+  # but this suite does not race on a SQLite stack, so the log is still cleared there rather than
+  # trusted; on MariaDB nothing is cleared.
   if [ "$(ap_eval 'global $wpdb; $g=$wpdb->get_var("SELECT GET_LOCK(\"gmcp_probe\",1)"); if($g==="1"){$wpdb->get_var("SELECT RELEASE_LOCK(\"gmcp_probe\")");} echo $g===null?"none":$g;')" != "1" ]; then
     echo "  ....  this stack has no GET_LOCK, so parallel audit writes fork the hash chain; clearing the log after the race"
     ap_eval 'GMCP_Audit::clear();' >/dev/null
