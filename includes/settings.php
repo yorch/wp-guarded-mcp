@@ -357,6 +357,7 @@ class GMCP_Settings {
       'mcp_tools_wordfence' => 'bool',
       'mcp_tools_stream' => 'bool',
       'mcp_tools_beaver' => 'bool',
+      'mcp_tools_beaver_write' => 'bool',
       'mcp_tools_export' => 'bool',
       'mcp_approval_mode' => 'approval_mode',
       'mcp_debug_mode' => 'bool',
@@ -1303,6 +1304,9 @@ class GMCP_Settings {
     // Beaver Builder: the version constant plus the model class its tools call, the same
     // per-call signal the group itself uses.
     $beaver = defined( 'FL_BUILDER_VERSION' ) && class_exists( 'FLBuilderModel' );
+    // The write group needs the same signal; kept as its own variable so the reader can be
+    // offered without the writer.
+    $beaver_write = $beaver;
 
     // Only the groups actually rendered are declared to the save. A checkbox that was
     // never on screen must keep its stored value rather than read as unticked, which is
@@ -1364,6 +1368,9 @@ class GMCP_Settings {
     }
     if ( $beaver ) {
       $keys[] = 'mcp_tools_beaver';
+    }
+    if ( $beaver_write ) {
+      $keys[] = 'mcp_tools_beaver_write';
     }
     ?>
     <p class="gmcp-intro"><?php esc_html_e( 'Which groups of tools an agent is offered. A group that is off is not merely hidden: its tools are refused if asked for by name.', 'guarded-mcp' ); ?></p>
@@ -1490,6 +1497,12 @@ class GMCP_Settings {
                   <?php esc_html_e( 'Beaver Builder (layout structure and node types, templates, and clearing generated CSS)', 'guarded-mcp' ); ?>
                 </label>
               <?php endif; ?>
+              <?php if ( $beaver_write ) : ?>
+                <label>
+                  <input type="checkbox" name="mcp_tools_beaver_write" value="1" <?php checked( !empty( $options['mcp_tools_beaver_write'] ) ); ?>>
+                  <?php esc_html_e( 'Beaver Builder writes (create a page\'s layout: headings, text, buttons, images — sanitised by the tool)', 'guarded-mcp' ); ?>
+                </label>
+              <?php endif; ?>
               <label>
                 <input type="checkbox" name="mcp_tools_export" value="1" <?php checked( !empty( $options['mcp_tools_export'] ) ); ?>>
                 <?php esc_html_e( 'Site files (a manifest of plugins, themes, mu-plugins or uploads, and an archive that only a person can approve)', 'guarded-mcp' ); ?>
@@ -1570,6 +1583,11 @@ class GMCP_Settings {
             <?php if ( $wordfence ) : ?>
               <p class="description">
                 <?php esc_html_e( 'The Wordfence tools only read, and they answer a different question from the activity log: is anything watching, and is the watching working. There is deliberately no tool that dismisses an issue, whitelists an address, changes a firewall mode or starts a scan, because each is a way to make the watcher quieter and an agent that can quiet it and read it back can confirm its own silence. A count of zero findings is always reported next to whether a scan has ever run, since on a fresh install it means nothing has looked rather than that the site is clean.', 'guarded-mcp' ); ?>
+              </p>
+            <?php endif; ?>
+            <?php if ( $beaver_write ) : ?>
+              <p class="description">
+                <?php esc_html_e( 'The Beaver Builder WRITE tool creates a page and builds its layout from a typed schema. It sanitises every value itself, because the builder\'s own write path applies none: text through wp_kses_post or plain text, links through esc_url_raw with a policy that refuses protocol-relative targets, a fixed set of heading tags, and photos only by attachment id. Settings keys that are raw sinks in Beaver\'s render path — bb_js_code, bb_css_code, custom_attributes, attributes, popup, lightbox_content_html, photo_url, photo_src — are refused by name. It only ever creates the FIRST layout on a page: there is no layout undo yet, so editing an existing layout is refused rather than shipped without one.', 'guarded-mcp' ); ?>
               </p>
             <?php endif; ?>
             <?php if ( $beaver ) : ?>
