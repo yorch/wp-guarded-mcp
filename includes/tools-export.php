@@ -87,6 +87,9 @@ class GMCP_Tools_Export {
   /** Temporary files all start with this, so a sweep can find one left by an old row. */
   const TEMP_PREFIX = 'gmcp-export-';
   const CRON_HOOK = 'gmcp_export_cleanup';
+  /** What a manifest said, kept by its digest for the Approvals screen. @see self::remember_summary() */
+  const SUMMARY_PREFIX = 'gmcp_export_summary_';
+  const SUMMARY_TTL = 2 * HOUR_IN_SECONDS;
 
   const ROOTS = [ 'plugins', 'themes', 'mu-plugins', 'uploads' ];
 
@@ -251,6 +254,7 @@ class GMCP_Tools_Export {
       // listing every included path would be a larger reconnaissance surface and a larger
       // audit row than the answer needs.
       unset( $scan['files'], $scan['directories'] );
+      self::remember_summary( $scan );
       return $this->json( $r, $scan );
     }
 
@@ -824,6 +828,72 @@ class GMCP_Tools_Export {
       'caps' => [ 'max_entries' => $max_entries, 'max_bytes' => $max_bytes ],
       'message' => $message,
     ];
+  }
+
+  /**
+  * Keep what a manifest said, keyed by its digest, for the screen where a person approves the pull.
+  *
+  * The approval record holds the call's arguments, and a pull's arguments are a root, a path, a mode
+  * and a digest: nothing that says how many files that is, how large, or how much was withheld, so
+  * a person approved "this directory as it was when the agent read it" without being told what it
+  * held. The numbers come from the server's own walk (not from anything the caller sent) and are
+  * bound to the digest, which covers the root, the path, every included file's name, size and
+  * contents and every exclusion; the pull refuses a tree that no longer hashes to it. They are kept
+  * as a transient whose name begins with the plugin's prefix, which the option tools refuse to read
+  * or list, and no tool reads the approval queue, so the agent that asks for the pull cannot read
+  * the summary back or edit it. No file name is stored, only counts.
+  */
+  private static function remember_summary( array $scan ): void {
+    $digest = (string) ( $scan['manifest_digest'] ?? '' );
+    if ( !preg_match( '/^[0-9a-f]{64}$/', $digest ) ) {
+      return;
+    }
+    set_transient( self::SUMMARY_PREFIX . substr( $digest, 0, 40 ), [
+      'digest' => $digest,
+      'root' => (string) ( $scan['root'] ?? '' ),
+      'path' => (string) ( $scan['path'] ?? '' ),
+      'files' => (int) ( $scan['file_count'] ?? 0 ),
+      'bytes' => (int) ( $scan['total_bytes'] ?? 0 ),
+      'withheld' => (int) ( $scan['excluded_count'] ?? 0 ),
+      'by_reason' => array_map( 'intval', (array) ( $scan['excluded_by_reason'] ?? [] ) ),
+      'at' => time(),
+    ], self::SUMMARY_TTL );
+  }
+
+  /**
+  * The sentence the Approvals screen prints above an export request's arguments: what the archive
+  * will hold according to the manifest whose digest the call names, or the plain statement that no
+  * summary is on record. Plain text; the caller escapes it. Null for a call that is not a pull.
+  *
+  * @param string $args_view The stored, canonical text of the call's arguments.
+  */
+  public static function approval_summary( string $args_view ): ?string {
+    $args = json_decode( $args_view, true );
+    if ( !is_array( $args ) || ( $args['mode'] ?? '' ) !== 'pull' ) {
+      return null;
+    }
+    $digest = isset( $args['manifest_digest'] ) && is_string( $args['manifest_digest'] ) ? strtolower( trim( $args['manifest_digest'] ) ) : '';
+    $row = preg_match( '/^[0-9a-f]{64}$/', $digest ) ? get_transient( self::SUMMARY_PREFIX . substr( $digest, 0, 40 ) ) : false;
+    // The digest covers the root and the path, so a row stored under it describes this call's tree.
+    if ( !is_array( $row ) || ( $row['digest'] ?? '' ) !== $digest ) {
+      return __( 'This screen has no summary for the manifest this request names (it was read more than two hours ago, or the digest did not come from a manifest read on this site). How many files this covers and what is withheld is not shown here; decline it unless you read the manifest yourself. The pull will still refuse a tree that no longer matches the digest.', 'guarded-mcp' );
+    }
+    $by = [];
+    foreach ( (array) $row['by_reason'] as $reason => $n ) {
+      $by[] = $reason . ' ' . (int) $n;
+    }
+    return sprintf(
+      /* translators: 1: root, 2: path, 3: file count, 4: size, 5: withheld count, 6: reasons, 7: age, 8: digest start. */
+      __( 'This pull archives %1$s/%2$s: %3$d files, %4$s. %5$d entries are withheld and not in the archive%6$s. Counted by the server %7$s ago, for digest %8$s; the pull refuses a tree that no longer hashes to it.', 'guarded-mcp' ),
+      (string) $row['root'],
+      (string) $row['path'] === '' ? '(whole root)' : (string) $row['path'],
+      (int) $row['files'],
+      self::bytes_label( (int) $row['bytes'] ),
+      (int) $row['withheld'],
+      $by ? ' (' . implode( ', ', $by ) . ')' : '',
+      human_time_diff( (int) $row['at'], time() ),
+      substr( $digest, 0, 12 ) . '…'
+    );
   }
 
   private static function bytes_label( int $bytes ): string {

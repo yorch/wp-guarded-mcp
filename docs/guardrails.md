@@ -1864,8 +1864,14 @@ one-time URL.
   recognised, and nothing writes one); `..`, `.`, empty segments, absolute paths, stream wrappers, a
   symlink in the path and a path in the wrong case are refused; and a
   400 MB archive streams under a 128 MB `memory_limit`.
-- **Honest limits.** The approval screen shows the root, the path and the digest, not a file list:
-  a person approves "this directory as it was when the agent read it". Between the per-entry
+- **Honest limits.** The approval screen shows the root, the path and the digest, and above them
+  what that digest covers: the file count, the size, the number of withheld entries and their
+  reasons, from the server's own walk when the agent read the manifest
+  (`GMCP_Tools_Export::remember_summary()`, a transient bound to the digest that the option tools
+  refuse to read and that no tool lists, so the agent cannot read it back; two hours). It is NOT a
+  file list, and when no manifest on this site produced the digest (or it is over two hours old) the
+  screen says it has no summary instead of showing numbers. A person approves "this directory as it
+  was when the agent read it". Between the per-entry
   re-check and the read `ZipArchive` does at `close()` a writer who can replace a file can still
   win the race; the closed archive is compared with the manifest's sizes and CRC-32s, which catches
   an accidental or naive change and not a deliberate collision. A fatal during the build leaves the

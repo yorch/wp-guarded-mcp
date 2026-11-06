@@ -144,7 +144,8 @@ submission). The digest covers
 each file's name, size and contents, so a file rewritten in place is a change. It never returns
 file contents, and it refuses over 20,000 entries or 512 MiB rather than truncating the count.
 Its `pull` mode takes the digest from a manifest, refuses if the tree has changed, and always
-waits for a signed-in administrator on the Approvals screen, whatever `mcp_approval_mode` is
+waits for a signed-in administrator on the Approvals screen (which shows the file count, size and
+number of withheld entries of the manifest the request names, not a file list), whatever `mcp_approval_mode` is
 set to. Only after that approval does it build a zip outside the web root, with 0600
 permissions, and return a one-time URL that streams it for five minutes (a GET spends it; a HEAD,
 which link previewers send, does not); the archive is never

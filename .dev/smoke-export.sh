@@ -278,6 +278,33 @@ approve() { # approve <request_id>
 }
 FORM=$(ap_form "$R1")
 check "the request has an approve form on the screen" "$(python3 -c 'import sys; print("yes" if "|" in sys.argv[1] else "no")' "$FORM")" "yes"
+# What the person is told about the archive. The approval record holds a root, a path, a mode and a
+# digest, which says nothing about how large the tree is or how much of it is withheld.
+ap_cell() { curl -sS -b "$JAR" "$AP_URL" | python3 -c '
+import re,sys,html
+page=sys.stdin.read(); rid=sys.argv[1]
+for tr in re.findall(r"<tr>.*?</tr>",page,re.S):
+    if re.search(r"name=\"request_id\" value=\""+rid+"\"",tr):
+        t=re.sub(r"<[^>]+>"," ",tr); print(re.sub(r"\s+"," ",html.unescape(t))); break
+' "$1"; }
+CELL=$(ap_cell "$R1")
+MAN_FILES=$(jget cap_ok2 file_count); MAN_EXCL=$(jget cap_ok2 excluded_count)
+check "CONTROL: the screen cell for the request was read" "$(printf '%s' "$CELL" | grep -c 'wp_export_request')" "1"
+check "the screen says how many files the archive will hold" "$(printf '%s' "$CELL" | grep -c "This pull archives uploads/.*: $MAN_FILES files, ")" "1"
+check "and how many entries are withheld" "$(printf '%s' "$CELL" | grep -c "$MAN_EXCL entries are withheld")" "1"
+check "and names the reasons" "$(printf '%s' "$CELL" | grep -c 'symbolic_link 1')" "1"
+check "and the start of the digest it is bound to" "$(printf '%s' "$CELL" | grep -c "digest ${MAN_DIGEST:0:12}")" "1"
+call "$TOK" pull_unseen "$(tc wp_export_request '{"root":"uploads","mode":"pull","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')"
+RU=$(rid pull_unseen)
+check "CONTROL: a pull naming a digest no manifest produced is held too" "$(state pull_unseen)" "awaiting_human_approval"
+check "its screen cell says no summary is on record, instead of a count" "$(ap_cell "$RU" | grep -c 'has no summary for the manifest this request names')" "1"
+check "and prints no file count" "$(ap_cell "$RU" | grep -c 'This pull archives')" "0"
+check "CONTROL: the summary row of the real manifest exists in the options table" \
+  "$(dbq "SELECT COUNT(*) FROM wp_options WHERE option_name = '_transient_gmcp_export_summary_${MAN_DIGEST:0:40}'")" "1"
+call "$TOK" sum_read "$(tc wp_get_option '{"key":"_transient_gmcp_export_summary_'"${MAN_DIGEST:0:40}"'"}')"
+check "the option tool will not read the summary back" "$(verdict sum_read)" "error"
+check "CONTROL: the same tool reads an ordinary option" "$(call "$TOK" sum_ctl "$(tc wp_get_option '{"key":"blogname"}')"; verdict sum_ctl)" "ok"
+wpq 'global $wpdb; $wpdb->query($wpdb->prepare("UPDATE {$wpdb->prefix}gmcp_approvals SET status=%s WHERE id=%d","declined",'"$RU"'));' >/dev/null
 WN=${FORM%%|*}; AN=${FORM##*|}
 curl -sS -b "$JAR" -o /dev/null -X POST "$AP_URL" \
   --data-urlencode "_wpnonce=$WN" --data-urlencode "gmcp_action=approve_request" \

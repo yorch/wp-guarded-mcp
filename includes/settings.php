@@ -1770,6 +1770,14 @@ class GMCP_Settings {
               <span class="gmcp-detail"><?php echo esc_html( $row['identity'] ); ?></span></td>
             <td><code><?php echo esc_html( $row['tool'] ); ?></code>
               <span class="gmcp-detail">(<?php echo esc_html( $row['tool_class'] ); ?>)</span>
+              <?php
+              // What an export pull will hold, from the server's own count of the manifest it names,
+              // above the arguments the person is approving. @see GMCP_Tools_Export::approval_summary()
+              $export_summary = $row['tool'] === 'wp_export_request' && class_exists( 'GMCP_Tools_Export' ) ? GMCP_Tools_Export::approval_summary( (string) $row['args_view'] ) : null;
+              if ( $export_summary !== null ) {
+                echo '<p class="gmcp-detail gmcp-export-summary"><strong>' . esc_html( $export_summary ) . '</strong></p>';
+              }
+              ?>
               <?php echo self::approval_args_html( (string) $row['args_view'], $row['args_redacted'] ?? null ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- every piece is escaped inside. ?></td>
             <td class="gmcp-nowrap"><?php echo esc_html( human_time_diff( time(), (int) $row['expires'] ) ); ?></td>
             <td class="gmcp-nowrap">
