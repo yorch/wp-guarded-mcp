@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.1](https://github.com/yorch/wp-guarded-mcp/compare/v1.3.0...v1.3.1) (2026-11-06)
+
+
+### Bug Fixes
+
+* close review findings in the listing guard, export, scanner and Beaver tool ([#56](https://github.com/yorch/wp-guarded-mcp/issues/56)) ([57730dd](https://github.com/yorch/wp-guarded-mcp/commit/57730ddda6b5f51fb962ae5f7625786855cc518f))
+
 ## [1.3.0](https://github.com/yorch/wp-guarded-mcp/compare/v1.2.0...v1.3.0) (2026-11-06)
 
 
