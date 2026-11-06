@@ -5,7 +5,7 @@ Plugin Name: Guarded MCP
 Plugin URI: https://github.com/yorch/wp-guarded-mcp
 Description: Safe MCP server for Claude and any AI agent. Full site administration with guardrails: confirmed deletions, repository-only installs, no API keys.
 Release-Please: x-release-please-start-version
-Version: 1.1.0
+Version: 1.2.0
 Release-Please: x-release-please-end
 Requires at least: 6.0
 Requires PHP: 8.1
@@ -29,7 +29,7 @@ if ( !defined( 'ABSPATH' ) ) {
   exit;
 }
 
-define( 'GMCP_VERSION', '1.1.0' ); // x-release-please-version
+define( 'GMCP_VERSION', '1.2.0' ); // x-release-please-version
 define( 'GMCP_PREFIX', 'guarded-mcp' );
 define( 'GMCP_DOMAIN', 'guarded-mcp' );
 define( 'GMCP_ENTRY', __FILE__ );
