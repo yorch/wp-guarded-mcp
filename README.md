@@ -138,7 +138,9 @@ and images); Markdown HTML is shown as text, not run.
 `plugins`, `themes`, `mu-plugins` or `uploads` — with an optional relative path under it. In
 its default `manifest` mode it walks the tree and reports the file count, total bytes, depth,
 a digest and the entries that WOULD be excluded with the reason (symbolic links, hard links,
-non-regular files, unreadable entries, anything resolving outside the root). The digest covers
+non-regular files, unreadable entries, anything resolving outside the root, names that are not
+safe in an archive, files private by name, and uploaded files that belong to a form
+submission). The digest covers
 each file's name, size and contents, so a file rewritten in place is a change. It never returns
 file contents, and it refuses over 20,000 entries or 512 MiB rather than truncating the count.
 Its `pull` mode takes the digest from a manifest, refuses if the tree has changed, and always
@@ -147,7 +149,17 @@ set to. Only after that approval does it build a zip outside the web root, with 
 permissions, and return a one-time URL that streams it for five minutes; the archive is never
 returned in a tool reply, and the token is scrubbed from the audit log. `uploads` means all of
 uploads, which on a real site can contain customer exports — that is why the group is off
-until somebody switches it on.
+until somebody switches it on. Some things are withheld in every root and are never read:
+dot-files (`.env`, `.htpasswd`), `wp-config*`, private keys and keystores, database dumps and
+SQLite files, logs, backup archives and editor leftovers; in `uploads`, the private directories
+of the common form, shop and backup plugins; and every uploaded file that belongs to a form
+submission (the files `wp_download_request` already refuses at every level), including the sizes
+WordPress generated from it. Naming one of them in `path` is refused. This is a list of names
+and a database question, not a content scan: a secret in a file with an ordinary name (a
+`config.php` in a plugin) is archived, a file no attachment row points at in a directory the
+list does not name is archived, and the plugin directory names are written from memory of each
+plugin's layout (extend them with `gmcp_export_private_directories` and `gmcp_export_private_names`).
+A tree whose every entry is withheld has nothing to archive and the pull says so.
 
 **Site administration**, off by default: installing, activating, updating and deleting
 plugins and themes; navigation menus and their items; widgets and widget areas; the
@@ -672,7 +684,7 @@ Other hooks:
 - No row belonging to this plugin, and no option whose name looks like a credential, can be read or written through the option tools. The change journal additionally inspects the value it is about to record, so a `secret_key` or `pass` field inside a settings array is blanked before the rest of that array is kept, and an undo leaves the live value in place rather than writing the placeholder over it. Strings that parse as JSON or as a serialized array are unpacked and judged too, and blanked whole when they hold one. Free text is read as well, so a post whose body has a pasted `{"api_key": "..."}`, a `define( 'DB_PASSWORD', ... )` line or an `Authorization: Bearer` header in it is not copied into the journal or the audit log: that field is left out of the undo record and the rest of the edit stays undoable. This is a heuristic for the shapes people paste, tuned so that prose which merely mentions a password is kept and undone as usual; it will not catch a secret that is a bare word under an innocuous name.
 - Undoing an edit never sets a post's status to `trash` or `auto-draft`, for the same reason the write tools refuse those statuses: WordPress deletes on them from a daily job. The other fields of that entry are still restored.
 - Optional human approval holds deletes, and optionally site changes, until an administrator signed in to wp-admin approves that exact call. There is no approval token for an agent to learn or mint, and no tool that reads or answers the queue. See Approvals above.
-- Site-file export is off by default, and its manifest returns counts and exclusions rather than file contents. A pull is always held for a person, whatever the approval mode says; the approval is bound to the manifest digest — which covers each file's name, size and contents — so a tree that changed after it was read needs a new one, and one whose file was rewritten in place is refused when the pull runs. The archive is built outside the web root with 0600 permissions, streamed once through a five-minute token, and deleted after it is sent, including when the client disconnects mid-download. The token is scrubbed from the audit log, like the download and upload tokens.
+- Site-file export is off by default, and its manifest returns counts and exclusions rather than file contents. Private files by name (dot-files, `wp-config`, keys, dumps, logs, backups) and uploaded files that belong to a form submission are withheld from the manifest and the archive; a secret inside a file with an ordinary name is not found. A pull is always held for a person, whatever the approval mode says; the approval is bound to the manifest digest — which covers each file's name, size and contents — so a tree that changed after it was read needs a new one, and one whose file was rewritten in place is refused when the pull runs. The archive is built outside the web root with 0600 permissions, streamed once through a five-minute token, and deleted after it is sent, including when the client disconnects mid-download. The token is scrubbed from the audit log, like the download and upload tokens.
 - The `readwrite` level cannot delete by another name. WordPress permanently deletes whatever carries an old `_wp_trash_meta_time`, every auto-draft older than a week, and, where Akismet or a similar plugin is active, every comment marked spam for fifteen days, so setting a post status of `trash` or `auto-draft` through `wp_update_post`, a comment status of `trash` or `spam` through `wp_update_comment`, and writing any `_wp_trash_meta_` meta key through any tool (in any spelling the database reads as the same key: case, trailing spaces, accents, invisible characters), are refused; `wp_delete_post` and `wp_delete_comment` are the way to delete and are held by the approval queue. An agent therefore cannot mark a comment as spam at any level; a person does that in wp-admin. `wp_run_cron_event` is held with the deletes.
 - Tools do not execute arbitrary PHP or SQL. Every tool is a fixed WordPress operation with a schema.
 - A preview link is a bearer credential for one unpublished post. Only a hash of it is stored, in a row the option tools refuse, and the audit log and debug trace scrub it from arguments and replies. It is shown once. Anyone who is given the link can use it until it expires or the post is published, and viewing it is not logged.
