@@ -222,11 +222,16 @@ every kind (tab, newline, carriage return, vertical tab, form feed, the Unicode 
 separators, the no-break and other fixed-width spaces) becomes one plain space BEFORE any scrub reads
 the line, so a separator with a tab in it is still a separator and a newline in a request value cannot
 start a forged second log line; any other control character is shown as a visible escape,
-`GMCP_Diag_Util::scrub_log_line()` removes the vendor key shapes, PEM blocks, URL user
-information, JWTs, escaped JSON, `define()` lines and `pw=`, and the whole value after a
-secret-named key goes, an unquoted one to `&` or the end of the line and a quoted one to its
-closing quote, where a backslash and the character after it count as one (an escaped quote does not end
-a value). It reads one line of at most 2,500 bytes of a value, and a call's arguments only up to a
+the whole value after a secret-named key goes, an unquoted one to `&` or the end of the line and a quoted
+one to its closing quote, where a backslash and the character after it count as one (an escaped quote does
+not end a value), then `GMCP_Credential_Scan` is asked of the line (`try_spans()`, the test the journal and
+the audit log apply, so a vendor shape the scanner knows is never written to the log because the log's own
+list had not heard of it: it had missed a `ya29.` token, the secret of a Slack webhook URL and a Discord
+one), then `GMCP_Diag_Util::scrub_log_line()` removes the vendor key shapes, PEM blocks, URL user
+information, JWTs, escaped JSON, `define()` lines and `pw=`. The three are a union: the debug log is never
+narrower than the scanner, and the scanner's own exemptions (placeholders, a complete code reference) are
+only exemptions of the scanner, not of the log. A scan that gives up withholds the line. It reads one line
+of at most 2,500 bytes of a value, and a call's arguments only up to a
 byte budget (see the audit log doc), so the cost does not grow with how many leaves a client sends. Every `error_log()` in `includes/` is checked by a tripwire in
 `.dev/test-credential-channels.php`: one that prints `$reason`, an exception message or a request
 parameter without `log_text()` fails it. A bare token with no key in front of it and no known

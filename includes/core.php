@@ -3058,6 +3058,8 @@ class GMCP_Core {
   *  3. A value after a secret-named key is taken whole: an unquoted one up to "&" or the end of
   *     the line, a quoted one up to its closing quote. "smtp_pwd=correct horse battery" was left
   *     as "smtp_pwd=[redacted] horse battery" by a scrub that ended a value at the first space.
+  *  3a. GMCP_Credential_Scan::try_spans(): the same test the journal, the audit log and the approval
+  *     view apply, as a union with the rules around it and never instead of them.
   *  4. GMCP_Diag_Util::scrub_log_line(), the scrubber the error-log reader already uses, which
   *     knows the vendor key prefixes, PEM blocks, URL user information, JWTs, escaped JSON,
   *     define() lines and pw=.
@@ -3079,6 +3081,28 @@ class GMCP_Core {
     }
     $text = str_replace( [ self::REDACTION_MARKER, self::LOG_SENTINEL ], self::LOG_SENTINEL, $text );
     $text = self::scrub_log_assignments( $text );
+    if ( $text !== self::UNSCRUBBABLE ) {
+      // What the journal and the audit log call a credential, asked of the debug log as well, so this
+      // channel is never narrower than the others: the scanner knows vendor shapes the scrub below does
+      // not (a Google OAuth token, the secret part of a Slack or Discord webhook URL), and the two rule
+      // sets drifted apart once already. It runs after the assignment rule, which takes a whole value
+      // where the scanner takes one token, and before the line scrub, which it adds to and does not
+      // replace. Its answer is a list of byte ranges, so the rest of the line stays readable; it is
+      // linear in the line, which is at most LOG_READ_BYTES; and a scan that gives up withholds the line.
+      $spans = GMCP_Credential_Scan::try_spans( $text );
+      if ( $spans === null ) {
+        $text = self::UNSCRUBBABLE;
+      }
+      else {
+        $at = 0;
+        $marked = '';
+        foreach ( $spans as [ $from, $len ] ) {
+          $marked .= substr( $text, $at, $from - $at ) . self::LOG_SENTINEL;
+          $at = $from + $len;
+        }
+        $text = $marked . substr( $text, $at );
+      }
+    }
     if ( $text !== self::UNSCRUBBABLE ) {
       $scrubbed = GMCP_Diag_Util::scrub_log_line( $text, [ 'patterns' => array_values( array_filter( array_map( 'strval', (array) self::credential_field_patterns() ), 'strlen' ) ) ] );
       // scrub_log_line() casts each rule's result to a string, so a rule that PCRE gives up on
