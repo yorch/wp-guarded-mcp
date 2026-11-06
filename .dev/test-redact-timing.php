@@ -172,6 +172,24 @@ function child(): void {
     'base64 words after Basic x 128 KB' => str_repeat( 'Basic dXNlcjpwYXNzMQ== ', 5600 ),
     'URL-encoded JSON open x 80 KB' => str_repeat( '%22token%22%3A%22', 5000 ),
     '[array][index] names x 64 KB' => str_repeat( "\$a['password']['x'] ", 3000 ),
+    // Third review: the input-tag, CLI-user and vendor-prefix rules each get an input that would be
+    // quadratic if the rule were.
+    '<input open x 160 KB' => str_repeat( '<input ', 23000 ),
+    '<input name value open x 96 KB' => str_repeat( '<input name="password" value="', 3100 ),
+    '<input tags with a secret name x 128 KB' => str_repeat( '<input name="api_key" value="x"> ', 3900 ),
+    '<input 1000 attributes' => '<input ' . str_repeat( 'a="b" ', 160 ) . 'name="password" value="Zx9Qw3Lp7Rt2">',
+    'curl -u a: x 64 KB' => str_repeat( 'curl -u a:', 6500 ),
+    '-u x 64 KB' => str_repeat( '-u ', 21000 ),
+    'cli user pairs x 96 KB' => str_repeat( '-u a:Zx9Qw3 ', 8000 ),
+    '://: x 64 KB' => str_repeat( '://:', 16000 ),
+    'empty-user userinfo chain 64 KB' => str_repeat( 'a://:b@', 9000 ),
+    'whsec_ x 64 KB' => str_repeat( 'whsec_', 10000 ),
+    'key- x 64 KB' => str_repeat( 'key-', 16000 ),
+    'SG. x 64 KB' => str_repeat( 'SG.', 21000 ),
+    'telegram digits:AA x 96 KB' => str_repeat( '1234567890:AA', 7400 ),
+    'hooks.slack.com/services/T x 96 KB' => str_repeat( 'hooks.slack.com/services/T', 3700 ),
+    'Authorization: Key x 96 KB' => str_repeat( 'Authorization: Key ', 5000 ),
+    'update_option chain 64 KB' => str_repeat( "update_option('a_token','b') ", 2300 ),
   ];
 
   foreach ( $inputs as $label => $text ) {
@@ -200,6 +218,44 @@ function child(): void {
     $t = microtime( true );
     $line = GMCP_Core::log_text( $text );
     $emit( "log_text of $label", microtime( true ) - $t, 2.0, $line !== '' );
+  }
+
+  // Fourth review: the scanner read each unquoted value to the end of its run of non-space characters,
+  // and a text that is one run with a secret-named assignment every few bytes ("password=|" repeated)
+  // was therefore read to its end once per assignment. Half a megabyte took 23 to 50 s through holds().
+  // Each input below is 512 KB, goes through the three entry points the journal, the audit log and the
+  // approval view use, and has to finish inside two seconds with the JIT on or off. A text the scanner
+  // gives up on is answered as a credential, which is why the answer is part of the check: the gave-up
+  // answer must be "yes" and the quick answer must not be an error.
+  $half = 524288;
+  $adversarial = [
+    'password=this. repeated' => str_repeat( 'password=this.', intdiv( $half, 14 ) ),
+    'password=| repeated' => str_repeat( 'password=|', intdiv( $half, 10 ) ),
+    'pw=| repeated' => str_repeat( 'pw=|', intdiv( $half, 4 ) ),
+    'pw=this. repeated' => str_repeat( 'pw=this.', intdiv( $half, 8 ) ),
+    'password=password= chained, no space' => str_repeat( 'password=', intdiv( $half, 9 ) ),
+    'one 512 KB value after password=' => 'password=' . str_repeat( 'Ab3', intdiv( $half, 3 ) ),
+    'password=<600 bytes> repeated' => str_repeat( 'password=' . str_repeat( 'Ab3dE', 120 ), intdiv( $half, 609 ) ),
+    'db_pass=a_ repeated (identifier)' => str_repeat( 'db_pass=a_', intdiv( $half, 10 ) ),
+    'token=a-b repeated (words)' => str_repeat( 'token=a-', intdiv( $half, 8 ) ),
+    'secret: nested names, no space' => str_repeat( 'secret:a=api_key:', intdiv( $half, 17 ) ),
+    'api_key=process.env. repeated' => str_repeat( 'api_key=process.env.', intdiv( $half, 20 ) ),
+    'DB_PASSWORD=config( repeated' => str_repeat( 'DB_PASSWORD=config(', intdiv( $half, 19 ) ),
+    'curl -ua: repeated (attached short form)' => str_repeat( 'curl -ua:', intdiv( $half, 9 ) ),
+    'curl -u a: repeated' => str_repeat( 'curl -u a:', intdiv( $half, 10 ) ),
+    '<input " repeated' => str_repeat( '<input "', intdiv( $half, 8 ) ),
+    '<input name="password" value=" repeated' => str_repeat( '<input name="password" value="', intdiv( $half, 31 ) ),
+    '<input a=\'b" repeated, mixed quotes' => str_repeat( '<input a=\'b"', intdiv( $half, 13 ) ),
+    '<input then one 512 KB tag' => '<input ' . str_repeat( 'a="b" ', intdiv( $half, 6 ) ) . 'name="password" value="Kx92mQ7zp">',
+    'redis://:a: repeated (empty user, colon)' => str_repeat( 'redis://:a:', intdiv( $half, 11 ) ),
+    'secret_key_base: and primary_key: repeated' => str_repeat( 'primary_key:storage_key=', intdiv( $half, 24 ) ),
+  ];
+  foreach ( $adversarial as $label => $text ) {
+    $begin( "scan of $label (512 KB)" );
+    $t = microtime( true );
+    $holds = GMCP_Credential_Scan::holds( $text );
+    $spans = GMCP_Credential_Scan::spans( $text );
+    $emit( "scan of $label (512 KB)", microtime( true ) - $t, 2.0, is_bool( $holds ) && is_array( $spans ) );
   }
 
   // Cost that grows with the NUMBER of leaves, not their size: a million one-character strings is

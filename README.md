@@ -138,16 +138,38 @@ and images); Markdown HTML is shown as text, not run.
 `plugins`, `themes`, `mu-plugins` or `uploads` — with an optional relative path under it. In
 its default `manifest` mode it walks the tree and reports the file count, total bytes, depth,
 a digest and the entries that WOULD be excluded with the reason (symbolic links, hard links,
-non-regular files, unreadable entries, anything resolving outside the root). The digest covers
+non-regular files, unreadable entries, anything resolving outside the root, names that are not
+safe in an archive, files private by name, and uploaded files that belong to a form
+submission). The digest covers
 each file's name, size and contents, so a file rewritten in place is a change. It never returns
 file contents, and it refuses over 20,000 entries or 512 MiB rather than truncating the count.
 Its `pull` mode takes the digest from a manifest, refuses if the tree has changed, and always
-waits for a signed-in administrator on the Approvals screen, whatever `mcp_approval_mode` is
+waits for a signed-in administrator on the Approvals screen (which shows the file count, size and
+number of withheld entries of the manifest the request names, not a file list), whatever `mcp_approval_mode` is
 set to. Only after that approval does it build a zip outside the web root, with 0600
-permissions, and return a one-time URL that streams it for five minutes; the archive is never
+permissions, and return a one-time URL that streams it for five minutes (a GET spends it; a HEAD,
+which link previewers send, does not); the archive is never
 returned in a tool reply, and the token is scrubbed from the audit log. `uploads` means all of
 uploads, which on a real site can contain customer exports — that is why the group is off
-until somebody switches it on.
+until somebody switches it on. Some things are withheld in every root and are never read:
+dot-files (`.env`, `.htpasswd`), `*.env`, `wp-config*`, private keys, certificates and keystores
+(`.pem`, `.key`, `.crt`, `.pfx`, `.p12`, `.jks`, `.keystore`, in any case), database dumps and
+SQLite files with their `-wal`, `-shm` and `.gz` companions, logs and their rotations (`error_log.1`,
+`access_log`), backup archives and editor leftovers, matched on the name as a filesystem would take
+it (a trailing dot or space, a no-break space, full-width letters and invisible format characters
+do not make `dump.sql ` another file); in `uploads`, the private directories
+of the common form, shop and backup plugins; and every uploaded file that belongs to a form
+submission (the files `wp_download_request` already refuses at every level), including the sizes
+WordPress generated from it. Naming one of them in `path` is refused. This is a list of names
+and a database question, not a content scan: a secret in a file with an ordinary name (a
+`config.php` in a plugin) is archived, a file no attachment row points at in a directory the
+list does not name is archived, and the form plugins' directory names were read from the source of
+their free releases (the table in `docs/guardrails.md` says which are verified and which, such as
+Gravity Forms and the paid add-ons, are not; extend them with `gmcp_export_private_directories` and `gmcp_export_private_names`).
+A form submission's uploads are found through the submission they hang from, so once core deletes
+the submission (which makes its attachments unattached) they are archived like any other media file
+unless they sit in a directory the list names; `docs/guardrails.md` says what the download tool does
+about the same file. A tree whose every entry is withheld has nothing to archive and the pull says so.
 
 **Site administration**, off by default: installing, activating, updating and deleting
 plugins and themes; navigation menus and their items; widgets and widget areas; the
@@ -166,7 +188,11 @@ post, 24 hours by default and 7 days at most. Viewing a preview link is not logg
 **WooCommerce**, off by default, and the switch only appears when the shop is installed:
 products, stock levels, orders, order notes, customers, a sales summary and a store
 briefing. Tools carrying personal data (orders, customers) are `admin`, not `read`;
-products, stock and sales figures stay at `read`. Refunds are not included.
+products, stock and sales figures stay at `read`. Refunds are not included. The generic post
+and comment tools treat an order as WooCommerce's order table does, by its id, whichever storage
+the shop uses: they do not write to an order, to a post or comment that shares its id, or to an
+order note (`wc_add_order_note` adds one), at any access level, and below admin they do not
+return them.
 
 **Elementor**, off by default, and the switch only appears when Elementor is installed:
 theme-builder conditions, regenerating Elementor's CSS, putting a library template on a
@@ -395,14 +421,36 @@ layout. So node types, counts and depth are returned, layout setting *names* are
 whether custom code is present is returned, and no value of either is. The layout keys are not
 readable through the generic meta tools either: `wp_get_post_meta` and `wp_get_post_snapshot` list
 them as withheld, and a key is judged the way the database compares it, so an accented or
-space-padded spelling is the same key. `beaver_layout` reports a post's title, type and status, so
+space-padded spelling is the same key. The generated REST tools (`update_pages` and the rest) do
+not read or write a layout either: a REST field another plugin registers for it (Beaver's
+`fl_builder_css_js`, which exists only while its debug flag is set) is refused, left out of replies
+and not offered in the tool's schema, a field that reaches the layout key through WordPress's meta
+functions is stopped while it runs, and the debug flag's option rows are not writable or readable
+through the option tools. `beaver_layout` reports a post's title, type and status, so
 it asks the same read policy the generic readers do: a form submission, and below admin an order
 or another plugin's configuration, answers as a post that does not exist. There is no tool that
-writes layout data at any level: it would be persistent script injection with no restore tool
-behind it, the same reasoning that keeps a Custom Code writer out of the Elementor Pro group.
-The one write is `beaver_clear_cache`, which deletes the generated CSS/JS so the builder
-regenerates them — derived files, admin level, and it says so when the site enqueues the
-builder's CSS inline and there is nothing to delete. There is no tool that applies or imports a
+edits or replaces an existing layout, and none that accepts layout settings from the caller: it
+would be persistent script injection, the same reasoning that keeps a Custom Code writer out of
+the Elementor Pro group. The writes are `beaver_clear_cache`, which deletes the generated CSS/JS
+so the builder regenerates them — derived files, admin level, and it says so when the site
+enqueues the builder's CSS inline and there is nothing to delete — and, behind a second switch
+(`mcp_tools_beaver_write`, off by default), `beaver_create_page`. That tool makes a NEW page from
+a typed list of four module types (heading, rich text, button, photo) and has no argument that
+names an existing post. The builder's own writer applies no sanitising, so the tool cleans every
+value itself: text through `wp_kses_post` or as plain text, a link as an absolute http(s) URL with
+a host and no user information or a path on the site (judged after sanitising, so a tab inside
+`//` is still refused), a fixed set of heading tags, and a photo only by attachment id, which must
+be an image and must be one a featured image could use (a form submission's upload is refused).
+`bb_js_code`, `bb_css_code`, `custom_attributes`, `attributes`, `popup`, `lightbox_content_html`,
+`photo_url` and `photo_src` are refused by name. It takes at most 50 modules, 100,000 bytes in a
+field and 400,000 in all. The page is made as a draft and made public last; the reply is the
+stored layout read from the table, and a page whose layout did not store as built is deleted
+again before the tool answers. It is admin level and classed as a site change by the approval queue
+(held in its wider mode, not in the deletes-only one). The change journal records the layout rows it writes and can undo them, but it has no
+entry for the creation of a page, which comes off with `wp_delete_post`. A rich-text line that is
+only a URL becomes a link, because the module would otherwise fetch it as an embed when the page
+renders. Not covered: what a caller writes in rich text is theirs (a link in a post body can point
+anywhere), and a theme or plugin that renders the module's output differently. There is no tool that applies or imports a
 template: applying a saved one is reversible, importing one rewrites the design system from an
 archive built elsewhere in a single call.
 
@@ -672,7 +720,7 @@ Other hooks:
 - No row belonging to this plugin, and no option whose name looks like a credential, can be read or written through the option tools. The change journal additionally inspects the value it is about to record, so a `secret_key` or `pass` field inside a settings array is blanked before the rest of that array is kept, and an undo leaves the live value in place rather than writing the placeholder over it. Strings that parse as JSON or as a serialized array are unpacked and judged too, and blanked whole when they hold one. Free text is read as well, so a post whose body has a pasted `{"api_key": "..."}`, a `define( 'DB_PASSWORD', ... )` line or an `Authorization: Bearer` header in it is not copied into the journal or the audit log: that field is left out of the undo record and the rest of the edit stays undoable. This is a heuristic for the shapes people paste, tuned so that prose which merely mentions a password is kept and undone as usual; it will not catch a secret that is a bare word under an innocuous name.
 - Undoing an edit never sets a post's status to `trash` or `auto-draft`, for the same reason the write tools refuse those statuses: WordPress deletes on them from a daily job. The other fields of that entry are still restored.
 - Optional human approval holds deletes, and optionally site changes, until an administrator signed in to wp-admin approves that exact call. There is no approval token for an agent to learn or mint, and no tool that reads or answers the queue. See Approvals above.
-- Site-file export is off by default, and its manifest returns counts and exclusions rather than file contents. A pull is always held for a person, whatever the approval mode says; the approval is bound to the manifest digest — which covers each file's name, size and contents — so a tree that changed after it was read needs a new one, and one whose file was rewritten in place is refused when the pull runs. The archive is built outside the web root with 0600 permissions, streamed once through a five-minute token, and deleted after it is sent, including when the client disconnects mid-download. The token is scrubbed from the audit log, like the download and upload tokens.
+- Site-file export is off by default, and its manifest returns counts and exclusions rather than file contents. Private files by name (dot-files, `wp-config`, keys, dumps, logs, backups) and uploaded files that belong to a form submission are withheld from the manifest and the archive; a secret inside a file with an ordinary name is not found. A pull is always held for a person, whatever the approval mode says; the approval is bound to the manifest digest — which covers each file's name, size and contents — so a tree that changed after it was read needs a new one, and one whose file was rewritten in place is refused when the pull runs. The archive is built outside the web root with 0600 permissions, streamed once through a five-minute token, and deleted after it is sent, including when the client disconnects mid-download. The token is scrubbed from the audit log, like the download and upload tokens.
 - The `readwrite` level cannot delete by another name. WordPress permanently deletes whatever carries an old `_wp_trash_meta_time`, every auto-draft older than a week, and, where Akismet or a similar plugin is active, every comment marked spam for fifteen days, so setting a post status of `trash` or `auto-draft` through `wp_update_post`, a comment status of `trash` or `spam` through `wp_update_comment`, and writing any `_wp_trash_meta_` meta key through any tool (in any spelling the database reads as the same key: case, trailing spaces, accents, invisible characters), are refused; `wp_delete_post` and `wp_delete_comment` are the way to delete and are held by the approval queue. An agent therefore cannot mark a comment as spam at any level; a person does that in wp-admin. `wp_run_cron_event` is held with the deletes.
 - Tools do not execute arbitrary PHP or SQL. Every tool is a fixed WordPress operation with a schema.
 - A preview link is a bearer credential for one unpublished post. Only a hash of it is stored, in a row the option tools refuse, and the audit log and debug trace scrub it from arguments and replies. It is shown once. Anyone who is given the link can use it until it expires or the post is published, and viewing it is not logged.
@@ -689,7 +737,7 @@ docker run --rm -v "$PWD":/app -w /app php:8.1-cli sh -c 'for f in includes/*.ph
 ```
 
 A throwaway WordPress for testing lives in `.dev/` (see that directory's README). It carries
-twenty-one suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
+twenty-three suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
 previews; `smoke-admin.sh` for the administration tools, the change journal, named keys and
 every guard around them, which rebuilds `.htaccess` partway through and is the destructive
 one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor tools;
@@ -701,11 +749,13 @@ WP Activity Log tools; `smoke-redirection.sh` for the Redirection tools; `smoke-
 for the Polylang tools; `smoke-seo.sh` for the Rank Math and All in One SEO tools;
 `smoke-forms.sh` for the form-submission tools; `smoke-wordfence.sh` for the Wordfence tools;
 `smoke-stream.sh` for the Stream tools; `smoke-beaver.sh` for the Beaver Builder tools;
-`smoke-download.sh` for the one-time download endpoint; and `smoke-export.sh` for the site
-files manifest, the approval-gated archive and its one-time endpoint. `smoke-seo.sh`,
+`smoke-beaver-write.sh` for the tool that builds a Beaver Builder page;
+`smoke-download.sh` for the one-time download endpoint; `smoke-export.sh` for the site
+files manifest, the approval-gated archive and its one-time endpoint; and `smoke-listing-filters.sh`
+for the listing tools under another plugin's query filters. `smoke-seo.sh`,
 `smoke-forms.sh`, `smoke-polylang.sh` and `smoke-redirection.sh` were written without a
 running stack and have not been run. The plugin-specific suites need their plugin installed;
-`smoke-download.sh` and `smoke-export.sh` need only this plugin.
+`smoke-download.sh`, `smoke-export.sh` and `smoke-listing-filters.sh` need only this plugin.
 
 Wordfence makes every call on a stack slow: it checks in with its own servers when it loads,
 and with no outbound route each request waits for that to time out — measured at 0.3s per

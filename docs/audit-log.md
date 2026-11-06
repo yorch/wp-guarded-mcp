@@ -67,19 +67,34 @@ the entry keeps (which then reads as withheld) and the short values and post lab
 the change summary are not cut up: each is replaced whole when it holds one, and for
 those short columns the test is wider than the arguments' (see below). It is a
 heuristic: it finds the shapes people paste, such as quoted `name = value` pairs under a
-secret-ended name, unquoted ones whose value looks like a token (six characters or more
-with a digit, or sixteen without), bearer and basic headers, URL user information, private
-key blocks and the common key prefixes, and it does not find a secret that is a bare word,
-or an unquoted lowercase word under a secret-named key with no digit in it. The debug log
-does take that last one; see `docs/guardrails.md`. A value that is plainly what a template
-writes where a secret goes (`password_here`, `YOUR_TOKEN_HERE`, `********`, `<token>`,
-`${DB_PASS}` or `$DB_PASS` in capitals only, `user:pass@host`) is not a credential, so WordPress's
-own sample config line does not cost a post its undo; `'$uperS3cret99'` is a password that starts
-with a dollar sign and is flagged. The scanner also reads PHP array-index assignments
-(`$cfg['db_password'] = '...'`), names of any length, and quoted values that hold escapes (an
-escaped quote, Gutenberg's `&`, a backslash path, text escaped twice, `=&gt;` in a code block);
-what it does not find (a value split across arguments, base64, a bare token) and the prose it
-still flags are listed in `docs/guardrails.md`. Ordinary prose that mentions a password is recorded as
+secret-ended name (any quoted value of four characters or more, so `"password":"changeme"`
+is one), unquoted ones whose value looks like a token (six characters or more with a digit, or
+sixteen without), bearer and basic headers, URL user information, `curl -u user:password` (and
+`-uuser:password`, `--user`, and a key in the user slot, `curl -u KEY:`), an `<input>` tag whose
+`name` is secret-ended and whose `value` is the secret (a button, a checkbox or an image only when
+the value has the shape of a credential), the first argument of `define()` and of the option and
+storage setters (`update_option`, `set_transient`, `setItem` and the like), private key blocks and the common
+key prefixes, and it does not find a secret that is a bare word, or an unquoted lowercase word under a
+secret-named key with no digit in it. The debug log does take that last one; see `docs/guardrails.md`.
+A value that is plainly what a template writes where a secret goes (`password_here`,
+`YOUR_TOKEN_HERE`, `YourPassword`, `********`, `<token>`, `${DB_PASS}` or `$DB_PASS` in capitals only,
+`user:pass@host`, `none`, `null`, `required`) is not a credential, so WordPress's own sample config line does
+not cost a post its undo; `'$uperS3cret99'` is a password that starts with a dollar sign and is flagged.
+The words `password`, `secret`, `token` and `changeme` are NOT placeholders: they are the default
+password of real products, and `elastic:changeme` is a credential. A value that reads a secret from the
+environment or a variable (`process.env.API_KEY`, `$_POST[`, `config(`) is not one either, but only when
+the whole value is such a reference and it is not quoted: `"this.is.my.password1"` and `'Self.Made#2024'`
+are quoted strings and are flagged. A name that is a secret only some of the time (`STORAGE_KEY`,
+`primary_key`, `session_key`, `service_key`, `shared_key`, `root_key`, `session_id`) is held to the shape
+of a credential (sixteen characters or more of one token with a digit and a letter), so `todos-vuejs-2.0`,
+`product_code` and `billing` are kept and an Azure account key is not. The scanner also reads PHP
+array-index assignments (`$cfg['db_password'] = '...'`), names of any length, and quoted values that
+hold escapes (an escaped quote, Gutenberg's `&`, a backslash path, text escaped twice, `=&gt;` in a code
+block); what it does not find (a value split across arguments, base64, a bare token) and the prose it
+still flags are listed in `docs/guardrails.md`. Its cost is linear in the text, with a budget that
+fails closed (a text that makes it re-read more than four times its own length is answered as a
+credential): half a megabyte takes tens of milliseconds, and the adversarial shapes are timed in
+`.dev/test-redact-timing.php`. Ordinary prose that mentions a password is recorded as
 written, and so is a caller named by a key id: the approval events' `caller` is an
 identity, not a secret, and is never blanked.
 
@@ -206,6 +221,41 @@ last row written under the old one, and every row is checked the way it was
 written: the old join at or below that mark, the canonical encoding above it.
 Old rows keep verifying, new rows are unambiguous, and nothing was rewritten to
 make either true.
+
+## Appends are serialised, and a lock that answers oddly is not "no lock"
+
+A row names the hash of the row before it, so two writers that read the same
+newest hash before either has inserted both chain to the same predecessor, and
+the second row fails its link: `verify()` calls that tampering in a log nobody
+touched, and it stays until the log is cleared. Parallel tool calls are
+ordinary client behaviour. The append therefore takes a named lock
+(`GET_LOCK`, one per database and table) around the read of the newest hash and
+the insert, and releases it explicitly.
+
+`GET_LOCK` answers `1` (taken) or `0` (not taken within five seconds). Anything
+else means the server has no usable lock: `NULL` from one that errors on the
+call, the string `1=1` from the SQLite drop-in, which reads the call as a
+comparison. The append used to treat that as "nothing to take" and carry on
+without a word, which on such a stack forks the chain under load (measured: eight
+processes writing forty rows each left 60 to 74 rows sharing a predecessor). It
+now writes one log line per request that names the answer (through the same
+redaction every debug line gets) and serialises with a lock row in the options
+table instead, taken with `INSERT IGNORE` on its unique name so exactly one
+writer holds it, released by deleting its own value, and taken over by
+compare-and-swap if it is older than thirty seconds because its holder died.
+If that lock cannot be had in five seconds either, the row is still written
+(unserialised, with a second log line), as it is when `GET_LOCK` answers `0`:
+an entry that might sit beside a fork is a better outcome than an entry that
+does not exist. A row is never dropped for want of a lock.
+
+What this does not cover: a server that answers `1` without holding the lock
+(a proxy that fakes it). The fallback was proved on MariaDB with the answer
+rewritten (`.dev/smoke-admin.sh`), and measured by hand on the SQLite drop-in,
+which answers `1=1` by itself: eight processes writing forty rows each left an
+intact chain twice with the fallback and a forked one (56 to 70 rows sharing a
+predecessor) without it. The suite does not run that on SQLite, and PHP's
+`usleep` between attempts is a polling wait, so under heavy contention a writer
+can take up to the five seconds before it writes past the lock.
 
 ## Two things the chain cannot do
 

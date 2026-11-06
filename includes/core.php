@@ -198,6 +198,11 @@ class GMCP_Core {
     $exact = apply_filters( 'gmcp_protected_options', $exact, $key );
     $patterns = apply_filters( 'gmcp_protected_option_patterns', $patterns, $key );
 
+    $switch = self::layout_switch_option_refusal( $key );
+    if ( $switch !== null ) {
+      return $switch;
+    }
+
     $needle = strtolower( $key );
     if ( in_array( $needle, array_map( 'strtolower', (array) $exact ), true ) ) {
       return "The option \"{$key}\" holds this plugin's own credentials and is not readable or writable through the API.";
@@ -385,6 +390,11 @@ class GMCP_Core {
     // This is the same shape as the option policies above it and lives in the same place for
     // the same reason: the settings tool, the generic option tool and the journal's undo all
     // write options, and a rule enforced in one of them is a rule two of them do not have.
+    $switch = self::layout_switch_option_refusal( $key );
+    if ( $switch !== null ) {
+      return $switch;
+    }
+
     foreach ( self::audit_log_option_prefixes() as $prefix ) {
       if ( $prefix !== '' && strpos( $key, strtolower( (string) $prefix ) ) === 0 ) {
         return 'This option configures an activity log that records what happens on this site. Changing it can stop events being recorded, shorten how long they are kept, or arm deleting the log on uninstall, and none of that can be undone from here. A log an agent can switch off is not a log. Change it on the plugin\'s own settings screen.';
@@ -392,6 +402,47 @@ class GMCP_Core {
     }
 
     return true;
+  }
+
+  /**
+  * Options (and the transient rows behind them) that switch on a page builder's layout editing
+  * outside its editor. Lowercased names.
+  *
+  * Beaver Builder registers a REST field that writes a layout's css and js while its debug
+  * transient `fl_debug_mode` is set, and the transient's value is also the token that turns its
+  * debug output on for any visitor who sends it. Flipping the flag through an option writer opened
+  * a write path to a layout that the layout meta rule closes everywhere else, so a writer that
+  * can set the flag has the layout's write access by another route, and a reader that can read
+  * it has the token. The transient is a row in the options table (`_transient_fl_debug_mode`
+  * and `_transient_timeout_fl_debug_mode`) unless an object cache holds it, and both the row and
+  * the transient name are covered. Filterable like layout_meta_keys().
+  *
+  * @return string[]
+  */
+  public static function layout_switch_options(): array {
+    return array_values( array_unique( array_map( static function ( $name ) {
+      return strtolower( trim( (string) $name ) );
+    }, (array) apply_filters( 'gmcp_layout_switch_options', [
+      'fl_debug_mode',
+      '_transient_fl_debug_mode',
+      '_transient_timeout_fl_debug_mode',
+      '_site_transient_fl_debug_mode',
+      '_site_transient_timeout_fl_debug_mode',
+    ] ) ) ) );
+  }
+
+  /**
+  * The refusal for an option that switches layout editing on, or null. Judged as the database
+  * compares the name (accents, case, trailing spaces), which is how a differently spelt row is
+  * the same row. Asked by the write and delete policies and by the read guard.
+  */
+  public static function layout_switch_option_refusal( string $key ): ?string {
+    foreach ( self::layout_switch_options() as $name ) {
+      if ( GMCP_Meta_Key::is( $key, $name ) ) {
+        return 'This option is the switch that lets a page builder\'s layout css and js be edited outside the builder (its debug transient, whose value is also the token that turns debug output on for any visitor). Setting it would open a write path to a layout that the generic tools refuse everywhere else, and reading it would hand over the token. Change it on the builder\'s own settings screen.';
+      }
+    }
+    return null;
   }
 
   /**
@@ -800,6 +851,89 @@ class GMCP_Core {
   }
 
   /**
+  * The name of WooCommerce's order table when it exists, or '' when it does not.
+  *
+  * Asked of the database rather than of WooCommerce, so the answer holds with the plugin
+  * deactivated: the rows are still there and still hold orders. Remembered for the request,
+  * because a listing asks it once per row.
+  */
+  private static function hpos_orders_table(): string {
+    static $table = null;
+    if ( $table === null ) {
+      global $wpdb;
+      $name = $wpdb->prefix . 'wc_orders';
+      $table = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $name ) ) ) === $name ? $name : '';
+    }
+    return $table;
+  }
+
+  /**
+  * The commerce type an id has in WooCommerce's own order table, or null when it is not an order there.
+  *
+  * With high-performance order storage an order is a row in wc_orders and not necessarily a
+  * row in wp_posts, and where it has a post row at all, that row is a placeholder that holds
+  * the id (shop_order_placehold). Every policy here is asked of the post row's TYPE, so an
+  * order with no post row at that id, or with an ordinary post at it (a page that took the
+  * id before WooCommerce reserved ids with placeholders, which is how shops that enabled the
+  * storage early came to share ids), was judged by nothing: the post was an ordinary page
+  * and the order's notes, which are comments on that id, hung from it.
+  *
+  * Order notes, items and the downloadable permissions all key on the id and not on the type,
+  * so WooCommerce acts on them for any post written, trashed or deleted under it (trashing the page
+  * hid every note of the order, measured). The id is the thing to judge, so this is asked of the
+  * id, and the answer is a type from commerce_post_types() so the rest of the guards need no
+  * second vocabulary.
+  *
+  * @return string|null A lowercased commerce type, or null.
+  */
+  public static function hpos_order_type( int $id ): ?string {
+    if ( $id <= 0 ) {
+      return null;
+    }
+    $table = self::hpos_orders_table();
+    if ( $table === '' ) {
+      return null;
+    }
+    // Remembered for the request, bounded: a listing asks once per row and once per parent, and the
+    // answer for an id does not change within the one request that is judging it.
+    static $seen = [];
+    if ( !array_key_exists( $id, $seen ) ) {
+      global $wpdb;
+      // $table is the prefix and a literal, checked against SHOW TABLES above.
+      $type = $wpdb->get_var( $wpdb->prepare( "SELECT type FROM `{$table}` WHERE id = %d", $id ) );
+      if ( count( $seen ) >= 4000 ) {
+        $seen = [];
+      }
+      $seen[ $id ] = $type === null || $type === false ? null : strtolower( (string) $type );
+    }
+    $type = $seen[ $id ];
+    if ( $type === null ) {
+      return null;
+    }
+    return self::is_commerce_post_type( $type ) ? $type : 'shop_order';
+  }
+
+  /**
+  * Comment types that are an order's own record, lowercased: WooCommerce's order notes.
+  *
+  * A note is the status history, the payment gateway's transaction messages and what the
+  * customer was told, and it is a comment on the order's id, so it is read as the order is
+  * and not written by the generic comment tools. Filterable as gmcp_order_note_types for a
+  * shop plugin that keeps its own.
+  *
+  * @return string[]
+  */
+  public static function order_note_types(): array {
+    $out = [];
+    foreach ( (array) apply_filters( 'gmcp_order_note_types', [ 'order_note' ] ) as $type ) {
+      if ( is_string( $type ) && $type !== '' ) {
+        $out[] = strtolower( $type );
+      }
+    }
+    return $out ?: [ 'order_note' ];
+  }
+
+  /**
   * Post types that hold another plugin's CONFIGURATION rather than site content.
   *
   * Separate from commerce_post_types() and from personal_data_post_types() because the reason
@@ -907,6 +1041,9 @@ class GMCP_Core {
       return $held;
     }
     $type = $post_id > 0 ? get_post_type( $post_id ) : false;
+    // An id that is an order in WooCommerce's own table is an order whatever the post row at
+    // that id says, or even if there is none. @see hpos_order_type().
+    $shared = $post_id > 0 && ( !$type || !self::is_commerce_post_type( $type ) ) ? self::hpos_order_type( $post_id ) : null;
     // Another plugin's configuration row first, because the sentence differs and so does the
     // reason. Asked for the target type as well as the existing one: creating or retyping into
     // one of these types is the same defect reached from the other side.
@@ -915,6 +1052,12 @@ class GMCP_Core {
       if ( $held !== true ) {
         return $held;
       }
+    }
+    if ( $shared !== null ) {
+      return $verb . ' post #' . $post_id . ' through the generic post tools is refused: that id is also ' . self::with_article( $shared )
+        . ' in WooCommerce\'s order table' . ( $type ? ' (the post at it is ' . self::with_article( (string) $type ) . ')' : ' (there is no post at it)' ) . '. '
+        . 'Order notes, items and download permissions are stored against the id and not against a type, so a write, a trash or a deletion under this id reaches the order. '
+        . 'Use the WooCommerce tools, which go through WooCommerce, or edit it in wp-admin.';
     }
     if ( !$type || !self::is_commerce_post_type( $type ) ) {
       if ( $target_type === null || !self::is_commerce_post_type( trim( $target_type ) ) ) {
@@ -1020,16 +1163,31 @@ class GMCP_Core {
   * data and a loop in it must not hang a read.
   *
   * @param int|WP_Post $post
-  * @return string[] Empty when the post does not exist.
+  * @return string[] Empty when the post does not exist and its id is no order's either.
   */
   public static function post_chain_types( $post ): array {
-    $post = $post instanceof WP_Post ? $post : get_post( (int) $post );
+    $row = $post instanceof WP_Post ? $post : get_post( (int) $post );
+    $id = $post instanceof WP_Post ? (int) $post->ID : (int) $post;
     $types = [];
     $seen = [];
-    for ( $depth = 0; $post instanceof WP_Post && $depth < 8 && !isset( $seen[ $post->ID ] ); $depth++ ) {
-      $seen[ $post->ID ] = true;
-      $types[] = strtolower( (string) $post->post_type );
-      $post = $post->post_parent ? get_post( (int) $post->post_parent ) : null;
+    for ( $depth = 0; $id > 0 && $depth < 8 && !isset( $seen[ $id ] ); $depth++ ) {
+      $seen[ $id ] = true;
+      $own = $row instanceof WP_Post ? strtolower( (string) $row->post_type ) : '';
+      // An id that is an order in WooCommerce's own table is one whatever the post row at it
+      // is, or if there is none: said first, so it is the nearest type. Not added where the
+      // row is already a commerce type, so the wording for an ordinary order is unchanged.
+      // @see hpos_order_type().
+      if ( $own === '' || !self::is_commerce_post_type( $own ) ) {
+        $order = self::hpos_order_type( $id );
+        if ( $order !== null ) {
+          $types[] = $order;
+        }
+      }
+      if ( $own !== '' ) {
+        $types[] = $own;
+      }
+      $id = $row instanceof WP_Post ? (int) $row->post_parent : 0;
+      $row = $id > 0 ? get_post( $id ) : null;
     }
     return $types;
   }
@@ -1055,7 +1213,8 @@ class GMCP_Core {
   * SQL for "this post is a held type, or hangs from one", for a query that cannot ask the guard
   * row by row. The types are read_excluded_post_types(), so below admin an order's tree is in
   * it too. $type_col and $parent_col name the columns of the row being judged, so the caller
-  * decides the table alias. The chain is the depth post_chain_types() walks: the row and
+  * decides the table alias, and $id_col names the column holding the row's own id (the posts
+  * table's ID, or a comment's comment_post_ID). The chain is the depth post_chain_types() walks: the row and
   * seven parents above it.
   *
   * Joins, not nested subqueries. Seven EXISTS inside one another is correct on MySQL and
@@ -1066,7 +1225,7 @@ class GMCP_Core {
   *
   * @return array{join: string, where: string} Both empty when no type is excluded.
   */
-  public static function unreadable_post_clauses( string $type_col, string $parent_col, string $alias = 'gmcp_u' ): array {
+  public static function unreadable_post_clauses( string $type_col, string $parent_col, string $alias = 'gmcp_u', string $id_col = '' ): array {
     global $wpdb;
     $in = implode( ',', array_map( function ( $type ) {
       return "'" . esc_sql( $type ) . "'";
@@ -1074,16 +1233,254 @@ class GMCP_Core {
     if ( $in === '' ) {
       return [ 'join' => '', 'where' => '' ];
     }
+    // Below admin an id that is an order in WooCommerce's own table is held whatever the post
+    // row at it is, or if there is none (@see hpos_order_type()). The same join by primary key,
+    // on the id of each row in the chain rather than on a row of the posts table, because the
+    // row that would carry the id may not exist. The caller says which column holds the row's
+    // own id; without it the order table is not consulted, which is the answer for a caller
+    // that has not been taught.
+    $orders = self::caller_access_level() !== 'admin' && $id_col !== '' ? self::hpos_orders_table() : '';
     $joins = '';
     $tests = [ 'LOWER(' . $type_col . ') IN (' . $in . ')' ];
+    if ( $orders !== '' ) {
+      $joins .= " LEFT JOIN `{$orders}` {$alias}o0 ON {$alias}o0.id = {$id_col}";
+      $tests[] = "{$alias}o0.id IS NOT NULL";
+    }
     $up = $parent_col;
     for ( $level = 1; $level <= 7; $level++ ) {
       $a = $alias . $level;
       $joins .= " LEFT JOIN {$wpdb->posts} {$a} ON {$a}.ID = {$up}";
       $tests[] = "COALESCE(LOWER({$a}.post_type),'') IN ({$in})";
+      if ( $orders !== '' ) {
+        $joins .= " LEFT JOIN `{$orders}` {$alias}o{$level} ON {$alias}o{$level}.id = {$up}";
+        $tests[] = "{$alias}o{$level}.id IS NOT NULL";
+      }
       $up = $a . '.post_parent';
     }
     return [ 'join' => $joins, 'where' => 'NOT (' . implode( ' OR ', $tests ) . ')' ];
+  }
+
+  /**
+  * Reads SQL text the way a database does for quotes and comments, so a guard can be judged on
+  * what the server will execute and not on what the string says.
+  *
+  * A fragment from another plugin can end in `/*` or `-- `, and a text search for the guard in
+  * the finished SQL then finds the guard inside the comment it was swallowed by. This walks the
+  * text once, keeps quoted strings and backticked names whole (a backslash and the character after
+  * it count as one inside a quote, a doubled quote is an escaped one), and replaces every comment
+  * (`/* *\/`, `-- `, `#`) with a space or a line break. A line comment is taken to start at any
+  * `--`, not only one followed by a space as MySQL has it, and at `#`, which SQLite does not read
+  * as one: over-reading a comment can only make a caller doubt a query that was fine.
+  *
+  * @return array{text: string, comment: bool, broken: bool, depth: int, excess: int}
+  *   text: the SQL with comments replaced. comment: whether there was one. broken: a quote or a
+  *   block comment that never closes (what follows an unclosed block comment is dropped, as the
+  *   server drops it). depth: parentheses opened and never closed. excess: parentheses closed that
+  *   were never opened.
+  */
+  public static function scan_sql( string $sql ): array {
+    $out = '';
+    $n = strlen( $sql );
+    $comment = false;
+    $broken = false;
+    $depth = 0;
+    $excess = 0;
+    for ( $i = 0; $i < $n; $i++ ) {
+      // A run of characters that start nothing is copied in one piece: a query can be long (a
+      // post__in of tens of thousands of ids), and this is asked of every query a listing runs.
+      $run = strcspn( $sql, "'\"`/#-()", $i );
+      if ( $run > 0 ) {
+        $out .= substr( $sql, $i, $run );
+        $i += $run;
+        if ( $i >= $n ) {
+          break;
+        }
+      }
+      $ch = $sql[ $i ];
+      if ( $ch === "'" || $ch === '"' || $ch === '`' ) {
+        $j = $i + 1;
+        while ( $j < $n ) {
+          if ( $sql[ $j ] === '\\' && $ch !== '`' ) {
+            $j += 2;
+            continue;
+          }
+          if ( $sql[ $j ] === $ch ) {
+            if ( $j + 1 < $n && $sql[ $j + 1 ] === $ch ) {
+              $j += 2;
+              continue;
+            }
+            break;
+          }
+          $j++;
+        }
+        if ( $j >= $n ) {
+          $broken = true;
+          $out .= substr( $sql, $i );
+          break;
+        }
+        $out .= substr( $sql, $i, $j - $i + 1 );
+        $i = $j;
+        continue;
+      }
+      $next = $i + 1 < $n ? $sql[ $i + 1 ] : '';
+      if ( $ch === '/' && $next === '*' ) {
+        $comment = true;
+        $out .= ' ';
+        $end = strpos( $sql, '*/', $i + 2 );
+        if ( $end === false ) {
+          $broken = true;
+          break;
+        }
+        $i = $end + 1;
+        continue;
+      }
+      if ( $ch === '#' || ( $ch === '-' && $next === '-' ) ) {
+        $comment = true;
+        $out .= "\n";
+        $i += strcspn( $sql, "\r\n", $i ) - 1;
+        continue;
+      }
+      if ( $ch === '(' ) {
+        $depth++;
+      }
+      elseif ( $ch === ')' ) {
+        if ( $depth > 0 ) {
+          $depth--;
+        }
+        else {
+          $excess++;
+        }
+      }
+      $out .= $ch;
+    }
+    return [ 'text' => $out, 'comment' => $comment, 'broken' => $broken, 'depth' => $depth, 'excess' => $excess ];
+  }
+
+  /** The SQL without its comments. @see scan_sql() */
+  public static function sql_without_comments( string $sql ): string {
+    $scan = self::scan_sql( $sql );
+    return $scan['comment'] ? $scan['text'] : $sql;
+  }
+
+  /**
+  * Another plugin's WHERE fragment, made safe to put inside parentheses of ours.
+  *
+  * The fragment is text from outside: `) OR 1=1 /*` closes the parenthesis the guard put around it
+  * and comments out the guard behind it (measured on SQLite, where the finished query then ran with
+  * no guard and no LIMIT). So the comments are taken out, a `(` is put in front for each `)` that
+  * has no opener, and a `)` behind for each `(` that is never closed. Whatever it wrote, the result
+  * is one parenthesised expression that cannot reach outside its own parentheses, and the guard
+  * stands before it, so a fragment this cannot repair (an unclosed quote) makes the query fail, not
+  * widen. The meaning of a well-formed fragment is unchanged.
+  *
+  * @param string $lead  What opens the expression: ' 1=1 ' for a WHERE that begins with AND (a
+  *                      post query), '' for one that does not (a comment query).
+  */
+  public static function wrap_foreign_where( string $fragment, string $lead = ' 1=1 ' ): string {
+    $scan = self::scan_sql( $fragment );
+    return '(' . str_repeat( '(', $scan['excess'] ) . $lead . $scan['text'] . str_repeat( ')', $scan['depth'] ) . "\n)";
+  }
+
+  /**
+  * Whether a finished query still carries the guard, read the way the server reads it: the guard's
+  * WHERE and its JOIN have to be in the text after the comments are taken out, and a query with a
+  * comment in it at all, or a quote or comment that never closes, is not trusted (WordPress writes
+  * none). A plain search for the text found it inside a comment.
+  */
+  public static function sql_carries( $sql, string $where, string $join ): bool {
+    if ( $where === '' ) {
+      return true;
+    }
+    if ( !is_string( $sql ) ) {
+      return false;
+    }
+    $scan = self::scan_sql( $sql );
+    if ( $scan['comment'] || $scan['broken'] ) {
+      return false;
+    }
+    return strpos( $scan['text'], $where ) !== false && ( $join === '' || strpos( $scan['text'], $join ) !== false );
+  }
+
+  /**
+  * Whether any query that ran for a listing cannot be trusted to have been the database's answer
+  * to a statement that carried the guard. Judged from the finished state, after every filter has
+  * had its say, and not from a hook that a later filter can run behind:
+  * the query's own `request` (what WordPress built and, after the filters, would send) has to carry
+  * the guard as sql_carries() reads it, and has to be among the SELECTs the database was actually
+  * given. A query that was answered without one (`posts_pre_query`, `comments_pre_query` registered
+  * from inside `pre_get_posts` to run after ours) has a request that was never sent, and so has one
+  * served from the object cache; neither is the database counting its offset over the guarded rows,
+  * so both are doubt, and doubt means the caller pages in PHP.
+  *
+  * @param object[]            $queries  The WP_Query / WP_Comment_Query objects that ran.
+  * @param array<string,true>  $sent     md5 of every SELECT the database was given meanwhile.
+  */
+  private static function listing_in_doubt( array $queries, array $sent, string $where, string $join ): bool {
+    global $wpdb;
+    if ( $where === '' ) {
+      return false;
+    }
+    foreach ( $queries as $query ) {
+      $sql = $query->request ?? null;
+      if ( !is_string( $sql ) || trim( $sql ) === '' ) {
+        return true;
+      }
+      if ( !self::sql_carries( $sql, $where, $join ) ) {
+        return true;
+      }
+      if ( !isset( $sent[ md5( trim( $wpdb->remove_placeholder_escape( $sql ) ) ) ] ) ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The guard of a post listing: SQL that leaves out held types and what hangs from them. */
+  private static function post_listing_guard(): array {
+    global $wpdb;
+    return self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l', "{$wpdb->posts}.ID" );
+  }
+
+  /**
+  * The guard of a comment listing. A comment is read as the post it is on; an order note is the
+  * order's own record, so it is held with the order wherever it hangs from and whether or not
+  * WooCommerce is there to hide it from comment queries (it does, with a filter of its own that a
+  * deactivated plugin takes with it). Below admin only, like the post types. @see order_note_types()
+  *
+  * @return array{where: string, join: string} Both empty when nothing is held.
+  */
+  private static function comment_listing_guard(): array {
+    global $wpdb;
+    $c = self::unreadable_post_clauses( "COALESCE(gmcp_cp.post_type,'')", 'gmcp_cp.post_parent', 'gmcp_cc', "{$wpdb->comments}.comment_post_ID" );
+    $conds = [];
+    $join = '';
+    if ( self::caller_access_level() !== 'admin' ) {
+      $notes = implode( ',', array_map( static function ( $type ) {
+        return "'" . esc_sql( $type ) . "'";
+      }, self::order_note_types() ) );
+      if ( $notes !== '' ) {
+        $conds[] = "{$wpdb->comments}.comment_type NOT IN ({$notes})";
+      }
+    }
+    if ( $c['where'] !== '' ) {
+      $join = " LEFT JOIN {$wpdb->posts} gmcp_cp ON gmcp_cp.ID = {$wpdb->comments}.comment_post_ID" . $c['join'];
+      $conds[] = $c['where'];
+    }
+    return [ 'where' => implode( ' AND ', $conds ), 'join' => $join ];
+  }
+
+  /**
+  * A short name for the guard a listing runs under: the caller's level and the guard's own SQL.
+  * Listings put it in the key their results are cached under. WP_Comment_Query keys its cache on
+  * its arguments alone, not on the SQL the filters made of them, so two callers with different
+  * guards and the same arguments shared one entry in a persistent object cache: an admin's page
+  * (with the order notes in it) was served to a read-only key, and a read-only key's page to an
+  * admin, who then missed the rows it had left out (measured, with an object cache standing in
+  * for Redis). WP_Query keys on the finished SQL and so was not shared, but is given the same
+  * argument, so that does not rest on the SQL staying different.
+  */
+  private static function listing_scope( array $guard ): string {
+    return substr( md5( self::caller_access_level() . "\n" . $guard['where'] . "\n" . $guard['join'] ), 0, 12 );
   }
 
   /**
@@ -1096,60 +1493,290 @@ class GMCP_Core {
   * into a WP_Post and had its parent chain walked, and an offset of ten million ran for over a
   * minute. Put in the query instead, the offset is an ordinary SQL offset over rows already
   * filtered. The query must run with suppress_filters false, or WordPress does not apply
-  * posts_join and posts_where at all.
+  * the clause filters at all.
+  *
+  * The clauses go in at `posts_clauses_request` at PHP_INT_MAX, which is the last hook that sees
+  * the clauses as parts, and the guard stands FIRST in the WHERE, ahead of the other plugins' text,
+  * which is wrapped (wrap_foreign_where()) so it cannot close the parenthesis around it, and has
+  * its comments taken out. Both matter: the guard used to be appended at `posts_where`, so a
+  * filter that ran later and replaced the clause set (`posts_clauses`) dropped it, and one that
+  * appended `OR 1=1` turned `a AND b OR 1=1 AND guard` into "anything the guard allows, or
+  * anything that matches a AND b" (measured: the REST list tools returned a file attached to a
+  * form submission under both); and one that ended its fragment with `) OR 1=1 /*` closed the
+  * wrapper and commented the guard and the LIMIT out (measured on SQLite). Behind the guard, a
+  * fragment that still breaks the statement makes it fail and not widen.
+  *
+  * What a filter can still do is rewrite the finished SQL (`posts_request`) or answer without
+  * a query (`posts_pre_query`), including from a callback it registered while the query ran, at
+  * the same priority as ours and so behind ours. Those are detected, not prevented, and detected
+  * from the finished state: when $run() returns, every WP_Query it ran is asked whether its
+  * `request` still carries the guard as the server would read it, with comments taken out
+  * (sql_carries()), and whether that request is among the SELECTs the database was given
+  * (listing_in_doubt()). $held is false when any query is in doubt: the database's offset may then
+  * have counted rows the guard would have left out, and a caller that pages must page in PHP.
+  * $judge_rows adds a row check as a `the_posts` filter at PHP_INT_MAX; a caller that must not
+  * trust even that to run last judges the rows it is given itself, afterwards (the REST dispatch
+  * does).
   *
   * @see unreadable_post_clauses() for the SQL, which the REST listings and the scans use too.
   *
+  * @param callable  $run         The queries.
+  * @param bool|null $held        Set to whether every query carried the guard and was answered by the database.
+  * @param bool      $judge_rows  Also drop, from each result, the posts post_read_guard() refuses.
   * @return mixed Whatever $run() returns.
   */
-  public static function with_readable_posts_sql( callable $run ) {
-    $join = static function ( $join ) {
-      global $wpdb;
-      return $join . self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l' )['join'];
+  public static function with_readable_posts_sql( callable $run, ?bool &$held = null, bool $judge_rows = false ) {
+    $c = self::post_listing_guard();
+    $state = (object) [ 'lost' => false, 'checked' => false, 'queries' => [], 'sent' => [] ];
+    $clauses = static function ( $parts ) use ( $c ) {
+      if ( !is_array( $parts ) || $c['where'] === '' ) {
+        return $parts;
+      }
+      // Comments in the pieces that follow the WHERE would swallow the LIMIT (and the offset the
+      // pager relies on) on a server that tolerates an unclosed one.
+      foreach ( [ 'join', 'groupby', 'orderby', 'limits' ] as $piece ) {
+        if ( isset( $parts[ $piece ] ) && is_string( $parts[ $piece ] ) ) {
+          $parts[ $piece ] = self::sql_without_comments( $parts[ $piece ] );
+        }
+      }
+      $parts['join'] = ( $parts['join'] ?? '' ) . $c['join'];
+      $parts['where'] = ' AND ' . $c['where'] . ' AND ' . self::wrap_foreign_where( (string) ( $parts['where'] ?? '' ) );
+      return $parts;
     };
-    $where = static function ( $where ) {
-      global $wpdb;
-      $c = self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l' );
-      return $c['where'] === '' ? $where : $where . ' AND ' . $c['where'];
+    // The finished text, after every other plugin has had its say, must still hold the guard.
+    // An early look: the final one is made when the run is over.
+    $request = static function ( $sql ) use ( $c, $state ) {
+      $state->checked = true;
+      if ( !self::sql_carries( $sql, $c['where'], $c['join'] ) ) {
+        $state->lost = true;
+      }
+      return $sql;
     };
-    add_filter( 'posts_join', $join, PHP_INT_MAX );
-    add_filter( 'posts_where', $where, PHP_INT_MAX );
+    // A big query is split: the ids are asked for by a second text, which is checked too, but
+    // does not count as the check of the next query.
+    $request_ids = static function ( $sql ) use ( $c, $state ) {
+      if ( !self::sql_carries( $sql, $c['where'], $c['join'] ) ) {
+        $state->lost = true;
+      }
+      return $sql;
+    };
+    // Applied to every query, even one run with filters off, which never reaches the check
+    // above: a query that arrives here unchecked never had the guard, and an answer given before
+    // the query ran is not the database's.
+    $pre = static function ( $posts ) use ( $state ) {
+      if ( $posts !== null || !$state->checked ) {
+        $state->lost = true;
+      }
+      $state->checked = false;
+      return $posts;
+    };
+    $judge = static function ( $posts ) {
+      if ( !is_array( $posts ) ) {
+        return $posts;
+      }
+      return array_values( array_filter( $posts, static function ( $post ) {
+        return !( $post instanceof WP_Post ) || self::post_read_guard( (int) $post->ID ) === true;
+      } ) );
+    };
+    // The clause filters do not run on a query that suppresses them, and another plugin can set
+    // that from pre_get_posts (measured: the REST list tools then returned a submission's upload,
+    // with no SQL guard and no row check, since `the_posts` is gated the same way). So inside
+    // the run every query runs with them on, set last.
+    $force = static function ( $query ) {
+      if ( $query instanceof WP_Query ) {
+        $query->set( 'suppress_filters', false );
+      }
+    };
+    // The finished state is read from the queries themselves and from what the database was given.
+    $capture = static function ( $query ) use ( $state ) {
+      if ( $query instanceof WP_Query ) {
+        $state->queries[] = $query;
+      }
+    };
+    $log = static function ( $sql ) use ( $state ) {
+      if ( is_string( $sql ) && count( $state->sent ) < 20000 && stripos( ltrim( $sql ), 'SELECT' ) === 0 ) {
+        $state->sent[ md5( trim( $sql ) ) ] = true;
+      }
+      return $sql;
+    };
+    add_action( 'pre_get_posts', $force, PHP_INT_MAX );
+    add_action( 'pre_get_posts', $capture, PHP_INT_MAX );
+    add_filter( 'posts_clauses_request', $clauses, PHP_INT_MAX );
+    add_filter( 'posts_request', $request, PHP_INT_MAX );
+    add_filter( 'posts_request_ids', $request_ids, PHP_INT_MAX );
+    add_filter( 'posts_pre_query', $pre, PHP_INT_MAX );
+    add_filter( 'query', $log, PHP_INT_MAX );
+    if ( $judge_rows ) {
+      add_filter( 'the_posts', $judge, PHP_INT_MAX );
+    }
     try {
       return $run();
     }
     finally {
-      remove_filter( 'posts_join', $join, PHP_INT_MAX );
-      remove_filter( 'posts_where', $where, PHP_INT_MAX );
+      remove_action( 'pre_get_posts', $force, PHP_INT_MAX );
+      remove_action( 'pre_get_posts', $capture, PHP_INT_MAX );
+      remove_filter( 'posts_clauses_request', $clauses, PHP_INT_MAX );
+      remove_filter( 'posts_request', $request, PHP_INT_MAX );
+      remove_filter( 'posts_request_ids', $request_ids, PHP_INT_MAX );
+      remove_filter( 'posts_pre_query', $pre, PHP_INT_MAX );
+      remove_filter( 'query', $log, PHP_INT_MAX );
+      remove_filter( 'the_posts', $judge, PHP_INT_MAX );
+      $held = !$state->lost && !self::listing_in_doubt( $state->queries, $state->sent, $c['where'], $c['join'] );
     }
   }
 
   /**
   * The same for a comment query: a comment is read as the post it is on, so a comment on a
   * post the caller may not read is left out by the query, and the offset is a SQL offset.
-  * WP_Comment_Query applies comments_clauses whatever the arguments.
+  * WP_Comment_Query applies comments_clauses whatever the arguments, and nothing after it
+  * touches the SQL, so the guard at PHP_INT_MAX is the last word of the clause hooks; the WHERE
+  * is placed and wrapped as in with_readable_posts_sql(). A filter registered from inside
+  * `pre_get_comments` runs behind the guard at the same priority, and so can strip it from the
+  * clauses or answer through `comments_pre_query`; both are found from the finished state, as
+  * there: $held is false when a query's `request` no longer carries the guard, or was never
+  * built or never sent (answered without a query, or from the object cache).
   *
   * A comment with no post, or whose post is gone, is readable, as the PHP check has it.
   *
   * @return mixed Whatever $run() returns.
   */
-  public static function with_readable_comments_sql( callable $run ) {
-    $clauses = static function ( $clauses ) {
-      global $wpdb;
-      $c = self::unreadable_post_clauses( "COALESCE(gmcp_cp.post_type,'')", 'gmcp_cp.post_parent', 'gmcp_cc' );
-      if ( !is_array( $clauses ) || $c['where'] === '' ) {
-        return $clauses;
+  public static function with_readable_comments_sql( callable $run, ?bool &$held = null ) {
+    $g = self::comment_listing_guard();
+    $state = (object) [ 'lost' => false, 'queries' => [], 'sent' => [] ];
+    $clauses = static function ( $parts ) use ( $g ) {
+      if ( !is_array( $parts ) || $g['where'] === '' ) {
+        return $parts;
       }
-      $clauses['join'] = ( $clauses['join'] ?? '' ) . " LEFT JOIN {$wpdb->posts} gmcp_cp ON gmcp_cp.ID = {$wpdb->comments}.comment_post_ID" . $c['join'];
-      $clauses['where'] = ( ( $clauses['where'] ?? '' ) !== '' ? $clauses['where'] . ' AND ' : '' ) . $c['where'];
-      return $clauses;
+      foreach ( [ 'join', 'groupby', 'orderby', 'limits' ] as $piece ) {
+        if ( isset( $parts[ $piece ] ) && is_string( $parts[ $piece ] ) ) {
+          $parts[ $piece ] = self::sql_without_comments( $parts[ $piece ] );
+        }
+      }
+      $parts['join'] = ( $parts['join'] ?? '' ) . $g['join'];
+      $had = trim( (string) ( $parts['where'] ?? '' ) );
+      $parts['where'] = $g['where'] . ( $had !== '' ? ' AND ' . self::wrap_foreign_where( $had, '' ) : '' );
+      return $parts;
     };
+    $pre = static function ( $answer ) use ( $state ) {
+      if ( $answer !== null ) {
+        $state->lost = true;
+      }
+      return $answer;
+    };
+    $capture = static function ( $query ) use ( $state ) {
+      if ( $query instanceof WP_Comment_Query ) {
+        $state->queries[] = $query;
+      }
+    };
+    $log = static function ( $sql ) use ( $state ) {
+      if ( is_string( $sql ) && count( $state->sent ) < 20000 && stripos( ltrim( $sql ), 'SELECT' ) === 0 ) {
+        $state->sent[ md5( trim( $sql ) ) ] = true;
+      }
+      return $sql;
+    };
+    add_action( 'pre_get_comments', $capture, PHP_INT_MAX );
     add_filter( 'comments_clauses', $clauses, PHP_INT_MAX );
+    add_filter( 'comments_pre_query', $pre, PHP_INT_MAX );
+    add_filter( 'query', $log, PHP_INT_MAX );
     try {
       return $run();
     }
     finally {
+      remove_action( 'pre_get_comments', $capture, PHP_INT_MAX );
       remove_filter( 'comments_clauses', $clauses, PHP_INT_MAX );
+      remove_filter( 'comments_pre_query', $pre, PHP_INT_MAX );
+      remove_filter( 'query', $log, PHP_INT_MAX );
+      $held = !$state->lost && !self::listing_in_doubt( $state->queries, $state->sent, $g['where'], $g['join'] );
     }
+  }
+
+  /**
+  * One page of the posts a query matches that the caller may read, for a listing tool.
+  *
+  * The unreadable rows are left out in SQL, and the offset is the database's, while the guard
+  * is also asked of every row that comes back (collect_readable()). When the finished state of a
+  * query is in doubt (another plugin's filters took the guard's SQL out of it, or answered it
+  * without the database, or it came from the object cache: @see with_readable_posts_sql()), the
+  * database's offset may count rows the guard leaves out, so the page is built again with the
+  * offset passed over in PHP, row by row and inside the 5000 rows collect_readable() looks at:
+  * slow for a large offset, and short past it, which the guardrails page states. A short page
+  * there is the price of not trusting a query another plugin rewrote.
+  *
+  * @param array $query  WP_Query arguments, without offset, paged or posts_per_page.
+  * @return WP_Post[]
+  */
+  public static function readable_posts_page( array $query, int $limit, int $skip = 0 ): array {
+    $keep = static function ( $row ) {
+      return self::post_read_guard( (int) $row->ID ) === true;
+    };
+    // The scope is a query argument and so part of the key WP_Query caches under.
+    $base = [ 'suppress_filters' => false, 'no_found_rows' => true, 'gmcp_scope' => self::listing_scope( self::post_listing_guard() ) ];
+    $held = true;
+    $rows = self::with_readable_posts_sql( static function () use ( $query, $limit, $skip, $keep, $base ) {
+      return self::collect_readable(
+        static function ( int $from, int $size ) use ( $query, $skip, $base ) {
+          return get_posts( [ 'offset' => $skip + $from, 'posts_per_page' => $size ] + $base + $query );
+        },
+        $keep,
+        $limit
+      );
+    }, $held );
+    if ( $held ) {
+      return $rows;
+    }
+    return self::with_readable_posts_sql( static function () use ( $query, $limit, $skip, $keep, $base ) {
+      return self::collect_readable(
+        static function ( int $from, int $size ) use ( $query, $base ) {
+          return get_posts( [ 'offset' => $from, 'posts_per_page' => $size ] + $base + $query );
+        },
+        $keep,
+        $limit,
+        $skip
+      );
+    } );
+  }
+
+  /**
+  * The same for comments. A comment is read as the post it is on.
+  *
+  * The results are cached under a domain that names the guard (listing_scope()): the cache key of
+  * a comment query does not include the SQL, so a shared domain served one level's page to
+  * another.
+  *
+  * @param array $args  get_comments() arguments, without offset, paged or number.
+  * @return WP_Comment[]
+  */
+  public static function readable_comments_page( array $args, int $limit, int $skip = 0 ): array {
+    $keep = static function ( $row ) {
+      if ( self::caller_access_level() !== 'admin' && in_array( strtolower( (string) $row->comment_type ), self::order_note_types(), true ) ) {
+        return false;
+      }
+      return !( (int) $row->comment_post_ID > 0 && self::post_read_guard( (int) $row->comment_post_ID ) !== true );
+    };
+    $scope = self::listing_scope( self::comment_listing_guard() );
+    $held = true;
+    $rows = self::with_readable_comments_sql( static function () use ( $args, $limit, $skip, $keep, $scope ) {
+      return self::collect_readable(
+        static function ( int $from, int $size ) use ( $args, $skip, $scope ) {
+          return get_comments( [ 'offset' => $skip + $from, 'number' => $size, 'cache_domain' => 'gmcp_readable_' . $scope ] + $args );
+        },
+        $keep,
+        $limit
+      );
+    }, $held );
+    if ( $held ) {
+      return $rows;
+    }
+    return self::with_readable_comments_sql( static function () use ( $args, $limit, $skip, $keep, $scope ) {
+      return self::collect_readable(
+        static function ( int $from, int $size ) use ( $args, $scope ) {
+          return get_comments( [ 'offset' => $from, 'number' => $size, 'cache_domain' => 'gmcp_readable_php_' . $scope ] + $args );
+        },
+        $keep,
+        $limit,
+        $skip
+      );
+    } );
   }
 
   /**
@@ -1614,42 +2241,6 @@ class GMCP_Core {
   * Asked by the generic meta readers and writers through generic_writer_meta_refusal(), and
   * NOT by the WordPress-level net: the builder writes these keys from its own save hook.
   */
-  /**
-  * Depth counter for a sanctioned layout write.
-  *
-  * A static counter rather than a flag: it is only non-zero inside with_layout_write()'s
-  * callback, it cannot be set from tool arguments, and there is no global switch. The reason it
-  * exists at all is that the journal's restore and the Beaver create tool both write layout meta
-  * through WordPress's own meta functions, and protected_meta_refusal() — which the WordPress
-  * level filter asks for every writer during a tool call — refuses those keys.
-  */
-  private static $layout_write_depth = 0;
-
-  /**
-  * Run a callback with layout-meta writes permitted.
-  *
-  * Deliberately NOT a way to re-open reads: meta_key_allowed() asks layout_meta_refusal()
-  * directly for a read and never comes through protected_meta_refusal(), so nothing here makes
-  * a layout readable through the generic tools.
-  *
-  * @param callable $fn The write, which must do its own sanitising: the builder's write path
-  *                     applies none.
-  * @return mixed Whatever the callback returns.
-  */
-  public static function with_layout_write( callable $fn ) {
-    self::$layout_write_depth++;
-    try {
-      return $fn();
-    } finally {
-      self::$layout_write_depth = max( 0, self::$layout_write_depth - 1 );
-    }
-  }
-
-  /** Whether a sanctioned layout write is in progress in this request. */
-  public static function layout_write_in_progress(): bool {
-    return self::$layout_write_depth > 0;
-  }
-
   public static function layout_meta_refusal( $key ): ?string {
     if ( !is_string( $key ) || $key === '' ) {
       return null;
@@ -2060,12 +2651,27 @@ class GMCP_Core {
   /**
   * Whether a comment may be written, as far as the post it is on (or would be moved to) goes.
   *
-  * @param int      $comment_id  The comment, or 0 for a creation.
-  * @param int|null $new_post_id The post a creation names, or the one an update moves it to.
+  * A form submission's tree is closed to every caller of this, the net included. An order's
+  * tree is closed to the generic comment TOOLS as well ($commerce), because an order note is
+  * the order's own record, and a comment on an order is read, counted and shown as part of it:
+  * the status history, the gateway's messages, what the customer was told. The tools that mean
+  * to write one go through WooCommerce (wc_add_order_note). The net leaves $commerce off,
+  * because WooCommerce writes its own notes while a tool call is in flight and must be let to.
+  *
+  * Judged on the post the comment is on, and also on the comment itself: a note whose order is
+  * gone, or whose id is in no table, is still a note. The type a write would leave it holding
+  * is judged too, since retyping a comment into order_note files it where no comment query looks
+  * and out of one makes an order note an ordinary comment.
+  *
+  * @param int         $comment_id  The comment, or 0 for a creation.
+  * @param int|null    $new_post_id The post a creation names, or the one an update moves it to.
+  * @param bool        $commerce    Close an order's tree and order notes as well. The generic comment tools pass true.
+  * @param string|null $new_type    The comment type the write would leave it with, when it sets one.
   * @return true|string
   */
-  public static function comment_write_guard( int $comment_id, ?int $new_post_id = null, string $verb = 'Changing' ) {
+  public static function comment_write_guard( int $comment_id, ?int $new_post_id = null, string $verb = 'Changing', bool $commerce = false, ?string $new_type = null ) {
     $current = 0;
+    $comment = null;
     if ( $comment_id > 0 ) {
       $comment = get_comment( $comment_id );
       $current = $comment ? (int) $comment->comment_post_ID : 0;
@@ -2076,12 +2682,25 @@ class GMCP_Core {
       $targets[] = (int) $new_post_id;
     }
     foreach ( $targets as $post_id ) {
-      $hit = $post_id > 0 ? self::guarded_tree_hit( $post_id, $moving ) : null;
+      $hit = $post_id > 0 ? self::guarded_tree_hit( $post_id, $moving || $commerce ) : null;
       if ( $hit !== null ) {
+        $is_order = self::is_commerce_post_type( $hit );
         return $verb . ( $comment_id > 0 ? ' comment #' . $comment_id : ' a comment' ) . ' is refused: '
-          . ( $moving ? 'it would be moved into or out of the tree of a ' . $hit : 'it is on a post in the tree of a ' . $hit . ', a form submission' ) . '. '
-          . 'A comment is read as the post it is on, so writing, moving or deleting one on a submission or anything hanging from it is refused at every access level, '
-          . 'for the reason post writes to one are: nothing here changes what the readers keep from a key that can only read.';
+          . ( $moving ? 'it would be moved into or out of the tree of ' . self::with_article( $hit ) : 'it is on a post in the tree of ' . self::with_article( $hit ) . ( $is_order ? ', so it is part of the order\'s own record' : ', a form submission' ) ) . '. '
+          . ( $is_order
+            ? 'A comment on an order is read and shown as the order is, and an order note is its status history and what the customer was told, so the generic comment tools neither write, move nor delete one at any access level. Use wc_add_order_note to add a note; nothing here edits or removes one.'
+            : 'A comment is read as the post it is on, so writing, moving or deleting one on a submission or anything hanging from it is refused at every access level, '
+              . 'for the reason post writes to one are: nothing here changes what the readers keep from a key that can only read.' );
+      }
+    }
+    if ( $commerce ) {
+      $notes = self::order_note_types();
+      $now = $comment ? strtolower( (string) $comment->comment_type ) : '';
+      $then = $new_type === null ? '' : strtolower( trim( $new_type ) );
+      if ( in_array( $now, $notes, true ) || in_array( $then, $notes, true ) ) {
+        return $verb . ( $comment_id > 0 ? ' comment #' . $comment_id : ' a comment' ) . ' is refused: '
+          . ( in_array( $now, $notes, true ) ? 'it is an order note' : 'it would be made an order note' ) . ', part of an order\'s own record. '
+          . 'The generic comment tools neither write, retype nor delete one at any access level; wc_add_order_note adds a note.';
       }
     }
     return true;
@@ -2213,7 +2832,158 @@ class GMCP_Core {
         }
       }
     }
+    // A field another plugin registered with register_rest_field() that stores a page builder's
+    // layout. The controller hands it to that plugin's own callback, which writes the layout key
+    // with update_post_meta() and so never meets the meta argument above.
+    foreach ( array_keys( $args ) as $name ) {
+      if ( in_array( strtolower( trim( (string) $name ) ), self::layout_rest_fields(), true ) ) {
+        return 'The field "' . $name . '" is a page builder\'s layout settings (css and js that run on every page using the layout) registered as a REST field, and the generic tools neither read nor write a layout. Use the builder\'s own tools to read the structure, or its editor in wp-admin to change it.';
+      }
+    }
     return null;
+  }
+
+  /**
+  * REST fields, registered by a plugin with register_rest_field(), that read or write a page
+  * builder's layout. Lowercased names.
+  *
+  * The generic meta tools refuse the layout keys (layout_meta_keys()), and a REST tool reaches the
+  * same rows by another door: Beaver Builder registers fl_builder_css_js on its post types when its
+  * debug transient is set or FL_ENABLE_META_CSS_EDIT is defined, and the field's callbacks read and
+  * write `_fl_builder_data_settings` (the layout's css and js, which the public page then loads).
+  * A named field is refused before the controller is asked and is neither accepted nor returned.
+  * Filterable, because the category is "a field that carries a layout", not one plugin. A field
+  * that is NOT on this list is still held by guard_rest_fields(), which stops its callbacks reading
+  * or writing a layout key through WordPress's meta functions.
+  *
+  * @return string[]
+  */
+  public static function layout_rest_fields(): array {
+    return array_values( array_unique( array_map( static function ( $name ) {
+      return strtolower( trim( (string) $name ) );
+    }, (array) apply_filters( 'gmcp_layout_rest_fields', [ 'fl_builder_css_js' ] ) ) ) );
+  }
+
+  /** Nesting depth of REST-field callbacks running now: [ 'get' => n, 'update' => n ]. */
+  private static $rest_field_depth = [ 'get' => 0, 'update' => 0 ];
+
+  /**
+  * Hold every REST field's callbacks away from a page builder's layout, for one dispatch.
+  *
+  * rest_write_refusal() names the fields it knows, and a field it does not know would still reach
+  * the layout, since the callback another plugin registered runs inside the controller. So the
+  * callbacks of every registered field are wrapped, and while one runs the WordPress meta
+  * functions answer for a layout key as the generic meta tools do: a write throws, a read finds
+  * nothing. A field on layout_rest_fields() has its callbacks removed, which the controller reads
+  * as "no such field", so it is neither accepted nor returned. The wrapping is of the global
+  * registry and is put back by the closure this returns, which the caller runs in a finally.
+  *
+  * What it does not see: a callback that reads the table with $wpdb, and a write made after the
+  * dispatch from a hook that fires later.
+  *
+  * @return callable Restores the registry and removes the hooks.
+  */
+  public static function guard_rest_fields(): callable {
+    global $wp_rest_additional_fields;
+    $saved = $wp_rest_additional_fields;
+    if ( !is_array( $wp_rest_additional_fields ) ) {
+      return static function () {};
+    }
+    $named = self::layout_rest_fields();
+    foreach ( $wp_rest_additional_fields as $type => $fields ) {
+      foreach ( (array) $fields as $name => $options ) {
+        if ( !is_array( $options ) ) {
+          continue;
+        }
+        if ( in_array( strtolower( trim( (string) $name ) ), $named, true ) ) {
+          $options['get_callback'] = null;
+          $options['update_callback'] = null;
+          $wp_rest_additional_fields[ $type ][ $name ] = $options;
+          continue;
+        }
+        foreach ( [ 'get', 'update' ] as $kind ) {
+          $original = $options[ $kind . '_callback' ] ?? null;
+          if ( !is_callable( $original ) ) {
+            continue;
+          }
+          $options[ $kind . '_callback' ] = static function ( ...$call_args ) use ( $original, $kind ) {
+            ++self::$rest_field_depth[ $kind ];
+            try {
+              return call_user_func_array( $original, $call_args );
+            }
+            finally {
+              --self::$rest_field_depth[ $kind ];
+            }
+          };
+        }
+        $wp_rest_additional_fields[ $type ][ $name ] = $options;
+      }
+    }
+    foreach ( [ 'add', 'update', 'delete' ] as $op ) {
+      add_filter( $op . '_post_metadata', [ __CLASS__, 'rest_field_meta_write_net' ], PHP_INT_MIN, 4 );
+    }
+    add_filter( 'update_post_metadata_by_mid', [ __CLASS__, 'rest_field_meta_by_mid_net' ], PHP_INT_MIN, 4 );
+    add_filter( 'delete_post_metadata_by_mid', [ __CLASS__, 'rest_field_meta_by_mid_net' ], PHP_INT_MIN, 2 );
+    add_filter( 'get_post_metadata', [ __CLASS__, 'rest_field_meta_read_net' ], PHP_INT_MIN, 4 );
+    return static function () use ( $saved ) {
+      global $wp_rest_additional_fields;
+      $wp_rest_additional_fields = $saved;
+      foreach ( [ 'add', 'update', 'delete' ] as $op ) {
+        remove_filter( $op . '_post_metadata', [ __CLASS__, 'rest_field_meta_write_net' ], PHP_INT_MIN );
+      }
+      remove_filter( 'update_post_metadata_by_mid', [ __CLASS__, 'rest_field_meta_by_mid_net' ], PHP_INT_MIN );
+      remove_filter( 'delete_post_metadata_by_mid', [ __CLASS__, 'rest_field_meta_by_mid_net' ], PHP_INT_MIN );
+      remove_filter( 'get_post_metadata', [ __CLASS__, 'rest_field_meta_read_net' ], PHP_INT_MIN );
+      self::$rest_field_depth = [ 'get' => 0, 'update' => 0 ];
+    };
+  }
+
+  public static function rest_field_meta_write_net( $check, $object_id = 0, $meta_key = '', $meta_value = null ) {
+    if ( self::$rest_field_depth['update'] > 0 ) {
+      $why = self::generic_writer_meta_refusal( $meta_key );
+      if ( $why !== null ) {
+        throw new GMCP_Policy_Refusal( $why );
+      }
+    }
+    return $check;
+  }
+
+  public static function rest_field_meta_by_mid_net( $check, $meta_id = 0, $meta_value = null, $meta_key = false ) {
+    if ( self::$rest_field_depth['update'] > 0 && function_exists( 'get_metadata_by_mid' ) ) {
+      $row = get_metadata_by_mid( 'post', (int) $meta_id );
+      $why = $row ? self::generic_writer_meta_refusal( $meta_key !== false ? $meta_key : $row->meta_key ) : null;
+      if ( $why !== null ) {
+        throw new GMCP_Policy_Refusal( $why );
+      }
+    }
+    return $check;
+  }
+
+  public static function rest_field_meta_read_net( $check, $object_id = 0, $meta_key = '', $single = false ) {
+    if ( self::$rest_field_depth['get'] <= 0 && self::$rest_field_depth['update'] <= 0 ) {
+      return $check;
+    }
+    if ( is_string( $meta_key ) && $meta_key !== '' ) {
+      if ( self::generic_writer_meta_refusal( $meta_key ) !== null ) {
+        return $single ? '' : [];
+      }
+      return $check;
+    }
+    // The whole meta of the post, which a callback may return as it is: serve it without the layout.
+    $cache = wp_cache_get( (int) $object_id, 'post_meta' );
+    if ( $cache === false ) {
+      update_meta_cache( 'post', [ (int) $object_id ] );
+      $cache = wp_cache_get( (int) $object_id, 'post_meta' );
+    }
+    if ( !is_array( $cache ) ) {
+      return $check;
+    }
+    foreach ( array_keys( $cache ) as $key ) {
+      if ( self::generic_writer_meta_refusal( (string) $key ) !== null ) {
+        unset( $cache[ $key ] );
+      }
+    }
+    return $cache;
   }
 
   private static $personal_net_installed = false;
@@ -2751,6 +3521,8 @@ class GMCP_Core {
   *  3. A value after a secret-named key is taken whole: an unquoted one up to "&" or the end of
   *     the line, a quoted one up to its closing quote. "smtp_pwd=correct horse battery" was left
   *     as "smtp_pwd=[redacted] horse battery" by a scrub that ended a value at the first space.
+  *  3a. GMCP_Credential_Scan::try_spans(): the same test the journal, the audit log and the approval
+  *     view apply, as a union with the rules around it and never instead of them.
   *  4. GMCP_Diag_Util::scrub_log_line(), the scrubber the error-log reader already uses, which
   *     knows the vendor key prefixes, PEM blocks, URL user information, JWTs, escaped JSON,
   *     define() lines and pw=.
@@ -2772,6 +3544,28 @@ class GMCP_Core {
     }
     $text = str_replace( [ self::REDACTION_MARKER, self::LOG_SENTINEL ], self::LOG_SENTINEL, $text );
     $text = self::scrub_log_assignments( $text );
+    if ( $text !== self::UNSCRUBBABLE ) {
+      // What the journal and the audit log call a credential, asked of the debug log as well, so this
+      // channel is never narrower than the others: the scanner knows vendor shapes the scrub below does
+      // not (a Google OAuth token, the secret part of a Slack or Discord webhook URL), and the two rule
+      // sets drifted apart once already. It runs after the assignment rule, which takes a whole value
+      // where the scanner takes one token, and before the line scrub, which it adds to and does not
+      // replace. Its answer is a list of byte ranges, so the rest of the line stays readable; it is
+      // linear in the line, which is at most LOG_READ_BYTES; and a scan that gives up withholds the line.
+      $spans = GMCP_Credential_Scan::try_spans( $text );
+      if ( $spans === null ) {
+        $text = self::UNSCRUBBABLE;
+      }
+      else {
+        $at = 0;
+        $marked = '';
+        foreach ( $spans as [ $from, $len ] ) {
+          $marked .= substr( $text, $at, $from - $at ) . self::LOG_SENTINEL;
+          $at = $from + $len;
+        }
+        $text = $marked . substr( $text, $at );
+      }
+    }
     if ( $text !== self::UNSCRUBBABLE ) {
       $scrubbed = GMCP_Diag_Util::scrub_log_line( $text, [ 'patterns' => array_values( array_filter( array_map( 'strval', (array) self::credential_field_patterns() ), 'strlen' ) ) ] );
       // scrub_log_line() casts each rule's result to a string, so a rule that PCRE gives up on

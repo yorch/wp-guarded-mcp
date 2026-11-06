@@ -52,14 +52,42 @@ final class GMCP_Credential_Scan {
   const STRONG_LAST = [
     'password', 'passwd', 'passphrase', 'pass', 'pwd', 'secret', 'secrets', 'token', 'credential',
     'credentials', 'salt', 'bearer', 'apikey', 'secretkey', 'accesskey', 'privatekey', 'authkey',
-    'authorization',
+    'authorization', 'pw', 'pswd', 'psw', 'sessionid', 'phpsessid', 'jsessionid',
   ];
+
+  /**
+  * Two-word endings that name a secret although neither word does alone: a session id, an
+  * authorisation code, Rails' secret_key_base. Checked on the last two (or three) segments.
+  */
+  const SECRET_ENDINGS = [ 'session,id', 'auth,code', 'key,base' ];
 
   /** A name ending in "key" is a secret when the segment before it says what kind of key. */
   const KEY_QUALIFIERS = [
     'api', 'secret', 'access', 'private', 'auth', 'license', 'licence', 'encryption', 'signing',
     'client', 'app', 'master', 'site', 'secure', 'in', 'nonce', 'consumer', 'webhook',
+    // What a key is for, or whose: AccountKey (Azure), STORAGE_KEY, SSH_KEY, DEPLOY_KEY, JWT_KEY, the
+    // vendor names that head an .env line. A bare "key" is still not a name: "Key: 3 bedrooms".
+    'account', 'ssh', 'deploy', 'jwt', 'hmac', 'rsa', 'pgp', 'gpg', 'stripe', 'openai', 'anthropic',
+    'sendgrid', 'mailgun', 'twilio', 'aws', 'azure', 'github', 'gitlab', 'slack', 'paypal', 'mailchimp',
+    'algolia', 'firebase', 'supabase',
   ];
+
+  /**
+  * Words that make "<word>_key" a secret only some of the time: a storage key is Azure's account key
+  * and also the localStorage entry a tutorial names STORAGE_KEY, a primary key is a Cosmos credential
+  * and also the column "product_code", a session, service, shared or root key is a credential in one
+  * product and a menu name in the next. A name ending this way is a secret name, but a value under it
+  * has to LOOK like a credential (sixteen characters or more of one token, with a digit and a letter)
+  * before it is flagged, which "todos-vuejs-2.0", "order_id" and "billing" do not. When a vendor
+  * heads the name (AZURE_STORAGE_KEY, AWS_SESSION_KEY) the name is a secret outright again.
+  */
+  const AMBIGUOUS_KEY_QUALIFIERS = [ 'storage', 'session', 'shared', 'service', 'primary', 'secondary', 'root' ];
+
+  /** Vendors whose name in front of an ambiguous qualifier settles it: AZURE_STORAGE_KEY. */
+  const KEY_VENDORS = [ 'azure', 'aws', 'gcp', 'google', 'stripe', 'openai', 'anthropic', 'sendgrid', 'mailgun', 'twilio', 'github', 'gitlab', 'slack', 'paypal', 'mailchimp', 'algolia', 'firebase', 'supabase', 'cosmos', 'redis' ];
+
+  /** Last name segments that are an abbreviation of "password": a short word under them is not trusted as one. */
+  const ABBREVIATION_LAST = [ 'pw', 'psw', 'pswd' ];
 
   /**
   * Whole values that are what a sample or a template says where a secret goes, compared
@@ -68,8 +96,19 @@ final class GMCP_Credential_Scan {
   * schema or a doc page writes. Short on purpose: every entry is a value that is then NOT
   * recorded as a credential, so each has to be something no one chooses as a secret.
   * The shapes in is_placeholder() are the other half of the list.
+  *
+  * NOT here, on purpose: "password", "secret", "token" and "changeme". They are what a template
+  * writes, and they are also the default password of a real product (elastic:changeme, a shipped
+  * JWT_SECRET='secret'), so a list that excused them hid exactly the credential that is most often
+  * left in place. A word that is the value of a secret-named key is flagged; "change_me" and
+  * "CHANGE-ME", which only a template contains, are the exception.
   */
-  const PLACEHOLDER_VALUES = [ 'password_here', 'put your unique phrase here', 'string', 'example' ];
+  const PLACEHOLDER_VALUES = [
+    'password_here', 'put your unique phrase here', 'string', 'example',
+    // What a schema, a form-field doc or an empty config writes where a secret would go.
+    'required', 'optional', 'none', 'null', 'nil', 'undefined', 'empty', 'hidden', 'redacted', 'n/a', 'tbd', 'todo',
+    'change_me', 'change-me',
+  ];
 
   /**
   * Names, lower case and spelled exactly, of keys that are published to every visitor: the
@@ -78,7 +117,7 @@ final class GMCP_Credential_Scan {
   */
   const PUBLIC_KEY_NAMES = [ 'sitekey', 'data-sitekey' ];
 
-  /** @var int[] name => strength, per request. Bounded: a text full of distinct names must not grow it. */
+  /** @var int[] name => code (0, 1, 2, or 3 and 4 for a strength-2 name with a stricter value test), per request. Bounded: a text full of distinct names must not grow it. */
   private static $strength_cache = [];
 
   /**
@@ -90,15 +129,35 @@ final class GMCP_Credential_Scan {
   * "DB_PASSWORD" is a password. camelCase is split first.
   */
   public static function name_strength( string $name ): int {
+    $code = self::name_code( $name );
+    return $code > 2 ? 2 : $code;
+  }
+
+  /**
+  * How strictly a value under a name is read: 0 for a value that must not be judged at all,
+  * and for a name of strength 2, KIND_NORMAL, KIND_SHAPED (an ambiguous "<word>_key": the value has
+  * to look like a credential, see AMBIGUOUS_KEY_QUALIFIERS) or KIND_ABBREVIATION (pw: a short plain
+  * word is not trusted as a password). The number is the kind for strength 2 and meaningless otherwise.
+  */
+  const KIND_NORMAL = 0;
+  const KIND_SHAPED = 1;
+  const KIND_ABBREVIATION = 2;
+
+  private static function name_kind( string $name ): int {
+    $code = self::name_code( $name );
+    return $code === 3 ? self::KIND_SHAPED : ( $code === 4 ? self::KIND_ABBREVIATION : self::KIND_NORMAL );
+  }
+
+  private static function name_code( string $name ): int {
     if ( isset( self::$strength_cache[ $name ] ) ) {
       return self::$strength_cache[ $name ];
     }
-    $strength = self::name_strength_uncached( $name );
+    $code = self::name_strength_uncached( $name );
     if ( count( self::$strength_cache ) >= 512 ) {
       self::$strength_cache = [];
     }
-    self::$strength_cache[ $name ] = $strength;
-    return $strength;
+    self::$strength_cache[ $name ] = $code;
+    return $code;
   }
 
   private static function name_strength_uncached( string $name ): int {
@@ -113,11 +172,30 @@ final class GMCP_Credential_Scan {
     }
     $last = end( $segments );
     $before = count( $segments ) > 1 ? $segments[ count( $segments ) - 2 ] : '';
+    // A session id is a secret that looks like one: thirty-odd characters of hex or base62. "session_id":
+    // "abcd" is a booking reference, so the value is held to the shape of a credential.
+    if ( in_array( $last, [ 'sessionid', 'phpsessid', 'jsessionid' ], true ) ) {
+      return 3;
+    }
     if ( in_array( $last, self::STRONG_LAST, true ) ) {
+      return in_array( $last, self::ABBREVIATION_LAST, true ) ? 4 : 2;
+    }
+    // wordpress_logged_in_<hash> and wordpress_sec_<hash>: the cookies that are a login.
+    if ( preg_match( '/^wordpress_(?:logged_in|sec)_[0-9a-f]{8,}$/i', $name ) ) {
+      return 2;
+    }
+    if ( in_array( $before . ',' . $last, self::SECRET_ENDINGS, true ) ) {
+      return $before === 'session' ? 3 : 2;
+    }
+    // secret_key_base: the qualifier is the word before "key".
+    if ( $last === 'base' && $before === 'key' && count( $segments ) > 2 && in_array( $segments[ count( $segments ) - 3 ], self::KEY_QUALIFIERS, true ) ) {
       return 2;
     }
     if ( $last === 'key' && in_array( $before, self::KEY_QUALIFIERS, true ) ) {
       return 2;
+    }
+    if ( $last === 'key' && in_array( $before, self::AMBIGUOUS_KEY_QUALIFIERS, true ) ) {
+      return ( count( $segments ) > 2 && in_array( $segments[ count( $segments ) - 3 ], self::KEY_VENDORS, true ) ) ? 2 : 3;
     }
     if ( class_exists( 'GMCP_Core' ) && GMCP_Core::field_looks_secret( $name ) ) {
       return 1;
@@ -129,10 +207,11 @@ final class GMCP_Credential_Scan {
   * Whether a value is what a template writes where a secret goes, rather than a secret.
   *
   *  - one of PLACEHOLDER_VALUES;
-  *  - "your_password", "YOUR_TOKEN_HERE", "your-api-key-here", "api_key_here": words, with no
-  *    digit, that begin "your" or end "here" (a real secret that happens to start with "your_"
-  *    carries digits, and is still flagged);
-  *  - a run of three or more "*" or "x" ("********", "xxxxxxxx");
+  *  - "your_password", "YOUR_TOKEN_HERE", "your-api-key-here", "api_key_here", "YourPassword": words,
+  *    with no digit, that begin "your" or end "here" (a real secret that happens to start with
+  *    "your_" carries digits, and is still flagged);
+  *  - a run of three or more "*", "x" or bullet characters ("********", "xxxxxxxx", what a password
+  *    field shows);
   *  - "<token>", "{{ token }}", "${DB_PASS}", "$DB_PASS": a template or an environment variable,
   *    which is written in capitals, digits and underscores. "$uperS3cret99" is a password that
   *    starts with a dollar sign and is not a placeholder (it was one, when any "$name" counted).
@@ -148,13 +227,17 @@ final class GMCP_Credential_Scan {
     if ( in_array( strtolower( $value ), self::PLACEHOLDER_VALUES, true ) ) {
       return true;
     }
-    if ( preg_match( '/^(?:\*{3,}|[xX]{3,})$/', $value ) ) {
+    if ( preg_match( '/^(?:\*{3,}|[xX]{3,})$/', $value ) || preg_match( '/^(?:\x{2022}|\x{25CF}|\x{00B7}){3,}$/u', $value ) ) {
       return true;
     }
     if ( preg_match( '/^(?:<[^<>\s]{1,60}>|\{\{[^{}]{1,60}\}\}|\$\{[A-Z_][A-Z0-9_]{0,60}\}|\$[A-Z_][A-Z0-9_]{0,60})$/', $value ) ) {
       return true;
     }
     if ( preg_match( '/^[A-Za-z_ -]{1,80}$/', $value ) && preg_match( '/^your[ _-]|[ _-]here$/i', $value ) ) {
+      return true;
+    }
+    // "YourPassword", "YourApiKey": the same words run together in capitals.
+    if ( preg_match( '/^Your(?:[A-Z][a-z]{1,15}){1,5}$/', $value ) ) {
       return true;
     }
     return false;
@@ -169,25 +252,92 @@ final class GMCP_Credential_Scan {
   * joined by hyphens or slashes is not a secret there. A password is never given that benefit:
   * a passphrase is often exactly such words.
   */
-  private static function value_fits( int $strength, string $value, bool $quoted, bool $soft = false ): bool {
+  private static function value_fits( int $strength, string $value, bool $quoted, bool $soft = false, int $kind = self::KIND_NORMAL ): bool {
+    // "Bearer " and "Basic " in 'Bearer ' . $token end in a space: a scheme with its value to come. The
+    // same word with nothing after it is a value ("token" is a default password).
+    $scheme_prefix = (bool) preg_match( '/^(?:Bearer|Basic|Token|Digest)\s+$/i', $value );
     $value = trim( $value );
-    if ( $value === '' || strtolower( $value ) === '[redacted]' || self::is_placeholder( $value ) || self::is_public_value( $value ) ) {
+    if ( $value === '' || strtolower( $value ) === '[redacted]' || self::is_placeholder( $value ) || self::is_public_value( $value ) || self::is_path_value( $value ) ) {
+      return false;
+    }
+    // The scheme of an Authorization header written as code ('Bearer ' . $token), and a read from the
+    // environment or a variable (process.env.API_KEY, $this->secret, ENV['TOKEN']): where the secret
+    // is fetched from, not the secret. Only a value written as code can be one: a string literal is
+    // data, however much it begins like a lookup ("this.is.my.password1", 'Self.Made#2024').
+    if ( $scheme_prefix || preg_match( '/^(?:Bearer|Basic|Digest)$/i', $value ) || ( !$quoted && self::is_code_reference( $value ) ) ) {
       return false;
     }
     $len = strlen( $value );
     $token = (bool) preg_match( '/^[A-Za-z0-9_\-.\/+=:@$!#%^*~]+$/', $value );
     $digit = (bool) preg_match( '/\d/', $value );
     $alpha = (bool) preg_match( '/[A-Za-z]/', $value );
+    // A name that is a secret only some of the time (STORAGE_KEY, primary_key): the value has to be
+    // the shape of a credential, which a file name, a column or a word is not.
+    if ( $kind === self::KIND_SHAPED ) {
+      return $token && $len >= 16 && $digit && $alpha;
+    }
     if ( $strength === 2 ) {
       // Quoted: an assignment of anything non-trivial. Unquoted ("DB_PASSWORD=...", a query
       // string) needs the shape of a token too, or "password=required" in prose would count.
       if ( $quoted ) {
+        // "pw": "full" is a width, not a password: an abbreviation is trusted for six characters, a
+        // digit or a symbol.
+        if ( $kind === self::KIND_ABBREVIATION && $len < 6 && !$digit && preg_match( '/^[A-Za-z]+$/', $value ) ) {
+          return false;
+        }
         return $len >= 4;
       }
-      return $token && $len >= 6 && ( $digit || $len >= 16 ) && !( $soft && self::prose_like( $value ) );
+      // A variable read, not a value: lowercase words joined by underscores or dots, no digit
+      // (password = encryption_algorithm.password, token = request.access_token, url_user_password).
+      // Unquoted only: a quoted "correct.horse.battery.staple" is a value. The cost is a passphrase
+      // written exactly like that after an unquoted password name.
+      if ( !$digit && preg_match( '/^_*+[a-z]++(?:[._]++[a-z]++)++$/', $value ) ) {
+        return false;
+      }
+      // A password name only: no digit, and still a secret when it is mixed the way a generator mixes
+      // it: letters with a capital inside the word (ten characters or more), or eight characters or
+      // more with a symbol inside it (not the "**" of markdown emphasis around a word). No sentence is written either way. Passwords are
+      // very often exactly this ("Txmyfk%WbZBu"), and a digit is not a rule that generators follow.
+      $core = trim( $value, '!@#$%^&*~' );
+      // Capitalised words run together ("JavaScript", "YourPassword") are a name or a phrase, and a generator
+      // does not produce a run of three-letter-plus lowercase words.
+      $mixed = !$soft && $alpha && ( ( strlen( $core ) >= 10 && (bool) preg_match( '/^[A-Za-z]++$/', $core ) && (bool) preg_match( '/[a-z][A-Z]/', $core ) && !preg_match( '/^(?:[A-Z]?[a-z]{3,}+){2,}+$/', $core ) )
+        || ( $len >= 8 && (bool) preg_match( '/[!@#$%^&*~]/', $core ) ) );
+      return $token && $len >= 6 && ( $digit || $len >= 16 || $mixed ) && !( $soft && self::prose_like( $value ) );
     }
     // A weak name (author, keywords) holds a credential only when the value looks like one.
     return $token && $len >= 16 && $digit && $alpha;
+  }
+
+  /**
+  * Whether a value reads a secret from somewhere rather than being one: an environment lookup,
+  * a request variable, a property of an object, a constant, a function call. The roots are the
+  * ones code actually uses; a passphrase of dotted words ("correct.horse.battery.staple") is not
+  * one of them, which is why this is a list of roots and not "looks like an identifier".
+  */
+  private static function is_code_reference( string $value ): bool {
+    if ( !preg_match( '/^\$?+(?:process\.env|import\.meta\.env|os\.environ|os\.getenv|ENV|env|secrets|vars|config|settings|options|this|self|static|parent|_(?:GET|POST|REQUEST|SERVER|ENV|COOKIE)|getenv|get_option|get_site_option|constant|sanitize_\w++|wp_unslash|esc_\w++)(?=\.|->|::|\[|\()/i', $value, $root ) ) {
+      return false;
+    }
+    // The whole value, not its beginning: what follows the root is a chain of names and nothing else.
+    // A name is a lower-case word, a capitalised one, camelCase, or CAPITALS with digits (API_KEY);
+    // anything else, a digit inside a mixed word, a symbol, is a payload that a lookup does not have
+    // ("this.Kx92mQ!", "Env[prod]9xQ", "options.Tr4der99xx").
+    $rest = substr( $value, strlen( $root[0] ) );
+    foreach ( preg_split( '/(?:->|::|[.\[\]()$])+/', $rest, -1, PREG_SPLIT_NO_EMPTY ) ?: [] as $piece ) {
+      if ( !preg_match( '/^(?:[a-z_]++|[A-Z][a-z]++|[a-z]++(?:[A-Z][a-z]*+)++|[A-Z_][A-Z0-9_]*+)$/', $piece ) ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+  * A file path, which a setting holds (ssh_key: "~/.ssh/id_ed25519.pub", PWD=/var/www/html) and a
+  * secret does not begin like: home-relative, dot-relative, or under a directory a system has.
+  */
+  private static function is_path_value( string $value ): bool {
+    return (bool) preg_match( '#^(?:~/|\.{1,2}/|/(?:etc|var|home|usr|opt|tmp|root|srv|mnt|run|bin|sbin|lib|app|data|www|Users)/)[A-Za-z0-9_.\-/~]*+$#', $value );
   }
 
   /**
@@ -336,31 +486,68 @@ final class GMCP_Credential_Scan {
   * regular expression cannot make. @see BEARER_BASIC
   */
   const FIXED = '/-----BEGIN [A-Z ]{0,20}PRIVATE KEY-----'
-    . '|(?i:\bAuthorization\s*+[:=]\s*+["\']?+(?:Basic|Bearer|Token|Digest)\s++)\K[A-Za-z0-9._~+\/=-]{8,}'
+    . '|(?i:\bAuthorization\s*+[:=]\s*+["\']?+(?:Basic|Bearer|Token|Digest|OAuth|ApiKey|Api-Key|Hawk|NTLM|Negotiate|Bot|Key|JWT)\s++)\K[A-Za-z0-9._~+\/=-]{8,}'
     . '|\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}'
     . '|\bsk-[A-Za-z0-9_-]{20,}'
     . '|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}'
     . '|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b'
-    . '|\bxox[abprs]-[A-Za-z0-9-]{10,}'
+    . '|\bxox[abprse]-[A-Za-z0-9-]{10,}'
     . '|\bAIza[0-9A-Za-z_-]{30,}'
     . '|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*'
-    . '|\bgmcp_[A-Za-z0-9]{4,}_[A-Za-z0-9]{16,}/';
+    . '|\bgmcp_[A-Za-z0-9]{4,}_[A-Za-z0-9]{16,}'
+    // Other vendors whose keys carry a prefix of their own. Each is a prefix plus a body of the length
+    // the vendor issues, so a word that merely starts the same way is not one.
+    . '|\bwhsec_[A-Za-z0-9]{24,}|\bnpm_[A-Za-z0-9]{30,}|\bglpat-[A-Za-z0-9_-]{20,}'
+    . '|\bsh(?:pat|pss|pca|ppa)_[a-f0-9]{32}\b|\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}'
+    . '|\bdop_v1_[a-f0-9]{64}\b|\bhf_[A-Za-z0-9]{30,}|\bkey-[0-9a-f]{32}\b'
+    . '|\bya29\.[A-Za-z0-9_-]{30,}|\bsq0(?:atp|csp)-[A-Za-z0-9_-]{22,}|\bpypi-AgEI[A-Za-z0-9_-]{50,}'
+    . '|\brubygems_[a-f0-9]{48}\b|\b[0-9]{8,10}:AA[A-Za-z0-9_-]{33}\b'
+    // A webhook URL is a bearer credential whose secret is its last path segment.
+    . '|\bhooks\.slack\.com\/services\/T[A-Z0-9]{6,}\/B[A-Z0-9]{6,}\/\K[A-Za-z0-9]{16,}'
+    . '|\bdiscord(?:app)?\.com\/api\/webhooks\/[0-9]{15,}\/\K[A-Za-z0-9_-]{50,}/';
 
   /** "Bearer x" and "Basic x": the label is group 1, the token group 2. @see bearer_basic_fits() */
   const BEARER_BASIC = '/(?i:\b(Bearer|Basic)\s++)\K([A-Za-z0-9._~+\/=-]{8,})/';
 
   /** user:password@ in a URL; the match is the user and the password, as two groups. */
-  const USERINFO = '/(?<![A-Za-z0-9+.\-])[a-z][a-z0-9+.\-]*+:\/\/\K([^\/\s:@<>"\']++):([^\/\s@<>"\']++)(?=@)/i';
+  const USERINFO = '/(?<![A-Za-z0-9+.\-])[a-z][a-z0-9+.\-]*+:\/\/\K([^\/\s:@<>"\']*+):([^\/\s@<>"\']++)(?=@)/i';
 
   /** User names and passwords a documentation page puts in a URL; such a pair is not a credential. */
   const SAMPLE_URL_USERS = [ 'user', 'username', 'login', 'name' ];
   const SAMPLE_URL_PASSWORDS = [ 'pass', 'password', 'passwd', 'pwd', 'secret' ];
 
+  /**
+  * curl -u user:password, --user user:password, --proxy-user, -U: the pair is the credential. The
+  * short form may be written with the value attached (-uadmin:secret). The password may be empty or a
+  * single character, because a token in the user slot is followed by ":" and nothing (curl -u KEY:).
+  */
+  const CLI_USER = '/(?<![A-Za-z0-9_\-])(?:-[uU](?:[ \t]*+|=)|(?:--user|--proxy-user)(?:[ \t]++|=))["\']?+([^\s:"\'$<>]{1,64}):([^\s"\']{0,256})/';
+
+  /** Programs whose -u / --user takes a user and a group, not a user and a password. */
+  const USER_GROUP_COMMANDS = '/\b(?:docker|podman|nerdctl|chown|chgrp|useradd|usermod|adduser|runuser|setpriv|sudo|su|kubectl|install)\b/i';
+
+  /** Programs whose -u / --user takes a user and a password. */
+  const PASSWORD_COMMANDS = '/\b(?:curl|wget|http|https|httpie|xh|lftp|ftp|aria2c|wp-cli|cadaver|svn|ab)\b/i';
+
+  /**
+  * An <input> tag, whose name and value are two attributes and so no assignment for the rules below.
+  * A quoted attribute value may hold ">" (a password is any character), and may not hold "<", which is
+  * what keeps the search inside one tag: no attempt reads past the next "<", so the cost is that of
+  * one pass over the text however many tags are opened and however long a tag is.
+  */
+  const INPUT_TAG = '/<input\b(?:[^<>"\']++|"[^"<]*+"|\'[^\'<]*+\')*+>/i';
+
+  /** One attribute of a tag, quoted: group 1 its name, 2 or 3 its value. */
+  const TAG_ATTRIBUTE = '/(?<![A-Za-z0-9_\-])(name|type|value)[ \t\r\n]*+=[ \t\r\n]*+(?:"([^"]*+)"|\'([^\']*+)\')/i';
+
+  /** Input types that carry a label or a flag in "value", not what was typed. */
+  const LABEL_INPUT_TYPES = [ 'submit', 'button', 'reset', 'image', 'checkbox', 'radio', 'file' ];
+
   /** A name, a separator and a quoted value; a backslash and the character after it count as one in the value. */
   const QUOTED_ASSIGNMENT = '/(?<![A-Za-z0-9_.\-])\$?["\']?+([A-Za-z0-9_.\-]++)["\']?+\]?+[ \t]*+(?:=>|:|=)[ \t]*+(["\'])((?:\\\\.|(?!\2)[^\r\n\\\\]){1,512}+)\2/';
 
-  /** define( 'NAME', 'value' ), the value allowed to hold escaped quotes. */
-  const DEFINE_CALL = '/\bdefine\s*+\(\s*+(["\'])([A-Za-z0-9_]{1,64})\1\s*+,\s*+(["\'])((?:\\\\.|(?!\3)[^\r\n\\\\]){1,512}+)\3/i';
+  /** define( 'NAME', 'value' ) and the option and storage setters that take a name and a value, the value allowed to hold escaped quotes. */
+  const DEFINE_CALL = '/\b(?:define|update_option|add_option|update_site_option|add_site_option|set_theme_mod|set_transient|set_site_transient|setItem)\s*+\(\s*+(["\'])([A-Za-z0-9_.\-]{1,64})\1\s*+,\s*+(["\'])((?:\\\\.|(?!\3)[^\r\n\\\\]){1,512}+)\3/i';
 
   /**
   * name => "value", "name": "value", name = 'value', $name = "value", $cfg['name'] = 'value' and
@@ -380,7 +567,7 @@ final class GMCP_Credential_Scan {
       }
       foreach ( $m as $one ) {
         $strength = self::name_strength( $one[ $name_group ][0] );
-        if ( $strength > 0 && self::value_fits( $strength, $one[ $value_group ][0], true ) ) {
+        if ( $strength > 0 && self::value_fits( $strength, $one[ $value_group ][0], true, false, self::name_kind( $one[ $name_group ][0] ) ) ) {
           $from = self::original_offset( $one[ $value_group ][1], $map );
           $to = self::original_offset( $one[ $value_group ][1] + strlen( $one[ $value_group ][0] ), $map );
           $spans[] = [ $from, max( 0, $to - $from ) ];
@@ -466,7 +653,114 @@ final class GMCP_Credential_Scan {
       if ( in_array( strtolower( $one[1][0] ), self::SAMPLE_URL_USERS, true ) && in_array( strtolower( $one[2][0] ), self::SAMPLE_URL_PASSWORDS, true ) ) {
         continue;
       }
+      // "cvs://:pserver:anoncvs@host": a root with no user, whose "password" is more fields (a
+      // repository access method and a user). A password after an empty user is the password, colons
+      // and all (redis://:secret@host, redis://:Kx92:mQ7zp@host).
+      if ( $one[1][0] === '' && preg_match( '/^(?:pserver|ext|local|gserver|kserver|server|fork|sspi):/i', $one[2][0] ) ) {
+        continue;
+      }
       $add( $one[1][1], strlen( $one[1][0] ) + 1 + strlen( $one[2][0] ) );
+      if ( $first ) {
+        return $spans;
+      }
+    }
+
+    $n = preg_match_all( self::CLI_USER, $plain, $m, PREG_OFFSET_CAPTURE | PREG_SET_ORDER );
+    if ( $n === false ) {
+      return null;
+    }
+    foreach ( $m as $one ) {
+      $user = $one[1][0];
+      $pass = $one[2][0];
+      // What the command is decides what the pair is. The words before the option, back to the start
+      // of its command (";", "|", "&&" or a new line), are a bounded window: a user:group tool
+      // (docker run -u 1000:docker1, chown, sudo -u www-data:www-data) takes a group where curl takes a
+      // password, and curl, wget and the HTTP clients take a password whatever its shape.
+      $before = substr( $plain, max( 0, $one[0][1] - 160 ), min( 160, $one[0][1] ) );
+      $cut = preg_match_all( '/[;|&\r\n`]/', $before, $seps, PREG_OFFSET_CAPTURE ) ? end( $seps[0] )[1] + 1 : 0;
+      $before = substr( $before, $cut );
+      $client = (bool) preg_match( self::PASSWORD_COMMANDS, $before );
+      if ( !$client && preg_match( self::USER_GROUP_COMMANDS, $before ) ) {
+        continue;
+      }
+      // An attached short form (-uadmin:secret) is only taken from a command that is an HTTP or FTP
+      // client; elsewhere "-until:3x" is a word.
+      if ( !$client && preg_match( '/^-[uU][^ \t=]/', $one[0][0] ) ) {
+        continue;
+      }
+      // A key in the user slot: curl -u KEY:X (Freshdesk) and curl -u KEY: (Stripe) authenticate with
+      // the key as the user name. Sixteen characters or more of one token with a digit, that are not
+      // hyphenated words, are not a person's name.
+      if ( strlen( $user ) >= 16 && preg_match( '/^[A-Za-z0-9_\-.]++$/', $user ) && preg_match( '/\d/', $user ) && preg_match( '/[A-Za-z]/', $user ) && !self::prose_like( $user ) ) {
+        $add( $one[1][1], strlen( $user ) );
+        if ( $first ) {
+          return $spans;
+        }
+      }
+      if ( strlen( $pass ) < 3 ) {
+        continue;
+      }
+      // -u 1000:1000 and --user www-data:www-data are a user and a group (docker, useradd, chown).
+      // Outside a command that is known to take a password, a password has a digit, a symbol or length,
+      // and is not the user's own name.
+      if ( $pass === $user || ( !$client && ( ( ctype_digit( $user ) && ctype_digit( $pass ) )
+        || !preg_match( '/\d|[^A-Za-z]|^.{10,}$/', $pass ) ) ) ) {
+        continue;
+      }
+      if ( ( in_array( strtolower( $user ), self::SAMPLE_URL_USERS, true ) && in_array( strtolower( $pass ), self::SAMPLE_URL_PASSWORDS, true ) )
+        || preg_match( '/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/', $pass ) || !self::value_fits( 2, $pass, true ) ) {
+        continue;
+      }
+      $add( $one[2][1], strlen( $pass ) );
+      if ( $first ) {
+        return $spans;
+      }
+    }
+
+    // <input name="api_key" value="...">: the value is the secret and the name is another attribute,
+    // in either order. A button or a checkbox puts a label or a flag in "value", and a value with a
+    // space in it is a label too.
+    $n = preg_match_all( self::INPUT_TAG, $plain, $tags, PREG_OFFSET_CAPTURE );
+    if ( $n === false ) {
+      return null;
+    }
+    foreach ( $tags[0] as [ $tag, $tag_at ] ) {
+      $got = preg_match_all( self::TAG_ATTRIBUTE, $tag, $attrs, PREG_SET_ORDER | PREG_OFFSET_CAPTURE );
+      if ( $got === false ) {
+        return null;
+      }
+      $name = $type = null;
+      $value = null;
+      foreach ( $attrs as $attr ) {
+        $key = strtolower( $attr[1][0] );
+        $text = isset( $attr[3] ) && $attr[3][1] >= 0 ? $attr[3] : $attr[2];
+        if ( $key === 'name' && $name === null ) {
+          $name = $text[0];
+        }
+        elseif ( $key === 'type' && $type === null ) {
+          $type = strtolower( $text[0] );
+        }
+        elseif ( $key === 'value' && $value === null ) {
+          $value = $text;
+        }
+      }
+      if ( $name === null || $value === null || self::name_strength( $name ) !== 2 ) {
+        continue;
+      }
+      // A button, a checkbox or an image puts a label or a flag in "value", so there it has to be the
+      // shape of a credential (ten characters or more of one token with a digit and a letter, which
+      // "Regenerate-key" and "remember" are not). A text field's value with a space in it is a label
+      // ("Not set"); a PASSWORD field's is what was typed, and a passphrase has spaces.
+      if ( in_array( $type, self::LABEL_INPUT_TYPES, true ) ) {
+        if ( !preg_match( '/^[A-Za-z0-9_\-.\/+=]{10,}$/', $value[0] ) || !preg_match( '/\d/', $value[0] ) || !preg_match( '/[A-Za-z]/', $value[0] )
+          || self::prose_like( $value[0] ) || !self::value_fits( 2, $value[0], true, false, self::name_kind( $name ) ) ) {
+          continue;
+        }
+      }
+      elseif ( ( $type !== 'password' && preg_match( '/\s/', $value[0] ) ) || !self::value_fits( 2, $value[0], true, false, self::name_kind( $name ) ) ) {
+        continue;
+      }
+      $add( $tag_at + $value[1], strlen( $value[0] ) );
       if ( $first ) {
         return $spans;
       }
@@ -503,42 +797,69 @@ final class GMCP_Credential_Scan {
     //
     // The name and separator are matched on their own and the value is read only for a secret name,
     // so a value is never consumed on behalf of a name that is not one: "redirect:https://x?token=..."
-    // must still show the token, and "https://x" is not "https" assigned "//x". The value is read at
-    // most once per byte (a name that starts inside an earlier credential's span is skipped) and up
-    // to 512 bytes at a time, which keeps a text of "password=password=password=..." linear. The
-    // name run is read from its beginning only (the lookbehind), possessively, so a long run of
-    // name characters is not read again from each position in it.
-    $n = preg_match_all(
-      '/(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]++)["\']?+\]?+[ \t]*+(?:=|:(?![\/:]))[ \t]*+/',
-      $plain, $m, PREG_SET_ORDER | PREG_OFFSET_CAPTURE
-    );
-    if ( $n === false ) {
-      return null;
-    }
+    // must still show the token, and "https://x" is not "https" assigned "//x". The name run is read
+    // from its beginning only (the lookbehind), possessively, so a long run of name characters is not
+    // read again from each position in it.
+    //
+    // The cost is linear in the text, and the argument is the reason this loop looks as it does. Names
+    // are found one at a time from where the last one ended, so the matches are not all held at once. A
+    // value is read ONCE, in one call, and at most 512 bytes of it (a longer one is judged by its first
+    // 512 and, when it is a credential, covered to its end in a second call that is paid for only
+    // once, because everything it covered is then skipped). The earlier version read to the end of a
+    // run in chunks, and a run that holds many names ("password=|password=|...") was read to its end
+    // again from each: 13 s at 256 KB. What is left is a name whose value contains further names, each
+    // reading its own 512 bytes, and for that there is a budget: the bytes read for values may not
+    // exceed four times the text (plus a floor), and a text that spends more is answered as a
+    // credential (null), never as clean. Real text reads each byte about once.
+    $at = 0;
     $covered = 0;
-    foreach ( $m as $one ) {
-      $value_at = $one[0][1] + strlen( $one[0][0] );
-      if ( $one[0][1] < $covered || self::name_strength( $one[1][0] ) !== 2 || preg_match( '/^[._\-]*+pass[._\-]*+$/i', $one[1][0] ) ) {
+    $budget = 4 * strlen( $plain ) + 2048;
+    $name_re = '/(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]++)["\']?+\]?+[ \t]*+(?:=|:(?![\/:]))[ \t]*+/';
+    while ( true ) {
+      $got = preg_match( $name_re, $plain, $one, PREG_OFFSET_CAPTURE, $at );
+      if ( $got === false ) {
+        return null;
+      }
+      if ( !$got ) {
+        break;
+      }
+      $at = $one[0][1] + strlen( $one[0][0] );
+      $value_at = $at;
+      $bare_pass = (bool) preg_match( '/^[._\-]*+pass[._\-]*+$/i', $one[1][0] );
+      // A bare "pass" is a password in "pass=hunter67" (a query string, a log line) and a word in
+      // "Day pass: 10am-6pm", so it counts only with "=", and only as a soft name (below).
+      if ( $one[0][1] < $covered || self::name_strength( $one[1][0] ) !== 2 || ( $bare_pass && strpos( $one[0][0], '=' ) === false ) ) {
         continue;
       }
-      $value = '';
-      for ( $from = $value_at; ; $from += 512 ) {
-        $got = preg_match( '/\G[^\s<>"\'&;,)]{1,512}/', $plain, $v, 0, $from );
-        if ( $got === false ) {
-          return null;
-        }
-        if ( !$got ) {
-          break;
-        }
-        $value .= $v[0];
-        if ( strlen( $v[0] ) < 512 ) {
-          break;
-        }
+      $got = preg_match( '/\G[^\s<>"\'&;,)]{1,512}/', $plain, $v, 0, $value_at );
+      if ( $got === false ) {
+        return null;
       }
-      $soft = !preg_match( '/(?:password|passwd|passphrase|pwd)[._\-]*+$/i', $one[1][0] );
-      if ( strlen( $value ) >= 6 && self::value_fits( 2, $value, false, $soft ) ) {
-        $add( $value_at, strlen( $value ) );
-        $covered = $value_at + strlen( $value );
+      if ( !$got ) {
+        continue;
+      }
+      $value = $v[0];
+      $budget -= strlen( $value );
+      if ( $budget < 0 ) {
+        return null;
+      }
+      // Not soft: a name that ends in a password word, or in "pass" qualified with "_" or "." or a
+      // capital (db_pass, DB_PASS, smtpPass). A hyphen does not qualify: "Season-Pass: 2024-2025".
+      $soft = $bare_pass || !( preg_match( '/(?:password|passwd|passphrase|pwd|pw)[._\-]*+$/i', $one[1][0] )
+        || preg_match( '/[_.]pass[._\-]*+$/i', $one[1][0] ) || preg_match( '/[a-z]Pass[._\-]*+$/', $one[1][0] ) );
+      // pass=annual2025 in an address is a pass for a season, not a password: a bare "pass" needs a
+      // value that is more than a word and a year.
+      if ( $bare_pass && preg_match( '/^[A-Za-z]++-?+(?:19|20)\d\d$/', $value ) ) {
+        continue;
+      }
+      if ( strlen( $value ) >= 6 && self::value_fits( 2, $value, false, $soft, self::name_kind( $one[1][0] ) ) ) {
+        $len = strlen( $value );
+        if ( $len === 512 && preg_match( '/\G[^\s<>"\'&;,)]++/', $plain, $rest, 0, $value_at + 512 ) ) {
+          $len += strlen( $rest[0] );
+        }
+        $add( $value_at, $len );
+        $covered = $value_at + $len;
+        $at = max( $at, $covered );
         if ( $first ) {
           return $spans;
         }
@@ -620,6 +941,11 @@ final class GMCP_Credential_Scan {
   public static function spans( string $text ): array {
     $found = self::find( $text, false );
     return $found === null ? [ [ 0, strlen( $text ) ] ] : $found;
+  }
+
+  /** Where the credentials are, or null when the scan gave up. For a caller that has to tell "none" from "could not tell". */
+  public static function try_spans( string $text ): ?array {
+    return self::find( $text, false );
   }
 
   /**

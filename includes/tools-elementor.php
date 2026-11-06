@@ -1160,8 +1160,8 @@ class GMCP_Tools_Elementor {
   * scan uses. $type_col and $parent_col are the row's columns, qualified.
   * @see GMCP_Core::unreadable_post_clauses()
   */
-  private static function unreadable_clauses( string $type_col, string $parent_col ): array {
-    $c = GMCP_Core::unreadable_post_clauses( $type_col, $parent_col, 'gmcp_e' );
+  private static function unreadable_clauses( string $type_col, string $parent_col, string $id_col = '' ): array {
+    $c = GMCP_Core::unreadable_post_clauses( $type_col, $parent_col, 'gmcp_e', $id_col );
     return [ 'join' => $c['join'], 'where' => $c['where'] === '' ? '' : ' AND ' . $c['where'] ];
   }
 
@@ -1170,7 +1170,7 @@ class GMCP_Tools_Elementor {
     global $wpdb;
 
     $like = '%' . $wpdb->esc_like( '[' . self::TEMPLATE_SHORTCODE ) . '%';
-    $skip = self::unreadable_clauses( 'p.post_type', 'p.post_parent' );
+    $skip = self::unreadable_clauses( 'p.post_type', 'p.post_parent', 'p.ID' );
     $candidates = $wpdb->get_results( $wpdb->prepare(
       "SELECT p.ID, p.post_title, p.post_type, p.post_status, p.post_content FROM {$wpdb->posts} p" . $skip['join'] . "
         WHERE p.post_content LIKE %s AND p.post_type != 'revision' AND p.post_status != 'auto-draft'" . $skip['where'] . "
@@ -1256,7 +1256,7 @@ class GMCP_Tools_Elementor {
     // phpcs:disable WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- the
     // placeholder count is dynamic: 1 (meta_key) + count($likes) + 1 (LIMIT) = count($args).
     // The sniff cannot count the array_fill-generated placeholders in $where.
-    $skip = self::unreadable_clauses( 'p.post_type', 'p.post_parent' );
+    $skip = self::unreadable_clauses( 'p.post_type', 'p.post_parent', 'p.ID' );
     $candidates = $wpdb->get_results( $wpdb->prepare(
       "SELECT p.ID, p.post_title, p.post_type, p.post_status, m.meta_value
         FROM {$wpdb->postmeta} m INNER JOIN {$wpdb->posts} p ON p.ID = m.post_id" . $skip['join'] . "
@@ -1767,7 +1767,7 @@ class GMCP_Tools_Elementor {
     $like = '%' . $wpdb->esc_like( 'globals' ) . '%';
     $examined = 0;
     $offset = 0;
-    $skip = self::unreadable_clauses( 'p.post_type', 'p.post_parent' );
+    $skip = self::unreadable_clauses( 'p.post_type', 'p.post_parent', 'p.ID' );
     while ( $examined < self::SCAN_LIMIT ) {
       $batch = $wpdb->get_results( $wpdb->prepare(
         "SELECT p.ID, p.post_title, p.post_type, p.post_status, m.meta_value

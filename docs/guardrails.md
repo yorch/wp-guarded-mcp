@@ -562,6 +562,38 @@ shop owner should make deliberately rather than inherit.
   meta, because High-Performance Order Storage moves orders out of `wp_posts`
   entirely. A tool built on post queries works on a fresh install and returns
   nothing on most real shops.
+- **The generic post tools judge an order by its id, not only by the post row at it.** With
+  High-Performance Order Storage an order is a row in `wc_orders`, and `wp_posts` holds a
+  `shop_order_placehold` row at the same id (or, on a shop that enabled the storage before
+  WooCommerce reserved ids, nothing at all, or an ordinary page that took the id). Every commerce
+  guard used to ask the post row's type, so an order with no post row, or with a page at its id,
+  was judged by nothing. Measured on WooCommerce 11.2.2 with a write-level key: `wp_update_post_meta`
+  wrote a post-meta row against an order that had no post row; `wp_update_post`, `wp_alter_post`,
+  `wp_duplicate_post` and the meta writers changed the page that shared an order's id; and an
+  admin key's `wp_delete_post` (no `force`) trashed that page, which marked every note of the order
+  `post-trashed` so that WooCommerce showed it none (with `force` WooCommerce's own storage check
+  stopped the deletion, which is not something this plugin relies on). `GMCP_Core::hpos_order_type()`
+  asks `wc_orders` directly (so it holds with WooCommerce deactivated) and `post_chain_types()`,
+  `commerce_post_guard()` and the SQL that leaves unreadable rows out (`unreadable_post_clauses()`,
+  now given the column that holds each row's own id) all ask it: a post, a post-meta row or a
+  comment under such an id is held like an order's, writes at every level and reads below admin.
+  What it does not do: it knows WooCommerce's table and no other shop plugin's (another plugin's
+  order TYPES are added with `gmcp_commerce_post_types`, its tables are not read), and a
+  legitimate page that really shares an order's id cannot be edited with the generic tools (it can
+  in wp-admin) until the clash is resolved, which is the price of the rule.
+- **An order note is the order's own record.** Notes are comments of type `order_note` on the order's
+  id, in either storage. `wp_create_comment`, `wp_update_comment` and `wp_delete_comment` (and the
+  preview of the last) refuse a comment on an order's tree, an `order_note` whatever it hangs from,
+  and a write that would make a comment one, at every access level; `wc_add_order_note` is how a note
+  is added, and it goes through WooCommerce, so it is not held. Measured before this at write level,
+  in both storages and on the placeholder row too: `wp_update_comment` rewrote a note's text,
+  retyped it to an ordinary comment, and `wp_create_comment` put a comment on the order. Reading is
+  held the same way as the order: below admin `wp_get_comments` leaves out comments on an order's
+  tree and every `order_note` by type, in SQL, whether or not WooCommerce is there to hide that type
+  from comment queries (it does, with a filter of its own that a deactivated plugin takes with it).
+  The net under WordPress does not close an order's tree to a comment, because WooCommerce writes
+  its own notes while a tool call is in flight; a third-party plugin's comment write is not caught,
+  as with the other nets.
 - A new product is created as a draft unless you ask otherwise, so a product with
   no price is never briefly for sale.
 
@@ -1269,7 +1301,8 @@ re-read.
   `wp_set_featured_image`, `wp_add_post_terms`, the SEO, ACF, Yoast and Elementor writers and the
   journal's undo already ask) and, where no commerce question was ever asked, by `wp_update_media`,
   `wp_delete_media` and `wp_create_comment`, `wp_update_comment` and `wp_delete_comment`
-  (`comment_write_guard()`). `tree_move_guard()` refuses any write that changes `post_parent` of an
+  (`comment_write_guard()`, which for these three tools also closes an order's tree and the
+  `order_note` type, see the WooCommerce section). `tree_move_guard()` refuses any write that changes `post_parent` of an
   existing post when its current chain or the new parent's chain holds a submission type or a
   commerce type, and `comment_write_guard()` the same for `comment_post_ID`, so nothing is moved
   out of a guarded tree (it would become readable) or into one (it would be hidden). A new post
@@ -1365,11 +1398,14 @@ re-read.
   returned and, for `update_media`, retitled a file attached to a seeded submission. Now every
   tool that takes an `id` asks `post_read_guard()` first (below admin the id is dispatched as
   one that names nothing, so the answer is the controller's own answer for a missing id); a list
-  call runs with `posts_join` and `posts_where` filters that leave out the guarded types and posts
+  call runs with a join and a WHERE that leave out the guarded types and posts
   hanging from them to the same depth the guards walk (the row and seven parents,
   `GMCP_Core::unreadable_post_clauses()`, joins because seven nested subqueries overflow the
   SQLite driver's parser), so rows are removed where the query is built and not afterwards,
-  because `_fields` can leave the id out of the rows and a page filtered afterwards is short; a
+  because `_fields` can leave the id out of the rows and a page filtered afterwards is short; the
+  clauses are added last and wrap what other plugins built, and the rows are judged once more as
+  they come back (see "Another plugin's query filters" below, which is where the REST tools had a
+  hole); a
   write that moves a row into or out of a tree (`update_media` with `post`, `update_pages` with
   `parent`) is refused by the net under `wp_insert_post_data`; and a route whose post type is a
   guarded type (a plugin registering one with `show_in_rest` and a `rest_base` of `posts`,
@@ -1471,20 +1507,122 @@ re-read.
     all, and the offset is not part of that count (it used to extend it). So the work is bounded by
     the database's own cost of an offset (an index walk, not objects) plus at most 5000 rows judged,
     and a short page is possible only if more than 5000 consecutive rows the SQL let through are
-    ones the guard refuses, which the two should never disagree about. The listings run with
-    `suppress_filters` off, as the REST listings do, so other plugins' query filters (a language
-    filter, for instance) now apply to them. The briefing's latest-post probe and the resource
-    still use the PHP pass alone with the 5000 bound, and for a window of more than 5000 unreadable
-    rows at the head of a listing they can still answer short. Rows with identical dates may come
-    back in another order than before, because the join changes the plan and `post_date` is the
-    only sort key.
+    ones the guard refuses, which the two should never disagree about. The briefing's latest-post
+    probe and the resource still use the PHP pass alone with the 5000 bound, and for a window of
+    more than 5000 unreadable rows at the head of a listing they can still answer short. Rows with
+    identical dates may come back in another order than before, because the join changes the plan
+    and `post_date` is the only sort key.
+  - **Another plugin's query filters, and the guard** (`.dev/smoke-listing-filters.sh`, which installs
+    a test-only plugin that filters in benign and hostile ways and attacks with a read-only key).
+    The listings above and the REST list tools must run with query filters on, because that is how
+    the guard's SQL gets into the query, so every filter another plugin registered applies to them
+    too. What that does, measured:
+    - *The guard could be defeated, in the REST list tools, and that was a defect.* The clauses used
+      to be appended at `posts_where` and `posts_join`, so a filter that appended `OR 1=1`
+      (`a AND b OR 1=1 AND guard` is "the guard, or a AND b"), replaced the clause set at
+      `posts_clauses`, or ran after the guard at the highest priority, dropped them. `list_media`,
+      `list_posts` and `list_pages` then returned a file attached to a form submission and a page
+      hanging from one to a read-only key (eleven of the twenty filter shapes the suite uses leaked, and the
+      reply held ids and titles). `wp_get_posts`, `wp_get_media` and `wp_get_comments` did not leak under any of them,
+      because they judge each returned row, and a filter that answers a query itself or injects a
+      row (`posts_pre_query`, `posts_results`, `the_posts`) was held by that row check; the REST
+      tools had no such check.
+    - *Now:* the guard is added at `posts_clauses_request` (the last hook that sees the clauses as
+      parts) and `comments_clauses`, both at `PHP_INT_MAX`, and it stands FIRST in the WHERE, ahead of
+      the other plugin's text, which is wrapped, not extended, and made safe to wrap: its comments
+      are taken out (a `/*` or `-- ` at the end of its fragment would otherwise comment out the
+      parenthesis and the guard behind it, and on SQLite the `LIMIT` too: measured with a
+      `posts_where` that returned `$w . ' ) OR 1=1 /*'`), a `(` is put in front for each `)` it
+      closes without having opened, and a `)` behind for each `(` it never closed, so whatever it
+      wrote is one parenthesised expression that cannot reach the guard. Comments are also taken out
+      of the join, group, order and limit pieces, for the same reason (an `ORDER BY ... /*`
+      swallows the `LIMIT` and with it the offset). A fragment this cannot repair (a quote that
+      never closes) makes the statement fail, because the guard stands in front of it: it cannot
+      widen the query. The REST list tools also judge the finished rows, by id, **after** the
+      dispatch returns, in the tool's own code (`judge_post_rows()`): a callback another plugin
+      registers while the query runs (from `pre_get_posts`, at `PHP_INT_MAX`) runs at the same
+      priority as the `the_posts` row check inside the query, but later, and added rows behind it
+      (measured: `list_media`, `list_posts` and `list_pages` returned a file attached to a form
+      submission, an order's file and a post that shares an order's id to a read-only key), and
+      nothing registered during the dispatch can run behind code that runs after it. The tool asks
+      the controller for `id` when the caller's `_fields` leaves it out, and takes it out of the
+      reply again, so the rows can be judged by something that is not shaped away; a row with no
+      `id` is not a row the controller made and is dropped; the route must be a post type's
+      (users, terms and comments have ids that are not post ids and are not judged). Every query
+      inside a listing runs with filters on whatever `pre_get_posts` asks for, because a plugin
+      that sets `suppress_filters` there took the guard's SQL and the row check with it (measured,
+      another leak). Each of those is asserted under twenty-nine filter shapes, with a control that the
+      filter ran and, where it widens the query, a control that the widening was visible.
+    - *What a filter can still do, detected and not prevented:* rewrite the finished SQL
+      (`posts_request`), or answer without asking the database (`posts_pre_query`,
+      `comments_pre_query`: a search plugin that serves queries from its own index does this),
+      and do it from a callback it registered while the query ran, which at the same priority
+      runs behind every check the guard installed before the query. So the decision is not made
+      by a hook: when the run is over, each `WP_Query` and `WP_Comment_Query` it made is asked,
+      from its own finished `request`, whether the guard's WHERE and JOIN are in it **as the
+      server reads it** (a guard inside a comment is not found, and a comment anywhere in
+      WordPress-built SQL is not trusted), and whether that exact statement is among the SELECTs
+      the database was actually given (recorded at the `query` filter). A statement that was built
+      and never sent is a query that was answered some other way, or served from the object cache.
+      Either way the guard's hold is reported lost ("in doubt") and a listing that pages then does
+      it in PHP (offset 0, the rows before the offset counted as they are read, inside the
+      5000-row bound), because the database's offset may have counted rows the guard would have
+      left out: measured, a hidden file between two others moved every later page by one
+      (`1, 2, 2, 3` for `1, 2, 3`), and a late filter that stripped the guard from the finished
+      SQL or answered from its own index did the same while the earlier check reported the guard
+      held. The price is that an offset past 5000 rows then gives a short or empty page, and only
+      then; and on a site with a persistent object cache a listing that is served from the cache
+      is in doubt by this rule, so it pages in PHP too (the cached windows make that cheap, and the
+      bound is the same). The REST tools do the same when the controller's own query is in doubt:
+      the page is built again in windows of 100 rows from offset 0 with the caller's offset passed
+      over row by row (`page_in_php()`), inside the same bound, so a hidden row no longer
+      shortens a page or shifts the ones after it, and a page the controller would have called out
+      of range (it counted pages from rows another plugin supplied) is answered. The rows
+      themselves are held in every case by the row check: the listings ask the guard of every row,
+      and the REST tools judge the finished response. What the finished-state check does **not**
+      see: a filter on `query` (the string handed to the database) that rewrites the statement
+      and runs AFTER the guard's recording of it (one registered at the highest priority from inside
+      the run, behind the guard's own); one that runs before it is seen, because the recorded text
+      then differs from the query's `request`. Its rows are still held by the row check, but the offset
+      may then be wrong, and nothing here claims otherwise.
+      A statement the database was given and answered with rows that a later `posts_results` or
+      `the_posts` filter changed is not a paging problem and is left to the row check.
+    - *Results are cached per guard.* `WP_Comment_Query` keys its cache on its arguments and not on
+      the SQL the filters made of them, so one cache domain for every access level served an
+      admin's page (with the order notes in it) to a read-only key, and a read-only key's page to an
+      admin, who then missed the rows it had left out (measured with an in-process object cache
+      standing in for a persistent one: the read-only page shifted by the admin's hidden rows, and
+      the admin's page lacked two comments). The listings now cache under a domain made of the
+      caller's level and a hash of the guard's SQL (`listing_scope()`), and the post listings put
+      the same value in their query arguments, which `WP_Query` includes in its key (it also keys
+      on the finished SQL, which differs by level, so that one was not shared, but did not rely on
+      it staying so).
+    - *Completeness is not the guard's to keep, and is documented rather than fixed.* A listing
+      shows what the site's own query layer returns, so a filter another plugin applies to every
+      query (a language filter, a membership plugin's or a "hide from admin" plugin's `posts_where`)
+      removes rows from these listings that `wp_get_post` still returns by id, and `pre_get_posts`
+      can change what a query is about. Measured: a `posts_where` hiding one post removes it from
+      `wp_get_posts` and the REST lists while `wp_get_post` reads it; a `posts_clauses` that joins
+      a meta table and requires a row in it lists only the posts that have one. A plugin that scopes
+      its filter to the main query or to the front end does not touch them. Stripping other plugins'
+      filters for the length of a call was considered and not done: it would rewrite global hook
+      state in the middle of a request and would show posts a site's visibility plugin hides from
+      every other query layer. An agent that cannot find a post it expects should read it by id
+      before concluding it does not exist, and none of the listings returns a total, so there is no
+      total for a filter to make wrong.
+    - *Totals.* The one total these tools compute from a query is `wp_count_media` with a date bound
+      (`after`/`before`), which counted with the query filters on and so followed another plugin's
+      (measured: 4 files counted as 258 under `OR 1=1`, 3 and 0 under two benign filters). It now
+      counts with them off, as WordPress's own undated count does. Counts are still not read-guarded
+      (see "What the guards do not cover"), so that figure includes a submission's upload.
   - A taxonomy shared between a submission type and an ordinary type is listed by
     `wp_get_terms`, and the same applies to its terms on an ordinary post.
   - Every route to the database that is not a post reader, and the optional groups' own stores
     (Gravity Forms entries, WooCommerce Subscriptions, LearnDash, the audit tables of an activity
     log), which are gated by their own tools and levels and not by this guard.
 
-  WooCommerce orders stored as posts ARE covered by `commerce_post_read_guard()` in
+  WooCommerce orders stored as posts, and (by id, see the WooCommerce section) orders in
+  `wc_orders`, ARE covered by `commerce_post_read_guard()` in
   `wp_get_posts`, `wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`,
   `wp_read_post_meta_chunk`, `wp_get_comments`, `wp_get_media`, the copy tools, the resource,
   the REST tools and the template-reference scans, and in the menu readers for an item whose
@@ -1571,6 +1709,57 @@ asks is written down here.
   write through it replaced the stored layout. Not covered: another plugin's own reader, a
   layout kept under a key a site has not added to the filter, and a builder other than the one
   listed.
+- **A registered REST field is a second door to the layout, and the generated REST tools shut it.**
+  Beaver Builder registers `fl_builder_css_js` on its post types while its debug transient
+  (`fl_debug_mode`) is set or `FL_ENABLE_META_CSS_EDIT` is defined, and the field's callbacks read
+  and write `_fl_builder_data_settings`, the css and js the public page loads from the builder's
+  cache. `update_pages` with that field stored attacker script under a readwrite key (measured),
+  and `get_pages` returned it to a readonly one. Now `GMCP_Core::rest_write_refusal()` refuses any
+  argument named in `GMCP_Core::layout_rest_fields()` (extendable through `gmcp_layout_rest_fields`)
+  before the controller is asked, the generated schemas do not offer it, and for a dispatch the
+  field's callbacks are removed so no reply carries it. For a field NOT on that list,
+  `GMCP_Core::guard_rest_fields()` wraps every registered field's callbacks for the dispatch and,
+  while one runs, the WordPress meta functions treat a layout key (and the attachment file key) as
+  the generic meta tools do: a write throws and a read finds nothing. That is a backstop and is
+  late: the controller applies the post's own fields before the registered ones, so a refusal from
+  there leaves earlier fields of the same update stored, and the reply says so. Not covered: a
+  field callback that reads or writes the table with `$wpdb`, and a layout kept under a key nobody
+  has listed. The debug transient itself is under `option_write_policy()` too
+  (`GMCP_Core::layout_switch_options()`: `fl_debug_mode`, its `_transient_` and
+  `_transient_timeout_` rows, extendable through `gmcp_layout_switch_options`), judged as the
+  database compares the name, and under `option_guard()` for reads, because its value is also the
+  token that turns the builder's debug output on for any visitor. `FL_ENABLE_META_CSS_EDIT` is a
+  constant in `wp-config.php` and nothing here can set it; a site that defines it has opened the
+  field on purpose, and the tools still refuse to use it. `smoke-beaver-write.sh` plants a value
+  through a stand-in field and through the real one, and asserts the stored row and the replies.
+- **`beaver_create_page` is the one tool that writes a layout, and it only creates.** It has no
+  argument that names an existing post. The builder's writer (`FLBuilderModel::update_layout_data()`)
+  applies no capability check, no kses and no `sanitize_settings()`, so the tool is the only
+  control and accepts four module types with a fixed set of fields each. Checked, with the control
+  that proves each check can see what it looks for (`smoke-beaver-write.sh`, which renders the
+  page it builds): a settings key that is a raw sink (`bb_js_code`, `bb_css_code`,
+  `custom_attributes`, `attributes`, `popup`, `lightbox_content_html`, `photo_url`, `photo_src`) is
+  refused by name; a link is judged after sanitising and in the form a browser reads it (a tab
+  inside `//`, `/\`, `http:host`, `user@host` and `javascript:` are refused, an absolute http(s)
+  URL or a path on the site is stored); a photo asks `pointer_meta_refusal( '_thumbnail_id' )` and
+  `post_read_guard()` (a form submission's upload was accepted before: measured), must be an image,
+  and its address is derived from the id; a rich-text line that is only a URL becomes a link,
+  because the module's renderer would fetch it as an embed (measured with the oEmbed filter);
+  50 modules, 100,000 bytes a field and 400,000 in all; the post type is fixed, and the commerce,
+  form-submission and drafts-only questions are asked anyway, so a site that extends one of those
+  lists with `page` is obeyed. The page is created as a draft, the layout is written, and the reply
+  is built from the row read through `$wpdb` (the builder's reader returns the array its writer
+  cached in the same request): if the stored layout is not the one built, or the write threw, the
+  page is deleted before the tool answers, and when even the deletion fails the reply names the
+  page. A page is made public last. It needs `edit_pages` (and `publish_pages` to publish). An
+  admin key only: a readwrite key and a drafts-only key (capped below admin) are refused. The
+  approval queue classes it as a site change, from its registration. The change journal records the
+  three layout rows as custom fields added and can undo and redo them (the redo restores the value
+  the tool sanitised, nothing a caller picks); it has no entry for the creation, so the page comes
+  off with `wp_delete_post`. Not covered: what a caller writes in rich text is theirs, a link in it
+  can point anywhere, and a theme or plugin that renders the modules differently is outside it.
+  There is no `GMCP_Core` flag that permits layout writes: an earlier `with_layout_write()` was
+  removed because nothing read it, and a permission nothing enforces reads as a guard.
 - **`beaver_layout` is a reader of the post it names.** It returns a title, a type and a status,
   so it asks `post_read_guard()`: below admin a form submission, anything hanging from one, an
   order or another plugin's configuration answers exactly as a missing id does; admin is told why.
@@ -1602,6 +1791,153 @@ asks is written down here.
   (the upload URL is a bearer credential of the same shape), so the audit log, the approval view and
   the debug log share it. A bare token with no route in front of it is not recognised, and the debug
   log was measured not to print a tool's reply.
+
+## Site-file export
+
+`wp_export_request` is off by default (its own switch, no plugin needed), admin level and nothing
+lower: a `readwrite` and a `readonly` key are refused by name and do not see it in `tools/list`
+(measured, with the admin key as the control that the call works). The `manifest` mode walks one of
+four named roots and returns counts, a digest and the exclusions; `pull` is held for a person in
+every approval mode (see Human approval), then builds a zip outside the web root and returns a
+one-time URL.
+
+- **A directory is not a classification of its contents.** The archive used to carry whatever
+  sat in the root. Measured on this stack before the rule: `.env`, `.htpasswd`, `wp-config.php`,
+  a SQL dump, `debug.log` and a PEM key in a fixture directory of uploads were all in the zip.
+  Now withheld, not read, listed in the manifest with a reason, and absent from the archive:
+  `unsafe_name` (not valid UTF-8, a backslash, a control, bidirectional or zero-width character),
+  `private_name` (`GMCP_Tools_Export::PRIVATE_NAME_GLOBS` in every root; in `uploads`, also the
+  directories of `PRIVATE_UPLOAD_DIRS` and their prefixes, at any depth), and
+  `personal_data_upload`. The last asks the database, through the same tree the read guards judge
+  (`GMCP_Core::unreadable_post_clauses()`): every attachment whose `post_parent` chain reaches a
+  form-submission type, with its generated sizes, the original of a scaled image, edit backups and
+  alternative formats, plus anything in the same directory whose name begins with one of their
+  names followed by a dot or a dash (`photo.jpg.webp`, `photo-300x200.jpg` and also `photo-final.jpg`,
+  which is more than a derivative and is withheld on purpose; `photos.jpg` is not matched). `wp_download_request` refuses such a file at
+  every level, and an archive of uploads would otherwise have been the other door. If the
+  database cannot be asked, the walk is refused, not treated as "none". A site extends the lists
+  with `gmcp_export_private_names` and `gmcp_export_private_directories`; the filters are merged
+  over the built-in lists, so they cannot remove an entry. Naming a withheld file or directory in
+  `path` is refused outright rather than answered with an empty tree.
+- **A name is matched as the system takes it, not as it was typed.** `dump.sql ` (trailing space),
+  `server.key.` (trailing dot), `db.sql` followed by a no-break or ideographic space, `ｄｕｍｐ.ｓｑｌ`
+  in full-width letters and `PROD.PEM` were each the file their short name says and each was
+  archived, because the globs were compared with `strtolower( $name )` (measured by an independent
+  review). `GMCP_Tools_Export::match_name()` now reads the name through NFKC (the `intl` extension;
+  without it the full-width ASCII block is mapped by hand and nothing else is folded), drops every
+  format character, strips leading and trailing spaces, control characters and trailing dots, and
+  folds case; a name is matched both as typed and as normalised, so `...` is still a dot-file. The
+  list grew by what the review found no rule for: rotated logs (`error_log*`, `access_log*`,
+  `*_log`, `*.log-*`), the SQLite companions (`*.sqlite3-wal`, `*-wal`, `*-shm`, `*.sqlite.gz`),
+  `*.env`, `*.dump`, and certificate and keystore files in any case. Not covered: a name that
+  differs by a character this does not fold (a look-alike letter from another script is not a
+  `.sql`), a secret kept in a file with an unlisted extension, and the archive entry itself keeps
+  the real name.
+- **What this does not find.** It is a list of names and a database question, not a content scan:
+  a secret in a file with an ordinary name (`config.php` in a plugin, a `.json` in a theme) is
+  archived. A file that no attachment row points at, in a directory the list does not name, is
+  archived. The directory names of the form plugins were read from source (the table below); the
+  shop, backup and generic names are still written from memory and not checked. Files in
+  `plugins`, `themes` and `mu-plugins` are matched by file name only, since a directory called
+  `logs` there is usually code.
+- **A deleted submission releases its uploads, and the guard cannot follow them.** Every guard that
+  protects a visitor's upload finds it by walking `post_parent` up to a form-submission type
+  (`post_read_guard()`, `unreadable_post_clauses()`, `personal_upload_paths()`). When core deletes
+  the submission, `wp_delete_post()` points its attachments at the deleted post's own parent, which
+  for a submission is 0 (measured: parent 1525 before, 0 after, the attachment row and its file
+  untouched). From then on the upload is an unattached media file: the tree test no longer finds
+  it, `wp_export_request` archives it unless it sits in a directory the name list withholds, and an
+  admin-level `wp_download_request` serves it. A key below admin is still refused by the download
+  tool, because that tool wants a published parent and an unattached file has none ("not attached to a
+  post at all"); the media listings, however, no longer hold the row back. A flag recorded on
+  `before_delete_post` (the ids of the attachments in the submission's tree, kept as meta and
+  read by the guards) would close it, and was not built: it would have to be read by every one of
+  those walks, by the SQL joins that page the listings and by the write guards, and a flag read by
+  some of them and not the rest would document a protection that some readers do not have, which is
+  worse than the plain statement. What helps today: the directory list above (a plugin that keeps
+  its uploads in its own folder stays withheld after the submission is gone), and deleting the
+  upload together with the submission, which the form plugin may or may not do. The suite pins the
+  gap (`smoke-export.sh`, "KNOWN LIMIT"), so a change that closes it has to update this paragraph.
+- **Where the form plugins put their files: measured from source, per plugin.** The list in
+  `GMCP_Tools_Export::PRIVATE_UPLOAD_DIRS` was written from memory and was wrong in both
+  directions. The free releases were downloaded from wordpress.org into a scratch directory and
+  READ with grep, never run (Contact Form 7 6.2.4.1, Flamingo 2.6.4, Ninja Forms 3.16.0, WPForms
+  Lite 2.0.4, Fluent Forms 6.2.17, Elementor 4.3.6, JetFormBuilder 3.6.8.1, Everest Forms 3.6.4,
+  Forminator 1.58.4, Formidable 7.0). Gravity Forms is paid and was not obtained.
+
+  | Plugin | Directory under `uploads` | Status |
+  |---|---|---|
+  | Contact Form 7 | `wpcf7_uploads` (`wpcf7_upload_tmp_dir()`); the constant `WPCF7_UPLOADS_TMP_DIR` moves it to a path under `wp-content`, outside uploads | verified in source |
+  | Flamingo | none: it writes no files (the earlier `flamingo` entry was removed) | verified: no upload code |
+  | Ninja Forms | `ninja-forms-tmp` (submission exports), `nf-field-exports`; export CSVs are also written to the dated uploads folder, which no name rule can find | verified in source |
+  | Ninja Forms File Uploads add-on | `ninja-forms` | UNVERIFIED (paid add-on, from memory) |
+  | WPForms Lite | `wpforms` (`wpforms_upload_dir()`: cache, `tmp`, icon choices, Stripe rate-limit files); filterable by `wpforms_upload_root` | verified in source |
+  | Fluent Forms | `fluentform` (the migrator writes there; the scheduler and the URL decoder build `uploads` + `FLUENTFORM_UPLOAD_DIR` + `/temp`) | verified in the free code; the constant is defined in the Pro plugin, which was not read |
+  | Elementor | `elementor` holds generated CSS, thumbnails and import scratch (`tmp`): none of it is a visitor's file, and it is not listed. The forms module that stores submissions' uploads is in Elementor Pro, not obtained | free: verified; Pro forms directory UNVERIFIED and not listed |
+  | JetFormBuilder | `jet-form-builder` (filter `jet-form-builder/file-upload/dir`), with `temp` and an md5-named folder per form and user; its attachments are inserted with a parent of 0 | verified in source |
+  | Everest Forms | `everest_forms_uploads` (per form, plus `tmp`), `Everes-Froms-Entries-CSV-file` (entry exports, spelt so), `evf-logs`; `everest_forms_styles` is generated CSS and is not listed | verified in source |
+  | Forminator | `forminator` (also leftover public exports), `forminator_temp`; the site can set a custom upload root, which is a name of its choosing | verified in source (custom root not findable by name) |
+  | Formidable | `formidable` holds only generated CSS in the free release (`formidable/css`); the upload folder of the Pro file field is from memory | UNVERIFIED for uploads; listed on that memory, which also hides the CSS from an export |
+  | Gravity Forms | `gravity_forms` | UNVERIFIED (paid, not obtained, from memory) |
+  | CFDB7 | `cfdb7_uploads` | inferred: Forminator's importer reads files from it; the plugin itself was not obtained |
+
+  Two consequences worth knowing. The database question (attachments whose parent chain reaches a
+  submission) does not help where a plugin inserts its uploads with a parent of 0, as
+  JetFormBuilder does, so for those the directory name is the only protection. And `wp_download_request`
+  does not ask the directory list at all; it asks the attachment's parent and publication state.
+- **A refusal costs a stat, not a read.** The byte cap was checked after a file was hashed, so one
+  4 GiB file cost 19 seconds of reading to be told no (measured; the cost grew with the file). The
+  size from `lstat` is compared first, and a private directory is never entered. The hash of a
+  file also stops one byte past the size the walk saw, so a file that is being appended to cannot
+  keep a pass running.
+- **A name is also a path.** A file called `a\..\..\x` is one file on Linux and a traversal for
+  an extractor that reads a backslash as a separator; it went into the archive as written
+  (measured). A name that is not UTF-8 made the finished archive disagree with the manifest, so one
+  such file refused its whole directory with a message about the tree having changed. Both are
+  `unsafe_name` now.
+- **Nothing to archive is said so.** A tree with no includable entry produced no zip, and the check
+  on the finished archive reported that the tree had changed. The pull refuses first, before a
+  temporary file or a token exists.
+- **A request that dies mid-build leaves no archive.** The temporary file is owned by nothing
+  until its token row exists, and the cleanup that removes it is only scheduled once an archive has
+  been issued. A shutdown callback removes it on the time limit, a fatal or a vanished client.
+- **Tried and stopped.** An agent cannot approve its own pull or read the queue (the approval is
+  taken on the Approvals screen with a logged-in cookie; there is no tool for it); `mode` spelled
+  `Pull`, `"pull "`, `["pull"]` or `true` is refused by the tool and the held spelling is the one
+  the tool accepts; eight simultaneous requests for one token get one archive and seven 403s; an
+  expired row is refused at the endpoint and its archive removed; the export token row cannot be
+  read, written or deleted through the option tools, is not recorded by the change journal, and is
+  absent from the audit log, the debug trace and the database after a pull (the scrubber was also run
+  on the plain, JSON-escaped, doubly JSON-escaped, percent-encoded and plain-permalink forms of the
+  URL, which are the ones the tool can emit; a token pasted bare or with a doubled slash is not
+  recognised, and nothing writes one); `..`, `.`, empty segments, absolute paths, stream wrappers, a
+  symlink in the path and a path in the wrong case are refused; and a
+  400 MB archive streams under a 128 MB `memory_limit`.
+- **Honest limits.** The approval screen shows the root, the path and the digest, and above them
+  what that digest covers: the file count, the size, the number of withheld entries and their
+  reasons, from the server's own walk when the agent read the manifest
+  (`GMCP_Tools_Export::remember_summary()`, a transient bound to the digest that the option tools
+  refuse to read and that no tool lists, so the agent cannot read it back; two hours). It is NOT a
+  file list, and when no manifest on this site produced the digest (or it is over two hours old) the
+  screen says it has no summary instead of showing numbers. A person approves "this directory as it
+  was when the agent read it". Between the per-entry
+  re-check and the read `ZipArchive` does at `close()` a writer who can replace a file can still
+  win the race; the closed archive is compared with the manifest's sizes and CRC-32s, which catches
+  an accidental or naive change and not a deliberate collision. A fatal during the build leaves the
+  approval spent. The reply and the audit log never carry the archive; the URL does carry a
+  bearer token for five minutes, and a web server's own access log will have it (the endpoint is a
+  GET).
+- **A HEAD request does not redeem a one-time URL.** WordPress routes HEAD to the GET handler, and
+  the handler spent the token on the way to answering, so a link previewer, a mail scanner or a
+  chat unfurler that fetched the URL it was shown burned the archive (or the download) before the
+  person it was minted for clicked (measured by an independent review). `handle_export()` and
+  `handle_download()` now answer HEAD from a read-only look at the token (`peek_token()` for the
+  export; the row, its timeout and the attachment's file for the download): 200 with the headers
+  the GET would send and no body, or the same 403, and nothing is deleted, not even an expired
+  row. Single use is for GET, and it is still all a scanner that sends GET gets: a previewer that
+  fetches with GET spends the token and nothing can tell it from a person. `smoke-export.sh` and
+  `smoke-download.sh` assert the rows and the archive after two HEADs, the GET that follows, and
+  HEAD on a spent, an unknown and (for the export) a switched-off token.
 
 ## Theme mods
 
@@ -1774,11 +2110,13 @@ escaped quote is taken whole; text that was escaped for embedding is read as wel
 code block, and the spans are mapped back to the original text. `Basic` is a credential when the
 token is the base64 of `user:password` (decoded, printable, with a colon), `Bearer` when it is eight
 characters or more with a digit (or twenty or more letters) and not words joined by hyphens or
-slashes, and an `Authorization:` header is read whole. What it does not find: a value split across
+slashes, and an `Authorization:` header is read whole (the schemes `Basic`, `Bearer`, `Token`, `Digest`,
+`OAuth`, `ApiKey`, `Hawk`, `NTLM`, `Negotiate`, `Bot`, `Key` and `JWT`). What it does not find: a value split across
 several arguments or lines, a credential that is base64 or encrypted and has no name or prefix
 around it, a bare token, a `Basic` credential that is not standard base64 of `user:password`, a
 secret under a name that does not end in a secret word, and an unquoted value under `token`, `secret` or `key`
-that is nothing but short words and numbers joined by hyphens or slashes.
+that is nothing but short words and numbers joined by hyphens or slashes. The measured list, with what is
+fixed and what is not, is under "Measured misses" below.
 
 It is built to avoid the opposite failure as carefully, because a false positive
 costs an undo and the journal exists so that an ordinary edit can be put back. The
@@ -1786,9 +2124,17 @@ last word of the name decides, so `passwordLabel` and `placeholder_text` are lab
 and a name that merely contains a pattern (`author`, `keywords`) counts only when its
 value looks like a token. Prose that uses the word "password" is kept whole and
 undone byte for byte, and a block attribute such as `{"authorId":3}` is not touched;
-both are asserted. On a half-megabyte body it takes about 15 to 60 milliseconds,
-measured, and a failure of the regular-expression engine itself answers "yes, a
-credential", never "no".
+both are asserted. The cost is linear in the text. On a half-megabyte body of ordinary text it takes
+about 40 milliseconds with the PCRE JIT and about 180 without, measured; the shapes built to make it
+quadratic (`password=|`, `pw=|` and `password=this.` repeated, a 512 KB value, nested names without a
+space, `curl -ua:` and unterminated `<input` tags, an empty-user URL repeated) take 0.05 to 0.5 s at
+512 KB, JIT on or off, and `.dev/test-redact-timing.php` holds each to 2 s. (This paragraph said 15
+to 60 ms, and the unquoted-assignment rule re-read each value to the end of its run once per
+assignment: `password=|` repeated cost 13 s at 256 KB and 23 to 50 s at 512 KB through `holds()`.) A
+value is now read once, at most 512 bytes of it; a text in which names sit inside the values of other
+names, so that the reads overlap, is allowed four times its own length in value bytes (plus a floor of
+2 KB) and is then answered as a credential, the same fail-closed answer as a failure of the
+regular-expression engine itself, which is "yes, a credential", never "no".
 
 Measured false positives. Ordinary prose that was flagged and is not now: `Course 1: Basic
 HTML/CSS for beginners`, `Basic 2024/2025 membership`, `Season Pass: 2024-2025`, `Day pass:
@@ -1809,6 +2155,139 @@ flagged and cannot be removed without losing real secrets: a Maps `?key=AIza...`
 is restricted by referrer, but the same prefix is a server secret on other Google services), a
 placeholder that is not on the list (`$Db_pass9`, `${db_pass}`), and any prose that really looks like
 `name=value` with a secret-ended name and a token-shaped value (`password=abc123`, said in a sentence).
+
+Measured misses, and false alarms again (`.dev/measure-credential-scan.php`). The placeholder and
+prose exemptions above were chosen by hand from the cases someone happened to see, so a generator now
+builds the evidence. It fills 180 templates (87 of credentials, 93 of ordinary text) with random names and values (the layouts a credential
+really arrives in: a code block in a post body, a `.env` file, a curl command, JSON, YAML, INI, a PHP
+array, a URL with user information, a log line, a form tag, an option setter, a cookie; and ordinary
+text: prose about passwords and keys, code that names a secret and holds none, forms and setters
+that hold no secret, hashes and ids, plain posts), 3,600 strings at the default size, wrapped in
+a post body half the time. A miss is a credential not found, or found with its bytes outside the
+blanked span (the audit log blanks only the span); a false alarm is ordinary text flagged. Vendor-shaped
+keys are assembled at run time, so the tree holds none, and the corpus is not written out unless
+asked (`--dump`), and must not be committed. Result, on the scanner before and after:
+
+| | credentials missed | ordinary text flagged |
+|---|---|---|
+| before | 584 of 1,740 (33.6%), 304 of them in shapes now fixed | 60 of 1,860 (3.2%) |
+| after | 260 of 1,740 (14.9%), all in the gaps listed below | 0 of 1,860 |
+
+(Measured on the generator as it was then; it has since grown, see the result after the next paragraph.)
+The after row is the same at seven other seeds (5,220 credentials and 5,580 ordinary strings each). The
+ordinary-text side of that table is written by the author of the rules and is near zero because of
+it, so the independent check is the one above, made again: 2,723 documentation and source files on this
+machine (24.8 MB, 537,467 lines), line by line. The scanner flags 69 lines where the previous one
+flagged 127, and none that it did not flag before. The 58 that went were code that reads a secret from
+somewhere (`self.password`, `request.access_token`, `'Bearer ' + token`); what is left is RFC examples
+(correctly), quoted assignments of any value under a secret name (`consumer_secret="consumer.secret"`,
+by policy), and Python type annotations (`private_key: Ed25519PrivateKey`), which cannot be told from
+a value without parsing the language. Fixed because they were measured: `curl -u user:password`
+and `--user`; a URL with no user (`redis://:secret@host`); `<input name="api_key" value="...">` in either
+attribute order (a button's or a checkbox's value is a label, not a secret); `update_option`, `add_option`,
+`set_transient`, `set_theme_mod` and `setItem` with a secret-named key; a bare `pass=` (a log line or
+query string; `Hall pass=2nd-floor` stays prose); `db_pass` and `smtpPass` with a value of hyphenated
+words and digits; a password of mixed-case letters, or of letters and a symbol inside, with no digit
+(`Txmyfk%WbZBu`, ten letters with a capital inside); names ending `pw`, `secret_key_base`,
+`AccountKey`, `STORAGE_KEY`, `SSH_KEY`, `DEPLOY_KEY`, `STRIPE_KEY` and similar (a key is a secret when the
+word before it says what kind, and that list grew); session cookies (`sessionid`, `PHPSESSID`,
+`wordpress_logged_in_<hash>`); keys of other vendors by prefix (`whsec_`, `npm_`, `glpat-`, `shpat_`,
+`SG.`, `dop_v1_`, `hf_`, `key-<32 hex>`, `ya29.`, `xoxe`, a Telegram bot token) and a Slack or Discord
+webhook URL's secret path segment. Fixed false alarms: a value that reads a secret from the environment
+or a variable (`process.env.API_KEY`, `$this->token`, `encryption_algorithm.password`, lowercase
+words joined by underscores or dots after an unquoted name), `'Bearer ' . $token`, `docker run -u
+1000:1000` and `--user www-data:www-data`, `cvs://:pserver:anoncvs@host`, and the words a schema
+or a form puts where a secret would go (`required`, `optional`, `none`, `null`, `hidden`, `redacted`)
+now joined the placeholders. The lists are still hand-made; what changed is that each entry now has
+a sample that fails without it.
+
+An independent review then measured what that widening broke, in both directions, and each item
+below is pinned in `.dev/journal-pure.php` with a counterpart of the same shape:
+
+- *Default passwords were placeholders.* `password`, `secret`, `token` and `changeme` had been added to
+  the placeholder words, so `define('DB_PASSWORD','password')`, `JWT_SECRET='secret'`,
+  `{"password":"changeme"}` and `curl -u elastic:changeme` were missed, and the generator had seeded one
+  as ordinary text, so it agreed. They are values again (`change_me` and `CHANGE-ME`, which only a
+  template contains, stay). A placeholder is now something that cannot be a real value: the
+  documented shapes and `YourPassword`-style words.
+- *A code reference was a prefix.* Any value that merely began `this.`, `self.`, `config.`, `Env[`,
+  `options.` or `static::` was exempt, before the quoted check, so `{"password":"this.is.my.password1"}`,
+  `'Self.Made#2024'`, `SMTP_PASSWORD="Env[prod]9xQ"` and `DB_PASSWORD=this.Kx92mQ!` were missed. The exemption
+  now applies to an UNQUOTED value only (a quoted string is data) and only to a complete reference: a root
+  (`process.env`, `$_POST`, `config(`, `getenv(`), then names of lower-case letters, capitals with digits
+  (`API_KEY`) or a capitalised or camelCase word, and nothing else, no digit inside a mixed word and no
+  symbol. The cost: an unquoted `DB_PASSWORD=config.db.password` is still read as a lookup, and so is a
+  passphrase written exactly like one.
+- *Quadratic time*, above.
+- *False alarms that cost an undo.* `STORAGE_KEY='todos-vuejs-2.0'`, `self.primary_key = "product_code"`,
+  `{"primary_key":"order_id"}`, `SESSION_KEY='user'`, `'root_key' => 'menu'`, `"service_key":"billing"`,
+  `"shared_key":"none yet"`, `primary_key: order_id_2`, `?pass=annual2025`, `Password: YourPassword`,
+  `Password: JavaScript`, `"pw":"full"`, `--user deploy:www-data2` and `docker run -u 1000:docker1`. A
+  `storage`, `session`, `shared`, `service`, `primary`, `secondary` or `root` key (and a `session_id`) is a secret name
+  only for a value of sixteen characters or more of one token with a digit and a letter, unless a vendor
+  heads the name (`AZURE_STORAGE_KEY`). A value that is a path (`~/.ssh/id_ed25519.pub`, `/var/www/...`) is
+  not a secret. A bare `pass=` is not a password when the value is a word and a year. Capitalised
+  words run together with no digit or symbol (`YourPassword`, `JavaScript`, `TypeScript`) are not a
+  generated password. An abbreviation (`pw`, `psw`) is not trusted for a short plain word. `-u` and
+  `--user` are read by the command they belong to: after `docker`, `podman`, `chown`, `useradd`,
+  `sudo`, `su`, `kubectl` and the like the pair is a user and a group; after `curl`, `wget`, `http`
+  and the other HTTP and FTP clients it is a password whatever its shape (`curl -u admin:Hunterxy`).
+- *Misses in forms and curl.* A password field's value with a space in it (`correct horse battery 42`)
+  and one with a `>` in it, a tag longer than a thousand bytes, a checkbox, image or radio input named
+  `remember_token` or `api_key` whose value has the shape of a credential (ten characters or more of one
+  token with a digit and a letter; a flag such as `remember` or `1` is still a flag), `curl -uadmin:pass`
+  with no space, a key in the user slot (`curl -u KEY:X`, `curl -u KEY:`), and `redis://:Kx92:mQ7zp@host`
+  (the exemption for `cvs://:pserver:...` is now for the repository access methods only).
+- *The debug log had its own vendor list.* It wrote a Google OAuth token, a Slack webhook's secret
+  segment and a Discord webhook's token that the scanner flags. `log_line()` now asks the scanner as
+  well, as a union with its own rules.
+
+Result on the grown generator (4,180 strings at the default size, 2,040 credentials and 2,140 ordinary
+ones): the scanner as it stood before this review missed 539 credentials (26.4%) and flagged 237
+ordinary strings (11.1%); now it misses 260 (12.7%), every one in a documented gap, and flags none, at
+ten seeds. The ordinary-text figure is zero because the same author wrote the prose; the
+independent figures are the reviewer's probe lists, each pinned by a test.
+
+Still missed, measured, 260 of the 1,740, each pinned by a test that says it is a gap
+(`.dev/journal-pure.php`) so that closing one is a decision and not an accident:
+
+- A secret with no name and no prefix around it: `It is h4PyKX2JRJhpaHDmkXq3GVXdLtiuNLLf.`
+- A password said in a sentence: `The password is hunter49`, `Login with admin / hunter49`.
+- A value not next to its name: a label and an input, a table row (`| password | hunter49 |`), `Username:` and
+  `Password:` on separate lines when the password has a space in it.
+- A short or wordlike unquoted password: `password=letmein`, `DB_PASSWORD: root`. `password=required` is
+  prose and the two cannot be told apart without a dictionary. The same for a passphrase of lowercase
+  words joined by underscores or dots (`password=correct_horse_battery_staple`), which reads as a
+  variable.
+- A password of short hyphenated words and digits after a bare `pass` (`pass=gijn-mgmf-7430`), which has
+  the shape of `Hall pass=2nd-floor`.
+- A base64 or hex value under a name that is not a secret word: `signature=`, `hmac =`, `nonce_value:`.
+- A key of a vendor that is not in the prefix list, and a credential in a vendor's own layout (a
+  connection string that is not a URL and does not say `Password=`).
+- Left after the fourth review, each a decision and not an oversight:
+  - An unquoted password that is a plain lowercase identifier or dotted words and has no digit
+    (`DB_PASSWORD=prod_wordpress_secret`, `password: my.dog.rex`), because the same shape is a variable
+    read (`password = encryption_algorithm.password`); and an unquoted `config.db.password`-style
+    value, which is read as a lookup.
+  - Capitalised words run together with no digit or symbol and fewer than sixteen characters after
+    an unquoted password name (`Password: correctHorse`), which cannot be told from
+    `Password: JavaScript` (`correctHorseBattery`, at sixteen, is flagged). A mixed-case
+    product name with an acronym in it (`Password: PostgreSQL`) is still flagged.
+  - A password of letters only under `pw` or `psw` of fewer than six characters, and a bare `pass=`
+    whose value is a word and a year (`pass=hunter2024`).
+  - A session id or an ambiguous `<word>_key` with a value under sixteen characters, and one without a digit.
+  - A `-u` or `--user` whose command is neither a known HTTP or FTP client nor a known user:group
+    tool (`docker`, `podman`, `chown`, `useradd`, `sudo`, `su`, `kubectl` and a few more): the pair needs a
+    digit, a symbol or ten characters to count (`-u user:Hunterxy` is missed there), and an attached
+    `-uuser:pass` is read only after an HTTP or FTP client.
+  - A password field whose tag holds a `<` inside a quoted attribute value, or a tag that is never closed.
+  - A credential that the budget refuses is answered as a credential, so these are not misses, but
+    they are false alarms by design: a text in which secret-named assignments nest inside each other's
+    values (`password=password=...` for half a megabyte) is treated as holding one.
+
+What a miss costs differs by channel: the journal keeps the value for undo, the audit log records
+it, the approval screen shows it. None of them is a store of secrets by design, and none of this
+makes the scanner a guarantee.
 
 What a post entry does about it is per field. A field that holds one is left out of
 `previous` and named in `redacted_fields`; the other fields of the same edit stay

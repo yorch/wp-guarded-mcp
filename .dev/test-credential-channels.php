@@ -80,6 +80,30 @@ check( 'log: scrubbing an already scrubbed line changes nothing', $stable, true 
 check( 'log: an array argument is scrubbed as JSON and still shows its harmless fields',
   [ has( GMCP_Core::log_text( [ 'smtp_pwd' => 'hunter2', 'note' => 'visible' ] ), 'hunter2' ), has( GMCP_Core::log_text( [ 'smtp_pwd' => 'hunter2', 'note' => 'visible' ] ), 'visible' ) ], [ false, true ] );
 
+echo "-- the debug log asks the credential scanner as well (it is never narrower than the other channels) --\n";
+// Each of these is a shape GMCP_Credential_Scan recognises and the debug log's own vendor list did not:
+// a Google OAuth access token (150 characters is what Google issues), the secret segment of a Slack
+// incoming-webhook URL and of a Discord one, a Square token. Built at run time so no literal in this
+// file looks like one. The control is the log's own scrub alone, which wrote each of them out.
+$body = static function ( int $n ) {
+  return substr( str_repeat( 'aB3dE5fG7hJ9kL1mN2pQ4rS6tU8vW0xY_-', 6 ), 0, $n );
+};
+$scanner_only = [
+  'a Google OAuth access token of 150 characters' => [ 'call with ya' . '29.' . $body( 150 ), $body( 150 ) ],
+  'the secret segment of a Slack webhook URL'     => [ 'post to https://hooks.' . 'slack.com/services/T0123ABCD/B0456EFGH/' . substr( $body( 40 ), 0, 24 ), substr( $body( 40 ), 0, 24 ) ],
+  'the token of a Discord webhook URL'            => [ 'post to https://discord' . '.com/api/webhooks/1234567890123456789/' . $body( 68 ), $body( 68 ) ],
+  'a Square access token'                         => [ 'square sq0' . 'atp-' . $body( 22 ), $body( 22 ) ],
+];
+foreach ( $scanner_only as $label => [ $text, $secret ] ) {
+  check( "CONTROL: $label is flagged by the scanner and written out by the line scrub alone", [ GMCP_Credential_Scan::text_holds( $text ), has( GMCP_Diag_Util::scrub_log_line( $text ), $secret ) ], [ true, true ] );
+  $line = GMCP_Core::log_text( $text );
+  check( "log: $label is not written", has( $line, $secret ), false );
+  check( "log: $label leaves the words around it readable", has( $line, 'call with' ) || has( $line, 'post to' ) || has( $line, 'square' ), true );
+}
+check( 'log: the scanner\'s marker is the debug log\'s own marker, and a second pass changes nothing',
+  GMCP_Core::log_line( GMCP_Core::log_text( $scanner_only['a Google OAuth access token of 150 characters'][0] ) ), GMCP_Core::log_text( $scanner_only['a Google OAuth access token of 150 characters'][0] ) );
+check( 'CONTROL: text the scanner has nothing to say about is written as it came', GMCP_Core::log_text( 'Visit https://hooks.example.com/services/status for the page' ), 'Visit https://hooks.example.com/services/status for the page' );
+
 echo "-- the debug log: one value is one line --\n";
 $forged = "tok\n[Guarded MCP OAuth] ❌ Authorize refused: forged by a client\r\n[Guarded MCP] WARNING: and another";
 $line = GMCP_Core::log_text( $forged );

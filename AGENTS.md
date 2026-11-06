@@ -83,7 +83,24 @@ parser on seven nested `EXISTS`), through `with_readable_posts_sql()` and
 `with_readable_comments_sql()` for the listing tools so the offset is the database's (measured:
 offset 40,000 of 50,000 posts took 13 s and 210 MB when the offset was paid for in PHP), and keeps
 `collect_readable()` as the row-by-row backstop, bounded in rows looked at independently of the
-offset. The change records go through `GMCP_Changes::record()` and
+offset. Those clauses go in last and wrap what other plugins built: at `posts_clauses_request` and
+`comments_clauses`, at `PHP_INT_MAX`, with the guard FIRST in the WHERE and the other plugin's WHERE
+after it, its comments taken out and its parentheses balanced (`wrap_foreign_where()`: a fragment
+ending `) OR 1=1 /*` commented out the guard and the LIMIT), because appended at `posts_where` a
+foreign `OR 1=1` or a replaced clause set dropped them and the REST list tools returned a submission's
+upload (measured). Every query inside a listing runs with filters on whatever `pre_get_posts` asks.
+Whether the guard held is decided from the FINISHED state, never from a hook, because a callback a
+plugin registers from inside `pre_get_posts` at `PHP_INT_MAX` runs behind every hook the guard added:
+each query's own `request` must carry the guard as the server reads it with comments taken out
+(`sql_carries()`) and must be among the SELECTs the database was given (`listing_in_doubt()`), and
+`readable_posts_page()` / `readable_comments_page()` re-page in PHP when it is not (`$held`), because
+then the database's offset counts hidden rows. The REST list tools judge the finished rows by id
+AFTER `rest_do_request()` returns (`judge_post_rows()`, asking the controller for `id` when `_fields`
+omits it), because no hook registered during the dispatch can run behind code that runs after it, and
+re-page in PHP the same way when the query is in doubt. Listing results are cached under a domain
+that names the level and the guard (`listing_scope()`): `WP_Comment_Query` keys on its arguments
+alone. `smoke-listing-filters.sh` attacks all of that with a read-only key and a
+test-only mu-plugin of foreign filters. The change records go through `GMCP_Changes::record()` and
 carry a submission as an id with `[withheld]` values, judged on the state before the write as
 well as after it, because `wp_list_changes` is a read-level tool and names a post by its title.
 A new reader of any of these asks the guard; `smoke-forms.sh` block 0c seeds a submission with a
@@ -110,6 +127,22 @@ post, its meta, its terms or a comment asks the guard; the net is the backstop, 
 a test-only tool registered by its mu-plugin writes through WordPress with the net taken out to
 show that the change records hold when a writer asks nothing.
 
+**An order is judged by its id, and its notes are part of it.** Every commerce guard used to ask the
+post row's type, which is the whole truth only with the legacy storage. With High-Performance Order
+Storage the order is a row in `wc_orders` and `wp_posts` holds a `shop_order_placehold` at the id,
+or on a shop that enabled it early nothing, or a page that took the id. Order notes, items and
+download permissions are keyed on the id, not on a type, so WooCommerce acts on them for any post
+written, trashed or deleted under it (measured: trashing the colliding page marked every note of the
+order `post-trashed`). `GMCP_Core::hpos_order_type()` asks `wc_orders` directly, and
+`post_chain_types()`, `commerce_post_guard()` and the SQL in `unreadable_post_clauses()` (which now
+takes the column holding each row's own id, `$id_col`: a new caller of it passes one) ask it. An
+order note is a comment of type `order_note`; `comment_write_guard()` closes an order's tree and that
+type to the generic comment tools (`$commerce`), but not under the net, because WooCommerce writes
+its own notes while a tool call is in flight. `smoke-woo.sh` seeds the three shapes (placeholder,
+page at the id, no post row), attacks each with a read-write and an admin key and compares the
+stored rows before and after. An id collision cannot be made with WooCommerce's own writer, so the
+fixture retypes or deletes the placeholder row by SQL, which is how the shape arises on a real shop.
+
 **A policy about a meta key is about the key as the database compares it.** `wp_postmeta.meta_key`
 is compared by its collation, `utf8mb4_unicode_520_ci` on a stock WordPress, which ignores accents,
 case, combining marks, soft hyphens, zero-width and control characters and trailing spaces and
@@ -134,6 +167,16 @@ policies before the controller is called (like `create_one_post()` does for `met
 `GMCP_Tools_Rest::handle_call()` deletes a row its own create inserted if a net still refuses from
 inside the controller, and says so. A new create or update path that writes in two steps pre-checks
 the second step or undoes the first; `smoke-forms.sh` asserts the table, not the reply.
+
+**A REST field is a door to a layout, and a REST tool is generated from every field a plugin
+registers.** `GMCP_Core::layout_meta_keys()` is refused by the generic meta tools, and Beaver
+Builder registers `fl_builder_css_js` (while its `fl_debug_mode` transient is set) whose callbacks
+write `_fl_builder_data_settings` with `update_post_meta()`: `update_pages` with that field stored
+a script the public page loaded, and `get_pages` returned it to a readonly key. So
+`rest_write_refusal()` refuses the fields in `layout_rest_fields()`, `guard_rest_fields()` wraps
+every registered field's callbacks for the dispatch so an unlisted one cannot touch a layout key
+through the meta functions, and the debug transient is under `option_write_policy()` and
+`option_guard()`. A new plugin's field is held by the wrapper, not by a list; `$wpdb` is outside it.
 
 **A deletion is not always a delete tool.** WordPress deletes on markers it reads from
 ordinary rows: `wp_scheduled_delete()` removes every post with an old `_wp_trash_meta_time`
@@ -198,11 +241,16 @@ every kind (tab, newline, carriage return, vertical tab, form feed, the Unicode 
 separators, the no-break and other fixed-width spaces) becomes one plain space BEFORE any scrub reads
 the line, so a separator with a tab in it is still a separator and a newline in a request value cannot
 start a forged second log line; any other control character is shown as a visible escape,
-`GMCP_Diag_Util::scrub_log_line()` removes the vendor key shapes, PEM blocks, URL user
-information, JWTs, escaped JSON, `define()` lines and `pw=`, and the whole value after a
-secret-named key goes, an unquoted one to `&` or the end of the line and a quoted one to its
-closing quote, where a backslash and the character after it count as one (an escaped quote does not end
-a value). It reads one line of at most 2,500 bytes of a value, and a call's arguments only up to a
+the whole value after a secret-named key goes, an unquoted one to `&` or the end of the line and a quoted
+one to its closing quote, where a backslash and the character after it count as one (an escaped quote does
+not end a value), then `GMCP_Credential_Scan` is asked of the line (`try_spans()`, the test the journal and
+the audit log apply, so a vendor shape the scanner knows is never written to the log because the log's own
+list had not heard of it: it had missed a `ya29.` token, the secret of a Slack webhook URL and a Discord
+one), then `GMCP_Diag_Util::scrub_log_line()` removes the vendor key shapes, PEM blocks, URL user
+information, JWTs, escaped JSON, `define()` lines and `pw=`. The three are a union: the debug log is never
+narrower than the scanner, and the scanner's own exemptions (placeholders, a complete code reference) are
+only exemptions of the scanner, not of the log. A scan that gives up withholds the line. It reads one line
+of at most 2,500 bytes of a value, and a call's arguments only up to a
 byte budget (see the audit log doc), so the cost does not grow with how many leaves a client sends. Every `error_log()` in `includes/` is checked by a tripwire in
 `.dev/test-credential-channels.php`: one that prints `$reason`, an exception message or a request
 parameter without `log_text()` fails it. A bare token with no key in front of it and no known
@@ -222,9 +270,16 @@ is still replaced whole, and each string is judged alone, so a secret split acro
 not recognised by the view). The journal keeps its whole-field drop, because a partly blanked value
 cannot be restored. The aggressive assignment scrub (any value after a secret-named key) belongs to
 the debug log only: in a record of what a call said it blanked ordinary prose. A value that is a
-documented placeholder (`password_here`, `YOUR_TOKEN_HERE`, `********`, `<token>`, `${UPPER_SNAKE}` or
+documented placeholder (`password_here`, `YOUR_TOKEN_HERE`, `YourPassword`, `********`, `<token>`, `${UPPER_SNAKE}` or
 `$UPPER_SNAKE` in capitals only, `user:pass@`) is not a credential, with a counterpart test for each that a
 real-looking value under the same name still is: `'$uperS3cret99'` and `${db_pass}` are not placeholders.
+A placeholder is something that cannot be a real value. A word that is also a product's default password
+(`password`, `secret`, `token`, `changeme`: `elastic:changeme`, a shipped `JWT_SECRET='secret'`) is a
+credential under a secret-named key, and the generator once seeded one as ordinary text, so it agreed with
+the list that excused it. A value that reads a secret from somewhere (`process.env.API_KEY`, `$this->secret`)
+is exempt only when it is a COMPLETE code reference, unquoted: a root, then names, nothing else. A quoted
+string is data however much it begins like a lookup (`"this.is.my.password1"`, `'Self.Made#2024'`).
+The scan is linear in the text and has a budget that fails closed: see `docs/guardrails.md`.
 What the scanner reads through is listed in `docs/guardrails.md`: quote escapes, a backslash and the
 character after it counting as one inside a quoted value, array-index and `define()` assignments, names of
 any length. What it does not find is listed there too (a value split over several arguments, base64, a bare
@@ -238,7 +293,25 @@ restore. A stored `what` is re-checked when entries are listed, because it outli
 fails is left out of `previous` and named in `redacted_fields`; a placeholder is never stored, because
 undo would write it over live content. Tune it against false positives as hard as against misses: an
 ordinary body that says "password" must stay undoable, and `.dev/journal-pure.php` holds that control.
+The lists in it (placeholders, key qualifiers, prefixes) are hand-chosen, so
+`.dev/measure-credential-scan.php` measures them over a generated corpus of 3,600 strings
+(`--assert` fails on a miss outside the documented gaps, on any false alarm, and on a documented gap
+that has been closed without being moved out of the list); run it after touching the scanner, and give a
+new entry a sample that fails without it. Never write the corpus to the tree: it holds vendor-shaped keys.
 Undo also refuses to restore a status `status_write_refusal()` refuses (`trash`, `auto-draft`).
+
+**A directory is not a classification of its contents, and an archive of one is a read of all of
+it.** `GMCP_Tools_Export` walks `plugins`, `themes`, `mu-plugins` and `uploads`, and the roots hold
+files whose whole purpose is to stay on the server (matched on the name as a system takes it,
+`match_name()`, so a trailing dot, space or no-break space does not make `dump.sql ` another
+file): dot-files, `wp-config*`, keys, dumps, logs,
+backups, a form plugin's uploaded files, and the files of every attachment that hangs from a form
+submission, which `wp_download_request` refuses at every level. The walk withholds them by name and
+by asking the database (`name_refusal()`, `personal_upload_paths()`, the same tree
+`unreadable_post_clauses()` judges), never reads them, lists them with a reason and keeps them out
+of the digest's reads; a failure to ask the database refuses the walk. A new reader of the file tree
+asks the same two questions. Its limits are in `docs/guardrails.md` (a secret in a file with an
+ordinary name is archived), and no sentence may say the archive holds no secrets.
 
 **There is no restore tool, at any access level.** Backups can be started and read. That is
 deliberate and not an omission to be helpfully filled in.
@@ -259,6 +332,28 @@ switches between kits the site already has, which is reversible because the prev
 still there. Importing one rewrites the whole design system from an archive built elsewhere,
 in a single call, with no restore tool behind it. Same category as the two above: deliberate,
 and not an omission to be helpfully filled in.
+
+**`beaver_create_page` creates, sanitises, and answers from the table.** It has no argument that
+names an existing post, so it cannot replace or extend a layout; the builder's own writer applies
+no capability check and no sanitising, so every value is cleaned in the tool (`sanitise_module()`),
+and a key that is a raw sink in the render path is refused by name. Four things were wrong in the
+first version and each is a rule now. The graph is row > column-group > column > module, built the
+way the builder's `add_row()` builds it: the version without the group level stored twelve nodes,
+answered success and rendered no module, and the suite now RENDERS the page. A module is written
+under the field its renderer reads (`heading`, not `text`; a photo's `photo_src`, derived from the
+attachment id and never taken from the caller). A photo is a pointer to a post that is
+dereferenced when the page renders, so it asks the one function that judges a featured image
+(`pointer_meta_refusal( '_thumbnail_id', ... )`) and `post_read_guard()`: a form submission's
+upload was accepted as a photo while the generic writer refused it as a featured image. And the
+reply is built from the stored row read through `$wpdb`, because the builder's reader returns the
+array its writer cached in the same request; a page whose stored layout is not the one built, or
+whose write threw, is deleted again before the tool answers, so it never says "failed" over a
+page that is there. A link is judged after sanitising, in the form a browser reads it (tabs and
+newlines are deleted by both). A rich-text line that is only a URL becomes a link, because the
+module renders through the oEmbed filter and would fetch it. What it does not cover: the journal
+records the three layout rows (and can undo them) but has no entry for the creation, so the page
+comes off with `wp_delete_post`; the text a caller writes is theirs (a link in rich text can
+point anywhere, as any post body can); the module set is four types.
 
 **The audit log has no bulk actions and no row deletion in the UI.** Rows hash the row
 before them, so removing one from the middle is exactly what the chain exists to make
@@ -327,16 +422,19 @@ Redirection tools, `smoke-polylang.sh` covers the Polylang tools, `smoke-seo.sh`
 All in One SEO tools, and `smoke-forms.sh` covers the form-submission tools (Contact Form 7 with
 Flamingo, Fluent Forms, Ninja Forms, WPForms; its first block needs no form plugin).
 `smoke-wordfence.sh` covers the Wordfence tools, `smoke-stream.sh` covers the Stream tools,
-`smoke-beaver.sh` covers the Beaver Builder tools, `smoke-download.sh` covers the one-time
-download endpoint and `smoke-export.sh` covers the site-file manifest, the approval-gated
-archive and its one-time endpoint.
+`smoke-beaver.sh` covers the Beaver Builder tools, `smoke-beaver-write.sh` covers the one that
+builds a page (and renders it, because a stored-node count passed on a page that showed nothing),
+`smoke-download.sh` covers the one-time download endpoint, `smoke-export.sh` covers the
+site-file manifest, the approval-gated archive and its one-time endpoint, and
+`smoke-listing-filters.sh` covers the listing tools under another plugin's query filters.
 Run all
-twenty-one before committing. The plugin-specific suites need
+twenty-three before committing. The plugin-specific suites need
 their plugin installed and say so and exit rather than reporting failures against a site that
-simply does not have it; `smoke-download.sh` and `smoke-export.sh` need only this plugin.
+simply does not have it; `smoke-download.sh`, `smoke-export.sh` and `smoke-listing-filters.sh` need only this plugin.
 (This sentence said fourteen while twelve suites existed and sixteen
-while seventeen did, which is the same drift the access-level table had: a count nothing checks
-moves on its own. It is twenty-one now, counted from `ls .dev/smoke*.sh`.)
+while seventeen did, and said twenty-one with twenty-two on disk and the newest suite missing
+from the list, which is the same drift the access-level table had: a count nothing checks
+moves on its own. It is twenty-three now, counted from `ls .dev/smoke*.sh`.)
 
 **A test for a guard must not depend on that guard.** Read the value, make the hostile
 call, read it back, **put it back**, and only then compare. The first version of the

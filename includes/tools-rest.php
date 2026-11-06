@@ -167,25 +167,117 @@ class GMCP_Tools_Rest {
   }
 
   /**
-  * A WHERE fragment, for WP_Query, that leaves out what the caller may not read: posts of the
-  * excluded types, and posts hanging from one at any depth post_chain_types() walks (a media
-  * row, a revision or a child of a submission or an order).
-  *
-  * Installed around the REST dispatch of a list call. The listing is built by WordPress's own
-  * query, and its rows are filtered by what _fields leaves in them, so an id-based filter on
-  * the rows afterwards would miss every call that does not ask for the id. The SQL is the one
-  * the other listings and scans use. @see GMCP_Core::unreadable_post_clauses()
+  * Whether a REST resource is the route of a post type, whose rows are posts and whose ids are
+  * post ids. The users, terms and comments routes are not, and a row's id there names something
+  * else, so the post guard is not asked of it.
   */
-  public function exclude_unreadable_posts( $where ) {
-    global $wpdb;
-    $c = GMCP_Core::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_r' );
-    return $c['where'] === '' ? $where : $where . ' AND ' . $c['where'];
+  private function resource_is_post_route( string $resource ): bool {
+    foreach ( get_post_types( [ 'show_in_rest' => true ], 'objects' ) as $type ) {
+      $base = $type->rest_base ? (string) $type->rest_base : (string) $type->name;
+      if ( $base === $resource ) {
+        return true;
+      }
+    }
+    return false;
   }
 
-  /** The parents the WHERE above judges, joined. @see exclude_unreadable_posts() */
-  public function join_unreadable_posts( $join ) {
-    global $wpdb;
-    return $join . GMCP_Core::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_r' )['join'];
+  /**
+  * Judges the rows of a finished post listing, one by one, by their id, and takes out the id that
+  * was only asked for to judge by.
+  *
+  * The query-side guard (with_readable_posts_sql(): the SQL, and a `the_posts` filter at
+  * PHP_INT_MAX) is not the last word on what the response holds. A callback that another plugin
+  * registers while the query runs (from `pre_get_posts`, at PHP_INT_MAX) runs behind both, and
+  * adds rows after they were judged: measured, a file attached to a form submission, an order's
+  * file and a post that shares an order's id came back to a read-only key from list_media,
+  * list_posts and list_pages. Nothing registered during the dispatch can run behind this: it is
+  * called with the finished data. A row with no id in it was not made by the controller (the id is
+  * always asked for), so it is dropped. A row whose id is not a number (a template's id is
+  * `theme//slug`) is not a row of the posts table and is left alone.
+  *
+  * The page can then be short, which says a row was left out; the REST tools cannot fetch more.
+  *
+  * @param mixed $data
+  * @return mixed
+  */
+  private function judge_post_rows( $data, bool $strip_id ) {
+    if ( !is_array( $data ) ) {
+      return $data;
+    }
+    $out = [];
+    foreach ( $data as $row ) {
+      if ( !is_array( $row ) || !array_key_exists( 'id', $row ) ) {
+        continue;
+      }
+      if ( is_int( $row['id'] ) || ( is_string( $row['id'] ) && ctype_digit( $row['id'] ) ) ) {
+        if ( GMCP_Core::post_read_guard( (int) $row['id'] ) !== true ) {
+          continue;
+        }
+      }
+      if ( $strip_id ) {
+        unset( $row['id'] );
+      }
+      $out[] = $row;
+    }
+    return $out;
+  }
+
+  /**
+  * A page of a post listing built with the offset counted here and not by the database, for the
+  * case where the query's guard is in doubt (@see GMCP_Core::with_readable_posts_sql()). The
+  * controller is asked for windows of 100 rows from offset 0, each row is judged by its id as in
+  * judge_post_rows(), and the rows before the caller's offset are passed over as they are read,
+  * inside a bound of 5000 rows looked at, so a page past it is short, as for the other listings.
+  *
+  * @return array|null The rows, or null when the controller refused a window (the caller then
+  *                    keeps its own answer, which has been judged and so is safe).
+  */
+  private function page_in_php( WP_REST_Request $request, bool $strip_id ): ?array {
+    $per = max( 1, min( 100, (int) ( $request->get_param( 'per_page' ) ?: 10 ) ) );
+    $offset = $request->get_param( 'offset' );
+    $skip = $offset !== null && $offset !== '' ? max( 0, (int) $offset ) : ( max( 1, (int) ( $request->get_param( 'page' ) ?: 1 ) ) - 1 ) * $per;
+    $out = [];
+    $raw = 0;
+    $scanned = 0;
+    while ( $scanned < 5000 && count( $out ) < $per ) {
+      $window = clone $request;
+      $window->set_param( 'per_page', 100 );
+      $window->set_param( 'page', 1 );
+      $window->set_param( 'offset', $raw );
+      $held = null;
+      $response = GMCP_Core::with_readable_posts_sql( static function () use ( $window ) {
+        return rest_do_request( $window );
+      }, $held );
+      if ( is_wp_error( $response ) || $response->get_status() >= 400 ) {
+        return null;
+      }
+      $rows = $response->get_data();
+      if ( !is_array( $rows ) || !$rows ) {
+        break;
+      }
+      foreach ( $this->judge_post_rows( $rows, false ) as $row ) {
+        // judge_post_rows() leaves out what is refused, so what it returns is the readable rows.
+        if ( $skip > 0 ) {
+          $skip--;
+          continue;
+        }
+        $out[] = $row;
+        if ( count( $out ) >= $per ) {
+          break;
+        }
+      }
+      $scanned += count( $rows );
+      $raw += count( $rows );
+      if ( count( $rows ) < 100 ) {
+        break;
+      }
+    }
+    if ( $strip_id ) {
+      foreach ( $out as $i => $row ) {
+        unset( $out[ $i ]['id'] );
+      }
+    }
+    return $out;
   }
 
   private function build_schema_from_args( $args ) {
@@ -208,6 +300,10 @@ class GMCP_Tools_Rest {
     ];
 
     foreach ( $args as $name => $def ) {
+      // A field that carries a page builder's layout is not offered: the tool would refuse it.
+      if ( in_array( strtolower( trim( (string) $name ) ), GMCP_Core::layout_rest_fields(), true ) ) {
+        continue;
+      }
       $property = [];
       foreach ( $allowed_keys as $key ) {
         if ( array_key_exists( $key, $def ) ) {
@@ -374,6 +470,17 @@ class GMCP_Tools_Rest {
         $row_id = 0;
         $args['id'] = 0;
       }
+      // And the write policy, for a write: the read guard above is silent at admin level, and the
+      // controller only checks that the row is of the route's type, so an ordinary page or
+      // attachment that shares its id with an order (measured: delete_pages at admin trashed it,
+      // which hid every note of the order) was written and deleted through here while the generic
+      // post tools refused. @see GMCP_Core::hpos_order_type()
+      if ( $action !== 'get' && $row_id > 0 ) {
+        $write_held = GMCP_Core::commerce_post_guard( $row_id, $action === 'delete' ? 'Deleting' : 'Updating' );
+        if ( $write_held !== true ) {
+          return $this->error( $id, $write_held, -32600 );
+        }
+      }
       $path .= '/' . $row_id;
     }
 
@@ -418,12 +525,28 @@ class GMCP_Tools_Rest {
       $request->set_body_params( $args );
     }
 
-    // A listing is filtered where it is built. Only for GET, and only for the lifetime of this
-    // one dispatch.
+    // A listing is filtered where it is built (the SQL guard, and a row check inside the query),
+    // and the finished rows are judged once more here, by id, after the dispatch: another plugin's
+    // query filter can widen the SQL (measured: with `OR 1=1` appended to the WHERE, list_media
+    // returned a file attached to a form submission to a read-only key) and can add rows from a
+    // callback it registers while the query runs, behind the query-side checks. Only for GET, and
+    // only for the lifetime of this one dispatch. @see GMCP_Core::with_readable_posts_sql()
     $listing = $method === 'GET' && $action === 'list';
-    if ( $listing ) {
-      add_filter( 'posts_join', [ $this, 'join_unreadable_posts' ] );
-      add_filter( 'posts_where', [ $this, 'exclude_unreadable_posts' ] );
+    // The rows of a post listing are judged by id AFTER the response is built, by this code and not
+    // by a hook, so nothing that runs inside the dispatch can run behind the judge. The id is asked
+    // of the controller even when the caller's _fields leaves it out, and taken out again below.
+    $judge_ids = $listing && $this->resource_is_post_route( $resource );
+    $sql_held = null;
+    $id_added = false;
+    if ( $judge_ids ) {
+      $fields = $request->get_param( '_fields' );
+      if ( is_array( $fields ) ) {
+        $fields = implode( ',', array_map( 'strval', $fields ) );
+      }
+      if ( is_string( $fields ) && trim( $fields ) !== '' && !in_array( 'id', array_map( 'trim', explode( ',', $fields ) ), true ) ) {
+        $request->set_param( '_fields', $fields . ',id' );
+        $id_added = true;
+      }
     }
     // Rows a create makes, so one the net refuses AFTER it was inserted can be taken back out.
     $made = [];
@@ -435,8 +558,15 @@ class GMCP_Tools_Rest {
     if ( $action === 'create' ) {
       add_action( 'wp_insert_post', $track, 0, 3 );
     }
+    // Every registered REST field is held away from a page builder's layout for this dispatch, and a
+    // field that carries one is removed. @see GMCP_Core::guard_rest_fields()
+    $release_fields = GMCP_Core::guard_rest_fields();
     try {
-      $response = rest_do_request( $request );
+      $response = $listing
+        ? GMCP_Core::with_readable_posts_sql( static function () use ( $request ) {
+          return rest_do_request( $request );
+        }, $sql_held, true )
+        : rest_do_request( $request );
     }
     catch ( GMCP_Policy_Refusal | GMCP_Drafts_Only_Refusal $refusal ) {
       // The controller inserts, then applies the featured image, terms and meta, and the net throws
@@ -458,18 +588,33 @@ class GMCP_Tools_Rest {
         $stuck[] = $new_id;
       }
       $note = $gone ? ' The ' . ( count( $gone ) === 1 ? 'post' : 'posts' ) . ' this call had already inserted (#' . implode( ', #', $gone ) . ') ' . ( count( $gone ) === 1 ? 'was' : 'were' ) . ' removed again, so nothing was created.' : '';
+      if ( $action === 'update' ) {
+        // The controller applies the post's own fields before the registered ones, so a refusal
+        // raised from a field's callback comes after part of the update was stored.
+        $note .= ' The other fields of this call may already have been applied: read the post to see what it holds.';
+      }
       if ( $stuck ) {
         $note .= ' Could not remove #' . implode( ', #', $stuck ) . ', which this call had already inserted: delete it with wp_delete_post.';
       }
       return $this->error( $id, $refusal->getMessage() . $note, 'gmcp_refused' );
     }
     finally {
+      $release_fields();
       if ( $action === 'create' ) {
         remove_action( 'wp_insert_post', $track, 0 );
       }
-      if ( $listing ) {
-        remove_filter( 'posts_where', [ $this, 'exclude_unreadable_posts' ] );
-        remove_filter( 'posts_join', [ $this, 'join_unreadable_posts' ] );
+    }
+
+    // The SQL guard was in doubt for this listing (the finished query lost it, or was answered
+    // without the database): the controller's page and offset counted rows the caller may not read,
+    // so the page is built again with the offset passed over here, row by row. Otherwise a short
+    // page marked where a hidden row sits, and a page the controller took for out of range was an
+    // error. Also for an error, which the same doubt can cause (the controller counted the pages
+    // from rows another plugin supplied); a page_in_php() that cannot answer leaves the error as it was.
+    if ( $judge_ids && $sql_held === false ) {
+      $paged = $this->page_in_php( $request, $id_added );
+      if ( $paged !== null ) {
+        return $paged;
       }
     }
 
@@ -488,6 +633,10 @@ class GMCP_Tools_Rest {
     }
 
     $data = $response->get_data();
+
+    if ( $judge_ids ) {
+      $data = $this->judge_post_rows( $data, $id_added );
+    }
 
     // Return just the data - execute_tool will wrap it properly
     return $data;
