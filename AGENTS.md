@@ -260,6 +260,28 @@ still there. Importing one rewrites the whole design system from an archive buil
 in a single call, with no restore tool behind it. Same category as the two above: deliberate,
 and not an omission to be helpfully filled in.
 
+**`beaver_create_page` creates, sanitises, and answers from the table.** It has no argument that
+names an existing post, so it cannot replace or extend a layout; the builder's own writer applies
+no capability check and no sanitising, so every value is cleaned in the tool (`sanitise_module()`),
+and a key that is a raw sink in the render path is refused by name. Four things were wrong in the
+first version and each is a rule now. The graph is row > column-group > column > module, built the
+way the builder's `add_row()` builds it: the version without the group level stored twelve nodes,
+answered success and rendered no module, and the suite now RENDERS the page. A module is written
+under the field its renderer reads (`heading`, not `text`; a photo's `photo_src`, derived from the
+attachment id and never taken from the caller). A photo is a pointer to a post that is
+dereferenced when the page renders, so it asks the one function that judges a featured image
+(`pointer_meta_refusal( '_thumbnail_id', ... )`) and `post_read_guard()`: a form submission's
+upload was accepted as a photo while the generic writer refused it as a featured image. And the
+reply is built from the stored row read through `$wpdb`, because the builder's reader returns the
+array its writer cached in the same request; a page whose stored layout is not the one built, or
+whose write threw, is deleted again before the tool answers, so it never says "failed" over a
+page that is there. A link is judged after sanitising, in the form a browser reads it (tabs and
+newlines are deleted by both). A rich-text line that is only a URL becomes a link, because the
+module renders through the oEmbed filter and would fetch it. What it does not cover: the journal
+records the three layout rows (and can undo them) but has no entry for the creation, so the page
+comes off with `wp_delete_post`; the text a caller writes is theirs (a link in rich text can
+point anywhere, as any post body can); the module set is four types.
+
 **The audit log has no bulk actions and no row deletion in the UI.** Rows hash the row
 before them, so removing one from the middle is exactly what the chain exists to make
 visible. A convenient button for it would be building the attack into the product.
@@ -327,16 +349,18 @@ Redirection tools, `smoke-polylang.sh` covers the Polylang tools, `smoke-seo.sh`
 All in One SEO tools, and `smoke-forms.sh` covers the form-submission tools (Contact Form 7 with
 Flamingo, Fluent Forms, Ninja Forms, WPForms; its first block needs no form plugin).
 `smoke-wordfence.sh` covers the Wordfence tools, `smoke-stream.sh` covers the Stream tools,
-`smoke-beaver.sh` covers the Beaver Builder tools, `smoke-download.sh` covers the one-time
-download endpoint and `smoke-export.sh` covers the site-file manifest, the approval-gated
-archive and its one-time endpoint.
+`smoke-beaver.sh` covers the Beaver Builder tools, `smoke-beaver-write.sh` covers the one that
+builds a page (and renders it, because a stored-node count passed on a page that showed nothing),
+`smoke-download.sh` covers the one-time download endpoint and `smoke-export.sh` covers the
+site-file manifest, the approval-gated archive and its one-time endpoint.
 Run all
-twenty-one before committing. The plugin-specific suites need
+twenty-two before committing. The plugin-specific suites need
 their plugin installed and say so and exit rather than reporting failures against a site that
 simply does not have it; `smoke-download.sh` and `smoke-export.sh` need only this plugin.
 (This sentence said fourteen while twelve suites existed and sixteen
-while seventeen did, which is the same drift the access-level table had: a count nothing checks
-moves on its own. It is twenty-one now, counted from `ls .dev/smoke*.sh`.)
+while seventeen did, and said twenty-one with twenty-two on disk and the newest suite missing
+from the list, which is the same drift the access-level table had: a count nothing checks
+moves on its own. It is twenty-two now, counted from `ls .dev/smoke*.sh`.)
 
 **A test for a guard must not depend on that guard.** Read the value, make the hostile
 call, read it back, **put it back**, and only then compare. The first version of the
