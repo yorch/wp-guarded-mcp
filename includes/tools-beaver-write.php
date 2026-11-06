@@ -7,20 +7,28 @@ if ( !defined( 'ABSPATH' ) ) {
 /**
 * Creating a Beaver Builder page, from a typed schema, with sanitising this plugin owns.
 *
-* WHY THIS IS CREATE-ONLY, AND WHY THAT IS NOT AN OVERSIGHT. Beaver's write path applies no
-* sanitisation of its own: FLBuilderModel::update_layout_data() writes `_fl_builder_data` with
-* no capability check, no kses and no sanitize_settings() — all of that lives in
-* save_settings(), which the builder's own UI uses and a direct writer never reaches. So the
-* tool below sanitises every value itself. That is the whole control, and it is why the
-* accepted shape is a small typed schema rather than a settings array.
+* WHY THIS IS CREATE-ONLY. Beaver's write path applies no sanitisation of its own:
+* FLBuilderModel::update_layout_data() writes `_fl_builder_data` with no capability check, no
+* kses and no sanitize_settings() — all of that lives in save_settings(), which the builder's
+* own UI uses and a direct writer never reaches. So the tool below sanitises every value itself.
+* That is the whole control, and it is why the accepted shape is a small typed schema rather
+* than a settings array. The tool has no argument that names an existing post, so it cannot
+* replace or extend a layout that is already there: every call makes a new page.
 *
-* The second reason is undo. This plugin's change journal restores post meta through
-* update_post_meta(), and GMCP_Core::layout_meta_refusal() refuses layout keys during a tool
-* call, so the journal cannot currently restore a layout — its own restore would be blocked by
-* this plugin's own guard. Rather than ship a write with no undo, this tool refuses to touch a
-* page that already has a layout. A page it creates has no previous layout to lose, and the
-* page itself can be deleted with the ordinary post tools. Editing an existing layout waits for
-* a `builder` journal kind and a narrow per-operation exemption; both are named in the PR.
+* UNDO. This file used to say the journal could not restore a layout. It can. The change journal records the three layout
+* rows (`_fl_builder_data`, `_fl_builder_data_settings`, `_fl_builder_enabled`) as custom fields
+* added, and wp_undo_change on them works both ways (measured): removing a row, and putting it
+* back from the journal, which restores exactly the sanitised value this tool wrote and nothing
+* a caller could choose. What the journal does not have is an entry for the CREATION of the page
+* (it has no kind that means "remove this post"), so a created page is removed with
+* wp_delete_post, and the reply says so.
+*
+* WHAT THE REPLY CLAIMS. The reply is built from the stored row, read straight from the
+* database after the write: the builder's own reader returns the array its writer cached in the
+* same request, so a read through it proves nothing about what reached the table. If the stored
+* layout is not the one that was built, the page is deleted again and the call fails; a tool
+* that answers failure over a page it left behind, or success over a layout it half stored, is
+* the defect this file's reply is written to avoid.
 *
 * WHAT IS NEVER ACCEPTED, at any level, and is refused by name rather than ignored:
 *   - `bb_js_code` and `bb_css_code`: the shared advanced path on every module. The JS is
@@ -80,6 +88,11 @@ class GMCP_Tools_Beaver_Write {
   /** How many modules one call may create. */
   const MAX_MODULES = 50;
 
+  /** Bytes in one text or link field, bytes across a page, characters in a title. */
+  const MAX_TEXT = 100000;
+  const MAX_TOTAL = 400000;
+  const MAX_TITLE = 200;
+
   /** Set when a write turned out to be a no-op, so gmcp_mutate does not fire for it. */
   private $noop = false;
 
@@ -105,7 +118,7 @@ class GMCP_Tools_Beaver_Write {
     return [
       'beaver_create_page' => [
         'name' => 'beaver_create_page',
-        'description' => 'Create a page and build its Beaver Builder layout from a typed schema. Admin level. Each entry in `modules` is one module the tool builds a row and column for, in this order, and the layout is written through the builder\'s own writer. Accepted types and the ONLY fields each may carry: heading {text, tag}, rich-text {text}, button {text, link, link_target}, photo {photo: an attachment id}. Everything is sanitised HERE on write, because Beaver\'s own write path applies no sanitisation at all — text goes through wp_kses_post, links through esc_url_raw with a policy that refuses non-http(s) and protocol-relative targets (esc_url keeps //host), the heading tag is a fixed enum, and a photo must be an existing attachment id. A settings key that is a raw sinking point in Beaver\'s render path is REFUSED BY NAME rather than ignored: bb_js_code, bb_css_code (the shared advanced path on every module), custom_attributes, attributes, popup, lightbox_content_html, photo_url and photo_src. The page is created as a draft unless told otherwise, and the reply reports what was stored by reading the layout back, not what was sent. It refuses to touch a page that already has a layout: there is no layout undo yet, so this tool only ever creates the first one.',
+        'description' => 'Create a page and build its Beaver Builder layout from a typed schema. Admin level. Each entry in `modules` becomes one row with one column holding that module, in this order, written through the builder\'s own writer. Accepted types and the ONLY fields each may carry: heading {text, tag}, rich-text {text}, button {text, link, link_target}, photo {photo: an attachment id}. Everything is sanitised HERE on write, because Beaver\'s own write path applies no sanitisation at all: text goes through wp_kses_post (headings and buttons as plain text), a button link must be an absolute http(s) URL with a host and no user information, or a path on this site, and is judged after sanitising (a protocol-relative or backslash target is refused), the heading tag is a fixed enum, and a photo must be an existing image attachment that a featured image could use (a form submission\'s upload, or an order\'s, is refused). A line of rich text that is only a URL becomes a link instead of an embed, so rendering the page does not fetch an address the caller chose. A settings key that is a raw sinking point in Beaver\'s render path is REFUSED BY NAME rather than ignored: bb_js_code, bb_css_code, custom_attributes, attributes, popup, lightbox_content_html, photo_url and photo_src. At most 50 modules, 100000 bytes in a field and 400000 in all. The page is created as a draft unless told otherwise, and made public last. The reply reports what is stored in the database (read after the write, not the builder\'s cache); if the stored layout is not the one built, or anything fails after the page exists, the page is deleted again and the call fails. This tool only creates: it has no argument that names an existing page. Remove a page it made with wp_delete_post.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -160,14 +173,27 @@ class GMCP_Tools_Beaver_Write {
     if ( $title === '' ) {
       return $this->error( $r, 'A title is required.' );
     }
-    $status = isset( $args['status'] ) ? (string) $args['status'] : 'draft';
-    if ( !in_array( $status, [ 'draft', 'publish' ], true ) ) {
-      return $this->error( $r, 'Unknown status "' . $status . '". Use draft or publish.' );
+    if ( mb_strlen( $title ) > self::MAX_TITLE ) {
+      return $this->error( $r, 'The title is ' . mb_strlen( $title ) . ' characters; this tool takes at most ' . self::MAX_TITLE . '.' );
     }
-    // The same question every other tool that creates a post asks before it writes: a key
-    // restricted to drafts may not publish.
-    // The net under wp_insert_post would stop it too, but only as an exception from inside
-    // WordPress; this says why in a sentence and leaves nothing behind.
+    $status = isset( $args['status'] ) && is_string( $args['status'] ) ? $args['status'] : 'draft';
+    if ( !in_array( $status, [ 'draft', 'publish' ], true ) ) {
+      return $this->error( $r, 'Unknown status. Use draft or publish.' );
+    }
+    // The same questions every other tool that creates a post asks before it writes. The post
+    // type is fixed at "page", but the lists behind these are filterable, and a site that adds
+    // "page" to one of them has made a decision this tool must not walk around.
+    $commerce = GMCP_Core::commerce_post_guard( 0, 'Creating', 'page' );
+    if ( $commerce !== true ) {
+      return $this->error( $r, $commerce, -32600 );
+    }
+    $submission = GMCP_Core::personal_data_retype_guard( 0, 'page' );
+    if ( $submission !== true ) {
+      return $this->error( $r, $submission, -32600 );
+    }
+    // A key restricted to drafts may not publish. (Such a key is capped below admin and never
+    // reaches this tool; asked anyway so the answer does not depend on that cap.) The net under
+    // wp_insert_post would stop it too, but only as an exception from inside WordPress.
     $drafts = GMCP_Core::drafts_only_status_guard( $status, 'Creating a page' );
     if ( $drafts !== true ) {
       return $this->error( $r, $drafts, -32600 );
@@ -177,13 +203,20 @@ class GMCP_Tools_Beaver_Write {
     if ( !current_user_can( 'edit_pages' ) ) {
       return $this->error( $r, 'Creating a page needs the edit_pages capability on this site, which the credential in use does not hold.', -32600 );
     }
-    if ( isset( $args['status'] ) && (string) $args['status'] === 'publish' && !current_user_can( 'publish_pages' ) ) {
+    if ( $status === 'publish' && !current_user_can( 'publish_pages' ) ) {
       return $this->error( $r, 'Publishing a page needs the publish_pages capability, which the credential in use does not hold. Create it as a draft instead.', -32600 );
     }
 
-    $requested = isset( $args['modules'] ) && is_array( $args['modules'] ) ? $args['modules'] : [];
-    if ( !$requested ) {
+    // Some clients send an array as a JSON string; the other create tools accept that.
+    $requested = $args['modules'] ?? [];
+    if ( is_string( $requested ) ) {
+      $requested = json_decode( $requested, true );
+    }
+    if ( !is_array( $requested ) || !$requested ) {
       return $this->error( $r, 'At least one module is required; an empty layout is not a page worth creating through this tool.' );
+    }
+    if ( !array_is_list( $requested ) ) {
+      return $this->error( $r, '"modules" must be a list of module objects, in order.' );
     }
     if ( count( $requested ) > self::MAX_MODULES ) {
       return $this->error( $r, 'That call named ' . count( $requested ) . ' modules; this tool builds at most ' . self::MAX_MODULES . ' in one page.' );
@@ -192,77 +225,207 @@ class GMCP_Tools_Beaver_Write {
     // Every module is validated and sanitised BEFORE the page exists, so a refusal leaves
     // nothing behind to clean up.
     $built = [];
+    $total = 0;
     foreach ( $requested as $index => $module ) {
       $one = $this->sanitise_module( $module, $index );
       if ( is_string( $one ) ) {
         return $this->error( $r, $one );
       }
+      $total += $one['bytes'];
+      if ( $total > self::MAX_TOTAL ) {
+        return $this->error( $r, 'The modules carry more than ' . self::MAX_TOTAL . ' bytes of text between them; this tool builds a page, not a document store.' );
+      }
       $built[] = $one;
     }
 
-    // A title is rendered by the theme, and an administrator with unfiltered_html could store
-    // markup in it. Sanitised here so the tool's own output is uniform.
-    $post_id = wp_insert_post( [
-      'post_title'   => sanitize_text_field( $title ),
-      'post_type'    => 'page',
-      'post_status'  => $status,
-      'post_content' => '',
-    ], true );
+    $layout = $this->build_layout( $built );
+
+    // Always created as a draft, and made live last, after the layout has been stored and read
+    // back: creating it live first left a published empty page standing whenever the layout
+    // write failed, and fired every publish hook for a page that then had to be deleted.
+    try {
+      $post_id = wp_insert_post( [
+        'post_title'   => sanitize_text_field( $title ),
+        'post_type'    => 'page',
+        'post_status'  => 'draft',
+        'post_content' => '',
+      ], true );
+    } catch ( \Throwable $e ) {
+      // A net under wp_insert_post throws BEFORE the row exists. Nothing was written.
+      // The guards' own refusals are sentences written for the caller; any other exception is not.
+      $why = $e instanceof GMCP_Drafts_Only_Refusal || $e instanceof GMCP_Policy_Refusal
+        ? $e->getMessage()
+        : 'WordPress threw ' . get_class( $e ) . '; the message is in the site error log.';
+      if ( !( $e instanceof GMCP_Drafts_Only_Refusal || $e instanceof GMCP_Policy_Refusal ) ) {
+        error_log( 'guarded-mcp beaver_create_page: ' . GMCP_Core::log_text( $e->getMessage() ) );
+      }
+      return $this->error( $r, 'The page could not be created, and nothing was written: ' . $why, -32600 );
+    }
     if ( is_wp_error( $post_id ) ) {
       return $this->error( $r, 'The page could not be created: ' . $post_id->get_error_message() );
     }
     $post_id = (int) $post_id;
 
-    $layout = $this->build_layout( $built );
-
-    // The layout keys are refused to the generic meta tools by generic_writer_meta_refusal(), and
-    // the WordPress-level net does not ask about them (the builder writes them from its own save
-    // hook). The permission is scoped to this callback anyway, so a later tightening of the net
-    // cannot break this tool; it is a static depth counter, not a flag a caller can set.
-    $stored = GMCP_Core::with_layout_write( function () use ( $post_id, $layout ) {
-      $previous = (int) \FLBuilderModel::get_post_id();
-      try {
-        \FLBuilderModel::set_post_id( $post_id );
-        \FLBuilderModel::update_layout_data( $layout, 'published', $post_id );
-        \FLBuilderModel::update_layout_settings( [], 'published', $post_id );
-        \FLBuilderModel::enable();
-        \FLBuilderModel::delete_asset_cache();
-      } finally {
-        \FLBuilderModel::set_post_id( $previous );
+    // From here on a row exists. Any failure removes it again and says so, so the reply never
+    // answers "failed" over a page that is still there.
+    try {
+      $this->write_layout( $post_id, $layout );
+      $problem = $this->verify_stored( $post_id, $built );
+      if ( $problem === null && $status === 'publish' ) {
+        $published = wp_update_post( [ 'ID' => $post_id, 'post_status' => 'publish' ], true );
+        if ( is_wp_error( $published ) ) {
+          $problem = 'The layout was stored but the page could not be published: ' . $published->get_error_message();
+        } elseif ( get_post_status( $post_id ) !== 'publish' ) {
+          $problem = 'The layout was stored but the page did not reach the publish status.';
+        }
       }
-      return \FLBuilderModel::get_layout_data( 'published', $post_id );
-    } );
+    } catch ( \Throwable $e ) {
+      $problem = 'Writing the layout failed (' . get_class( $e ) . '; the message is in the site error log).';
+      error_log( 'guarded-mcp beaver_create_page: ' . GMCP_Core::log_text( $e->getMessage() ) );
+    }
 
-    // What was STORED, read back through the builder, not what was sent.
-    $stored = is_array( $stored ) ? $stored : [];
-    $types = [];
+    if ( $problem !== null ) {
+      // The removal can fail for the reason the write did (the builder clears its layout from a
+      // delete hook), so it is not trusted to succeed: the reply says what is actually there.
+      try {
+        wp_delete_post( $post_id, true );
+      } catch ( \Throwable $e ) {
+        error_log( 'guarded-mcp beaver_create_page: removing the page failed: ' . GMCP_Core::log_text( $e->getMessage() ) );
+      }
+      clean_post_cache( $post_id );
+      $left = get_post( $post_id ) instanceof \WP_Post;
+      return $this->error( $r, $problem . ( $left
+        ? ' The page it had created (ID ' . $post_id . ') could not be removed; delete it with wp_delete_post.'
+        : ' The page it had created was removed again, so nothing is left behind.' ) );
+    }
+
+    // What was STORED, read from the table, not what was sent and not the builder's cache.
+    $stored = $this->stored_layout( $post_id );
+    $counts = [];
+    $modules = [];
     foreach ( $stored as $node ) {
-      if ( is_object( $node ) && isset( $node->type ) ) {
-        $types[] = (string) $node->type;
+      $counts[ $node->type ] = ( $counts[ $node->type ] ?? 0 ) + 1;
+      if ( $node->type === 'module' ) {
+        $modules[] = (string) ( $node->settings->type ?? '' );
       }
     }
-    sort( $types );
+    ksort( $counts );
+    sort( $modules );
 
     return $this->json( $r, [
       'ID' => $post_id,
-      'status' => $status,
-      'builder_enabled' => (bool) \FLBuilderModel::is_builder_enabled( $post_id ),
+      'status' => get_post_status( $post_id ),
+      'builder_enabled' => (bool) get_post_meta( $post_id, '_fl_builder_enabled', true ),
       'stored_nodes' => count( $stored ),
-      'stored_types' => $types,
-      'note' => 'The reply is the layout read back out of the builder, not the modules that were sent. Editing this page\'s layout is refused: there is no layout undo yet, so this tool only creates the first one. Publish it from wp-admin when it looks right.',
+      'stored_node_types' => $counts,
+      'stored_module_types' => $modules,
+      'note' => 'The reply is the layout read back out of the database, not the modules that were sent. This tool only creates: it has no argument that names an existing page. To remove this page use wp_delete_post; the change journal records the layout rows but has no entry for the creation of a page.' . ( $status === 'publish' ? '' : ' It is a draft; publish it from wp-admin when it looks right.' ),
     ] );
+  }
+
+  /** Write the layout through the builder's own writer. Throws; the caller removes the page. */
+  private function write_layout( int $post_id, array $layout ): void {
+    $previous = (int) \FLBuilderModel::get_post_id();
+    try {
+      \FLBuilderModel::set_post_id( $post_id );
+      \FLBuilderModel::update_layout_data( $layout, 'published', $post_id );
+      \FLBuilderModel::update_layout_settings( [], 'published', $post_id );
+      \FLBuilderModel::enable();
+      \FLBuilderModel::delete_asset_cache();
+    } finally {
+      \FLBuilderModel::set_post_id( $previous );
+    }
+  }
+
+  /**
+  * The layout row as the table holds it, bypassing every cache.
+  *
+  * FLBuilderModel::get_layout_data() returns the array update_layout_data() cached in the same
+  * request, so a check made through it passes whatever reached the table.
+  *
+  * @return object[] Nodes by id, or [] when there is no readable row.
+  */
+  private function stored_layout( int $post_id ): array {
+    global $wpdb;
+    $rows = $wpdb->get_col( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = '_fl_builder_data'", $post_id ) );
+    if ( count( $rows ) !== 1 ) {
+      return [];
+    }
+    $data = maybe_unserialize( $rows[0] );
+    if ( !is_array( $data ) ) {
+      return [];
+    }
+    $nodes = [];
+    foreach ( $data as $id => $node ) {
+      if ( is_object( $node ) && isset( $node->type ) ) {
+        $nodes[ (string) $id ] = $node;
+      }
+    }
+    return $nodes;
+  }
+
+  /**
+  * Whether what is stored is what was built: the node counts, and the value of every field this
+  * tool set on every module. Builder filters and the builder's own cleaning drop nodes without
+  * saying so, and the tool must not call that a page.
+  *
+  * @return string|null A sentence, or null when the stored layout matches.
+  */
+  private function verify_stored( int $post_id, array $built ): ?string {
+    $stored = $this->stored_layout( $post_id );
+    $want = count( $built );
+    $have = [ 'row' => 0, 'column-group' => 0, 'column' => 0, 'module' => 0 ];
+    $mods = [];
+    foreach ( $stored as $node ) {
+      if ( isset( $have[ $node->type ] ) ) {
+        $have[ $node->type ]++;
+      }
+      if ( $node->type === 'module' ) {
+        $mods[] = $node;
+      }
+    }
+    foreach ( $have as $type => $n ) {
+      if ( $n !== $want ) {
+        return 'The layout that reached the database holds ' . $n . ' ' . $type . ' node(s) where ' . $want . ' were built, so something between the tool and the table changed it.';
+      }
+    }
+    // Modules in page order: by the position of the row each one hangs from.
+    $row_position = function ( $node ) use ( $stored ) {
+      $col = $stored[ (string) $node->parent ] ?? null;
+      $grp = $col ? ( $stored[ (string) $col->parent ] ?? null ) : null;
+      $row = $grp ? ( $stored[ (string) $grp->parent ] ?? null ) : null;
+      return $row ? (int) $row->position : -1;
+    };
+    usort( $mods, function ( $a, $b ) use ( $row_position ) {
+      return $row_position( $a ) <=> $row_position( $b );
+    } );
+    foreach ( $built as $i => $module ) {
+      $node = $mods[ $i ] ?? null;
+      if ( !$node || !is_object( $node->settings ?? null ) || ( $node->settings->type ?? '' ) !== $module['type'] ) {
+        return 'Module ' . $i . ' is not in the stored layout as a ' . $module['type'] . ' module.';
+      }
+      foreach ( $module['settings'] as $key => $value ) {
+        if ( !isset( $node->settings->$key ) || (string) $node->settings->$key !== (string) $value ) {
+          return 'Module ' . $i . ' (' . $module['type'] . ') was stored with a different "' . $key . '" than the one that was built, so something between the tool and the table changed it.';
+        }
+      }
+    }
+    if ( !get_post_meta( $post_id, '_fl_builder_enabled', true ) ) {
+      return 'The layout was stored but the builder is not enabled on the page.';
+    }
+    return null;
   }
 
   /**
   * One module, validated and sanitised, as a node waiting for its parent.
   *
-  * @return array|string The node settings, or a refusal sentence.
+  * @return array|string The node, or a refusal sentence.
   */
   private function sanitise_module( $module, int $index ) {
     if ( !is_array( $module ) ) {
       return 'Module ' . $index . ' is not an object.';
     }
-    $type = isset( $module['type'] ) ? (string) $module['type'] : '';
+    $type = isset( $module['type'] ) && is_string( $module['type'] ) ? $module['type'] : '';
     if ( $type === '' ) {
       return 'Module ' . $index . ' has no type.';
     }
@@ -287,6 +450,15 @@ class GMCP_Tools_Beaver_Write {
         return 'Module ' . $index . ' (' . $type . ') carries an unsupported field "' . $key . '". Accepted: ' . implode( ', ', $allowed ) . '.';
       }
     }
+    $bytes = 0;
+    foreach ( [ 'text', 'link' ] as $field ) {
+      if ( isset( $module[ $field ] ) && is_string( $module[ $field ] ) ) {
+        $bytes += strlen( $module[ $field ] );
+        if ( strlen( $module[ $field ] ) > self::MAX_TEXT ) {
+          return 'Module ' . $index . ' (' . $type . ') carries ' . strlen( $module[ $field ] ) . ' bytes in "' . $field . '"; this tool takes at most ' . self::MAX_TEXT . ' per field.';
+        }
+      }
+    }
 
     $out = [];
     switch ( $type ) {
@@ -295,13 +467,14 @@ class GMCP_Tools_Beaver_Write {
         if ( $text === '' ) {
           return 'Module ' . $index . ' (heading) has no text.';
         }
-        $tag = isset( $module['tag'] ) ? strtolower( (string) $module['tag'] ) : 'h2';
+        $tag = isset( $module['tag'] ) ? strtolower( is_string( $module['tag'] ) ? $module['tag'] : '' ) : 'h2';
         if ( !in_array( $tag, self::TAGS, true ) ) {
-          return 'Module ' . $index . ' (heading) asks for tag "' . $tag . '". Use one of: ' . implode( ', ', self::TAGS ) . '. The tag is an element name in Beaver\'s output, so free text there is an injection point.';
+          return 'Module ' . $index . ' (heading) asks for an unsupported tag. Use one of: ' . implode( ', ', self::TAGS ) . '. The tag is an element name in Beaver\'s output, so free text there is an injection point.';
         }
-        // The stored value is what the renderer echoes, and it echoes it RAW, so the
-        // sanitiser has to run here rather than being trusted to the builder.
-        $out = [ 'text' => $text, 'tag' => $tag ];
+        // The module's own field is `heading`, and its renderer echoes it RAW, so the sanitiser
+        // has to run here rather than being trusted to the builder. (This was stored under
+        // `text`, which the heading module never reads: the page rendered an empty heading.)
+        $out = [ 'heading' => $text, 'tag' => $tag ];
         break;
 
       case 'rich-text':
@@ -318,54 +491,98 @@ class GMCP_Tools_Beaver_Write {
           return 'Module ' . $index . ' (button) has no text.';
         }
         $link = $this->safe_link( $module['link'] ?? '', $index );
-        if ( is_string( $link ) && $link !== '' && $link[0] !== '/' && strpos( $link, ':' ) === false ) {
-          return $link;
+        if ( $link['error'] !== null ) {
+          return $link['error'];
         }
-        $target = isset( $module['link_target'] ) ? (string) $module['link_target'] : '_self';
+        $target = isset( $module['link_target'] ) && is_string( $module['link_target'] ) ? $module['link_target'] : '_self';
         if ( !in_array( $target, self::TARGETS, true ) ) {
-          return 'Module ' . $index . ' (button) asks for target "' . $target . '". Use _self or _blank.';
+          return 'Module ' . $index . ' (button) asks for an unsupported target. Use _self or _blank.';
         }
-        $out = [ 'text' => $text, 'link' => $link, 'link_target' => $target ];
+        $out = [ 'text' => $text, 'link' => $link['url'], 'link_target' => $target ];
         break;
 
       case 'photo':
-        $att = isset( $module['photo'] ) ? (int) $module['photo'] : 0;
-        if ( $att < 1 || get_post_type( $att ) !== 'attachment' ) {
-          return 'Module ' . $index . ' (photo) needs "photo" set to an existing attachment id.';
+        $att = isset( $module['photo'] ) && is_scalar( $module['photo'] ) ? (int) $module['photo'] : 0;
+        $why = $this->photo_refusal( $att );
+        if ( $why !== null ) {
+          return 'Module ' . $index . ' (photo): ' . $why;
         }
-        // The id, never a URL: Beaver resolves the id server-side, and a URL string is a
-        // caller-controlled sink.
-        $out = [ 'photo' => $att, 'photo_source' => 'library' ];
+        // The id, never a URL from the caller. The module renders `photo_src`, not the id, so the
+        // address is derived here from the attachment (a caller's own `photo_src` is refused by
+        // name): without it the module rendered Beaver's placeholder pixel.
+        $out = [ 'photo' => $att, 'photo_source' => 'library', 'photo_src' => esc_url_raw( (string) wp_get_attachment_url( $att ) ) ];
         break;
     }
 
-    return [ 'type' => $type, 'settings' => $out ];
+    return [ 'type' => $type, 'settings' => $out, 'bytes' => $bytes ];
   }
 
   /**
-  * A layout graph: one row per module, one column inside it, the module inside that.
+  * Why this id may not be a photo module's image, or null when it may.
+  *
+  * The module dereferences the id when the page is RENDERED, for every visitor, so it is a
+  * pointer to a post exactly as a featured image is, and the same policy applies: the one
+  * function that judges `_thumbnail_id` is asked, so the two cannot drift apart (a visitor's
+  * upload attached to a form submission was accepted here while wp_update_post_meta refused it
+  * as a featured image: measured).
+  */
+  private function photo_refusal( int $att ): ?string {
+    if ( $att < 1 || get_post_type( $att ) !== 'attachment' ) {
+      return 'needs "photo" set to an existing attachment id.';
+    }
+    $read = GMCP_Core::post_read_guard( $att );
+    if ( $read !== true ) {
+      return $read;
+    }
+    $pointer = GMCP_Core::pointer_meta_refusal( '_thumbnail_id', $att, 0 );
+    if ( $pointer !== null ) {
+      return str_replace( 'as a featured image', 'as a photo', $pointer );
+    }
+    if ( !wp_attachment_is_image( $att ) ) {
+      return 'attachment #' . $att . ' is not an image, and a photo module would print the file as one.';
+    }
+    if ( !wp_get_attachment_url( $att ) ) {
+      return 'attachment #' . $att . ' has no file to show.';
+    }
+    return null;
+  }
+
+  /**
+  * A layout graph the way the builder's own add_row() / add_col_group() / add_module() make
+  * one: row > column-group > column > module, one of each per module, with the builder's
+  * default settings under the fields this tool sets.
   *
   * Built here rather than accepted from the caller, so the parent/position chain is valid by
-  * construction. Beaver's clean_layout_data() silently drops nodes it cannot place, so a
-  * graph a caller assembled badly would produce an empty page and a success reply.
+  * construction. The column-group level was missing once (row > column > module), and the page
+  * stored twelve nodes, answered success and rendered no module at all: Beaver's renderer
+  * walks row > group > column and skips what does not fit. The suite renders the page now.
   */
   private function build_layout( array $built ): array {
     $layout = [];
-    $next = 1;
-    $position = 0;
-    foreach ( $built as $module ) {
-      $row = (string) $next++;
-      $col = (string) $next++;
-      $node = (string) $next++;
-      $layout[ $row ] = (object) [ 'node' => $row, 'type' => 'row', 'parent' => null, 'position' => $position, 'settings' => (object) [] ];
-      $layout[ $col ] = (object) [ 'node' => $col, 'type' => 'column', 'parent' => $row, 'position' => 0, 'settings' => (object) [] ];
-      // A module node is `type = 'module'` with the module's slug in settings->type. Measured
-      // at class-fl-builder.php:3088, where the renderer tests exactly that: a node whose type
-      // is the slug ('heading') is skipped, so the page would render an invisible layout while
-      // every stored-state check passed. The suite now asserts RENDERED output because of it.
-      $settings = array_merge( [ 'type' => $module['type'] ], $module['settings'] );
-      $layout[ $node ] = (object) [ 'node' => $node, 'type' => 'module', 'parent' => $col, 'position' => 0, 'settings' => (object) $settings ];
-      $position++;
+    $new_id = function () use ( &$layout ) {
+      do {
+        $id = (string) \FLBuilderModel::generate_node_id();
+      } while ( isset( $layout[ $id ] ) );
+      return $id;
+    };
+    $row_defaults = \FLBuilderModel::get_row_defaults();
+    foreach ( $built as $position => $module ) {
+      $row = $new_id();
+      $layout[ $row ] = (object) [ 'node' => $row, 'type' => 'row', 'parent' => null, 'position' => $position, 'settings' => is_object( $row_defaults ) ? clone $row_defaults : (object) [] ];
+      $group = $new_id();
+      $layout[ $group ] = (object) [ 'node' => $group, 'type' => 'column-group', 'parent' => $row, 'position' => 0, 'settings' => '' ];
+      $col = $new_id();
+      $layout[ $col ] = (object) [ 'node' => $col, 'type' => 'column', 'parent' => $group, 'position' => 0, 'settings' => (object) [ 'size' => 100 ] ];
+      // A module node is `type = 'module'` with the module's slug in settings->type; a node
+      // whose type is the slug ('heading') is skipped by the renderer.
+      $defaults = \FLBuilderModel::get_module_defaults( $module['type'] );
+      $settings = is_object( $defaults ) ? clone $defaults : (object) [];
+      foreach ( $module['settings'] as $key => $value ) {
+        $settings->$key = $value;
+      }
+      $settings->type = $module['type'];
+      $node = $new_id();
+      $layout[ $node ] = (object) [ 'node' => $node, 'type' => 'module', 'parent' => $col, 'position' => 0, 'settings' => $settings ];
     }
     return $layout;
   }
@@ -375,17 +592,17 @@ class GMCP_Tools_Beaver_Write {
   #region Sanitising
 
   /**
-  * Text that must stay literal: no tags, no entities, no shortcode brackets.
+  * Text that must stay literal: no tags, no shortcode brackets.
   *
-  * Beaver's heading and button renderers echo their text RAW. Escaping to entities is not
-  * enough on its own for a value that is also passed through do_shortcode() when the assembled
-  * layout is rendered, so square brackets are neutralised here: a shortcode is a way to run
-  * code from a string, and this tool's input is a string from a model.
+  * Beaver's heading and button renderers echo their text RAW. Brackets are neutralised because
+  * the assembled layout can pass through do_shortcode() when it is rendered (a shortcode is a
+  * way to run code from a string, and this tool's input is a string from a model), and a stray
+  * angle bracket that strip_tags left is written as the entity it means.
   */
   private function plain_text( $value ): string {
     $text = is_scalar( $value ) ? (string) $value : '';
     $text = wp_strip_all_tags( $text );
-    $text = str_replace( [ '[', ']' ], [ '&#91;', '&#93;' ], $text );
+    $text = str_replace( [ '<', '>', '[', ']' ], [ '&lt;', '&gt;', '&#91;', '&#93;' ], $text );
     return trim( $text );
   }
 
@@ -394,45 +611,71 @@ class GMCP_Tools_Beaver_Write {
   *
   * wp_kses_post is WordPress's own allowlist for post content: it strips script, event handlers
   * and embeds. Shortcode brackets are neutralised for the same reason as above.
+  *
+  * A line that is only a URL is turned into a link first. The rich-text module renders through
+  * WP_Embed::autoembed(), which turns such a line into an oEmbed: the server then fetches an
+  * address the caller chose, every time the page renders and no one has been asked.
   */
   private function html_text( $value ): string {
     $text = is_scalar( $value ) ? (string) $value : '';
+    $text = preg_replace_callback( '~^([ \t]*)(https?://[^\s"<>]+)([ \t]*)$~im', function ( $m ) {
+      return $m[1] . '<a href="' . esc_url( $m[2] ) . '">' . esc_html( $m[2] ) . '</a>' . $m[3];
+    }, $text ) ?? '';
     $text = wp_kses_post( $text );
     $text = str_replace( [ '[', ']' ], [ '&#91;', '&#93;' ], $text );
     return trim( $text );
   }
 
   /**
-  * A link this site can justify, or '' / a refusal sentence.
+  * A link this site can justify.
   *
   * Beaver renders the link through esc_url(), which strips javascript: and data: but KEEPS a
-  * protocol-relative "//host" — measured on this stack. A protocol-relative link leaves the
-  * site on whatever scheme the visitor arrived with, so it is refused here rather than relied
-  * on to be stripped.
+  * protocol-relative "//host" — measured on this stack. So the value is judged AFTER sanitising,
+  * on what will be stored, and in the form a browser reads it: a browser deletes tabs and
+  * newlines inside a URL, so "/<tab>/evil.example" is "//evil.example" to it, and esc_url_raw()
+  * deletes the same characters (the check used to run on the raw value for a path and was
+  * bypassed by exactly that).
+  *
+  * Accepted: a path on this site ("/x", not "//x" and not "/\x"), or an absolute http(s) URL with
+  * a host and no user information. "http:evil.example" is neither: it is a relative reference on
+  * an http page and an absolute one on an https page, and "https://trusted@evil.example" shows a
+  * host that is not the destination.
+  *
+  * @return array{url:string,error:?string}
   */
-  private function safe_link( $value, int $index ) {
+  private function safe_link( $value, int $index ): array {
+    $fail = function ( string $why ) use ( $index ) {
+      return [ 'url' => '', 'error' => 'Module ' . $index . ' (button) link ' . $why . ' Give an absolute http(s) URL or a path on this site.' ];
+    };
     $raw = is_scalar( $value ) ? trim( (string) $value ) : '';
     if ( $raw === '' ) {
-      return '';
+      return [ 'url' => '', 'error' => null ];
     }
-    if ( strpos( $raw, '//' ) === 0 ) {
-      return 'Module ' . $index . ' (button) link starts with "//", which is protocol-relative and points at another host. Beaver\'s esc_url keeps it. Give an absolute http(s) URL or a path on this site.';
+    $seen = preg_replace( '/[\x00-\x1f\x7f]/', '', $raw );
+    if ( $seen === '' || $seen === null ) {
+      return $fail( 'is not a URL this tool will store.' );
     }
-    if ( $raw[0] === '/' ) {
-      return esc_url_raw( $raw );
+    if ( preg_match( '~^/[/\\\\]~', $seen ) ) {
+      return $fail( 'is protocol-relative and points at another host; Beaver\'s esc_url keeps it.' );
     }
-    $scheme = strtolower( (string) wp_parse_url( $raw, PHP_URL_SCHEME ) );
-    if ( !in_array( $scheme, [ 'http', 'https' ], true ) ) {
-      return 'Module ' . $index . ' (button) link must be http(s) or a path beginning with "/", not "' . $scheme . '".';
+    $is_path = $seen[0] === '/';
+    if ( !$is_path && !preg_match( '~^https?://[^/?#\s]+~i', $seen ) ) {
+      return $fail( 'must be http(s) with a host, or a path beginning with "/".' );
     }
-    $clean = esc_url_raw( $raw );
-    // Re-checked AFTER sanitising, because esc_url_raw() strips control characters: a value
-    // like "/\t/evil.example" is not protocol-relative on the way in and is "//evil.example"
-    // on the way out. The check has to be on the value that will be stored.
-    if ( strpos( $clean, '//' ) === 0 ) {
-      return 'Module ' . $index . ' (button) link sanitises to a protocol-relative target ("' . $clean . '"). Give an absolute http(s) URL or a path on this site.';
+    $clean = esc_url_raw( $seen, [ 'http', 'https' ] );
+    if ( $clean === '' ) {
+      return $fail( 'is not a URL this tool will store.' );
     }
-    return $clean;
+    if ( preg_match( '~^/[/\\\\]~', $clean ) ) {
+      return $fail( 'sanitises to a protocol-relative target.' );
+    }
+    if ( !$is_path ) {
+      $parts = wp_parse_url( $clean );
+      if ( empty( $parts['host'] ) || isset( $parts['user'] ) || isset( $parts['pass'] ) || !in_array( strtolower( (string) ( $parts['scheme'] ?? '' ) ), [ 'http', 'https' ], true ) ) {
+        return $fail( 'has no host, or carries user information ("user@host" shows a host that is not the destination).' );
+      }
+    }
+    return [ 'url' => $clean, 'error' => null ];
   }
 
   #endregion
