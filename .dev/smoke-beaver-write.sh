@@ -57,7 +57,15 @@ check "the page is created" "$(verdict c2)" "ok"
 PID=$(jget c2 ID)
 check "CONTROL: the builder is enabled on it" "$(jget c2 builder_enabled)" "true"
 check "stored node count is rows+columns+modules" "$(jget c2 stored_nodes)" "12"
-check "CONTROL: the stored layout really holds a heading node" "$(dbq "SELECT IF(meta_value LIKE '%\"heading\"%', 'yes','no') FROM wp_postmeta WHERE post_id=$PID AND meta_key='_fl_builder_data'")" "yes"
+# The builder's own node contract, not a substring of the JSON and not the rendered page.
+# The first version of this check looked for the word "heading" in _fl_builder_data and passed
+# on a graph the builder could not render: a module node must be type="module" with the slug in
+# settings->type (class-fl-builder.php:3088). Rendering the page was tried and abandoned — BB
+# renders through a page template, and the active block theme does not call it, so that
+# assertion would have been testing the theme.
+check "the stored node is type=module, not the slug used as a type" "$(dbq "SELECT IF(meta_value LIKE '%\"type\";s:6:\"module\"%', 'yes','no') FROM wp_postmeta WHERE post_id=$PID AND meta_key='_fl_builder_data'")" "yes"
+check "and its settings name the module slug" "$(dbq "SELECT IF(meta_value LIKE '%\"type\";s:7:\"heading\"%', 'yes','no') FROM wp_postmeta WHERE post_id=$PID AND meta_key='_fl_builder_data'")" "yes"
+check "and the heading text is stored" "$(dbq "SELECT IF(meta_value LIKE '%Title here%', 'yes','no') FROM wp_postmeta WHERE post_id=$PID AND meta_key='_fl_builder_data'")" "yes"
 check "the page is a draft by default" "$(wpc eval 'echo get_post_status('"$PID"');')" "draft"
 
 echo "-- the tool sanitises, because Beaver does not --"
@@ -68,6 +76,7 @@ check "no <script> survives in the stored layout" "$(dbq "SELECT IF(meta_value L
 check "no onmouseover/onclick handler survives" "$(dbq "SELECT IF(meta_value LIKE '%onclick%', 'LEAKED','clean') FROM wp_postmeta WHERE post_id=$PID2 AND meta_key='_fl_builder_data'")" "clean"
 
 echo "-- raw sinks are refused by name, not dropped --"
+BEFORE=$(dbq "SELECT COUNT(*) FROM wp_posts WHERE post_type='page'")
 call r1 "$(tc beaver_create_page '{"title":"r '"$MARK"'","modules":[{"type":"heading","text":"x","bb_js_code":"alert(1)"}]}')"
 check "bb_js_code is refused" "$(verdict r1)" "error"
 call r2 "$(tc beaver_create_page '{"title":"r '"$MARK"'","modules":[{"type":"button","text":"x","link":"//evil.example.com/x"}]}')"
@@ -78,6 +87,7 @@ call r4 "$(tc beaver_create_page '{"title":"r '"$MARK"'","modules":[{"type":"tex
 check "a module type that does not exist is refused" "$(verdict r4)" "error"
 call r5 "$(tc beaver_create_page '{"title":"r '"$MARK"'","modules":[{"type":"heading","text":"x","tag":"h2 onclick=alert(1)"}]}')"
 check "a tag that is not an element name is refused" "$(verdict r5)" "error"
+check "and no page was created by any of those refusals" "$(dbq "SELECT COUNT(*) FROM wp_posts WHERE post_type='page'")" "$BEFORE"
 
 echo "-- cleanup --"
 for p in "$PID" "$PID2" "$ATT"; do wpc eval 'wp_delete_post('"${p:-0}"', true);' >/dev/null 2>&1; done

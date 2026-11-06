@@ -164,6 +164,15 @@ class GMCP_Tools_Beaver_Write {
     if ( !in_array( $status, [ 'draft', 'publish' ], true ) ) {
       return $this->error( $r, 'Unknown status "' . $status . '". Use draft or publish.' );
     }
+    // The transport's manage_options does not imply these for a custom role, and neither is a
+    // capability the tool may assume. Checked before anything is created.
+    if ( !current_user_can( 'edit_pages' ) ) {
+      return $this->error( $r, 'Creating a page needs the edit_pages capability on this site, which the credential in use does not hold.', -32600 );
+    }
+    if ( isset( $args['status'] ) && (string) $args['status'] === 'publish' && !current_user_can( 'publish_pages' ) ) {
+      return $this->error( $r, 'Publishing a page needs the publish_pages capability, which the credential in use does not hold. Create it as a draft instead.', -32600 );
+    }
+
     $requested = isset( $args['modules'] ) && is_array( $args['modules'] ) ? $args['modules'] : [];
     if ( !$requested ) {
       return $this->error( $r, 'At least one module is required; an empty layout is not a page worth creating through this tool.' );
@@ -183,8 +192,10 @@ class GMCP_Tools_Beaver_Write {
       $built[] = $one;
     }
 
+    // A title is rendered by the theme, and an administrator with unfiltered_html could store
+    // markup in it. Sanitised here so the tool's own output is uniform.
     $post_id = wp_insert_post( [
-      'post_title'   => $title,
+      'post_title'   => sanitize_text_field( $title ),
       'post_type'    => 'page',
       'post_status'  => $status,
       'post_content' => '',
@@ -339,7 +350,12 @@ class GMCP_Tools_Beaver_Write {
       $node = (string) $next++;
       $layout[ $row ] = (object) [ 'node' => $row, 'type' => 'row', 'parent' => null, 'position' => $position, 'settings' => (object) [] ];
       $layout[ $col ] = (object) [ 'node' => $col, 'type' => 'column', 'parent' => $row, 'position' => 0, 'settings' => (object) [] ];
-      $layout[ $node ] = (object) [ 'node' => $node, 'type' => $module['type'], 'parent' => $col, 'position' => 0, 'settings' => (object) $module['settings'] ];
+      // A module node is `type = 'module'` with the module's slug in settings->type. Measured
+      // at class-fl-builder.php:3088, where the renderer tests exactly that: a node whose type
+      // is the slug ('heading') is skipped, so the page would render an invisible layout while
+      // every stored-state check passed. The suite now asserts RENDERED output because of it.
+      $settings = array_merge( [ 'type' => $module['type'] ], $module['settings'] );
+      $layout[ $node ] = (object) [ 'node' => $node, 'type' => 'module', 'parent' => $col, 'position' => 0, 'settings' => (object) $settings ];
       $position++;
     }
     return $layout;
@@ -400,7 +416,14 @@ class GMCP_Tools_Beaver_Write {
     if ( !in_array( $scheme, [ 'http', 'https' ], true ) ) {
       return 'Module ' . $index . ' (button) link must be http(s) or a path beginning with "/", not "' . $scheme . '".';
     }
-    return esc_url_raw( $raw );
+    $clean = esc_url_raw( $raw );
+    // Re-checked AFTER sanitising, because esc_url_raw() strips control characters: a value
+    // like "/\t/evil.example" is not protocol-relative on the way in and is "//evil.example"
+    // on the way out. The check has to be on the value that will be stored.
+    if ( strpos( $clean, '//' ) === 0 ) {
+      return 'Module ' . $index . ' (button) link sanitises to a protocol-relative target ("' . $clean . '"). Give an absolute http(s) URL or a path on this site.';
+    }
+    return $clean;
   }
 
   #endregion
