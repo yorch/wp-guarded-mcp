@@ -25,6 +25,7 @@ register_shutdown_function( function () {
     update_option( 'gmcp_test_filter_hits', (int) get_option( 'gmcp_test_filter_hits', 0 ) + $GLOBALS['gmcp_ff_hits'], false );
   }
 } );
+
 global $wpdb;
 switch ( $gmcp_ff_mode ) {
   case 'where_exclude': // benign: a visibility plugin hiding one post
@@ -158,5 +159,47 @@ switch ( $gmcp_ff_mode ) {
       }
       return $comments;
     } );
+    break;
+
+  // ---- Shapes that run BEHIND the guard: registered from inside pre_get_posts / pre_get_comments
+  // ---- at PHP_INT_MAX, so at the guard's own priority but later in the hook's order.
+  case 'late_the_posts': // adds one chosen post to every result of a post query, behind the row judge
+    add_action( 'pre_get_posts', function () use ( $gmcp_ff_arg ) {
+      add_filter( 'the_posts', function ( $posts ) use ( $gmcp_ff_arg ) {
+        if ( !is_array( $posts ) ) {
+          return $posts;
+        }
+        foreach ( $posts as $p ) {
+          if ( (int) $p->ID === $gmcp_ff_arg ) {
+            return $posts;
+          }
+        }
+        $p = get_post( $gmcp_ff_arg );
+        if ( $p ) {
+          $GLOBALS['gmcp_ff_hits']++;
+          array_unshift( $posts, $p );
+        }
+        return $posts;
+      }, PHP_INT_MAX );
+    }, PHP_INT_MAX );
+    break;
+  case 'late_rest_inject': // adds a row naming a chosen post to the REST response at the last filter of the dispatch, behind everything
+  case 'late_rest_inject_noid': // the same row with no id in it
+    add_action( 'pre_get_posts', function () use ( $gmcp_ff_arg, $gmcp_ff_mode ) {
+      add_filter( 'rest_request_after_callbacks', function ( $result ) use ( $gmcp_ff_arg, $gmcp_ff_mode ) {
+        $data = $result instanceof WP_HTTP_Response ? $result->get_data() : null;
+        if ( !is_array( $data ) || !wp_is_numeric_array( $data ) ) {
+          return $result;
+        }
+        $row = [ 'title' => [ 'rendered' => get_the_title( $gmcp_ff_arg ) ] ];
+        if ( $gmcp_ff_mode === 'late_rest_inject' ) {
+          $row = [ 'id' => $gmcp_ff_arg ] + $row;
+        }
+        $GLOBALS['gmcp_ff_hits']++;
+        array_unshift( $data, $row );
+        $result->set_data( $data );
+        return $result;
+      }, PHP_INT_MAX );
+    }, PHP_INT_MAX );
     break;
 }

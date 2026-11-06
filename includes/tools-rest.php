@@ -166,6 +166,62 @@ class GMCP_Tools_Rest {
     return false;
   }
 
+  /**
+  * Whether a REST resource is the route of a post type, whose rows are posts and whose ids are
+  * post ids. The users, terms and comments routes are not, and a row's id there names something
+  * else, so the post guard is not asked of it.
+  */
+  private function resource_is_post_route( string $resource ): bool {
+    foreach ( get_post_types( [ 'show_in_rest' => true ], 'objects' ) as $type ) {
+      $base = $type->rest_base ? (string) $type->rest_base : (string) $type->name;
+      if ( $base === $resource ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+  * Judges the rows of a finished post listing, one by one, by their id, and takes out the id that
+  * was only asked for to judge by.
+  *
+  * The query-side guard (with_readable_posts_sql(): the SQL, and a `the_posts` filter at
+  * PHP_INT_MAX) is not the last word on what the response holds. A callback that another plugin
+  * registers while the query runs (from `pre_get_posts`, at PHP_INT_MAX) runs behind both, and
+  * adds rows after they were judged: measured, a file attached to a form submission, an order's
+  * file and a post that shares an order's id came back to a read-only key from list_media,
+  * list_posts and list_pages. Nothing registered during the dispatch can run behind this: it is
+  * called with the finished data. A row with no id in it was not made by the controller (the id is
+  * always asked for), so it is dropped. A row whose id is not a number (a template's id is
+  * `theme//slug`) is not a row of the posts table and is left alone.
+  *
+  * The page can then be short, which says a row was left out; the REST tools cannot fetch more.
+  *
+  * @param mixed $data
+  * @return mixed
+  */
+  private function judge_post_rows( $data, bool $strip_id ) {
+    if ( !is_array( $data ) ) {
+      return $data;
+    }
+    $out = [];
+    foreach ( $data as $row ) {
+      if ( !is_array( $row ) || !array_key_exists( 'id', $row ) ) {
+        continue;
+      }
+      if ( is_int( $row['id'] ) || ( is_string( $row['id'] ) && ctype_digit( $row['id'] ) ) ) {
+        if ( GMCP_Core::post_read_guard( (int) $row['id'] ) !== true ) {
+          continue;
+        }
+      }
+      if ( $strip_id ) {
+        unset( $row['id'] );
+      }
+      $out[] = $row;
+    }
+    return $out;
+  }
+
   private function build_schema_from_args( $args ) {
     $schema = [
       'type' => 'object',
@@ -407,13 +463,29 @@ class GMCP_Tools_Rest {
       $request->set_body_params( $args );
     }
 
-    // A listing is filtered where it is built, and its rows are judged once more when they come
-    // back: the rows are shaped by _fields, which can leave the id out, so the page cannot be
-    // judged afterwards, and another plugin's query filter can widen the SQL (measured: with
-    // `OR 1=1` appended to the WHERE, list_media returned a file attached to a form submission
-    // to a read-only key). Only for GET, and only for the lifetime of this one dispatch.
-    // @see GMCP_Core::with_readable_posts_sql()
+    // A listing is filtered where it is built (the SQL guard, and a row check inside the query),
+    // and the finished rows are judged once more here, by id, after the dispatch: another plugin's
+    // query filter can widen the SQL (measured: with `OR 1=1` appended to the WHERE, list_media
+    // returned a file attached to a form submission to a read-only key) and can add rows from a
+    // callback it registers while the query runs, behind the query-side checks. Only for GET, and
+    // only for the lifetime of this one dispatch. @see GMCP_Core::with_readable_posts_sql()
     $listing = $method === 'GET' && $action === 'list';
+    // The rows of a post listing are judged by id AFTER the response is built, by this code and not
+    // by a hook, so nothing that runs inside the dispatch can run behind the judge. The id is asked
+    // of the controller even when the caller's _fields leaves it out, and taken out again below.
+    $judge_ids = $listing && $this->resource_is_post_route( $resource );
+    $sql_held = null;
+    $id_added = false;
+    if ( $judge_ids ) {
+      $fields = $request->get_param( '_fields' );
+      if ( is_array( $fields ) ) {
+        $fields = implode( ',', array_map( 'strval', $fields ) );
+      }
+      if ( is_string( $fields ) && trim( $fields ) !== '' && !in_array( 'id', array_map( 'trim', explode( ',', $fields ) ), true ) ) {
+        $request->set_param( '_fields', $fields . ',id' );
+        $id_added = true;
+      }
+    }
     // Rows a create makes, so one the net refuses AFTER it was inserted can be taken back out.
     $made = [];
     $track = static function ( $post_id, $post = null, $update = false ) use ( &$made ) {
@@ -477,6 +549,10 @@ class GMCP_Tools_Rest {
     }
 
     $data = $response->get_data();
+
+    if ( $judge_ids ) {
+      $data = $this->judge_post_rows( $data, $id_added );
+    }
 
     // Return just the data - execute_tool will wrap it properly
     return $data;

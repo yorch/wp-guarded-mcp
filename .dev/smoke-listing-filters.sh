@@ -125,6 +125,8 @@ readers() {
     'list_posts|{"search":"GMCPFF","status":"any","per_page":100,"_fields":"id,title"}' \
     'list_pages|{"search":"GMCPFF","status":"any","per_page":100,"_fields":"id,title"}' \
     'list_media|{"search":"GMCPFF","per_page":100,"_fields":"id,title"}' \
+    'list_media|{"search":"GMCPFF","per_page":100,"_fields":"title"}' \
+    'list_posts|{"search":"GMCPFF","status":"any","per_page":100,"_fields":"title"}' \
     'list_media|{"per_page":100,"_fields":"id"}'
 }
 # Which of the submission's markers came back from any reader, naming the reader.
@@ -163,7 +165,8 @@ for spec in \
   "request_rewrite|0||yes" "pre_get_posts_suppress|0||no" "pre_query_index|0||no" \
   "results_inject|$UP||no" "the_posts_inject|$UP||no" "pre_query_inject|$UP||no" \
   "comments_exclude|$C2||no" "comments_reset|0||no" "comments_or1|0||no" \
-  "comments_results_inject|$CS||no" "comments_pre_query_ids|0|$CS,$C1,$C2|no"; do
+  "comments_results_inject|$CS||no" "comments_pre_query_ids|0|$CS,$C1,$C2|no" \
+  "late_the_posts|$UP||no" "late_rest_inject|$UP||no" "late_rest_inject_noid|$UP||no" ; do
   IFS='|' read -r mode arg ids widens <<< "$spec"
   setmode "$mode" "$arg" "$ids"
   check "$mode: no reader returns the submission's tree" "$(leaks)" ""
@@ -206,6 +209,7 @@ check "comments_or1: comments guard held" "$(cheld)" "held"
 setmode "comments_pre_query_ids" 0 "$CS,$C1"
 check "comments_pre_query_ids: comments guard lost (answered without a query)" "$(cheld)" "lost"
 setmode ""
+
 
 echo "== Block 3: the guard's hooks are taken off again =="
 HOOKS='foreach ( [ "posts_clauses_request", "posts_request", "posts_request_ids", "posts_pre_query", "the_posts", "pre_get_posts", "comments_clauses", "comments_pre_query" ] as $h ) { $n[$h] = isset( $GLOBALS["wp_filter"][$h] ) ? array_sum( array_map( "count", $GLOBALS["wp_filter"][$h]->callbacks ) ) : 0; } echo wp_json_encode( $n );'
@@ -272,10 +276,30 @@ done
 setmode ""
 
 # ---------------------------------------------------------------------------------------------
+echo "== Block 6: the REST rows are judged by id after the response is built =="
+setmode ""
+callro list_media '{"search":"GMCPFF","per_page":100,"_fields":"title"}' f1
+check "_fields without id: the rows carry no id (it was asked for to judge by, and taken out)" \
+  "$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]));j=json.loads(d["result"]["content"][0]["text"])
+print("noid" if j and all("id" not in x for x in j) else "id-present-or-empty")' "$OUT/f1")" "noid"
+callro list_media '{"search":"GMCPFF","per_page":100,"_fields":"id,title"}' f2
+check "_fields with id: the rows carry it" "$(hasid f2 "$M1")" "yes"
+callro list_media '{"search":"GMCPFF","per_page":100,"_fields":"title"}' f3
+check "CONTROL: the id-less reply still holds the ordinary files" "$(has f3 GMCPFF-FILE-1)$(has f3 GMCPFF-FILE-3)" "yesyes"
+check "CONTROL: and not the upload" "$(has f3 GMCPFF-UPLOAD)" "no"
+# Without the judge after the response, a row added at the last filter of the dispatch is returned.
+setmode "late_rest_inject_noid" "$UP"
+callro list_media '{"search":"GMCPFF","per_page":100,"_fields":"id,title"}' f4
+check "a row with no id added behind everything is dropped" "$(has f4 GMCPFF-UPLOAD)" "no"
+check "CONTROL: the filter added it" "$([ "$(hits)" -gt 0 ] && echo yes || echo no)" "yes"
+setmode ""
+
+# ---------------------------------------------------------------------------------------------
 echo "== Cleanup =="
 docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/gmcp-test-foreign-filters.php >/dev/null 2>&1
 docker compose exec -T cli wp eval '
-foreach ( [ "gmcp_test_filter_mode", "gmcp_test_filter_arg", "gmcp_test_filter_ids", "gmcp_test_filter_hits" ] as $o ) { delete_option( $o ); }
+foreach ( [ "gmcp_test_filter_mode", "gmcp_test_filter_arg", "gmcp_test_filter_ids", "gmcp_test_filter_hits", "gmcp_test_filter_marker" ] as $o ) { delete_option( $o ); }
 foreach ( json_decode( '"'"''"$SEED"''"'"', true ) as $k => $id ) {
   if ( in_array( $k, [ "C1", "CS", "C2" ], true ) ) { wp_delete_comment( $id, true ); } else { wp_delete_post( $id, true ); }
 }

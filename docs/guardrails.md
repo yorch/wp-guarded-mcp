@@ -1531,10 +1531,20 @@ re-read.
       parts) and `comments_clauses`, both at `PHP_INT_MAX`, and the other plugin's WHERE is wrapped,
       not extended (`AND ( 1=1 <theirs>` + a newline + `) AND <guard>`; the newline is so that a `-- `
       comment at the end of their fragment cannot swallow the parenthesis). The REST tools also drop,
-      at `the_posts` at `PHP_INT_MAX`, every row `post_read_guard()` refuses, and every query inside
+      at `the_posts` at `PHP_INT_MAX`, every row `post_read_guard()` refuses, and then judge the
+      finished rows by id **after** the dispatch returns, in the tool's own code (`judge_post_rows()`):
+      a callback another plugin registers while the query runs (from `pre_get_posts`, at
+      `PHP_INT_MAX`) runs at the same priority as the `the_posts` check but behind it, and added rows
+      after they were judged (measured: `list_media`, `list_posts` and `list_pages` returned a file
+      attached to a form submission, an order's file and a post that shares an order's id to a
+      read-only key), whereas nothing registered during the dispatch can run behind code that runs
+      after it. The tool asks the controller for `id` when the caller's `_fields` leaves it out, and
+      takes it out of the reply again; a row with no `id` is not a row the controller made and is
+      dropped; only a post type's route is judged (users, terms and comments have ids that are not
+      post ids). Every query inside
       a listing runs with filters on whatever `pre_get_posts` asks for, because a plugin that sets
       `suppress_filters` there took the guard's SQL and the row check with it (measured, another
-      leak). Each of those is asserted under twenty filter shapes, with a control that the
+      leak). Each of those is asserted under twenty-three filter shapes, with a control that the
       filter ran and, where it widens the query, a control that the widening was visible.
     - *What a filter can still do, detected and not prevented:* rewrite the finished SQL
       (`posts_request`), or answer without asking the database (`posts_pre_query`,

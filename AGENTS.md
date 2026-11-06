@@ -87,7 +87,10 @@ offset. Those clauses go in last and wrap what other plugins built: at `posts_cl
 `comments_clauses`, at `PHP_INT_MAX`, with the other plugin's WHERE in parentheses, because
 appended at `posts_where` a foreign `OR 1=1` or a replaced clause set dropped them and the REST
 list tools returned a submission's upload (measured). The REST tools also judge each row at
-`the_posts`, every query inside a listing runs with filters on whatever `pre_get_posts` asks, and
+`the_posts` and then, by id, AFTER `rest_do_request()` returns (`judge_post_rows()`, asking the
+controller for `id` when `_fields` omits it), because no hook registered during the dispatch can run
+behind code that runs after it; every query inside a listing runs with filters on whatever
+`pre_get_posts` asks, and
 `readable_posts_page()` / `readable_comments_page()` re-page in PHP when the finished SQL no longer
 carries the guard or a filter answered without a query (`$held`), because then the database's offset
 counts hidden rows. `smoke-listing-filters.sh` attacks all of that with a read-only key and a
