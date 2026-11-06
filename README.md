@@ -79,7 +79,7 @@ The settings screen shows the endpoint URL. There are two ways in.
 }
 ```
 
-If your host strips the `Authorization` header before PHP sees it, the plugin also registers `/wp-json/mcp/v1/<token>` as an alternative path. Prefer the header when it works.
+If your host strips the `Authorization` header before PHP sees it, there is no alternative path: re-save your permalink structure to regenerate the `.htaccess` rule that forwards it, and use the connection check on the settings screen to see whether it worked.
 
 ## Access levels
 
@@ -87,9 +87,9 @@ An access level belongs to a named key, or to an OAuth grant. A key carries the 
 
 | Level | Content only | + administration | + WooCommerce | What it can do |
 |---|---|---|---|---|
-| `admin` | 55 | 94 | 106 | Everything, including deletes, users and options |
-| `readwrite` | 38 | 51 | 60 | Create and update, no destructive tools |
-| `readonly` | 18 | 28 | 32 | Reads only |
+| `admin` | 56 | 95 | 107 | Everything, including deletes, users and options |
+| `readwrite` | 39 | 52 | 61 | Create and update, no destructive tools |
+| `readonly` | 19 | 29 | 33 | Reads only |
 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
 nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO,
@@ -123,8 +123,13 @@ and `wp_duplicate_post` copy inside PHP so a large design never leaves the serve
 `wp_write_post_meta_chunk` and `wp_read_post_meta_chunk` stage a value across several
 calls. `wp_download_request` returns a one-time URL that streams an attachment's file, so a
 file's bytes never pass through a tool reply or the audit log; a file attached to a post that is
-not published can only be requested with an admin-level key, and the endpoint refuses anything
-that does not resolve inside the site's uploads directory. `wp_create_posts` creates up to twenty in one call. `wp_site_briefing` answers
+not published can only be requested with an admin-level key, a file attached to a form submission
+(or to anything hanging from one) is not available at any level and, below admin, answers exactly as
+a missing attachment does, the token expires after five minutes at the endpoint and not only in the
+reply, and the endpoint refuses anything that does not resolve inside the site's uploads directory.
+The token in the URL is scrubbed from the audit log and the debug log like a preview link's. No
+generic tool writes `_wp_attached_file`, because repointing an attachment at another file under
+uploads would move that file out from under these rules. `wp_create_posts` creates up to twenty in one call. `wp_site_briefing` answers
 "what am I looking at" in one call. `wp_write_blocks` takes either a list of block specs or
 a Markdown string (headings, paragraphs, lists, blockquotes, fenced code, emphasis, links
 and images); Markdown HTML is shown as text, not run.
@@ -209,8 +214,15 @@ plugin that stores them is not installed", "its table is missing" and, for Ninja
 form records nothing" — Contact Form 7 alone stores nothing, so it is Flamingo that is read.
 Because Flamingo and Ninja Forms keep a submission as a post, the generic post readers
 (`wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`, `wp_read_post_meta_chunk`,
-`wp_get_posts`) now refuse those post types, whether or not this group is on. That guard is a
-list of readers, and the guardrails page says what it does not cover.
+`wp_get_posts`, `wp_get_post_terms`, `wp_get_comments`, `wp_get_media`, the briefing, the
+resources and the REST-generated tools) refuse those post types and what hangs off them (a
+revision, an upload, a comment, a child post), and below admin answer one exactly as they
+answer a post that does not exist. No generic tool writes to a submission or to anything in its
+tree, at any access level, and none moves a post or a comment into or out of such a tree or
+points a featured image or a menu item at one, so the tree cannot be rearranged to get round
+the readers. The change records withhold a submission's title and values whichever state of it
+they describe, whether or not this group is on. Those guards are a list of readers and writers,
+and the guardrails page says exactly what they do not cover (counts, for one).
 
 **WPForms** is in that group and is deliberately the smallest part of it: two tools, a form's
 schema and a submission briefing, and **no entry tool at all**. Measured on WPForms Lite
@@ -224,7 +236,12 @@ can exercise. The briefing names its source for every count, because "no submiss
 post content is one JSON document holding the fields, the notification recipients and the
 confirmation redirects, so `wpforms_get_form` counts those settings and never returns them —
 and the generic post tools are refused on that post type, below admin for reads and for every
-write, because otherwise the withholding would be decoration.
+write, because otherwise the withholding would be decoration. A saved user template is the same
+document under a second post type, `wpforms-template` (measured on Lite 2.0.4: registered
+there, and read through `wpforms_decode()` like a form), so it is refused the same way. The
+SQL readers ask the same list below admin (`read_excluded_post_types()`), so a listing does not
+depend on the per-row check alone, and a REST route one of these types takes over is not turned
+into tools.
 
 **Advanced Custom Fields**, off by default, and the switch only appears when ACF is
 installed: custom field discovery, value get/set through `update_field`/`get_field` with
@@ -298,7 +315,16 @@ plaintext. The names of what was withheld are listed so an absence is visible. A
 as a serialised object is never read, only marked, since casting one still exposes every
 property it holds. Filesystem paths are returned relative to the content directory. The
 failure-login alerts do not return their message at all, because it is built from what someone
-typed at the login form and that field regularly holds a mistyped password.
+typed at the login form and that field regularly holds a mistyped password. An event about a
+form submission or its contact record (the `gmcp_personal_data_post_types` list) returns no
+message and no title, old title, new title or address, at admin level too, because a form store
+titles a submission from what the visitor typed ("Enquiry from" and their IP address) and names
+a contact by email address, and the log copies that title into every event about the post. It
+is judged by the type the log recorded, which is all that is left once the submission is
+deleted, and by the post's parent chain while the post still exists, so an upload under a
+submission is held as well. What it does not cover: an upload to a submission that has since
+been deleted records no post and no type, and its file name (which a visitor chose) is not
+recognised.
 
 Each reply carries a `log_state` block, which is what separates "nothing happened" from
 "nothing is being recorded" — the same false-zero trap Gravity Forms and Elementor Pro have.
@@ -339,7 +365,12 @@ count is zero and the honest answer is "nothing has looked yet", so the scan blo
 firewall's `learning-mode` is reported with what it means, because "enabled" and "blocking"
 are different claims. `wf_lockouts` lists only the block types that name one address — a
 country or pattern block stores an all-zero IP, which renders as `::` — and the counts in
-`wf_status` break down by type so those are not lost. There is **no write tool, and there will
+`wf_status` break down by type so those are not lost. A login lockout's recorded reason ends
+in what the visitor typed at the login form (`... was: 'username'`, and the same for the
+password-reset form and for an invalid username), which regularly is a mistyped password or an
+email address, so that text is replaced with `[withheld: typed text]` and the fixed wording
+around it is kept. Only those three templates of Wordfence's are recognised; a reason of any
+other shape is returned as stored. There is **no write tool, and there will
 not be one**: dismissing an issue, whitelisting an address, changing a firewall mode or
 starting a scan are each a way to make the watcher quieter, and an agent that can quiet it and
 then read it back can confirm its own silence. No configuration value that is a credential or
@@ -361,7 +392,12 @@ reports both copies' node counts. The tools report the SHAPE and never the setti
 `settings` is the content and, for the `html` module, arbitrary markup including script, and
 `_fl_builder_data_settings` holds layout-level `css` and `js` that run on every page using the
 layout. So node types, counts and depth are returned, layout setting *names* are returned,
-whether custom code is present is returned, and no value of either is. There is no tool that
+whether custom code is present is returned, and no value of either is. The layout keys are not
+readable through the generic meta tools either: `wp_get_post_meta` and `wp_get_post_snapshot` list
+them as withheld, and a key is judged the way the database compares it, so an accented or
+space-padded spelling is the same key. `beaver_layout` reports a post's title, type and status, so
+it asks the same read policy the generic readers do: a form submission, and below admin an order
+or another plugin's configuration, answers as a post that does not exist. There is no tool that
 writes layout data at any level: it would be persistent script injection with no restore tool
 behind it, the same reasoning that keeps a Custom Code writer out of the Elementor Pro group.
 The one write is `beaver_clear_cache`, which deletes the generated CSS/JS so the builder
@@ -409,7 +445,10 @@ and a reader written without it installed is how a confident "no translations" i
 
 **REST API tools**, off by default: tools generated from the site's own REST API routes.
 Generated once and cached for a day; the cache is thrown away on the first request after
-the plugin's version changes.
+the plugin's version changes. A route that belongs to a form-submission or commerce post
+type is not generated at all, and every call is judged by the same read policies as the
+generic post tools (including media attached to a submission or an order); a list leaves
+those rows out where the query is built, to the full depth of their tree.
 
 **Preview.** Six tools whose effect is not visible from the call accept `preview`, which
 describes what would happen and changes nothing: `wp_delete_post`, `wp_update_post`,
@@ -420,8 +459,10 @@ a setting, a post, a custom field, a term's name, slug, description or parent (w
 includes renaming a menu), which terms a post carries, and an individual theme setting
 (a menu-location assignment is one). A menu item's edit is covered because a menu item is a
 post and some custom fields. Only writes made during a tool call are recorded, never a
-person's own edits. **Creations, deletions and users are not covered**, and adding or
-deleting a menu item is a creation or a deletion. An undo is itself recorded, so
+person's own edits. **The creation or deletion of a post, term, menu or menu item, and changes to users, are not covered**, and adding or
+deleting a menu item is a creation or a deletion. The options WordPress itself writes as a side effect of a creation
+(`wp_calendar_block_has_published_posts` under `wp_create_post`, for one) are ordinary option writes and are journalled
+under the tool that ran; the created post is not. An undo is itself recorded, so
 reverting the undo puts the edit back; that second step is refused if the thing has
 changed since, so it cannot overwrite newer work with an older copy. For a custom
 field that includes a row someone added to the same key in the meantime.
@@ -510,9 +551,13 @@ repeats the identical call and it runs once.
 - The screen shows the call in one canonical order (sorted, the tool's declared arguments
   first) and never shortens it: a call with an argument its tool does not declare, nested
   more than 12 levels, or longer than 16000 bytes written out is refused with an error
-  instead of queued, because an approval covers every byte. A credential is hidden, and the
+  instead of queued, because an approval covers every byte. A field named like a credential, or a JSON
+  string with one inside, is hidden whole. In any other text only the part that looks like a credential
+  is hidden (a `define( 'DB_PASSWORD', ... )` line inside a tagline), the rest of the text stays
+  readable with `[hidden values present: N]` after it, and the
   screen says how many values are hidden and which fields, so you know a value you cannot
-  see is part of what you approve (the hash covers the real value). Requests,
+  see is part of what you approve (the hash covers the real value). Each text is judged on its own: a
+  secret split across two arguments is not recognised by the screen. Requests,
   approvals, declines, lapses, uses and refused replays are written to the audit log.
   There are no bulk actions and nothing to delete: a request leaves the list by being
   answered or by lapsing.
@@ -533,7 +578,8 @@ Audit Log page says so and links back here.
 
 ### Audit Log
 
-The record itself: every tool call, refusals included, with the arguments it was given,
+The record itself: every tool call, refusals included, with the arguments it was given
+(credential-shaped fields and strings that carry a pasted secret are replaced by `[redacted]`),
 what it changed, what made it, what it was aimed at, how long it took and why it was
 turned down. Without it an agent works with no visible record at all.
 
@@ -623,10 +669,11 @@ Other hooks:
 - Only administrators can authorize an OAuth client, checked both at authorize time and again on every request. A grant approved as read-only stays read-only through every refresh.
 - A drafts-only key cannot publish a post or change a post that is already live, through any tool, because the refusal sits under the post writes rather than in each tool. That is posts, their custom fields, term assignments, featured image and attached media: not comments, taxonomy terms, users, options, or media attached to no post (edits to which are refused because a live page may be showing it). It does not cover writers that bypass WordPress and update the posts table directly, which is why the key is held below full administration.
 - Keys are stored as a SHA-256 hash and shown once, so the database holds nothing that can be replayed. A key also records the administrator who created it and acts as that account, which is what lets the log name a person; it stops working the moment that account stops holding `manage_options`, so revoking somebody's access revokes their agent with it.
-- No row belonging to this plugin, and no option whose name looks like a credential, can be read or written through the option tools. The change journal additionally inspects the value it is about to record, so a `secret_key` or `pass` field inside a settings array is blanked before the rest of that array is kept, and an undo leaves the live value in place rather than writing the placeholder over it. Strings that parse as JSON or as a serialized array are unpacked and judged too, and blanked whole when they hold one. The check reads field names, not content, so it will not catch a secret held as a bare string under an innocuous option name.
+- No row belonging to this plugin, and no option whose name looks like a credential, can be read or written through the option tools. The change journal additionally inspects the value it is about to record, so a `secret_key` or `pass` field inside a settings array is blanked before the rest of that array is kept, and an undo leaves the live value in place rather than writing the placeholder over it. Strings that parse as JSON or as a serialized array are unpacked and judged too, and blanked whole when they hold one. Free text is read as well, so a post whose body has a pasted `{"api_key": "..."}`, a `define( 'DB_PASSWORD', ... )` line or an `Authorization: Bearer` header in it is not copied into the journal or the audit log: that field is left out of the undo record and the rest of the edit stays undoable. This is a heuristic for the shapes people paste, tuned so that prose which merely mentions a password is kept and undone as usual; it will not catch a secret that is a bare word under an innocuous name.
+- Undoing an edit never sets a post's status to `trash` or `auto-draft`, for the same reason the write tools refuse those statuses: WordPress deletes on them from a daily job. The other fields of that entry are still restored.
 - Optional human approval holds deletes, and optionally site changes, until an administrator signed in to wp-admin approves that exact call. There is no approval token for an agent to learn or mint, and no tool that reads or answers the queue. See Approvals above.
 - Site-file export is off by default, and its manifest returns counts and exclusions rather than file contents. A pull is always held for a person, whatever the approval mode says; the approval is bound to the manifest digest — which covers each file's name, size and contents — so a tree that changed after it was read needs a new one, and one whose file was rewritten in place is refused when the pull runs. The archive is built outside the web root with 0600 permissions, streamed once through a five-minute token, and deleted after it is sent, including when the client disconnects mid-download. The token is scrubbed from the audit log, like the download and upload tokens.
-- The `readwrite` level cannot delete by another name. WordPress permanently deletes whatever carries an old `_wp_trash_meta_time`, every auto-draft older than a week, and, where Akismet or a similar plugin is active, every comment marked spam for fifteen days, so setting a post status of `trash` or `auto-draft` through `wp_update_post`, a comment status of `trash` or `spam` through `wp_update_comment`, and writing any `_wp_trash_meta_` meta key through any tool, are refused; `wp_delete_post` and `wp_delete_comment` are the way to delete and are held by the approval queue. An agent therefore cannot mark a comment as spam at any level; a person does that in wp-admin. `wp_run_cron_event` is held with the deletes.
+- The `readwrite` level cannot delete by another name. WordPress permanently deletes whatever carries an old `_wp_trash_meta_time`, every auto-draft older than a week, and, where Akismet or a similar plugin is active, every comment marked spam for fifteen days, so setting a post status of `trash` or `auto-draft` through `wp_update_post`, a comment status of `trash` or `spam` through `wp_update_comment`, and writing any `_wp_trash_meta_` meta key through any tool (in any spelling the database reads as the same key: case, trailing spaces, accents, invisible characters), are refused; `wp_delete_post` and `wp_delete_comment` are the way to delete and are held by the approval queue. An agent therefore cannot mark a comment as spam at any level; a person does that in wp-admin. `wp_run_cron_event` is held with the deletes.
 - Tools do not execute arbitrary PHP or SQL. Every tool is a fixed WordPress operation with a schema.
 - A preview link is a bearer credential for one unpublished post. Only a hash of it is stored, in a row the option tools refuse, and the audit log and debug trace scrub it from arguments and replies. It is shown once. Anyone who is given the link can use it until it expires or the post is published, and viewing it is not logged.
 - `wp_get_php_error_log` and `wp_fetch_page` return text written by other people (visitors, plugins, whoever controls a page). Both label it as data, and both are `admin` level for that reason as well as for what they can reach. The log is scrubbed for credential shapes, not for meaning, so a secret inside an ordinary sentence can survive it.

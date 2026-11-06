@@ -224,6 +224,7 @@ class GMCP_Changes {
   * @param array $record kind, op, id, subject, label, fields
   */
   private function record( array $record ): void {
+    $record = self::withhold_personal_data( $record );
     $record['tool'] = self::$tool;
     $record['call'] = self::$call;
     // Counted past the cap, so a truncated summary can say how many were left out rather
@@ -238,6 +239,61 @@ class GMCP_Changes {
     // record and decides. Anything else that wants to watch an agent's writes can hook
     // this too, which is why it carries the values rather than a description of them.
     do_action( 'gmcp_change', $record );
+  }
+
+  /**
+  * Whether a post is a form submission, or hangs from one (a revision, an upload, a child).
+  *
+  * The change records are read by tools below admin (wp_list_changes names the post by its
+  * title) and carry the values a field held before and after (the audit log, the journal's
+  * snapshots), so a record about a submission is a second route to what the generic post
+  * readers refuse to return. Asked with the post in hand because a deleted one can no
+  * longer be looked up by id.
+  */
+  private static function is_personal_post( $post ): bool {
+    if ( !is_object( $post ) ) {
+      return false;
+    }
+    if ( GMCP_Core::personal_data_post_guard( 0, (string) $post->post_type ) !== true ) {
+      return true;
+    }
+    return $post->post_parent > 0 && GMCP_Core::personal_data_post_guard( (int) $post->post_parent ) !== true;
+  }
+
+  /**
+  * One record about a form submission, with everything it quotes taken out.
+  *
+  * Applied in record(), the one place every record passes, rather than at each observer, so
+  * an observer added later is covered the day it is written. What stays is what happened
+  * (the post, that a field changed, which one): enough for the log to say an agent touched a
+  * submission. What goes is every value, the previous value a journal would restore from,
+  * and the title, which for a submission is the visitor's subject line (post_label() already
+  * answers with the id for these posts).
+  *
+  * @param array $record As the observers build it.
+  * @return array
+  */
+  private static function withhold_personal_data( array $record ): array {
+    // Set by an observer that held the post as it was BEFORE the write. A record is judged on
+    // both states, because a write can move a post out of a submission's tree (a revision or an
+    // upload given another parent) and the row, read afterwards, is then an ordinary one whose
+    // title and values this record would quote.
+    $was_personal = !empty( $record['personal_before'] );
+    unset( $record['personal_before'] );
+    if ( !in_array( $record['kind'] ?? '', [ 'post', 'meta', 'termrel' ], true ) ) {
+      return $record;
+    }
+    $post = get_post( (int) ( $record['id'] ?? 0 ) );
+    if ( !$was_personal && ( !( $post instanceof WP_Post ) || !self::is_personal_post( $post ) ) ) {
+      return $record;
+    }
+    $record['label'] = '#' . (int) ( $record['id'] ?? 0 );
+    foreach ( (array) ( $record['fields'] ?? [] ) as $field => $pair ) {
+      $record['fields'][ $field ] = [ 'from' => '[withheld]', 'to' => '[withheld]' ];
+    }
+    unset( $record['previous'], $record['rows'] );
+    $record['withheld'] = true;
+    return $record;
   }
 
   private static function diff( array $fields, $before, $after ): array {
@@ -377,6 +433,9 @@ class GMCP_Changes {
   }
 
   private function post_label( WP_Post $post ): string {
+    if ( self::is_personal_post( $post ) ) {
+      return '#' . (int) $post->ID;
+    }
     $title = (string) $post->post_title;
     if ( $title === '' && $post->post_type === 'nav_menu_item' ) {
       // Menu items keep their visible text in the linked object, not in post_title.
@@ -437,8 +496,13 @@ class GMCP_Changes {
     // WooCommerce saves an order's status through wp_update_post(), so a write-level key
     // could revert a completed order to processing with no transition hooks, no stock or
     // email side effects reversed and the linked subscription never told.
+    //
+    // A form submission is not offered either: its previous values are what the record
+    // withholds, so there is nothing to put back, and a restore would write a visitor's
+    // data over whatever the post holds now.
     return !GMCP_Core::is_commerce_post_type( $post->post_type )
-      && !in_array( $post->post_type, self::UNRECORDED_POST_TYPES, true );
+      && !in_array( $post->post_type, self::UNRECORDED_POST_TYPES, true )
+      && !self::is_personal_post( $post );
   }
 
   public function post_changed( $post_id, $after, $before ): void {
@@ -459,6 +523,7 @@ class GMCP_Changes {
       'subject' => $this->post_subject( $after ),
       'label' => $this->post_label( $after ),
       'fields' => $changed,
+      'personal_before' => self::is_personal_post( $before ),
     ] );
   }
 
@@ -670,6 +735,7 @@ class GMCP_Changes {
       'subject' => $this->post_subject( $post ),
       'label' => $this->post_label( $post ),
       'fields' => [],
+      'personal_before' => self::is_personal_post( $post ),
     ] );
   }
 
@@ -1063,6 +1129,11 @@ class GMCP_Changes {
     // "value", so testing the field name alone asked whether "value" looks like a secret,
     // which it never does, while the option was called mailchimp_key and said so plainly.
     // Both names are tested, and either one is enough to redact.
+    // A value with more nodes than can be read is described by its size and nothing of it is read:
+    // the walks below cost per node, and a client can send a million.
+    if ( ( is_array( $value ) || is_object( $value ) ) && !GMCP_Credential_Scan::within_budget( $value ) ) {
+      return '[' . size_format( GMCP_Core::weigh( $value ) ) . ' of structured data, too large to read]';
+    }
     if ( GMCP_Core::field_looks_secret( $field )
       || ( $context !== '' && GMCP_Core::field_looks_secret( $context ) )
       || GMCP_Core::holds_credential( $value ) ) {
@@ -1076,9 +1147,17 @@ class GMCP_Changes {
     }
     if ( is_scalar( $value ) ) {
       $text = (string) $value;
-      return mb_strlen( $text ) <= self::MAX_VALUE
-        ? $text
-        : '[' . size_format( strlen( $text ) ) . ' of text]';
+      if ( mb_strlen( $text ) > self::MAX_VALUE ) {
+        return '[' . size_format( strlen( $text ) ) . ' of text]';
+      }
+      // What is about to be written down is judged as text: a short title or excerpt with a
+      // pasted wp-config line in it names no field, so the structural test above passes it.
+      // Longer values are described by size and nothing of them is kept, so only this branch
+      // needs the scan, and it is bounded by MAX_VALUE characters. The wider test, not the
+      // scanner alone: wp_update_option {blogdescription: "password: hunter2"} recorded
+      // "to":"password: hunter2" while its arguments column said "password: [redacted]".
+      // This column is read for what changed, and a value withheld from it costs one line.
+      return GMCP_Core::looks_credentialed( $text ) ? '[redacted]' : $text;
     }
     // An array or an object gets the same allowance as a string rather than being
     // described by size on principle. A widget's settings and most option values are a
@@ -1086,7 +1165,7 @@ class GMCP_Changes {
     // could act on when the whole value would have fitted.
     $json = wp_json_encode( $value, JSON_UNESCAPED_SLASHES );
     if ( is_string( $json ) && mb_strlen( $json ) <= self::MAX_VALUE ) {
-      return $json;
+      return GMCP_Core::looks_credentialed( $json ) ? '[redacted]' : $json;
     }
     return '[' . size_format( strlen( maybe_serialize( $value ) ) ) . ' of structured data]';
   }
@@ -1126,7 +1205,8 @@ class GMCP_Changes {
       }
       $out[] = [
         'what' => trim( ( $record['subject'] ?? $record['kind'] ) . ' ' . ( $record['id'] ?? '' ) ),
-        'label' => (string) ( $record['label'] ?? '' ),
+        // The label is a post's title, up to 80 characters of free text the agent chose.
+        'label' => GMCP_Core::looks_credentialed( (string) ( $record['label'] ?? '' ) ) ? '[redacted]' : (string) ( $record['label'] ?? '' ),
         'op' => (string) ( $record['op'] ?? '' ),
         'kind' => (string) ( $record['kind'] ?? '' ),
         'fields' => $fields,

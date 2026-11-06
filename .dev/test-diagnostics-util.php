@@ -12,7 +12,8 @@
 * anything that needs WordPress. Those are in the smoke suites, which need a site.
 */
 define( 'ABSPATH', '/' );
-require __DIR__ . '/../includes/diagnostics-util.php';
+// GMCP_UTIL points the test at a mutated copy when proving it fails without a fix.
+require getenv( 'GMCP_UTIL' ) ?: __DIR__ . '/../includes/diagnostics-util.php';
 
 $pass = 0;
 $fail = 0;
@@ -74,6 +75,11 @@ check( 'control: explicit default port', $fetch( 'https://example.com:443/a' )['
 check( 'control: index.php is a page', $fetch( 'https://example.com/index.php?p=3' )['ok'], true );
 check( 'control: a site in a subdirectory', $fetch( 'https://example.com/blog/post/', 'https://example.com/blog' )['ok'], true );
 check( 'control: IPv6 answer', $fetch( 'https://v6.example.com/', 'https://v6.example.com' )['ok'], true );
+// The HTTP library upper-cases percent escapes before its hooks run, so the string checked
+// here has to be the string that is sent.
+check( 'rebuilt URL: lowercase escapes in the path are upper-cased', $fetch( 'https://example.com/caf%c3%a9/' )['url'], 'https://example.com/caf%C3%A9/' );
+check( 'rebuilt URL: ...and in the query', $fetch( 'https://example.com/?q=%c3%a9&r=%C3%A9&s=%e2%82%ac' )['url'], 'https://example.com/?q=%C3%A9&r=%C3%A9&s=%E2%82%AC' );
+check( 'control: a URL with no escapes is unchanged by that', $fetch( 'https://example.com/a-b/?q=1' )['url'], 'https://example.com/a-b/?q=1' );
 
 echo "-- check_fetch_url: what is refused --\n";
 $refused = [
@@ -142,6 +148,15 @@ check( 'filter opens a private resolve for a production name', $fetch( 'https://
 check( 'the filter does not open the never class', ( function () use ( $fetch ) {
   return $fetch( 'https://meta.example.com/', 'https://meta.example.com', true )['ok'];
 } )(), false );
+
+echo "-- resolve_entry (the CURLOPT_RESOLVE pin) --\n";
+check( 'a name pinned to an IPv4 address', GMCP_Diag_Util::resolve_entry( 'example.com', 443, '93.184.216.34' ), 'example.com:443:93.184.216.34' );
+check( 'a name pinned to an IPv6 address is bracketed', GMCP_Diag_Util::resolve_entry( 'example.com', 8080, '2606:2800:220:1:248:1893:25c8:1946' ), 'example.com:8080:[2606:2800:220:1:248:1893:25c8:1946]' );
+check( 'a name pinned to ::1 is bracketed', GMCP_Diag_Util::resolve_entry( 'dev.test', 80, '::1' ), 'dev.test:80:[::1]' );
+check( 'an IPv6 literal host has no entry (libcurl rejects "::1:80:[::1]")', GMCP_Diag_Util::resolve_entry( '::1', 80, '::1' ), null );
+check( 'a bracketed IPv6 literal host has no entry', GMCP_Diag_Util::resolve_entry( '[::1]', 80, '::1' ), null );
+check( 'an IPv4 literal host has no entry', GMCP_Diag_Util::resolve_entry( '127.0.0.1', 8223, '127.0.0.1' ), null );
+check( 'control: a name that merely contains digits and dots still gets one', GMCP_Diag_Util::resolve_entry( 'a1.2b.test', 80, '10.0.0.1' ), 'a1.2b.test:80:10.0.0.1' );
 
 echo "-- resolve_location --\n";
 foreach ( [
@@ -243,6 +258,61 @@ check( 'same_regular_file: a link where a file was', GMCP_Diag_Util::same_regula
 check( 'same_regular_file: a pipe was opened', GMCP_Diag_Util::same_regular_file( $ls, [ 'mode' => 0010600 ] + $ls ), false );
 unlink( "$dir/link.log" );
 
+echo "-- resolve_log, dir_chain_problem, open_verified, read_log --\n";
+// (The race itself is .dev/stress-log-race.php. These are the pieces, one at a time.)
+mkdir( "$dir/site/wp-content/logs", 0755, true );
+mkdir( "$dir/elsewhere", 0755 );
+file_put_contents( "$dir/site/wp-content/logs/debug.log", "alpha\nbeta\n" );
+file_put_contents( "$dir/elsewhere/other.log", "gamma\n" );
+$roots = [ "$dir/site/wp-content", "$dir/site" ];
+$loc = GMCP_Diag_Util::resolve_log( "$dir/site/wp-content/logs/debug.log", $roots );
+check( 'resolve_log: a path under the content directory is anchored to it', $loc['ok'] && $loc['below_root'], true );
+check( '  ...expected path is the root plus the configured components', $loc['expected'], realpath( "$dir/site/wp-content" ) . '/logs/debug.log' );
+check( '  ...and the one directory below the root is the one to check', $loc['dirs'], [ realpath( "$dir/site/wp-content" ) . '/logs' ] );
+check( 'resolve_log: the longest root wins (content directory, not the install root)', strpos( $loc['expected'], realpath( "$dir/site/wp-content" ) ) === 0 && $loc['dirs'] === [ realpath( "$dir/site/wp-content" ) . '/logs' ], true );
+check( 'resolve_log: ".." is refused', GMCP_Diag_Util::resolve_log( "$dir/site/wp-content/../wp-content/logs/debug.log", $roots )['ok'], false );
+check( 'resolve_log: "." is refused', GMCP_Diag_Util::resolve_log( "$dir/site/wp-content/./logs/debug.log", $roots )['ok'], false );
+check( 'resolve_log: a relative path is refused', GMCP_Diag_Util::resolve_log( 'logs/debug.log', $roots )['ok'], false );
+check( 'resolve_log: ...and the refusal says it is a relative path and what to do', [ strpos( GMCP_Diag_Util::resolve_log( 'error_log', $roots )['error'], 'relative' ) !== false, strpos( GMCP_Diag_Util::resolve_log( 'error_log', $roots )['error'], 'absolute path' ) !== false ], [ true, true ] );
+check( 'resolve_log: control: the same file as an absolute path under the content directory is accepted', GMCP_Diag_Util::resolve_log( "$dir/site/wp-content/error_log", $roots )['ok'], true );
+check( 'resolve_log: a NUL byte is refused', GMCP_Diag_Util::resolve_log( "$dir/site/wp-content/logs/debug.log\0.txt", $roots )['ok'], false );
+$out = GMCP_Diag_Util::resolve_log( "$dir/elsewhere/other.log", $roots );
+check( 'resolve_log: a path outside both roots is canonicalised once, not anchored', $out['ok'] && !$out['below_root'], true );
+check( '  ...expected is the canonical directory plus the name', $out['expected'], realpath( "$dir/elsewhere" ) . '/other.log' );
+check( 'resolve_log: a missing directory outside the roots says so', GMCP_Diag_Util::resolve_log( "$dir/nowhere/x.log", $roots )['ok'], false );
+check( 'dir_chain_problem: control, plain directories pass', GMCP_Diag_Util::dir_chain_problem( [ "$dir/site/wp-content/logs" ] )[0], null );
+symlink( "$dir/elsewhere", "$dir/site/wp-content/linked" );
+check( 'dir_chain_problem: a directory that is a link is refused', GMCP_Diag_Util::dir_chain_problem( [ "$dir/site/wp-content/linked" ] )[0] !== null, true );
+check( 'dir_chain_problem: a component that is a file is refused', GMCP_Diag_Util::dir_chain_problem( [ "$dir/site/wp-content/logs/debug.log" ] )[0] !== null, true );
+check( 'dir_chain_problem: a missing component is refused', GMCP_Diag_Util::dir_chain_problem( [ "$dir/site/wp-content/gone" ] )[0] !== null, true );
+unlink( "$dir/site/wp-content/linked" );
+chmod( "$dir/elsewhere", 0777 );
+check( 'dir_chain_problem: a world-writable directory without the sticky bit is reported, not refused', [ GMCP_Diag_Util::dir_chain_problem( [ "$dir/elsewhere" ], 12345, [] )[0], count( GMCP_Diag_Util::dir_chain_problem( [ "$dir/elsewhere" ], 12345, [] )[1] ) ], [ null, 1 ] );
+chmod( "$dir/elsewhere", 01777 );
+check( 'dir_chain_problem: control, the sticky bit (as /tmp has it) is not reported', GMCP_Diag_Util::dir_chain_problem( [ "$dir/elsewhere" ], 12345, [] )[1], [] );
+chmod( "$dir/elsewhere", 0755 );
+check( 'dir_chain_problem: control, a private directory is not reported', GMCP_Diag_Util::dir_chain_problem( [ "$dir/elsewhere" ], 12345, [] )[1], [] );
+$v = GMCP_Diag_Util::open_verified( "$dir/site/wp-content/logs/debug.log", $loc['expected'] );
+check( 'open_verified: the real file opens at its expected path', is_resource( $v['fh'] ), true );
+if ( is_resource( $v['fh'] ) ) {
+  check( '  ...and nothing was read yet (the handle is positioned at the start)', ftell( $v['fh'] ), 0 );
+  fclose( $v['fh'] );
+}
+$v = GMCP_Diag_Util::open_verified( "$dir/site/wp-content/logs/debug.log", "$dir/elsewhere/debug.log" );
+check( 'open_verified: a file that is not at the expected path is refused', $v['fh'], null );
+$full = GMCP_Diag_Util::read_log( "$dir/site/wp-content/logs/debug.log", $roots, 10, 1000, 12345, [] );
+check( 'read_log: control, reads the lines', $full['lines'], [ 'alpha', 'beta' ] );
+check( 'read_log: and reports the path the kernel must see', $full['expected'], $loc['expected'] );
+rename( "$dir/site/wp-content/logs", "$dir/site/wp-content/logs.hold" );
+symlink( "$dir/elsewhere", "$dir/site/wp-content/logs" );
+file_put_contents( "$dir/elsewhere/debug.log", "CANARY\n" );
+$full = GMCP_Diag_Util::read_log( "$dir/site/wp-content/logs/debug.log", $roots, 10, 1000, 12345, [] );
+check( 'read_log: control, the swapped directory really does contain a readable debug.log', @file_get_contents( "$dir/site/wp-content/logs/debug.log" ), "CANARY\n" );
+check( 'read_log: a directory below the root swapped for a link is refused', $full['ok'], false );
+check( '  ...and nothing of the other file is returned', strpos( implode( '', $full['lines'] ) . $full['error'], 'CANARY' ), false );
+unlink( "$dir/site/wp-content/logs" );
+rename( "$dir/site/wp-content/logs.hold", "$dir/site/wp-content/logs" );
+
 echo "-- scrub_log_line --\n";
 $ctx = [ 'content_dir' => '/srv/www/site/wp-content', 'abspath' => '/srv/www/site/', 'patterns' => [ 'pass', 'pwd', 'secret', 'token', 'key', 'auth', 'salt', 'nonce', 'credential', 'bearer', 'signature', 'licence', 'license', 'private' ] ];
 $s = static function ( string $l ) use ( $ctx ): string {
@@ -286,6 +356,239 @@ foreach ( $cases as [ $label, $in, $gone, $kept ] ) {
   check( "  ...control: the probe sees it in the input ($label)", $has( $in, $gone ), true );
 }
 
+echo "-- scrub_log_line: cookies, escaped JSON, DSNs, vendor keys, private keys --\n";
+$more = [
+  [ 'Cookie header', 'curl sent Cookie: wordpress_logged_in_5d41402abc4b2a76b9719d911017c592=admin%7C1699999999%7CAbCdEf0123%7Cdeadbeef; wp-settings-1=mfold%3Do', 'AbCdEf0123', 'curl sent Cookie:' ],
+  [ 'Cookie header: the user name in it too', 'curl sent Cookie: wordpress_logged_in_5d41402abc4b2a76b9719d911017c592=zoeadmin%7C1699999999%7CT0k3n%7Chmac', 'zoeadmin', 'curl sent' ],
+  [ 'Set-Cookie header', 'response Set-Cookie: wordpress_sec_5d41402abc4b2a76b9719d911017c592=admin|1699999999|TokenValueHere|hmacvalue; path=/wp-admin; HttpOnly', 'TokenValueHere', 'response Set-Cookie:' ],
+  [ 'cookie in a dump of $_COOKIE', '[wordpress_logged_in_5d41402abc4b2a76b9719d911017c592] => admin|1699999999|TokenValueHere|hmacvalue', 'TokenValueHere', '=>' ],
+  [ 'a short WordPress cookie name, k=v', 'COOKIE wordpress_logged_in_abc=admin%7C123%7CZZZtok%7Chmac1 seen', 'ZZZtok', 'COOKIE' ],
+  [ 'PHP session id', 'request cookie PHPSESSID=0123456789abcdef0123456789abcdef done', '0123456789abcdef0123456789abcdef', 'done' ],
+  [ 'post password cookie', 'seen wp-postpass_abc123=%24P%24Bxyz done', 'Bxyz', 'done' ],
+  [ 'commenter e-mail cookie', 'seen comment_author_email_5d41402abc4b2a76b9719d911017c592=bob%40customer-domain.org done', 'customer-domain', 'done' ],
+  [ 'passwd=', 'GET /x?passwd=hunter2pw&a=1', 'hunter2pw', 'a=1' ],
+  [ 'pwd= from a login form', 'POST /wp-login.php log=bob&pwd=correcthorsebattery&wp-submit=Log+In', 'correcthorsebattery', 'wp-submit' ],
+  [ 'password in escaped JSON', 'body {\"password\":\"hunter2pw\",\"user\":\"bob\"}', 'hunter2pw', 'bob' ],
+  [ 'secret in escaped JSON, a value with spaces', 'body {\"client_secret\":\"two words here\",\"x\":1}', 'two words here', '\"x\":1' ],
+  [ 'secret in escaped JSON, a number', 'body {\"secret\":99887766,\"x\":1}', '99887766', '\"x\":1' ],
+  [ 'redis DSN with an empty user', 'cannot connect redis://:r3d1sPassw0rd@cache.internal:6379/0', 'r3d1sPassw0rd', 'cache.internal' ],
+  [ 'mysql DSN', 'PDOException mysql://app:Pa55w0rd@db.internal:3306/wp', 'Pa55w0rd', 'db.internal:3306/wp' ],
+  [ 'DSN whose password contains @', 'dsn mysql://app:p4@ssw0rd@db.internal/wp', 'ssw0rd', 'db.internal/wp' ],
+  [ 'amqp DSN', 'amqp://guest:gu3stPw@rabbit:5672/', 'gu3stPw', 'rabbit:5672' ],
+  [ 'a host before @ is not the host', 'redirect https://example.com@evil.example/path', 'example.com@', 'evil.example/path' ],
+  [ 'Stripe secret key', 'Stripe error with key ' . 'sk_' . 'live_abcdefghijklmnopqrstuvwx', 'sk_live_abcdef', 'Stripe error with key' ],
+  [ 'Stripe webhook secret', 'verify failed whsec_abcdefghijklmnopqrstuvwxyz', 'whsec_abcdef', 'verify failed' ],
+  [ 'GitHub token', 'push with ghp_abcdefghijklmnopqrstuvwxyz0123456789 failed', 'ghp_abcdef', 'push with' ],
+  [ 'Google API key', 'GET https://maps.googleapis.com/maps/api/js?x=1 AIzaSyA-abcdefghijklmnopqrstuvwxyz012345 denied', 'AIzaSyA-abcdef', 'maps/api/js?x=1' ],
+  [ 'Slack token', 'webhook xoxb-1234567890-abcdefghijkl used', 'xoxb-1234567890', 'webhook' ],
+  [ 'GitLab token', 'clone with glpat-abcdefghij0123456789 refused', 'glpat-abcdefghij', 'refused' ],
+  [ 'Mailgun key', 'mailgun auth ' . 'key-' . '0123456789abcdef0123456789abcdef' . ' bad', 'key-0123456789abcdef', 'bad' ],
+  [ 'SendGrid key', 'smtp login SG.abcdefghijklmnop.qrstuvwxyz012345 refused', 'SG.abcdefghijklmnop', 'refused' ],
+  [ 'a private key on one line (escaped newlines)', 'config key=-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj\n-----END PRIVATE KEY----- tail', 'MIIEvQIBADANBgkq', 'tail' ],
+  [ 'a private key cut off before its end marker', 'config -----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun', 'MIIEowIBAAKC', 'config' ],
+  [ 'the first line of a multi-line private key', '-----BEGIN OPENSSH PRIVATE KEY-----', 'OPENSSH PRIVATE KEY', '[private-key-block]' ],
+  [ 'a base64 line of a key printed over several lines, with slashes', 'VaYf7yG5uQ9o/ZqWZbq3Fv4sPzRtL8mNoPqRsTuVwXyZ0123456789abcdefghiJ', 'VaYf7yG5uQ9o', 'base64 line redacted' ],
+  [ 'a base64 line with letters only', 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz', 'abcdefghijklmnopqrstuvwxyzabcdefghijkl', 'base64 line redacted' ],
+];
+foreach ( $more as [ $label, $in, $gone, $kept ] ) {
+  $out = $s( $in );
+  check( "removed: $label", $has( $out, $gone ), false );
+  check( "  ...rest of the line kept ($label)", $has( $out, $kept ), true );
+  check( "  ...control: the probe sees it in the input ($label)", $has( $in, $gone ), true );
+}
+
+echo "-- scrub_log_lines: a private key over several lines --\n";
+$pem = [
+  'PHP Notice:  key material follows',
+  '-----BEGIN PRIVATE KEY-----',
+  'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj',
+  'short/line+with=chars',
+  '-----END PRIVATE KEY-----',
+  'PHP Notice:  after the key',
+];
+$o = GMCP_Diag_Util::scrub_log_lines( $pem, $ctx );
+check( 'same number of lines out as in', count( $o ), count( $pem ) );
+check( 'no body line survives', $has( implode( "\n", $o ), 'short/line' ) || $has( implode( "\n", $o ), 'MIIEvQ' ), false );
+check( 'control: the probe sees the body in the input', $has( implode( "\n", $pem ), 'short/line' ), true );
+check( 'the line before is kept', $o[0], 'PHP Notice:  key material follows' );
+check( 'the line after is kept', $o[5], 'PHP Notice:  after the key' );
+$pem_cut = [ '-----BEGIN RSA PRIVATE KEY-----', 'abc/def+ghi', '[04-Nov-2026 22:36:32 UTC] PHP Warning:  next record', 'ordinary line' ];
+$o = GMCP_Diag_Util::scrub_log_lines( $pem_cut, $ctx );
+check( 'a key with no end marker ends at the next log record', [ $has( $o[1], 'abc/def' ), $o[2], $o[3] ], [ false, '[04-Nov-2026 22:36:32 UTC] PHP Warning:  next record', 'ordinary line' ] );
+$o = GMCP_Diag_Util::scrub_log_lines( array_merge( [ '-----BEGIN PRIVATE KEY-----' ], array_fill( 0, 150, 'x/y+z' ), [ 'plain after' ] ), $ctx );
+check( 'a key with no end marker and no new record cannot swallow more than 100 lines', end( $o ), 'plain after' );
+check( 'control: a certificate (public) is not withheld', GMCP_Diag_Util::scrub_log_lines( [ '-----BEGIN CERTIFICATE-----', 'short', '-----END CERTIFICATE-----' ], $ctx )[1], 'short' );
+
+echo "-- scrub_log_line: shapes a log can print a secret in that carry no 'name=value' --\n";
+// Each secret below came back unchanged before its rule existed. Each has a harmless line next to it
+// that the same rule must leave alone, and a control that the probe sees the secret in the input.
+$shapes = [
+  'PHP serialized string' => [ 's:9:"user_pass";s:7:"hunter2xq";', 'hunter2xq' ],
+  'serialized inside an array' => [ 'a:2:{s:5:"login";s:5:"admin";s:8:"password";s:9:"hunter2xq";}', 'hunter2xq' ],
+  'serialized with an escaped quote in the value' => [ 's:8:"password";s:9:"hun\\"ter2xq";', 'ter2xq' ],
+  'element named like a secret' => [ '<Password>hunter2xq</Password>', 'hunter2xq' ],
+  'element with an attribute' => [ '<db_password type="string">hunter2xq</db_password>', 'hunter2xq' ],
+  'mysqldump -pPASSWORD' => [ 'mysqldump -u root -phunter2xq wordpress > /tmp/x.sql', 'hunter2xq' ],
+  'mysql -pPASSWORD quoted' => [ "mysql -h db -u wp -p'hunter2xq' wordpress", 'hunter2xq' ],
+  '--password VALUE' => [ 'mysqldump --user=root --password hunter2xq db', 'hunter2xq' ],
+  '--password=VALUE' => [ 'mysqldump --user=root --password=hunter2xq db', 'hunter2xq' ],
+  '--api-key VALUE' => [ 'tool --api-key hunter2xq --verbose', 'hunter2xq' ],
+  'URL-encoded token' => [ 'token%3Dhunter2xq', 'hunter2xq' ],
+  'URL-encoded password after an encoded ampersand' => [ 'a=1%26password%3Dhunter2xq%26b=2', 'hunter2xq' ],
+  'double-encoded password' => [ 'password%253Dhunter2xq', 'hunter2xq' ],
+  'Azure sig, percent-encoded value' => [ 'SharedAccessSignature=sv=2020-08-04&sig=Hunter2xQ%2Bef&se=2030', 'Hunter2xQ' ],
+  'Azure sig, in a URL' => [ 'GET https://acct.blob.core.windows.net/c/b?sv=2020&sig=Hunter2xQ%2Fef%3D&sp=r', 'Hunter2xQ' ],
+];
+foreach ( $shapes as $label => [ $line, $secret ] ) {
+  check( "control: the probe sees the secret in the input ($label)", $has( $line, $secret ), true );
+  $out = GMCP_Diag_Util::scrub_log_line( $line, $ctx );
+  check( "removed: $label", $has( $out, $secret ), false );
+  check( "  ...and not by emptying the line ($label)", $out !== '' && preg_last_error() === PREG_NO_ERROR, true );
+}
+check( 'the fields around a serialized secret survive', GMCP_Diag_Util::scrub_log_line( 'a:2:{s:5:"login";s:5:"admin";s:8:"password";s:9:"hunter2xq";}', $ctx ), 'a:2:{s:5:"login";s:5:"admin";s:8:"password";s:10:"[redacted]";}' );
+check( 'the next URL-encoded field survives', GMCP_Diag_Util::scrub_log_line( 'a=1%26password%3Dhunter2xq%26b=2', $ctx ), 'a=1%26password%3D[redacted]%26b=2' );
+check( 'the Azure fields around the signature survive', GMCP_Diag_Util::scrub_log_line( 'x?sv=2020&sig=Hunter2xQ%2Bef&se=2030', $ctx ), 'x?sv=2020&sig=[redacted]&se=2030' );
+foreach ( [
+  '<Passwords count="3"/>',
+  '<Passwords>',
+  '<Password/>',
+  '<Pass>',
+  '<note>the password field is empty</note>',
+  '<div class="x">plain text</div>',
+  's:5:"login";s:5:"admin";',
+  's:4:"city";s:4:"Oslo";',
+  'mysqldump -u root -p wordpress',
+  'mysqldump -P3306 -h db wordpress',
+  'ls -plan and tar -pxf a.tar',
+  'rsync -p --password-file /etc/rsync.pass src dst',
+  'tool --keyfile /tmp/k --no-token-check yes',
+  'tokenizer%20extension%20ok',
+  'sig_handler installed',
+  'signal 11 and design%3Dfinal',
+  'a%3Db and 100%25 done and %26amp',
+] as $line ) {
+  check( 'unchanged: ' . $line, GMCP_Diag_Util::scrub_log_line( $line, $ctx ), $line );
+}
+
+echo "-- scrub_log_lines: a value printed on the line after its name --\n";
+$dump = [ 'array(2) {', '  ["login"]=>', '  string(5) "admin"', '  ["password"]=>', '  string(9) "hunter2xq"', '}' ];
+$o = GMCP_Diag_Util::scrub_log_lines( $dump, $ctx );
+check( 'control: the probe sees the secret in the input', $has( implode( "\n", $dump ), 'hunter2xq' ), true );
+check( 'var_dump: the value after a secret name is withheld', $has( implode( "\n", $o ), 'hunter2xq' ), false );
+check( 'var_dump: the name line, the other field and the structure stay', [ $o[0], $o[1], $o[2], $o[3], $o[5] ], [ 'array(2) {', '  ["login"]=>', '  string(5) "admin"', '  ["password"]=>', '}' ] );
+check( 'var_dump: the same number of lines', count( $o ), count( $dump ) );
+$o = GMCP_Diag_Util::scrub_log_lines( [ "  'db_password' =>", "  'hunter2xq',", "  'login' =>", "  'admin'," ], $ctx );
+check( 'var_export: the value after a secret name is withheld, the other field is not', [ $has( implode( "\n", $o ), 'hunter2xq' ), $o[3] ], [ false, "  'admin'," ] );
+$o = GMCP_Diag_Util::scrub_log_lines( [ '  [secret_options] =>', '  Array', '  (', '      [login] => admin', '  )' ], $ctx );
+check( 'a secret name followed by an array: the structure is kept and its members judged by their own names', array_slice( $o, 1 ), [ '  Array', '  (', '      [login] => admin', '  )' ] );
+$o = GMCP_Diag_Util::scrub_log_lines( [ '  ["password"]=>', '[04-Nov-2026 22:36:32 UTC] PHP Warning:  next record' ], $ctx );
+check( 'a name at the end of the window does not swallow the next record', $o[1], '[04-Nov-2026 22:36:32 UTC] PHP Warning:  next record' );
+$o = GMCP_Diag_Util::scrub_log_lines( [ 'ordinary line =>', 'following line' ], $ctx );
+check( 'control: a line ending in => whose name is not secret withholds nothing', $o[1], 'following line' );
+
+echo "-- scrub_log_lines: a key block that closes and opens on one line --\n";
+$two = [ 'x -----BEGIN PRIVATE KEY-----AAAA-----END PRIVATE KEY----- y -----BEGIN PRIVATE KEY-----', 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw', 'short/body+line', '-----END PRIVATE KEY-----', 'after' ];
+$o = GMCP_Diag_Util::scrub_log_lines( $two, $ctx );
+check( 'control: the probe sees the body in the input', $has( implode( "\n", $two ), 'short/body' ), true );
+check( 'the lines of the second block are withheld', $has( implode( "\n", $o ), 'short/body' ) || $has( implode( "\n", $o ), 'MIIEvQ' ), false );
+check( 'the line after the end marker is kept', end( $o ), 'after' );
+$one = [ '-----BEGIN PRIVATE KEY-----AAAA-----END PRIVATE KEY----- then more', 'ordinary next line' ];
+check( 'control: a block that closes on its own line does not withhold the next line', GMCP_Diag_Util::scrub_log_lines( $one, $ctx )[1], 'ordinary next line' );
+
+echo "-- scrub_log_line: pathological 5000-character lines (a pattern that backtracks shows here) --\n";
+$bad = [
+  'letters' => str_repeat( 'a', 5000 ),
+  'scheme repeats' => str_repeat( 'a://', 1250 ),
+  'scheme then no @' => 'a://' . str_repeat( 'x', 4990 ),
+  'at signs' => str_repeat( '@', 5000 ),
+  'scheme then at signs' => 'a://' . str_repeat( '@', 4990 ),
+  'password= repeats' => str_repeat( 'password=', 550 ),
+  'escaped JSON, unterminated' => str_repeat( '\"secret\":\"', 450 ),
+  'escaped JSON, no closing' => '\"secret\":\"' . str_repeat( 'a', 4980 ),
+  'key then no value' => str_repeat( 'secret ', 700 ),
+  'BEGIN repeats' => str_repeat( '-----BEGIN PRIVATE KEY-----', 185 ),
+  'BEGIN then text' => '-----BEGIN PRIVATE KEY-----' . str_repeat( 'x', 4960 ),
+  'Cookie: repeats' => str_repeat( 'Cookie:', 700 ),
+  'cookie names repeat' => str_repeat( 'wordpress_logged_in_', 250 ),
+  'PHPSESSID repeats' => str_repeat( 'PHPSESSID=', 500 ),
+  'colons' => str_repeat( ':', 5000 ),
+  'dots and digits' => str_repeat( '1.', 2500 ),
+  'quotes' => str_repeat( '"', 5000 ),
+  'backslashes' => str_repeat( '\\', 5000 ),
+  'vendor prefixes' => str_repeat( 'sk_live_', 600 ),
+  'base64 almost' => str_repeat( 'A', 4999 ) . '!',
+  'Authorization repeats' => str_repeat( 'Authorization:', 350 ),
+  'brackets' => str_repeat( '[a]', 1600 ),
+  'serialized prefixes' => str_repeat( 's:5:"pass', 500 ),
+  'serialized names, no value' => str_repeat( 's:9:"user_pass";', 300 ),
+  'serialized, open string' => 's:9:"password";s:7:"' . str_repeat( 'a', 4970 ),
+  'elements open' => str_repeat( '<password>', 500 ),
+  'elements, a long name' => '<' . str_repeat( 'pass', 1250 ) . '>x</a>',
+  'elements, no close' => '<password>' . str_repeat( 'x', 4980 ),
+  'elements, many tags' => str_repeat( '<a>', 1600 ),
+  'encoded names' => str_repeat( 'token%3D', 600 ),
+  'encoded percent signs' => str_repeat( '%25', 1600 ),
+  'encoded name, long value' => 'password%3D' . str_repeat( 'a%2B', 1600 ),
+  'option repeats' => str_repeat( '--password ', 450 ),
+  'option, long value' => '--password ' . str_repeat( 'x', 4980 ),
+  'mysql repeats' => str_repeat( 'mysql -', 700 ),
+  'mysql, long tail' => 'mysql ' . str_repeat( 'x ', 2490 ),
+  'mysql words, no -p' => str_repeat( 'mysql ', 800 ),
+  'sig repeats' => str_repeat( 'sig=', 1250 ),
+  'sig, long encoded value' => 'sig=' . str_repeat( 'a%2B', 1200 ),
+];
+$worst = 0.0;
+foreach ( $bad as $label => $line ) {
+  $t0 = microtime( true );
+  $r = GMCP_Diag_Util::scrub_log_line( $line, $ctx );
+  $dt = microtime( true ) - $t0;
+  $worst = max( $worst, $dt );
+  // A regular expression that gives up (backtrack limit) makes preg_replace() return null, which the
+  // scrubber casts to an empty line: quick, and a silent failure. So speed alone proves nothing.
+  check( sprintf( 'pathological line "%s" (%d chars) scrubs in under 0.5 s', $label, strlen( $line ), $dt ), $dt < 0.5 && is_string( $r ), true );
+  check( '  ...and no regular expression gave up on it (no PCRE error, a non-empty result)', preg_last_error() === PREG_NO_ERROR && $r !== '', true );
+}
+printf( "        slowest of %d pathological lines: %.1f ms\n", count( $bad ), $worst * 1000 );
+// The PCRE JIT hides a quadratic pattern (it is the default on most builds) and some hosts run
+// without it, so the same kind of lines are timed in a child process started with it off (a
+// pattern already compiled with the JIT stays compiled with it, so ini_set() here would change
+// nothing). Before the name-based rule was anchored to the start of a run of name characters,
+// each of these took about 0.3 s.
+$jit_lines = [ str_repeat( 'a_', 2500 ), str_repeat( '[a]', 1600 ), str_repeat( 'wordpress_logged_in_', 250 ), str_repeat( 'a', 5000 ), 'a://' . str_repeat( 'x', 4990 ) ];
+foreach ( $bad as $label => $line ) {
+  // The new rules, at the length they see (the scrubber cuts at 2000) and at 5000.
+  if ( preg_match( '/serialized|element|encoded|option|mysql|sig/', $label ) ) {
+    $jit_lines[] = substr( $line, 0, 2000 );
+    $jit_lines[] = $line;
+  }
+}
+$child_code = 'define( "ABSPATH", "/" ); require $argv[1]; $worst = 0; $empty = 0; $n = 0;'
+  . ' foreach ( json_decode( (string) file_get_contents( $argv[2] ), true ) as $l ) { $n++;'
+  . ' $t0 = microtime( true ); $r = GMCP_Diag_Util::scrub_log_line( $l, [ "patterns" => [ "pass", "pwd", "secret", "token", "key", "auth", "salt", "nonce", "credential", "bearer", "signature", "licence", "license", "private" ] ] );'
+  . ' $worst = max( $worst, microtime( true ) - $t0 ); if ( $r === "" || preg_last_error() !== PREG_NO_ERROR ) { $empty++; } }'
+  . ' echo json_encode( [ ini_get( "pcre.jit" ), $worst, $empty, $n ] );';
+$util_path = getenv( 'GMCP_UTIL' ) ?: __DIR__ . '/../includes/diagnostics-util.php';
+$jit_file = tempnam( sys_get_temp_dir(), 'gmcp-jit' );
+file_put_contents( $jit_file, (string) json_encode( $jit_lines ) );
+$child_out = (string) shell_exec( escapeshellarg( PHP_BINARY ) . ' -d pcre.jit=0 -r ' . escapeshellarg( $child_code ) . ' ' . escapeshellarg( $util_path ) . ' ' . escapeshellarg( $jit_file ) . ' 2>&1' );
+unlink( $jit_file );
+$child = json_decode( $child_out, true );
+check( 'JIT-off child ran with the JIT off', is_array( $child ) ? (string) $child[0] : $child_out, '0' );
+check( 'JIT off: the child scrubbed every line it was given (' . count( $jit_lines ) . ')', is_array( $child ) ? $child[3] : -1, count( $jit_lines ) );
+check( 'JIT off: every pathological line, the new rules at 2000 and 5000 characters included, scrubs in under 0.1 s (the slowest of them)', is_array( $child ) && $child[1] < 0.1, true );
+check( 'JIT off: and none was emptied, or hit a PCRE error, by a regular expression giving up', is_array( $child ) ? $child[2] : -1, 0 );
+printf( "        slowest with the JIT off: %.1f ms\n", is_array( $child ) ? $child[1] * 1000 : -1 );
+// scrub_log_line() cuts a line at 2000 characters before any rule runs, so the time above is the
+// time for 2000 characters. Time the rules with the cut taken away from their input as well: the
+// same lines at 2000 characters are what they actually see.
+$lines5k = [];
+for ( $i = 0; $i < 40; $i++ ) {
+  $lines5k[] = str_repeat( 'password=a ', 180 );
+}
+$t0 = microtime( true );
+GMCP_Diag_Util::scrub_log_lines( $lines5k, $ctx );
+check( '40 long lines of repeated credentials scrub in under 2 s', microtime( true ) - $t0 < 2, true );
+
 echo "-- scrub_log_line: left alone --\n";
 $keep = [
   'PHP Warning:  Undefined array key "foo" in [content]/plugins/x/y.php on line 12',
@@ -298,6 +601,18 @@ $keep = [
   // The new shapes must not eat ordinary text: "pw" is a whole word only, and a define() of something that is not a credential is just a notice.
   'power=5 and pwa=1 and showpw=2 were set',
   "define( 'WP_DEBUG', true ); define( 'WP_CONTENT_URL', 'https://x.test/c' );",
+  // New shapes must not eat ordinary text either.
+  'Cookie policy page loaded and set cookie banner to dismissed',
+  'wordpress_test_cookie=WP%20Cookie%20check',
+  'seen cookie wp-settings-1=mfold%3Do',
+  'fetched https://example.com/blog/post?id=3&ref=a@b and moved on',
+  'GET http://example.com:8080/a/b@c/d HTTP/1.1',
+  'Using skeleton_live_view and task_key_ready and ghost_writer_enabled',
+  'The SG.1 and SG.2 labels were shown; key-value pairs follow',
+  'BEGIN CERTIFICATE rotation done; the private key was not printed',
+  'a/b/c/some/long/path/with/segments/that/is/not/base64/at/all/and/has/spaces too',
+  '{\"user\":\"bob\",\"city\":\"Oslo\"}',
+  'the file was 0123456789abcdef.jpg and a_long_but_plain_identifier_with_no_digits_in_it_at_all_x',
 ];
 foreach ( $keep as $line ) {
   check( 'unchanged: ' . substr( $line, 0, 50 ), GMCP_Diag_Util::scrub_log_line( $line, [] ), $line );
@@ -388,6 +703,62 @@ check( 'control: text with no preview key is untouched', $sp( "see https://x/?p=
 check( 'control: the word preview alone is untouched', $sp( 'a preview of the page' ), 'a preview of the page' );
 check( 'scrub_log_line applies it too', strpos( GMCP_Diag_Util::scrub_log_line( "404 /?gmcp.preview=$tok", [] ), $tok ) === false, true );
 
+echo "-- scrub_preview_tokens: one-time download and upload URLs --\n";
+// The reply that hands the URL out is JSON, and wp_json_encode writes "/" as "\/", so the form that
+// is actually recorded in the audit log is the escaped one. The first scrub looked for "/download/"
+// only and passed that form through (measured on a live site: the token sat in the detail column).
+$dl = 'Zk3Qm9Lp2Rt7Xw4Vb8Nc5Hd1Jf6Gs0A';
+$route = 'wp-json/mcp/v1/download/';
+$reply = (string) json_encode( [ 'download_url' => "https://x/{$route}{$dl}", 'usage' => "curl -L \"https://x/{$route}{$dl}\"" ], JSON_PRETTY_PRINT );
+foreach ( [
+  'a plain URL' => "https://x/{$route}{$dl}",
+  'the JSON-escaped URL a tool reply holds' => str_replace( '/', '\\/', "https://x/{$route}{$dl}" ),
+  'a reply quoted inside a second JSON string' => str_replace( '/', '\\\\/', "https://x/{$route}{$dl}" ),
+  'the whole reply as the audit log stores it' => $reply,
+  'a plain-permalink URL, percent-encoded' => "https://x/?rest_route=%2Fmcp%2Fv1%2Fdownload%2F{$dl}",
+  'a plain-permalink URL, lower-case percent-encoding' => "https://x/?rest_route=%2fmcp%2fv1%2fdownload%2f{$dl}",
+  'an upload URL' => "https://x/wp-json/mcp/v1/upload/{$dl}",
+  'the JSON-escaped upload URL' => str_replace( '/', '\\/', "https://x/wp-json/mcp/v1/upload/{$dl}" ),
+  'a plain-permalink upload URL' => "https://x/?rest_route=%2Fmcp%2Fv1%2Fupload%2F{$dl}",
+] as $label => $text ) {
+  check( "control: the $label probe holds the token", strpos( $text, $dl ) !== false, true );
+  $out = $sp( $text );
+  check( "scrubbed: $label (token gone)", strpos( $out, $dl ) === false, true );
+  check( "  ...and marked ($label)", strpos( $out, '[redacted]' ) !== false, true );
+  check( "  ...and the route is kept ($label)", (bool) preg_match( '#(download|upload)#', $out ), true );
+  check( "stable: $label is unchanged by a second pass", $sp( $out ), $out );
+}
+check( 'control: an ordinary uploads path is untouched', $sp( 'see wp-content/uploads/2026/11/holiday-photo.jpg' ), 'see wp-content/uploads/2026/11/holiday-photo.jpg' );
+check( 'control: a short path segment after /download/ is untouched', $sp( 'https://x/download/readme' ), 'https://x/download/readme' );
+check( 'control: the word download alone is untouched', $sp( 'a download of the report' ), 'a download of the report' );
+check( 'control: a bare /upload/ path outside the plugin route is untouched', $sp( "https://x/upload/{$dl}" ), "https://x/upload/{$dl}" );
+
+echo "-- scrub_log_line: shapes found missing in review --\n";
+$sec = 'Zx9Qw3Lp7Rt2';
+$rev = [
+  'an escaped quote inside a define() value'  => [ "define('DB_PASSWORD', 'ab\\'cdef12345');", 'cdef12345', "define('DB_PASSWORD', [redacted]);" ],
+  'an escaped quote inside a quoted value'    => [ "smtp_pass = 'ab\\'cdef12345' tail", 'cdef12345', 'smtp_pass = [redacted] tail' ],
+  'a double-quoted value with an escaped quote' => [ 'smtp_pass = "ab\\"cdef12345" tail', 'cdef12345', 'smtp_pass = [redacted] tail' ],
+  'a CDATA element'                           => [ "<password><![CDATA[Zx9<Qw3>Lp7]]></password>", 'Lp7', '<password>[redacted]</password>' ],
+  'a CDATA element with attributes'           => [ "<api_key id=\"1\"><![CDATA[$sec]]></api_key>", $sec, '<api_key id="1">[redacted]</api_key>' ],
+  'JSON in a URL, percent-encoded'            => [ "GET /x?data=%7B%22access_token%22%3A%22$sec%22%2C%22b%22%3A1%7D", $sec, 'GET /x?data=%7B%22access_token%22%3A%22[redacted]%22%2C%22b%22%3A1%7D' ],
+  'curly double quotes around a value'        => [ "password: “Zx9 Qw3 Lp7” tail", 'Qw3', 'password: [redacted] tail' ],
+  'curly single quotes around a value'        => [ "password = ‘Zx9 Qw3 Lp7’ tail", 'Qw3', 'password = [redacted] tail' ],
+  'curly quotes around the name too'          => [ "“password”: “Zx9 Qw3”", 'Qw3', '“password”: [redacted]' ],
+  'a fullwidth equals sign'                   => [ "password＝{$sec} next", $sec, 'password＝[redacted] next' ],
+  'a fullwidth colon'                         => [ "password：{$sec} next", $sec, 'password：[redacted] next' ],
+  'pw with a fullwidth colon'                 => [ "pw：{$sec} next", $sec, 'pw：[redacted] next' ],
+  'Authorization: Token'                      => [ "Authorization: Token {$sec}abc", $sec, 'Authorization: [redacted]' ],
+  'a key whose value is a one-line private key' => [ 'key: -----' . 'BEGIN OPENSSH PRIVATE KEY----- abc -----END OPENSSH PRIVATE KEY-----', 'abc', 'key: [private-key-block]' ],
+];
+foreach ( $rev as $label => [ $text, $leak, $want ] ) {
+  check( "control: the $label probe holds what must go", strpos( $text, $leak ) !== false, true );
+  $out = GMCP_Diag_Util::scrub_log_line( $text, [] );
+  check( "scrubbed: $label", $out, $want );
+  check( "stable: $label is unchanged by a second pass", GMCP_Diag_Util::scrub_log_line( $out, [] ), $out );
+}
+check( 'control: curly quotes round a harmless value are kept', GMCP_Diag_Util::scrub_log_line( 'title: “Hello there” and more', [] ), 'title: “Hello there” and more' );
+check( 'control: an element not named like a secret keeps its CDATA', GMCP_Diag_Util::scrub_log_line( '<title><![CDATA[Hello]]></title>', [] ), '<title><![CDATA[Hello]]></title>' );
 // The upload and export endpoints hand out a token in the path for the same reason the
 // download one does, and their replies are copied into the same audit log. Each check has
 // a control on a nearby ordinary URL, so "the token is gone" cannot be the scrubber

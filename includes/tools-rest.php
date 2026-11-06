@@ -9,11 +9,12 @@
 class GMCP_Tools_Rest {
   // Bump the suffix when build_schema_from_args() changes so old cached schemas are ignored.
   // v5: _fields advertised.
+  // v6: a resource whose route belongs to a guarded post type is not generated.
   //
   // Public, and a constant rather than a property, because GMCP_Core clears it on an
   // upgrade and the name has to have one home. Spelled out in two files, it is a name that
   // gets bumped in one of them.
-  const CACHE_KEY = 'gmcp_tools_cache_v5';
+  const CACHE_KEY = 'gmcp_tools_cache_v6';
   private $cache_key = self::CACHE_KEY;
   private $allowed = [ 'posts', 'pages', 'media' ];
 
@@ -35,6 +36,15 @@ class GMCP_Tools_Rest {
       $routes = $server->get_routes();
 
       foreach ( $this->allowed as $resource ) {
+        // A route that a guarded post type has taken over is not turned into tools at all.
+        // The names above are fixed, so today a guarded type cannot reach here; a plugin
+        // that registers one with show_in_rest and a rest_base of "posts", "pages" or
+        // "media" could make these tools read and write it through its own controller, past
+        // every guard the generic post tools ask. Not generating the tools is the answer
+        // that needs no second list of what to refuse. @see resource_is_guarded().
+        if ( $this->resource_is_guarded( $resource ) ) {
+          continue;
+        }
         $base = "/wp/v2/{$resource}";
         $item = "{$base}/(?P<id>[\d]+)";
 
@@ -130,6 +140,52 @@ class GMCP_Tools_Rest {
     }
 
     return array_merge( array_values( $cached ), $prevTools );
+  }
+
+  /**
+  * Whether a REST resource name belongs to a post type the generic post tools must not
+  * read or write: a form submission type, a commerce type, or a type that holds another
+  * plugin's configuration.
+  *
+  * Both lists, whatever the caller's level, because the tools are generated once and cached
+  * for every key. An order type is then also unavailable to an admin key here, which costs
+  * nothing: the WooCommerce tools are the way to read one.
+  */
+  private function resource_is_guarded( string $resource ): bool {
+    $guarded = array_merge(
+      array_map( 'strtolower', array_map( 'strval', GMCP_Core::personal_data_post_types() ) ),
+      GMCP_Core::commerce_post_types(),
+      array_map( 'strtolower', array_map( 'strval', array_keys( GMCP_Core::plugin_config_post_types() ) ) )
+    );
+    foreach ( get_post_types( [ 'show_in_rest' => true ], 'objects' ) as $type ) {
+      $base = $type->rest_base ? (string) $type->rest_base : (string) $type->name;
+      if ( $base === $resource && in_array( strtolower( (string) $type->name ), $guarded, true ) ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+  * A WHERE fragment, for WP_Query, that leaves out what the caller may not read: posts of the
+  * excluded types, and posts hanging from one at any depth post_chain_types() walks (a media
+  * row, a revision or a child of a submission or an order).
+  *
+  * Installed around the REST dispatch of a list call. The listing is built by WordPress's own
+  * query, and its rows are filtered by what _fields leaves in them, so an id-based filter on
+  * the rows afterwards would miss every call that does not ask for the id. The SQL is the one
+  * the other listings and scans use. @see GMCP_Core::unreadable_post_clauses()
+  */
+  public function exclude_unreadable_posts( $where ) {
+    global $wpdb;
+    $c = GMCP_Core::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_r' );
+    return $c['where'] === '' ? $where : $where . ' AND ' . $c['where'];
+  }
+
+  /** The parents the WHERE above judges, joined. @see exclude_unreadable_posts() */
+  public function join_unreadable_posts( $join ) {
+    global $wpdb;
+    return $join . GMCP_Core::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_r' )['join'];
   }
 
   private function build_schema_from_args( $args ) {
@@ -302,7 +358,23 @@ class GMCP_Tools_Rest {
       if ( empty( $args['id'] ) ) {
         return $this->error( $id, 'Missing parameter: id', -32602 );
       }
-      $path .= '/' . intval( $args['id'] );
+      // The same read policies the generic post tools ask, about the post and about what it
+      // hangs from. The controller refuses an id of the wrong type with a 404 and so answers
+      // for a submission's own id, but a media row attached to one is a perfectly good
+      // attachment to the media controller, and an update or a delete replies with the row.
+      $row_id = intval( $args['id'] );
+      $held = GMCP_Core::post_read_guard( $row_id );
+      if ( $held !== true ) {
+        if ( $held !== GMCP_Core::post_not_found_text( $row_id ) ) {
+          return $this->error( $id, $held, -32600 );
+        }
+        // Below admin, a post this key may not read is asked of the controller as an id that
+        // names nothing, so its answer is the controller's own answer for one that does not
+        // exist and cannot differ from it.
+        $row_id = 0;
+        $args['id'] = 0;
+      }
+      $path .= '/' . $row_id;
     }
 
     switch ( $action ) {
@@ -316,6 +388,16 @@ class GMCP_Tools_Rest {
       default:
         $method = 'GET';
         break;
+    }
+
+    // The arguments that name another post, judged before the controller writes anything. The net
+    // would refuse them too, but from inside the controller after it had inserted the row, so the
+    // reply said refused over a draft that stood in the table. @see GMCP_Core::rest_write_refusal().
+    if ( $method === 'POST' ) {
+      $refused = GMCP_Core::rest_write_refusal( $action === 'update' ? (int) ( $args['id'] ?? 0 ) : 0, $args );
+      if ( $refused !== null ) {
+        return $this->error( $id, $refused . ' Nothing was written.', 'gmcp_refused' );
+      }
     }
 
     $request = new WP_REST_Request( $method, $path );
@@ -336,7 +418,60 @@ class GMCP_Tools_Rest {
       $request->set_body_params( $args );
     }
 
-    $response = rest_do_request( $request );
+    // A listing is filtered where it is built. Only for GET, and only for the lifetime of this
+    // one dispatch.
+    $listing = $method === 'GET' && $action === 'list';
+    if ( $listing ) {
+      add_filter( 'posts_join', [ $this, 'join_unreadable_posts' ] );
+      add_filter( 'posts_where', [ $this, 'exclude_unreadable_posts' ] );
+    }
+    // Rows a create makes, so one the net refuses AFTER it was inserted can be taken back out.
+    $made = [];
+    $track = static function ( $post_id, $post = null, $update = false ) use ( &$made ) {
+      if ( !$update ) {
+        $made[] = (int) $post_id;
+      }
+    };
+    if ( $action === 'create' ) {
+      add_action( 'wp_insert_post', $track, 0, 3 );
+    }
+    try {
+      $response = rest_do_request( $request );
+    }
+    catch ( GMCP_Policy_Refusal | GMCP_Drafts_Only_Refusal $refusal ) {
+      // The controller inserts, then applies the featured image, terms and meta, and the net throws
+      // from that tail. rest_write_refusal() names what it can before the call; this is for the rest.
+      // A refused create must not leave a row, so it is removed, and the reply says which.
+      remove_action( 'wp_insert_post', $track, 0 );
+      $gone = [];
+      $stuck = [];
+      foreach ( $made as $new_id ) {
+        try {
+          if ( wp_delete_post( $new_id, true ) ) {
+            $gone[] = $new_id;
+            continue;
+          }
+        }
+        catch ( Throwable $e ) {
+          // Reported below.
+        }
+        $stuck[] = $new_id;
+      }
+      $note = $gone ? ' The ' . ( count( $gone ) === 1 ? 'post' : 'posts' ) . ' this call had already inserted (#' . implode( ', #', $gone ) . ') ' . ( count( $gone ) === 1 ? 'was' : 'were' ) . ' removed again, so nothing was created.' : '';
+      if ( $stuck ) {
+        $note .= ' Could not remove #' . implode( ', #', $stuck ) . ', which this call had already inserted: delete it with wp_delete_post.';
+      }
+      return $this->error( $id, $refusal->getMessage() . $note, 'gmcp_refused' );
+    }
+    finally {
+      if ( $action === 'create' ) {
+        remove_action( 'wp_insert_post', $track, 0 );
+      }
+      if ( $listing ) {
+        remove_filter( 'posts_where', [ $this, 'exclude_unreadable_posts' ] );
+        remove_filter( 'posts_join', [ $this, 'join_unreadable_posts' ] );
+      }
+    }
 
     if ( is_wp_error( $response ) || $response->get_status() >= 400 ) {
       $error_obj = is_wp_error( $response ) ? $response : $response->as_error();

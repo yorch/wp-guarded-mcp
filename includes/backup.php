@@ -963,9 +963,14 @@ class GMCP_Backup {
   /**
   * Backuply's backups, newest first.
   *
-  * backuply_get_backups_info() already sorts by the timestamp in the info filename and
-  * drops records whose archive has gone, so this is a filter and a reshape rather than a
-  * scan. It returns objects, not arrays, which is the one thing to be careful of.
+  * backuply_get_backups_info() sorts by the timestamp in the info filename, which is when a
+  * backup STARTED, and drops records whose archive has gone. The identifier below is the
+  * completion time, and a long full backup that started first can finish after a short
+  * database-only one that started later, so the order Backuply returns is not the order
+  * of what this reports (measured on a site large enough for a full backup to outlast a
+  * second one: the list came back with a later completion time second). The entries are
+  * therefore sorted here by completion, newest first, and an undated one goes last. It
+  * returns objects, not arrays, which is the one thing to be careful of.
   *
   * btime is the completion time and doubles as the identifier. The name field beside it
   * is not returned: it is the archive's own filename, and Backuply keeps archives in a
@@ -995,7 +1000,17 @@ class GMCP_Backup {
       }
       $out[] = $entry;
     }
-    return $out;
+    // Decorated with the original position so equal times keep Backuply's order: usort is
+    // only stable from PHP 8.
+    $rows = [];
+    foreach ( $out as $i => $entry ) {
+      $rows[] = [ $i, $entry ];
+    }
+    usort( $rows, function ( $a, $b ) {
+      $by = ( (int) ( $b[1]['completed'] ?? 0 ) ) <=> ( (int) ( $a[1]['completed'] ?? 0 ) );
+      return $by !== 0 ? $by : $a[0] <=> $b[0];
+    } );
+    return array_column( $rows, 1 );
   }
 
   /** Which halves of the site a Backuply archive holds, from the flags it was made with. */

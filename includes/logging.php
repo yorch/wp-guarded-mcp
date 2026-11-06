@@ -30,7 +30,7 @@ class GMCP_Logging {
   */
   public static function log( $message ) {
     if ( self::enabled() ) {
-      error_log( '[Guarded MCP] ' . $message );
+      self::write( '[Guarded MCP] ' . $message );
     }
   }
 
@@ -39,10 +39,19 @@ class GMCP_Logging {
   * with debug mode on is a warning nobody sees when it matters.
   */
   public static function warn( $message ) {
-    error_log( '[Guarded MCP] WARNING: ' . $message );
+    self::write( '[Guarded MCP] WARNING: ' . $message );
   }
 
   public static function error( $message ) {
-    error_log( '[Guarded MCP] ERROR: ' . $message );
+    self::write( '[Guarded MCP] ERROR: ' . $message );
+  }
+
+  /**
+  * The one writer for this class. Every message goes through the full log scrub here as well as
+  * at the call sites that print client text, so a caller that forgets is still covered, and a
+  * newline in a message cannot start a second log line. @see GMCP_Core::log_line()
+  */
+  private static function write( $line ) {
+    error_log( GMCP_Core::log_line( (string) $line ) );
   }
 }

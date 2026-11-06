@@ -690,7 +690,9 @@ class GMCP_Core {
   *
   * Deliberately about structure rather than content: guessing whether a bare string is a
   * secret means guessing, and guessing wrong in the permissive direction stores the
-  * secret. Settings hold these under named fields, and the names say so.
+  * secret. Settings hold these under named fields, and the names say so. Free text that
+  * can carry a pasted secret (a post body) is the one place that is not enough, and
+  * @see GMCP_Credential_Scan reads it.
   *
   * It has to walk more than arrays. An option holding a stdClass and an option holding a
   * JSON string are two of the three commonest ways plugins store settings, and checking
@@ -823,6 +825,13 @@ class GMCP_Core {
         'owner' => 'WPForms',
         'why' => 'the whole form — its fields, its notification recipients and its confirmation redirects — is one JSON document in the post content',
       ],
+      // A saved user template: registered on Lite (measured on 2.0.4), and the plugin reads its
+      // post_content through the same wpforms_decode() as a form's and builds new forms from
+      // it, so the recipients and redirects sit in it exactly as they do in a form.
+      'wpforms-template' => [
+        'owner' => 'WPForms',
+        'why' => 'a saved template is the same JSON document as a form — its fields, its notification recipients and its confirmation redirects — and new forms are made from it',
+      ],
       'wp_stream_alerts' => [
         'owner' => 'Stream',
         'why' => 'an alert rule is a post whose status decides whether that alert fires at all',
@@ -889,6 +898,14 @@ class GMCP_Core {
   * @return true|string True when the write is allowed, otherwise the refusal.
   */
   public static function commerce_post_guard( int $post_id, string $verb = 'Changing', ?string $target_type = null ) {
+    // The same question for the other policy that refuses every generic write: a form
+    // submission, and what hangs from one. Asked here because this is the function every
+    // generic writer already asks, so one definition covers all of them. The name is the
+    // older of the two policies. @see personal_data_write_guard().
+    $held = self::personal_data_write_guard( $post_id, $verb );
+    if ( $held !== true ) {
+      return $held;
+    }
     $type = $post_id > 0 ? get_post_type( $post_id ) : false;
     // Another plugin's configuration row first, because the sentence differs and so does the
     // reason. Asked for the target type as well as the existing one: creating or retyping into
@@ -956,23 +973,237 @@ class GMCP_Core {
       return true;
     }
     if ( $post instanceof WP_Post ) {
-      $type = $post->post_type;
+      $types = self::post_chain_types( $post );
     }
     elseif ( is_int( $post ) || ( is_string( $post ) && ctype_digit( $post ) ) ) {
-      $type = get_post_type( (int) $post );
+      $types = self::post_chain_types( (int) $post );
     }
     else {
-      $type = $post;
+      $types = [ $post ];
     }
-    if ( !self::is_commerce_post_type( $type ) ) {
-      // Another plugin's configuration row: below admin it is not returned either, for the
-      // reason the write guard gives one function up.
-      return self::plugin_config_post_refusal( (string) $type, 'Changing', true );
+    $type = null;
+    foreach ( $types as $candidate ) {
+      if ( self::is_commerce_post_type( $candidate ) ) {
+        $type = $candidate;
+        break;
+      }
+    }
+    if ( $type === null ) {
+      // Not a commerce post, but possibly another plugin's configuration row, or a revision,
+      // media row or child hanging from one: below admin it is not returned either, for the
+      // reason the write guard gives. Followed up the chain for the same reason the commerce
+      // types are, since a revision of a form holds the form's JSON.
+      foreach ( $types as $candidate ) {
+        $held = self::plugin_config_post_refusal( (string) $candidate, 'Changing', true );
+        if ( $held !== true ) {
+          return $held;
+        }
+      }
+      return true;
     }
     return 'Reading a ' . strtolower( (string) $type ) . ' through the generic post tools needs an admin-level key. '
       . 'Orders and subscriptions carry customers\' names, email addresses, phone numbers, postal addresses and IP addresses in their meta, '
       . 'which is why the WooCommerce tools that read them on purpose (wc_get_order, wc_list_orders) are admin-level too. '
+      . ( $types[0] !== $type ? 'This post belongs to one: a revision, a media row or a child of an order is read under the order\'s policy. ' : '' )
       . 'This key is ' . self::caller_access_level() . '.';
+  }
+
+  /**
+  * The post type of a post and of every post above it, nearest first, lowercased.
+  *
+  * A read policy about a post type has to follow what hangs off it. A revision of a form
+  * submission holds the submission's body, a media row attached to one is a file a visitor
+  * uploaded, and a child post is part of it, yet each is an ordinary row of another type
+  * ("revision", "attachment", "page") that asked of itself alone passes every type check.
+  * Walked rather than looked up one level because a revision of a media row's parent is
+  * two steps from the post that carries the policy, and bounded because post_parent is
+  * data and a loop in it must not hang a read.
+  *
+  * @param int|WP_Post $post
+  * @return string[] Empty when the post does not exist.
+  */
+  public static function post_chain_types( $post ): array {
+    $post = $post instanceof WP_Post ? $post : get_post( (int) $post );
+    $types = [];
+    $seen = [];
+    for ( $depth = 0; $post instanceof WP_Post && $depth < 8 && !isset( $seen[ $post->ID ] ); $depth++ ) {
+      $seen[ $post->ID ] = true;
+      $types[] = strtolower( (string) $post->post_type );
+      $post = $post->post_parent ? get_post( (int) $post->post_parent ) : null;
+    }
+    return $types;
+  }
+
+  /**
+  * Post types a SQL query that reads posts for the current caller must leave out: the
+  * form-submission types always, the commerce types and the types that hold another plugin's
+  * configuration below admin. For a query that cannot ask a guard row by row, so it has to say
+  * what commerce_post_read_guard() says. Lowercased; empty is possible only if the filters
+  * empty the lists.
+  *
+  * @return string[]
+  */
+  public static function read_excluded_post_types(): array {
+    $types = array_map( 'strtolower', array_map( 'strval', self::personal_data_post_types() ) );
+    if ( self::caller_access_level() !== 'admin' ) {
+      $types = array_merge( $types, self::commerce_post_types(), array_map( 'strtolower', array_map( 'strval', array_keys( self::plugin_config_post_types() ) ) ) );
+    }
+    return array_values( array_unique( $types ) );
+  }
+
+  /**
+  * SQL for "this post is a held type, or hangs from one", for a query that cannot ask the guard
+  * row by row. The types are read_excluded_post_types(), so below admin an order's tree is in
+  * it too. $type_col and $parent_col name the columns of the row being judged, so the caller
+  * decides the table alias. The chain is the depth post_chain_types() walks: the row and
+  * seven parents above it.
+  *
+  * Joins, not nested subqueries. Seven EXISTS inside one another is correct on MySQL and
+  * overflows the parser of the SQLite driver WordPress can run on ("parser stack overflow",
+  * measured), so the parents are joined by primary key instead: each join yields at most one
+  * row, so no row is duplicated, and a missing parent is a NULL that the COALESCE reads as "not
+  * a held type". The caller puts 'join' after its FROM and 'where' behind an AND.
+  *
+  * @return array{join: string, where: string} Both empty when no type is excluded.
+  */
+  public static function unreadable_post_clauses( string $type_col, string $parent_col, string $alias = 'gmcp_u' ): array {
+    global $wpdb;
+    $in = implode( ',', array_map( function ( $type ) {
+      return "'" . esc_sql( $type ) . "'";
+    }, self::read_excluded_post_types() ) );
+    if ( $in === '' ) {
+      return [ 'join' => '', 'where' => '' ];
+    }
+    $joins = '';
+    $tests = [ 'LOWER(' . $type_col . ') IN (' . $in . ')' ];
+    $up = $parent_col;
+    for ( $level = 1; $level <= 7; $level++ ) {
+      $a = $alias . $level;
+      $joins .= " LEFT JOIN {$wpdb->posts} {$a} ON {$a}.ID = {$up}";
+      $tests[] = "COALESCE(LOWER({$a}.post_type),'') IN ({$in})";
+      $up = $a . '.post_parent';
+    }
+    return [ 'join' => $joins, 'where' => 'NOT (' . implode( ' OR ', $tests ) . ')' ];
+  }
+
+  /**
+  * Runs $run() with the readable-only SQL on every WP_Query that does not suppress filters, and
+  * takes it off again, so a listing's paging happens in the database.
+  *
+  * A listing that skipped unreadable rows in PHP could only page by loading every row up to its
+  * offset: measured with 50,000 posts and a read-only key, `limit 5` took 0.6 seconds and
+  * `limit 5, offset 40000` took 13 seconds and 210 MB, because each row up to the offset was built
+  * into a WP_Post and had its parent chain walked, and an offset of ten million ran for over a
+  * minute. Put in the query instead, the offset is an ordinary SQL offset over rows already
+  * filtered. The query must run with suppress_filters false, or WordPress does not apply
+  * posts_join and posts_where at all.
+  *
+  * @see unreadable_post_clauses() for the SQL, which the REST listings and the scans use too.
+  *
+  * @return mixed Whatever $run() returns.
+  */
+  public static function with_readable_posts_sql( callable $run ) {
+    $join = static function ( $join ) {
+      global $wpdb;
+      return $join . self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l' )['join'];
+    };
+    $where = static function ( $where ) {
+      global $wpdb;
+      $c = self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l' );
+      return $c['where'] === '' ? $where : $where . ' AND ' . $c['where'];
+    };
+    add_filter( 'posts_join', $join, PHP_INT_MAX );
+    add_filter( 'posts_where', $where, PHP_INT_MAX );
+    try {
+      return $run();
+    }
+    finally {
+      remove_filter( 'posts_join', $join, PHP_INT_MAX );
+      remove_filter( 'posts_where', $where, PHP_INT_MAX );
+    }
+  }
+
+  /**
+  * The same for a comment query: a comment is read as the post it is on, so a comment on a
+  * post the caller may not read is left out by the query, and the offset is a SQL offset.
+  * WP_Comment_Query applies comments_clauses whatever the arguments.
+  *
+  * A comment with no post, or whose post is gone, is readable, as the PHP check has it.
+  *
+  * @return mixed Whatever $run() returns.
+  */
+  public static function with_readable_comments_sql( callable $run ) {
+    $clauses = static function ( $clauses ) {
+      global $wpdb;
+      $c = self::unreadable_post_clauses( "COALESCE(gmcp_cp.post_type,'')", 'gmcp_cp.post_parent', 'gmcp_cc' );
+      if ( !is_array( $clauses ) || $c['where'] === '' ) {
+        return $clauses;
+      }
+      $clauses['join'] = ( $clauses['join'] ?? '' ) . " LEFT JOIN {$wpdb->posts} gmcp_cp ON gmcp_cp.ID = {$wpdb->comments}.comment_post_ID" . $c['join'];
+      $clauses['where'] = ( ( $clauses['where'] ?? '' ) !== '' ? $clauses['where'] . ' AND ' : '' ) . $c['where'];
+      return $clauses;
+    };
+    add_filter( 'comments_clauses', $clauses, PHP_INT_MAX );
+    try {
+      return $run();
+    }
+    finally {
+      remove_filter( 'comments_clauses', $clauses, PHP_INT_MAX );
+    }
+  }
+
+  /**
+  * Rows a listing may return, collected until the page is full.
+  *
+  * A listing that fetches a page and then drops what the caller may not read returns a short
+  * page, and the length of the page is itself an answer: with a limit of one, an empty reply
+  * says the newest row is one the caller may not see. So the unreadable rows are skipped as
+  * the page is filled, and a hidden row changes nothing a caller can count.
+  *
+  * The listings leave the unreadable rows out in SQL (with_readable_posts_sql(),
+  * with_readable_comments_sql()), which is where their offset is applied, so this is the backstop
+  * for a row the SQL let through and the guard would not: it asks the guard row by row.
+  *
+  * Bounded, so a window of nothing but unreadable rows cannot run a query forever. The bound is
+  * on rows looked at, $max_scan of them in all, and counts the rows passed over for $skip as well:
+  * an offset buys no extra work (it used to extend the bound, and an offset of ten million
+  * loaded every row below it). Past the bound the page can come back short, which the
+  * guardrails page states. Callers give the database their offset and pass no $skip.
+  *
+  * @param callable $fetch (int $offset, int $size): array, the next raw rows in listing order.
+  * @param callable $keep  (mixed $row): bool, whether the caller may see the row.
+  * @param int      $skip  Readable rows to pass over first, counted against $max_scan.
+  */
+  public static function collect_readable( callable $fetch, callable $keep, int $limit, int $skip = 0, int $max_scan = 5000 ): array {
+    $out = [];
+    $raw = 0;
+    $scanned = 0;
+    $size = max( 50, min( 500, $limit * 2 ) );
+    while ( $scanned < $max_scan ) {
+      $rows = $fetch( $raw, $size );
+      if ( !is_array( $rows ) || !$rows ) {
+        break;
+      }
+      foreach ( $rows as $row ) {
+        $scanned++;
+        if ( !$keep( $row ) ) {
+          continue;
+        }
+        if ( $skip > 0 ) {
+          $skip--;
+          continue;
+        }
+        $out[] = $row;
+        if ( count( $out ) >= $limit ) {
+          break 2;
+        }
+      }
+      $raw += count( $rows );
+      if ( count( $rows ) < $size ) {
+        break;
+      }
+    }
+    return $out;
   }
 
   #region Drafts-only keys
@@ -1316,7 +1547,8 @@ class GMCP_Core {
   * status_write_refusal()). Only core's own wp_trash_post() and wp_untrash_post() may touch
   * it, and trash_meta_net() lets exactly those through. Matched case-insensitively and
   * ignoring trailing spaces, because the meta_key column compares that way: "_WP_TRASH_META_TIME "
-  * is the same row to every query WordPress runs.
+  * is the same row to every query WordPress runs. And accents, ignorable characters and expansions
+  * too, on the collations that have them (see GMCP_Meta_Key, which measured what they equal).
   *
   * Not on the list, and why: _edit_lock only says who is editing, _wp_desired_post_slug only
   * names the slug an untrash restores and _wp_old_slug only adds a redirect from a slug the
@@ -1325,6 +1557,29 @@ class GMCP_Core {
   *
   * @return string|null The refusal, or null when the key is fine.
   */
+  /**
+  * The refusal for the meta key that names an attachment's FILE, asked by the generic meta
+  * writers and not by the WordPress-level net.
+  *
+  * `_wp_attached_file` is the path wp_download_request streams, and the access rule that tool
+  * applies (an unattached file, or one on an unpublished post, is admin only; a submission's
+  * upload is never served below admin) is a rule about the attachment ROW. Repointing the row
+  * at another file under uploads moves the file out from under the rule: a readwrite key set
+  * `_wp_attached_file` on an ordinary published attachment to the relative path of a form
+  * submission's upload and downloaded it through that one (measured). Nothing a generic meta
+  * tool legitimately does needs the key, because the media tools write it through core
+  * (update_attached_file) and not through these writers. It is not in the net: the same core
+  * call runs under wp_upload_media while a tool is in flight and has to keep working.
+  *
+  * @return string|null The refusal, or null for any other key.
+  */
+  public static function attachment_file_meta_refusal( $key ): ?string {
+    if ( !is_string( $key ) || $key === '' || !GMCP_Meta_Key::is( $key, '_wp_attached_file' ) ) {
+      return null;
+    }
+    return 'The meta key "' . $key . '" names the file an attachment serves, and the generic meta tools do not write it: pointing one attachment at another file under uploads would hand over, to anyone who can download the first, a file the second one\'s access rules keep from them. Upload the file as a new attachment instead (wp_upload_request).';
+  }
+
   /**
   * Meta keys that hold a page builder's LAYOUT, which no generic tool may read or write.
   *
@@ -1356,8 +1611,8 @@ class GMCP_Core {
   /**
   * The refusal for a layout meta key, or null when the key is fine.
   *
-  * Asked by the generic meta readers and writers, and by protected_meta_refusal() so the
-  * WordPress-level net covers writers that do not come through those tools.
+  * Asked by the generic meta readers and writers through generic_writer_meta_refusal(), and
+  * NOT by the WordPress-level net: the builder writes these keys from its own save hook.
   */
   /**
   * Depth counter for a sanctioned layout write.
@@ -1399,7 +1654,17 @@ class GMCP_Core {
     if ( !is_string( $key ) || $key === '' ) {
       return null;
     }
-    if ( !in_array( strtolower( rtrim( $key ) ), self::layout_meta_keys(), true ) ) {
+    // Judged as the database compares the key, not as it was typed: on a collation that ignores
+    // accents "_fl_builder_dáta" is the "_fl_builder_data" row, so a comparison of the typed
+    // spelling refused only the people who spell it right. @see GMCP_Meta_Key.
+    $hit = false;
+    foreach ( self::layout_meta_keys() as $layout_key ) {
+      if ( GMCP_Meta_Key::is( $key, $layout_key ) ) {
+        $hit = true;
+        break;
+      }
+    }
+    if ( !$hit ) {
       return null;
     }
     return 'The meta key "' . $key . '" holds a page builder layout, and the generic meta tools neither read nor write it: a node\'s settings is the content and the html module makes it executable, and the layout settings hold css and js that run on every page using it. Reading it would hand over a script payload and writing it would install one, with no restore tool behind it. Use the builder\'s own tools to read the structure (node types, counts, whether it carries custom code), or its editor in wp-admin to change it. A site can extend the list with the gmcp_layout_meta_keys filter.';
@@ -1409,23 +1674,29 @@ class GMCP_Core {
     if ( !is_string( $key ) ) {
       return null;
     }
-    $needle = strtolower( rtrim( $key ) );
-    if ( strncmp( $needle, '_wp_trash_meta_', 15 ) === 0 ) {
+    // The key as the database will compare it, not as it was typed: "_wp_trash_meta_tíme" is the
+    // "_wp_trash_meta_time" row to every query on a collation that ignores accents. @see GMCP_Meta_Key.
+    if ( GMCP_Meta_Key::starts_with( $key, '_wp_trash_meta_' ) ) {
       return 'The meta key "' . $key . '" is refused: WordPress deletes posts and comments for good on the schedule these keys hold, so writing one is a deletion by another name. Use wp_delete_post.';
     }
-    // A page builder's layout, for the same reason and through the same door: the WordPress
-    // filters installed by install_trash_meta_net() ask this function, so a writer that never
-    // calls the tools is covered too.
-    $layout = self::layout_meta_refusal( $key );
-    if ( $layout !== null ) {
-      // A sanctioned write (the Beaver create tool, and later the journal's restore) runs
-      // inside with_layout_write(). Reads do not come through this function at all.
-      if ( self::layout_write_in_progress() ) {
-        return null;
-      }
-      return $layout;
-    }
+    // NOT the page builder's layout keys, although they are refused to the generic meta tools
+    // too. This function is also what the net under the WordPress meta functions asks while a
+    // tool call is in flight, and the builder writes its own keys from inside an ordinary save:
+    // Beaver Builder copies a page's layout onto the revision from its save_post hook, so with
+    // the layout keys here wp_update_post on any Beaver page threw halfway through (measured:
+    // the title was written and the tool answered "failed"). @see generic_writer_meta_refusal().
     return null;
+  }
+
+  /**
+  * The key rules the generic meta WRITERS apply and the net under WordPress does not: a page
+  * builder's layout and the file an attachment serves. Asked beside protected_meta_refusal() by
+  * the meta tools, copy, meta_input and the REST meta argument. Not in the net, because the
+  * builder and core write these keys themselves from inside a save or an upload, and a refusal
+  * there fails a legitimate write after part of it is done.
+  */
+  public static function generic_writer_meta_refusal( $key ): ?string {
+    return self::layout_meta_refusal( $key ) ?? self::attachment_file_meta_refusal( $key );
   }
 
   /**
@@ -1533,20 +1804,66 @@ class GMCP_Core {
     ] );
   }
 
+  /** "a flamingo_inbound", "an attachment": a type name with the right indefinite article. */
+  private static function with_article( string $noun ): string {
+    return ( preg_match( '/^[aeiou]/i', $noun ) === 1 ? 'an ' : 'a ' ) . $noun;
+  }
+
   /**
   * @param int    $post_id The post a read is aimed at.
   * @param string $type    A post type named directly, for a listing that names no post.
   * @return true|string True when the read is allowed, otherwise the refusal.
   */
   public static function personal_data_post_guard( int $post_id, string $type = '' ) {
-    if ( $type === '' ) {
-      $type = $post_id > 0 ? (string) get_post_type( $post_id ) : '';
+    $held = array_map( 'strtolower', array_map( 'strval', self::personal_data_post_types() ) );
+    if ( $type !== '' ) {
+      $chain = [ strtolower( $type ) ];
     }
-    if ( $type === '' || !in_array( $type, self::personal_data_post_types(), true ) ) {
+    else {
+      $chain = $post_id > 0 ? self::post_chain_types( $post_id ) : [];
+    }
+    $hit = null;
+    foreach ( $chain as $candidate ) {
+      if ( $candidate !== '' && in_array( $candidate, $held, true ) ) {
+        $hit = $candidate;
+        break;
+      }
+    }
+    if ( $hit === null ) {
       return true;
     }
-    return 'A ' . $type . ' is a form submission: personal data a member of the public typed, stored as a post. The generic post readers do not return it, because they are available to a read-only key and a submission is admin-level data. '
+    return 'A ' . $hit . ' is a form submission: personal data a member of the public typed, stored as a post. The generic post readers do not return it, because they are available to a read-only key and a submission is admin-level data. '
+      . ( $chain[0] !== $hit ? 'This post belongs to one (it is ' . self::with_article( $chain[0] ) . ' under it), and a revision, an upload or a child of a submission carries the same data. ' : '' )
       . 'Use the form tools for that plugin (cf7_, fluentform_ or ninjaform_), which return it at admin level, never return passwords, file uploads, IP addresses or user agents, and report whether the store is there at all.';
+  }
+
+  /**
+  * Whether a taxonomy exists only to classify form submissions, and the refusal if so.
+  *
+  * Asked by the term LISTING, which names no post and so cannot ask the post guard. A term
+  * attached to a submission is not visitor data in the plugins checked (Flamingo assigns a
+  * channel only when the term already exists, and its contact tags are taken from existing
+  * terms), but a taxonomy whose every object type is a submission type is, by construction,
+  * a vocabulary about submissions, and a plugin that mints its terms from what a visitor
+  * typed would put that text in the listing. A taxonomy shared with an ordinary type is not
+  * refused: its terms are ordinary content, and which of them sit on a submission is only
+  * reachable through the post, which the post guard refuses.
+  *
+  * @return true|string
+  */
+  public static function personal_data_taxonomy_guard( string $taxonomy ) {
+    $tax = get_taxonomy( $taxonomy );
+    if ( !$tax || empty( $tax->object_type ) ) {
+      return true;
+    }
+    $held = array_map( 'strtolower', array_map( 'strval', self::personal_data_post_types() ) );
+    foreach ( (array) $tax->object_type as $object_type ) {
+      if ( !in_array( strtolower( (string) $object_type ), $held, true ) ) {
+        return true;
+      }
+    }
+    return 'The ' . $taxonomy . ' taxonomy classifies form submissions only, and the terms of such a taxonomy are not listed through the generic term tools: a submission is personal data, and what a vocabulary built around submissions holds is not something a read-only key is shown. '
+      . 'The form tools for that plugin (cf7_, fluentform_ or ninjaform_) report on submissions at admin level.';
   }
 
   /**
@@ -1565,9 +1882,30 @@ class GMCP_Core {
   public static function post_read_guard( int $post_id ) {
     $held = self::personal_data_post_guard( $post_id );
     if ( $held !== true ) {
-      return $held;
+      // Below admin the answer is the one a post that does not exist gets, word for word, so
+      // a key that can only read cannot walk ids and learn which are submissions, which are
+      // their revisions or uploads, and which are nothing. The explanation stays for admin,
+      // who can list submissions through the form tools anyway, and in the audit log, which
+      // records the call and the reply it got. @see post_not_found_text().
+      return self::caller_access_level() === 'admin' ? $held : self::post_not_found_text( $post_id );
     }
     return self::commerce_post_read_guard( $post_id );
+  }
+
+  /**
+  * What every generic reader says about a post id it cannot return, and what it says about
+  * one that does not exist. One function, so the two cannot drift apart.
+  */
+  public static function post_not_found_text( int $post_id ): string {
+    return 'No post with ID ' . $post_id . '.';
+  }
+
+  /**
+  * The error code that goes with a refusal from post_read_guard(): the one "not found" carries
+  * when the answer is the not-found sentence, so the code does not give the difference away.
+  */
+  public static function read_refusal_code( int $post_id, string $held ): int {
+    return $held === self::post_not_found_text( $post_id ) ? -32602 : -32600;
   }
 
   /**
@@ -1603,6 +1941,404 @@ class GMCP_Core {
       . ' is refused: ' . ( $from ? $current : $target ) . ' is a form submission, personal data that the generic post tools never return. '
       . 'Retyping a submission would make it an ordinary post those tools read, and a submission made by hand is not one a visitor sent. The form tools read submissions; nothing here writes one.';
   }
+
+  #region What hangs from a submission: writes, moves and pointers
+
+  /** The form-submission post types, lowercased. @see personal_data_post_types() */
+  private static function held_personal_types(): array {
+    return array_map( 'strtolower', array_map( 'strval', self::personal_data_post_types() ) );
+  }
+
+  /**
+  * The nearest post type in a post's chain (itself, then every parent above it) that is a
+  * form-submission type, or null. Commerce types too when $commerce is set, for the questions
+  * where an order's tree must be as closed as a submission's (moving a row into or out of it).
+  *
+  * @param int|WP_Post $post
+  */
+  public static function guarded_tree_hit( $post, bool $commerce = false ): ?string {
+    $held = self::held_personal_types();
+    if ( $commerce ) {
+      $held = array_merge( $held, self::commerce_post_types() );
+    }
+    foreach ( self::post_chain_types( $post ) as $type ) {
+      if ( $type !== '' && in_array( $type, $held, true ) ) {
+        return $type;
+      }
+    }
+    return null;
+  }
+
+  /** The nearest form-submission type in a post's chain, or null. @see guarded_tree_hit() */
+  public static function personal_data_chain_hit( $post ): ?string {
+    return self::guarded_tree_hit( $post, false );
+  }
+
+  /**
+  * Whether a generic WRITE may touch this post, as far as the form-submission policy goes.
+  *
+  * The read guards keep a submission, and everything that hangs from it through post_parent,
+  * away from the generic readers. That is only true while the tree stays as it is, and every
+  * generic writer could change it: re-parent a revision of a submission and it was an ordinary
+  * post whose body any key read, re-parent a visitor's upload under a page and it was readable
+  * media, comment_post_ID did the same for a comment. So the policy is symmetric with the
+  * commerce one, which has always refused every generic write to an order: no generic write
+  * touches a submission or anything in its tree, at any access level. Nothing legitimate is
+  * lost, because nobody edits a visitor's submission through an administration agent and the
+  * form tools only read.
+  *
+  * Called from commerce_post_guard(), which every generic writer already asks, and by the
+  * writers that never asked it. The net below asks it again for the writers that ask neither.
+  *
+  * @param bool $descendants_only Refuse only a post that hangs FROM a submission, and let the
+  *                               submission's own row through. The net uses it: Flamingo records
+  *                               a contact (a post of a guarded type, with meta and terms) every
+  *                               time a user profile is saved, so refusing every write to such a
+  *                               row while a tool call is in flight broke wp_update_user and
+  *                               wp_create_user on a site that has it. The generic tools ask the
+  *                               strict question.
+  * @return true|string
+  */
+  public static function personal_data_write_guard( int $post_id, string $verb = 'Changing', bool $descendants_only = false ) {
+    if ( $post_id <= 0 ) {
+      return true;
+    }
+    $hit = self::personal_data_chain_hit( $post_id );
+    if ( $hit === null ) {
+      return true;
+    }
+    $own = strtolower( (string) get_post_type( $post_id ) );
+    if ( $descendants_only && $own === $hit ) {
+      return true;
+    }
+    return $verb . ' post #' . $post_id . ' is refused: '
+      . ( $own === $hit ? 'it is ' . self::with_article( $hit ) : 'it is ' . self::with_article( $own ) . ' that hangs from ' . self::with_article( $hit ) ) . ', a form submission. '
+      . 'Nothing here edits, moves, annotates or deletes a visitor\'s submission or anything in its tree (its revisions, uploads and comments), at any access level: '
+      . 'the form tools only read, and a write through the generic tools would change what the readers return, move a row out of the tree they keep from the readers, or destroy the only record of what the visitor sent. '
+      . 'Handle submissions in wp-admin or with the form plugin.';
+  }
+
+  /**
+  * Whether a post may be given this parent, when that changes what it hangs from.
+  *
+  * Which readers may see a post is decided by the chain above it, so changing the parent is
+  * changing who may read it: moving a row OUT of a guarded tree makes it readable, moving one
+  * INTO it hides it from every generic reader (a key could bury one of its own published pages
+  * under a submission). Both are refused, and for the commerce trees as well as the
+  * submission ones, because the commerce read policy follows the same chain.
+  *
+  * @param int  $post_id    The post being written, or 0 for a creation.
+  * @param int  $new_parent The parent the write leaves it with.
+  * @param bool $caller_named_it The parent was named by the caller of a tool (a create tool's
+  *                         `parent` or `post` argument), as opposed to by a plugin's own code
+  *                         under the net. A creation is then judged against commerce trees too.
+  * @return true|string
+  */
+  public static function tree_move_guard( int $post_id, int $new_parent, string $verb = 'Changing the parent of', bool $caller_named_it = false ) {
+    $current = $post_id > 0 ? (int) get_post_field( 'post_parent', $post_id ) : 0;
+    if ( $new_parent === $current ) {
+      return true;
+    }
+    $from = $post_id > 0 ? self::guarded_tree_hit( $post_id, true ) : null;
+    // A creation the net sees is judged against submission trees only. Commerce plugins make
+    // child rows of an order themselves (a refund hangs from its order), so refusing every
+    // new child of a commerce post under the net would break their own tools. A creation whose
+    // parent the CALLER named is judged against both: a new page parented under an order is
+    // unreadable below admin, so a write key could otherwise hide its own page (REST
+    // create_pages takes `parent`, create_media takes `post`). An EXISTING post is moved into or
+    // out of either.
+    $to = $new_parent > 0 ? self::guarded_tree_hit( $new_parent, $post_id > 0 || $caller_named_it ) : null;
+    if ( $from === null && $to === null ) {
+      return true;
+    }
+    return $verb . ( $post_id > 0 ? ' post #' . $post_id : ' a new post' ) . ' is refused: '
+      . ( $from !== null ? 'it is in the tree of a ' . $from : 'the new parent (#' . $new_parent . ') is in the tree of a ' . $to ) . '. '
+      . 'Which readers may see a post is decided by what it hangs from, so moving a row out of such a tree would make personal data readable and moving one into it would hide it from every generic reader. '
+      . 'Neither is done through these tools.';
+  }
+
+  /**
+  * Whether a comment may be written, as far as the post it is on (or would be moved to) goes.
+  *
+  * @param int      $comment_id  The comment, or 0 for a creation.
+  * @param int|null $new_post_id The post a creation names, or the one an update moves it to.
+  * @return true|string
+  */
+  public static function comment_write_guard( int $comment_id, ?int $new_post_id = null, string $verb = 'Changing' ) {
+    $current = 0;
+    if ( $comment_id > 0 ) {
+      $comment = get_comment( $comment_id );
+      $current = $comment ? (int) $comment->comment_post_ID : 0;
+    }
+    $moving = $comment_id > 0 && $new_post_id !== null && $new_post_id !== $current;
+    $targets = [ $current ];
+    if ( $new_post_id !== null && $new_post_id !== $current ) {
+      $targets[] = (int) $new_post_id;
+    }
+    foreach ( $targets as $post_id ) {
+      $hit = $post_id > 0 ? self::guarded_tree_hit( $post_id, $moving ) : null;
+      if ( $hit !== null ) {
+        return $verb . ( $comment_id > 0 ? ' comment #' . $comment_id : ' a comment' ) . ' is refused: '
+          . ( $moving ? 'it would be moved into or out of the tree of a ' . $hit : 'it is on a post in the tree of a ' . $hit . ', a form submission' ) . '. '
+          . 'A comment is read as the post it is on, so writing, moving or deleting one on a submission or anything hanging from it is refused at every access level, '
+          . 'for the reason post writes to one are: nothing here changes what the readers keep from a key that can only read.';
+      }
+    }
+    return true;
+  }
+
+  /**
+  * Meta keys whose VALUE is another post's id that something renders or reads from, and the
+  * refusal when that id is in a guarded tree.
+  *
+  * A featured image is displayed on the page that holds it and returned by the snapshot; a
+  * menu item copies its title and its URL from the object it points at, into the public
+  * navigation and into wp_get_menu_items. Pointing either at a visitor's submission or an
+  * upload of one is a read of it by another name, and a write that "touches only an
+  * ordinary post".
+  *
+  * @param mixed $value The value being written.
+  * @return string|null
+  */
+  public static function pointer_meta_refusal( $key, $value, int $object_id = 0 ): ?string {
+    if ( !is_string( $key ) ) {
+      return null;
+    }
+    // Judged as the database will compare it, not as typed. On a collation that ignores accents
+    // "_thumbnaíl_id" updates the "_thumbnail_id" row (or, with none, files a row every later
+    // query for "_thumbnail_id" matches), so a rule keyed on the typed spelling was a rule for
+    // the people who spell it right. One verdict per spelling the collations disagree on. @see GMCP_Meta_Key.
+    foreach ( GMCP_Meta_Key::folds( $key ) as $needle ) {
+      $why = self::pointer_meta_refusal_for( $needle, $value, $object_id );
+      if ( $why !== null ) {
+        return $why;
+      }
+    }
+    return null;
+  }
+
+  /** The folded spelling of a meta key, the one every key policy judges. @see GMCP_Meta_Key::folds() */
+  public static function meta_key_fold( $key ): string {
+    return GMCP_Meta_Key::fold( $key );
+  }
+
+  private static function pointer_meta_refusal_for( string $needle, $value, int $object_id ): ?string {
+    $target = 0;
+    $what = '';
+    if ( $needle === '_thumbnail_id' ) {
+      $target = is_scalar( $value ) ? (int) $value : 0;
+      $what = 'a featured image';
+    }
+    elseif ( $needle === '_menu_item_object_id' ) {
+      $kind = $object_id > 0 ? (string) get_post_meta( $object_id, '_menu_item_type', true ) : '';
+      if ( !in_array( $kind, [ 'taxonomy', 'custom', 'post_type_archive' ], true ) ) {
+        $target = is_scalar( $value ) ? (int) $value : 0;
+        $what = 'a menu item';
+      }
+    }
+    elseif ( $needle === '_menu_item_type' ) {
+      // Judged in the other order too: an item made a taxonomy item, pointed at a number and
+      // then switched back to a post item would otherwise carry the id through.
+      if ( is_scalar( $value ) && (string) $value === 'post_type' && $object_id > 0 ) {
+        $target = (int) get_post_meta( $object_id, '_menu_item_object_id', true );
+        $what = 'a menu item';
+      }
+    }
+    elseif ( $needle === '_menu_item_object' ) {
+      $named = is_scalar( $value ) ? strtolower( trim( (string) $value ) ) : '';
+      if ( $named !== '' && in_array( $named, array_merge( self::held_personal_types(), self::commerce_post_types() ), true ) ) {
+        return 'Pointing a menu item at the ' . $named . ' type is refused: its rows are personal data and the public navigation would print them.';
+      }
+    }
+    if ( $target <= 0 ) {
+      return null;
+    }
+    $hit = self::guarded_tree_hit( $target, true );
+    if ( $hit === null ) {
+      return null;
+    }
+    return 'Using post #' . $target . ' as ' . $what . ' is refused: it is, or hangs from, a ' . $hit . '. '
+      . 'A featured image is shown on the public page that holds it and a menu item prints the title and URL of what it points at, so this would publish, and let every reader see, something the generic readers keep from them.';
+  }
+
+  /**
+  * The refusal for one post-meta write, from every route: the policy about the post it is on,
+  * and the policy about a value that points at another post.
+  */
+  public static function meta_write_refusal( int $object_id, $key, $value = null ): ?string {
+    if ( $object_id > 0 ) {
+      $held = self::personal_data_write_guard( $object_id, 'Writing meta on', true );
+      if ( $held !== true ) {
+        return $held;
+      }
+    }
+    return self::pointer_meta_refusal( $key, $value, $object_id );
+  }
+
+  /**
+  * What the arguments of a REST create or update tool may not say, judged BEFORE the controller
+  * is asked.
+  *
+  * The controller inserts the row and then applies the featured image, the parent-like fields and
+  * the registered meta, and the net throws from inside that tail. A refusal from there leaves the
+  * row it had already inserted, under a reply that says the write failed: measured, create_posts
+  * with featured_media naming a form submission's upload answered "refused" and a draft stood in
+  * the table. Asked here, nothing has been written when it says no. The net remains the backstop
+  * for what this does not name, and handle_call() removes a row the net refused after it was made.
+  *
+  * @param int   $post_id The post an update names, or 0 for a creation.
+  * @param array $args    The tool's arguments.
+  * @return string|null The refusal, or null when nothing in them is refused.
+  */
+  public static function rest_write_refusal( int $post_id, array $args ): ?string {
+    if ( array_key_exists( 'featured_media', $args ) && is_scalar( $args['featured_media'] ) ) {
+      $why = self::pointer_meta_refusal( '_thumbnail_id', $args['featured_media'], $post_id );
+      if ( $why !== null ) {
+        return $why;
+      }
+    }
+    foreach ( [ 'parent', 'post' ] as $field ) {
+      if ( array_key_exists( $field, $args ) && is_scalar( $args[ $field ] ) ) {
+        $why = self::tree_move_guard( $post_id, (int) $args[ $field ], $post_id > 0 ? 'Changing the parent of' : 'Creating', true );
+        if ( $why !== true ) {
+          return $why;
+        }
+      }
+    }
+    if ( isset( $args['meta'] ) && is_array( $args['meta'] ) ) {
+      foreach ( $args['meta'] as $key => $value ) {
+        $why = self::protected_meta_refusal( (string) $key ) ?? self::generic_writer_meta_refusal( (string) $key ) ?? self::pointer_meta_refusal( (string) $key, $value, $post_id );
+        if ( $why !== null ) {
+          return $why;
+        }
+      }
+    }
+    return null;
+  }
+
+  private static $personal_net_installed = false;
+
+  /**
+  * The same refusals under WordPress, for writers that never ask the guards above: every
+  * route to a post, its meta, its terms, its comments or its deletion that goes through
+  * WordPress passes one of these hooks. Active only while a tool call is in flight, so
+  * wp-admin, cron and wp-cli (and the form plugins' own saves) are untouched. It throws, for
+  * the reason restrict_caller_to_drafts() does: a filter that answered false would let a
+  * writer report success over a write that did not happen.
+  *
+  * It refuses what hangs FROM a submission (a revision, an upload) being written, deleted or
+  * given other terms, a post or comment moving into or out of such a tree, and a pointer into
+  * one. It does NOT refuse a write to the submission's own row, because a form plugin keeps
+  * such rows itself and does so from hooks a tool call can fire (Flamingo records a contact when
+  * a profile is saved); the generic tools refuse that write themselves, through
+  * commerce_post_guard().
+  *
+  * What it cannot see: a plugin writing the posts or comments table with $wpdb directly,
+  * wp_set_comment_status() (no hook in front of it) and wp_insert_comment() (none either; the
+  * comment tool asks the guard itself, and wp_new_comment() is covered).
+  */
+  public static function install_personal_data_net(): void {
+    if ( self::$personal_net_installed ) {
+      return;
+    }
+    self::$personal_net_installed = true;
+    add_filter( 'wp_insert_post_data', [ __CLASS__, 'pd_net_insert' ], PHP_INT_MAX - 1, 4 );
+    add_filter( 'wp_insert_attachment_data', [ __CLASS__, 'pd_net_insert' ], PHP_INT_MAX - 1, 4 );
+    foreach ( [ 'add', 'update', 'delete' ] as $op ) {
+      add_filter( $op . '_post_metadata', [ __CLASS__, 'pd_net_meta' ], PHP_INT_MIN + 1, 4 );
+    }
+    add_filter( 'update_post_metadata_by_mid', [ __CLASS__, 'pd_net_meta_by_mid' ], PHP_INT_MIN + 1, 4 );
+    add_filter( 'delete_post_metadata_by_mid', [ __CLASS__, 'pd_net_meta_by_mid' ], PHP_INT_MIN + 1, 2 );
+    foreach ( [ 'pre_delete_post', 'pre_delete_attachment', 'pre_trash_post', 'pre_untrash_post' ] as $hook ) {
+      add_filter( $hook, [ __CLASS__, 'pd_net_remove' ], PHP_INT_MIN + 1, 2 );
+    }
+    add_action( 'add_term_relationship', [ __CLASS__, 'pd_net_terms' ], PHP_INT_MIN + 1, 3 );
+    add_action( 'delete_term_relationships', [ __CLASS__, 'pd_net_terms' ], PHP_INT_MIN + 1, 3 );
+    add_filter( 'wp_update_comment_data', [ __CLASS__, 'pd_net_comment_update' ], PHP_INT_MAX - 1, 3 );
+    add_filter( 'preprocess_comment', [ __CLASS__, 'pd_net_comment_new' ], PHP_INT_MIN + 1 );
+    foreach ( [ 'delete_comment', 'trash_comment' ] as $hook ) {
+      add_action( $hook, [ __CLASS__, 'pd_net_comment_remove' ], PHP_INT_MIN + 1, 1 );
+    }
+  }
+
+  private static function pd_refuse( $why ): void {
+    if ( $why !== true && $why !== null ) {
+      throw new GMCP_Policy_Refusal( (string) $why );
+    }
+  }
+
+  public static function pd_net_insert( $data, $postarr = [], $unsanitized = [], $update = false ) {
+    if ( !self::tool_in_flight() || !is_array( $data ) ) {
+      return $data;
+    }
+    $id = (int) ( $postarr['ID'] ?? 0 );
+    if ( $update && $id > 0 ) {
+      self::pd_refuse( self::personal_data_write_guard( $id, 'Updating', true ) );
+    }
+    $parent = (int) ( $data['post_parent'] ?? 0 );
+    self::pd_refuse( self::tree_move_guard( $update ? $id : 0, $parent, $update ? 'Changing the parent of' : 'Creating' ) );
+    return $data;
+  }
+
+  public static function pd_net_meta( $check, $object_id = 0, $meta_key = '', $meta_value = null ) {
+    if ( self::tool_in_flight() ) {
+      self::pd_refuse( self::meta_write_refusal( (int) $object_id, $meta_key, $meta_value ) );
+    }
+    return $check;
+  }
+
+  public static function pd_net_meta_by_mid( $check, $meta_id = 0, $meta_value = null, $meta_key = false ) {
+    if ( self::tool_in_flight() ) {
+      $row = function_exists( 'get_metadata_by_mid' ) ? get_metadata_by_mid( 'post', (int) $meta_id ) : null;
+      if ( $row ) {
+        self::pd_refuse( self::meta_write_refusal( (int) $row->post_id, $meta_key !== false ? $meta_key : $row->meta_key, $meta_value ) );
+      }
+    }
+    return $check;
+  }
+
+  public static function pd_net_remove( $check, $post = null ) {
+    if ( self::tool_in_flight() && $post instanceof WP_Post ) {
+      self::pd_refuse( self::personal_data_write_guard( (int) $post->ID, 'Removing', true ) );
+    }
+    return $check;
+  }
+
+  public static function pd_net_terms( $object_id = 0, $unused = null, $taxonomy = '' ) {
+    if ( !self::tool_in_flight() ) {
+      return;
+    }
+    // Only a taxonomy that belongs to the post's own type is a post write: the action also
+    // fires for users and links, whose ids can equal a post's.
+    $post = get_post( (int) $object_id );
+    $tax = $post ? get_taxonomy( (string) $taxonomy ) : null;
+    if ( $post && $tax && in_array( $post->post_type, (array) $tax->object_type, true ) ) {
+      self::pd_refuse( self::personal_data_write_guard( (int) $post->ID, 'Changing the terms of', true ) );
+    }
+  }
+
+  public static function pd_net_comment_update( $data, $comment = [], $commentarr = [] ) {
+    if ( self::tool_in_flight() && is_array( $data ) ) {
+      $cid = (int) ( $data['comment_ID'] ?? $commentarr['comment_ID'] ?? 0 );
+      self::pd_refuse( self::comment_write_guard( $cid, isset( $data['comment_post_ID'] ) ? (int) $data['comment_post_ID'] : null, 'Updating' ) );
+    }
+    return $data;
+  }
+
+  public static function pd_net_comment_new( $commentdata ) {
+    if ( self::tool_in_flight() && is_array( $commentdata ) ) {
+      self::pd_refuse( self::comment_write_guard( 0, (int) ( $commentdata['comment_post_ID'] ?? 0 ), 'Creating' ) );
+    }
+    return $commentdata;
+  }
+
+  public static function pd_net_comment_remove( $comment_id = 0 ) {
+    if ( self::tool_in_flight() ) {
+      self::pd_refuse( self::comment_write_guard( (int) $comment_id, null, 'Removing' ) );
+    }
+  }
+
+  #endregion
 
   /**
   * Whether a post is an Elementor library template something still renders, and the
@@ -1772,8 +2508,15 @@ class GMCP_Core {
     if ( $depth > 8 || is_object( $value ) ) {
       return [ false, null ];
     }
+    // A value too large to be read within the budget is refused, as one nested too deep is: the
+    // walk below judges every leaf, and the answer for a value it cannot finish is "not kept".
+    if ( $depth === 0 && !GMCP_Credential_Scan::within_budget( $value ) ) {
+      return [ false, null ];
+    }
     if ( is_string( $value ) ) {
-      return [ true, self::holds_credential( $value ) ? self::REDACTION_MARKER : $value ];
+      // Free text too: a string leaf with a pasted wp-config line in it names nothing, so the
+      // structural test passes it. @see GMCP_Credential_Scan.
+      return [ true, ( self::holds_credential( $value ) || GMCP_Credential_Scan::text_holds( $value ) ) ? self::REDACTION_MARKER : $value ];
     }
     if ( !is_array( $value ) ) {
       return [ true, $value ];
@@ -1803,7 +2546,315 @@ class GMCP_Core {
   * and by the audit log for the reply text it keeps.
   */
   public static function scrub_preview_tokens( string $text ): string {
-    return GMCP_Diag_Util::scrub_preview_tokens( $text );
+    $out = GMCP_Diag_Util::scrub_preview_tokens( $text );
+    return self::scrubbed_or_withheld( $out, $text );
+  }
+
+  /** What stands in for text a scrub could not process. Never an empty string. @see scrubbed_or_withheld() */
+  const UNSCRUBBABLE = '[unscrubbable text withheld]';
+
+  /**
+  * The result of a preg_replace over $original, or a marker when PCRE gave up.
+  *
+  * preg_replace() returns null when it hits a backtrack, recursion or JIT limit, and a cast to
+  * string makes that "". A scrub that wrote "" for text it could not read recorded the argument
+  * as an empty string: a false record, in a log whose whole value is that its records are true.
+  * Failing closed means the marker says "something was here and was withheld", never nothing.
+  *
+  * @param string|null $result what preg_replace() returned
+  */
+  public static function scrubbed_or_withheld( $result, string $original ): string {
+    if ( !is_string( $result ) || ( $result === '' && $original !== '' ) ) {
+      return self::UNSCRUBBABLE;
+    }
+    return $result;
+  }
+
+  /**
+  * Text that is about to be written down, with a preview link's token and any credential written
+  * as an assignment inside it blanked.
+  *
+  * redact() used to judge a string only by the preview-link rule, so a string value was written
+  * whole, and "smtp_pwd=hunter2" inside a search query went into the debug log as the query's
+  * first thirty characters. A credential in a URL or a free-text field is named by the key in
+  * front of it, the same way a field is, so the key decides here too: a key that
+  * field_looks_secret() flags has its value blanked, and a Bearer or Basic credential is blanked
+  * whatever it is named. The value ends at the first delimiter (a space, & , ; a quote or a
+  * closing bracket), which is what makes the output read as the text it came from.
+  *
+  * Aggressive on purpose: any value after a secret-named key is blanked, whatever it looks like,
+  * so "To reset your password: click the link" becomes "...password: [redacted] the link". That
+  * is right for a log nobody should find a secret in, and wrong for a record of what a post said,
+  * which is why the audit log's arguments and the journal's undo records use GMCP_Credential_Scan
+  * (the shapes and assignments whose VALUE looks like a credential). The short free-text columns,
+  * where over-redacting a label is cheaper than leaking one, ask looks_credentialed(), which is
+  * this rule's assignment half joined to the scanner. @see log_line(), @see looks_credentialed()
+  *
+  * Still structural. A bare token with no key in front of it is not recognised, and this says so
+  * rather than pretending otherwise.
+  *
+  * Linear in the length of the text, with the JIT on or off, and never returns "" for text:
+  *  - a name run is only started at its beginning (the lookbehind), and the name, the separator and
+  *    the value are possessive, so no run is ever re-scanned from a later position. The earlier
+  *    form had neither and was quadratic: measured at 31 s for 512 KB of "pass" with the JIT on and
+  *    over three minutes for 16 KB with it off, run by redact() over every argument of every call;
+  *  - whether the name holds a credential word is asked inside the match, by a lookahead over the
+  *    run alone, and only for the words that occur in the text at all;
+  *  - when PCRE gives up the result is UNSCRUBBABLE, not "".
+  */
+  public static function scrub_written_text( string $text ): string {
+    $text = self::scrub_preview_tokens( $text );
+    if ( $text === '' || $text === self::UNSCRUBBABLE ) {
+      return $text;
+    }
+    $text = self::scrubbed_or_withheld(
+      preg_replace( '/\b(Bearer|Basic)\s++[A-Za-z0-9._~+\/=-]{8,}+/i', '$1 ' . self::REDACTION_MARKER, $text ),
+      $text
+    );
+    return $text === self::UNSCRUBBABLE ? $text : self::scrub_assignments( $text );
+  }
+
+  /**
+  * Whether a short piece of free text should be withheld from a record of what changed: the
+  * scanner's answer (a credential by shape, or by the value after a secret-named name), or
+  * anything scrub_assignments() or the preview-link rule would change.
+  *
+  * Wider than the scanner on purpose, and only for the places where over-redacting costs a
+  * label: the audit log's target, reply and change summary, and the journal's one-line
+  * description of an entry. "password: hunter2" and "smtp_pwd=hunter" passed the scanner (the
+  * first has no assignment shape it recognises; the second is six lowercase letters) and were
+  * recorded in the clear in the changes column, the journal and wp_list_changes, which is a
+  * read-level tool. NOT used to decide whether the journal keeps a value for undo: a value it
+  * refuses to keep is a value it cannot restore, and the narrower scanner is what keeps ordinary
+  * edits undoable.
+  *
+  * Fails closed: when PCRE gives up, scrub_assignments() returns UNSCRUBBABLE, which differs.
+  */
+  public static function looks_credentialed( string $text ): bool {
+    if ( $text === '' ) {
+      return false;
+    }
+    if ( GMCP_Credential_Scan::text_holds( $text ) ) {
+      return true;
+    }
+    $previews = self::scrub_preview_tokens( $text );
+    return $previews !== $text || self::scrub_assignments( $text ) !== $text;
+  }
+
+  /**
+  * The assignment half of scrub_written_text(): the value after a secret-named name replaced.
+  * @see scrub_written_text() for the rule and for why it is written the way it is.
+  */
+  public static function scrub_assignments( string $text ): string {
+    $names = [];
+    foreach ( (array) self::credential_field_patterns() as $pattern ) {
+      if ( is_string( $pattern ) && $pattern !== '' && stripos( $text, $pattern ) !== false ) {
+        $names[] = preg_quote( $pattern, '/' );
+      }
+    }
+    if ( !$names ) {
+      return $text;
+    }
+    // A name that contains a credential word, followed by a separator (= : => or their
+    // URL-encoded forms, with an optional closing quote), then the value up to the next
+    // delimiter. The name class admits the brackets and dots of form and query names.
+    // The (?!\[redacted\]) keeps this idempotent: a value already replaced by the marker is left
+    // as it is, because the marker's own brackets would otherwise end the value early and
+    // leave a stray "]" behind on a second pass.
+    $re = '/(?<![A-Za-z0-9_.\-\[\]])(?=[A-Za-z0-9_.\-\[\]]*?(?:' . implode( '|', $names ) . '))'
+      . '([A-Za-z0-9_.\-\[\]]++)(["\']?+\s*+(?:=>|=|:|%3D|%3A|%3d|%3a)\s*+["\']?+)(?!\[redacted\])[^\s&,;"\'}\])<>]++/i';
+    return self::scrubbed_or_withheld( preg_replace( $re, '$1$2' . self::REDACTION_MARKER, $text ), $text );
+  }
+
+  /**
+  * One request-derived value, as a debug line may carry it: a scalar as text, an array or
+  * object as its redacted JSON, with the full log scrub applied either way. @see log_line()
+  *
+  * Every log line that prints something a client sent goes through this. The value is
+  * scrubbed before anything truncates it, so a cut cannot leave a secret's head visible.
+  */
+  public static function log_text( $value ): string {
+    if ( is_array( $value ) || is_object( $value ) ) {
+      // A line holds LOG_READ_BYTES of this, so no more than a small multiple of that is read:
+      // the redaction walk costs per leaf, and a million of them is an argument a client may send.
+      $unused = 0;
+      $budget = self::LOG_READ_BYTES * 4;
+      $json = wp_json_encode( self::redact( self::cut_leaves( $value, self::LOG_READ_BYTES, $unused, 0, $budget ) ) );
+      return self::log_line( is_string( $json ) ? $json : '' );
+    }
+    return self::log_line( (string) $value );
+  }
+
+  /**
+  * What the debug line for a tool call prints in place of an identifier argument's own name.
+  * Free of every credential word on purpose: the line is scrubbed as text afterwards, and text
+  * that says `"key":"x_pwd"` reads as a value assigned to a secret-named field.
+  */
+  const IDENTIFIER_LOG_LABELS = [ 'key' => 'target', 'meta_key' => 'meta_target', 'option_key' => 'option_target' ];
+
+  /**
+  * A tool call's arguments as the debug log prints them: redact_call_args()'s answer for what each
+  * argument may say, in a line that still says WHICH row a call named.
+  *
+  * The top-level "key" of wp_update_option and the meta tools is the name of the row, so it is
+  * judged by its VALUE, as the audit log and the approval view judge it: kept unless it is
+  * credential-shaped (a vendor key, an assignment, a token) and then hidden by the same scrub as
+  * every other string in the line. Passing the result of redact_call_args() to log_text() as an
+  * array did not do that: log_text() redacts an array by field name, which blanked "key" (the
+  * option's name, "x_pwd") whatever it held, and the scrub after it read `"key":"x_pwd"` as a
+  * secret-named assignment. So the identifiers are printed under labels with no credential word
+  * in them (IDENTIFIER_LOG_LABELS), and everything else goes through redact() as before: a nested
+  * field named "key" and every other secret-named argument are still redacted by name.
+  *
+  * The result is a string; the call site hands it to log_text() as every client-derived line
+  * does, which scrubs it a second time and leaves it as it is.
+  *
+  * @param array $args The arguments the client sent.
+  */
+  public static function log_call_args( array $args ): string {
+    $safe = self::redact_call_args( $args );
+    $named = [];
+    foreach ( self::IDENTIFIER_ARGS as $field ) {
+      if ( array_key_exists( $field, $safe ) && is_scalar( $safe[ $field ] ) ) {
+        $named[ self::IDENTIFIER_LOG_LABELS[ $field ] ?? 'target' ] = $safe[ $field ];
+        unset( $safe[ $field ] );
+      }
+    }
+    $unused = 0;
+    $budget = self::LOG_READ_BYTES * 4;
+    $json = wp_json_encode( $named + self::redact( self::cut_leaves( $safe, self::LOG_READ_BYTES, $unused, 0, $budget ) ) );
+    return self::log_line( is_string( $json ) ? $json : '' );
+  }
+
+  /** The longest stretch of one value that is read for a debug line; the line itself is shorter. */
+  const LOG_READ_BYTES = 2500;
+
+  /**
+  * Stands in for a redacted value while a log line is being scrubbed in two passes. Letters only,
+  * so the second pass reads it as one ordinary token and ends its own replacement exactly there.
+  */
+  const LOG_SENTINEL = 'GMCPREDACTEDVALUE';
+
+  /**
+  * Text as the debug log may keep it. Over-redacting is acceptable here and under-redacting is
+  * not: a log is read by whoever runs the server, and nobody is expected to be told what is
+  * in it before they open it. Steps, in this order.
+  *
+  *  1. Cut to what a line can hold (read no more than that), so a megabyte argument is not
+  *     processed to print two thousand characters.
+  *  2. Whitespace of every kind (tab, newline, carriage return, vertical tab, form feed, the
+  *     Unicode line and paragraph separators and the no-break spaces) becomes one plain space,
+  *     before any scrub reads the text, so a separator written with a tab in it is still a
+  *     separator. A request value with a newline in it was written as a second line, so any
+  *     client could forge "[Guarded MCP] ..." lines in the log an operator reads; one line in,
+  *     one line out. Other control characters are escaped to a visible form after the scrubs.
+  *  3. A value after a secret-named key is taken whole: an unquoted one up to "&" or the end of
+  *     the line, a quoted one up to its closing quote. "smtp_pwd=correct horse battery" was left
+  *     as "smtp_pwd=[redacted] horse battery" by a scrub that ended a value at the first space.
+  *  4. GMCP_Diag_Util::scrub_log_line(), the scrubber the error-log reader already uses, which
+  *     knows the vendor key prefixes, PEM blocks, URL user information, JWTs, escaped JSON,
+  *     define() lines and pw=.
+  *
+  * The two scrubs cannot read each other's marker: given "key=[redacted]" the second ends the
+  * value at the "]" and leaves "[redacted]]" behind. So a marker is a letters-only sentinel
+  * between steps 3 and 4 and becomes "[redacted]" at the end, which also makes the whole thing
+  * stable when a line that was already scrubbed is scrubbed again (GMCP_Logging does that to
+  * every line a call site has already passed through log_text()).
+  *
+  * Never returns "" for text: a scrub that gives up yields UNSCRUBBABLE.
+  */
+  public static function log_line( string $text ): string {
+    // Whitespace first, so the scrubs read it as the separator it was; then every other control
+    // character as a visible escape, because the scrubber would otherwise delete it unseen.
+    $text = self::escape_control_characters( self::whitespace_to_spaces( self::cut_bytes( $text, self::LOG_READ_BYTES ) ) );
+    if ( $text === '' ) {
+      return '';
+    }
+    $text = str_replace( [ self::REDACTION_MARKER, self::LOG_SENTINEL ], self::LOG_SENTINEL, $text );
+    $text = self::scrub_log_assignments( $text );
+    if ( $text !== self::UNSCRUBBABLE ) {
+      $scrubbed = GMCP_Diag_Util::scrub_log_line( $text, [ 'patterns' => array_values( array_filter( array_map( 'strval', (array) self::credential_field_patterns() ), 'strlen' ) ) ] );
+      // scrub_log_line() casts each rule's result to a string, so a rule that PCRE gives up on
+      // blanks the line and the rules after it run over nothing: what comes back is "" or just
+      // its own truncation note. That is a line that lost its content, not a clean one.
+      $left = trim( str_replace( ' …[line truncated]', '', $scrubbed ) );
+      $text = ( $left === '' && trim( $text ) !== '' && trim( $text ) !== self::LOG_SENTINEL ) ? self::UNSCRUBBABLE : $scrubbed;
+    }
+    return self::escape_control_characters( str_replace( self::LOG_SENTINEL, self::REDACTION_MARKER, $text ) );
+  }
+
+  /**
+  * Every kind of whitespace that is not a plain space or that a pattern's \s would not read as one,
+  * as a single plain space: tab, vertical tab, form feed, carriage return, newline, the Unicode
+  * next-line and line and paragraph separators, the no-break and other fixed-width spaces. Not a
+  * regular expression: a table, which cannot give up.
+  *
+  * This runs BEFORE the scrubs. Escaping a tab first turned "smtp_pass<TAB>=<TAB>x" into the
+  * characters backslash and "t", which neither the separator rule nor "Bearer\s++" matches, so a
+  * value the client had put a tab in front of reached the log. A line still has one line's worth of
+  * characters afterwards (a newline cannot start a forged record), and any other control character
+  * is escaped to a visible form at the end of log_line().
+  */
+  public static function whitespace_to_spaces( string $text ): string {
+    static $table = null;
+    if ( $table === null ) {
+      $table = [ "\t" => ' ', "\x0B" => ' ', "\x0C" => ' ', "\r" => ' ', "\n" => ' ',
+        "\xC2\x85" => ' ', "\xC2\xA0" => ' ', "\xE1\x9A\x80" => ' ', "\xE2\x80\xA8" => ' ', "\xE2\x80\xA9" => ' ',
+        "\xE2\x80\xAF" => ' ', "\xE2\x81\x9F" => ' ', "\xE3\x80\x80" => ' ' ];
+      // U+2000 to U+200A: the en and em spaces, the thin and hair spaces and their neighbours.
+      for ( $i = 0x80; $i <= 0x8A; $i++ ) {
+        $table[ "\xE2\x80" . chr( $i ) ] = ' ';
+      }
+    }
+    return strtr( $text, $table );
+  }
+
+  /**
+  * Control characters (and the three Unicode line separators) as visible escapes, so that what
+  * is written is one line. Not a regular expression: a table, which cannot give up.
+  */
+  public static function escape_control_characters( string $text ): string {
+    static $table = null;
+    if ( $table === null ) {
+      $table = [ "\n" => '\\n', "\r" => '\\r', "\t" => '\\t', "\x7F" => '\\x7f',
+        "\xC2\x85" => '\\u0085', "\xE2\x80\xA8" => '\\u2028', "\xE2\x80\xA9" => '\\u2029' ];
+      for ( $i = 0; $i < 32; $i++ ) {
+        if ( !isset( $table[ chr( $i ) ] ) ) {
+          $table[ chr( $i ) ] = sprintf( '\\x%02x', $i );
+        }
+      }
+    }
+    return strtr( $text, $table );
+  }
+
+  /**
+  * The whole value after a secret-named key replaced by the sentinel, for the debug log. See
+  * log_line() step 3. Linear for the same reasons scrub_written_text() is: the name run starts
+  * at its beginning only, the pieces are possessive, and the credential word is asked of the
+  * run by a lookahead and only for words that occur in the text. A value that is already the
+  * sentinel is left as it is, and a quoted value keeps its quotes.
+  */
+  private static function scrub_log_assignments( string $text ): string {
+    $names = [];
+    foreach ( (array) self::credential_field_patterns() as $pattern ) {
+      if ( is_string( $pattern ) && $pattern !== '' && stripos( $text, $pattern ) !== false ) {
+        $names[] = preg_quote( $pattern, '/' );
+      }
+    }
+    if ( !$names ) {
+      return $text;
+    }
+    $re = '/(?<![A-Za-z0-9_.\-\[\]])(?=[A-Za-z0-9_.\-\[\]]*?(?:' . implode( '|', $names ) . '))'
+      . '([A-Za-z0-9_.\-\[\]]++)((?:\\\\*+["\'])?+\s*+(?:=>|=|:|%3[Dd]|%3[Aa])\s*+)'
+      . '(["\']?+' . self::LOG_SENTINEL . '["\']?+|"(?:[^"\\\\\r\n]++|\\\\.)*+"?+|\'(?:[^\'\\\\\r\n]++|\\\\.)*+\'?+|[^&\r\n]++)/i';
+    $out = preg_replace_callback( $re, static function ( $m ) {
+      if ( strpos( $m[3], self::LOG_SENTINEL ) !== false && strlen( $m[3] ) <= strlen( self::LOG_SENTINEL ) + 2 ) {
+        return $m[0];
+      }
+      $quote = $m[3][0] === '"' || $m[3][0] === "'" ? $m[3][0] : '';
+      return $m[1] . $m[2] . $quote . self::LOG_SENTINEL . $quote;
+    }, $text );
+    return self::scrubbed_or_withheld( $out, $text );
   }
 
   /**
@@ -1816,7 +2867,12 @@ class GMCP_Core {
   *
   * Walks arrays and objects. Does not try to parse strings: a JSON blob under an
   * innocuous field name is left whole, and callers that care should test it with
-  * field_looks_secret() on the field it arrived under.
+  * field_looks_secret() on the field it arrived under. A string leaf gets the preview-link
+  * rule and nothing more: the assignment scrub that used to run here blanked ordinary text
+  * ("To reset your password: click the link" became "password: [redacted] the link") in a
+  * record whose job is to say what was written. Free text is judged as text by
+  * redact_credential_spans() for the audit log, and by log_line() for the debug log, which
+  * is the channel that takes the aggressive rule.
   *
   * $scrub_preview is for what is WRITTEN DOWN (the audit log, the debug log), where a
   * preview link's token must never land, and defaults to on so a new logging caller is
@@ -1872,6 +2928,10 @@ class GMCP_Core {
   * blanked whole.
   */
   public static function redact_call_args( array $args ): array {
+    // The debug line prints a few hundred characters of this; nothing is gained by reading more.
+    $unused = 0;
+    $budget = 16384;
+    $args = self::cut_leaves( $args, 4096, $unused, 0, $budget );
     foreach ( self::NEVER_RECORD_ARGS as $field ) {
       if ( array_key_exists( $field, $args ) ) {
         $args[ $field ] = self::REDACTION_MARKER;
@@ -1896,19 +2956,172 @@ class GMCP_Core {
     return self::blank_credential_strings( $redacted );
   }
 
-  /** Every string leaf holds_credential() flags, replaced by the marker. */
-  private static function blank_credential_strings( $value, int $depth = 0 ) {
+  /**
+  * A string cut to at most $max bytes without ending in half a character.
+  *
+  * Pure PHP: mb_strcut() is not guaranteed to exist and WordPress does not polyfill it.
+  */
+  public static function cut_bytes( string $text, int $max ): string {
+    if ( strlen( $text ) <= $max ) {
+      return $text;
+    }
+    $cut = substr( $text, 0, max( 0, $max ) );
+    $i = strlen( $cut ) - 1;
+    $back = 0;
+    while ( $i >= 0 && $back < 3 && ( ord( $cut[ $i ] ) & 0xC0 ) === 0x80 ) {
+      $i--;
+      $back++;
+    }
+    if ( $i >= 0 && ord( $cut[ $i ] ) >= 0xC0 ) {
+      $need = ord( $cut[ $i ] ) >= 0xF0 ? 4 : ( ord( $cut[ $i ] ) >= 0xE0 ? 3 : 2 );
+      if ( strlen( $cut ) - $i < $need ) {
+        $cut = substr( $cut, 0, $i );
+      }
+    }
+    return $cut;
+  }
+
+  /**
+  * Every string leaf of a value cut to at most $max bytes, and how many bytes that removed.
+  *
+  * For a caller that can write down no more than $max bytes of any one leaf and wants the scrubs
+  * to read no more than it can use: the scrubs are linear, but linear in 512 KB is still work
+  * done after the tool has run, for text that cannot be stored. The count lets the caller say how
+  * large the original was instead of reporting the size of the copy.
+  *
+  * Bounding each leaf does not bound how many there are, and the scrubs that run afterwards cost
+  * about as much per leaf as per byte: a million one-character strings (4 MB) took 2.5 s to
+  * record, a million secret-looking assignments (40 MB) 17 s, and both are well inside the size a
+  * request may be. So $budget, when given, is how many bytes of the call may be kept at all. What
+  * a node costs is never more than it takes in JSON (a string its length and two quotes, a string
+  * key its length and three bytes, a number or a boolean one byte), so the encoded copy is at least
+  * as large as what was spent, and a caller whose budget is its storage cap and whose budget ran out
+  * would have been over that cap anyway. Once it is spent the rest of that array is dropped without
+  * being read, and one entry named "__gmcp_omitted" says how many entries and bytes went unexamined.
+  *
+  * @param int      $removed running total of bytes not kept, by reference
+  * @param int|null $budget  bytes still to be spent, by reference; null for no budget
+  */
+  public static function cut_leaves( $value, int $max, int &$removed, int $depth = 0, ?int &$budget = null ) {
+    if ( is_string( $value ) ) {
+      if ( strlen( $value ) > $max ) {
+        $cut = self::cut_bytes( $value, $max );
+        $removed += strlen( $value ) - strlen( $cut );
+        $value = $cut;
+      }
+      if ( $budget !== null ) {
+        $budget -= strlen( $value ) + 2;
+      }
+      return $value;
+    }
+    if ( is_object( $value ) ) {
+      $value = get_object_vars( $value );
+    }
+    if ( !is_array( $value ) || $depth > 8 ) {
+      if ( $budget !== null ) {
+        $budget -= 1;
+      }
+      return $value;
+    }
+    $dropped = 0;
+    $dropped_bytes = 0;
+    foreach ( $value as $k => $inner ) {
+      if ( $budget !== null && $budget <= 0 ) {
+        $dropped++;
+        $dropped_bytes += self::weigh( $inner ) + strlen( (string) $k );
+        unset( $value[ $k ] );
+        continue;
+      }
+      if ( $budget !== null && is_string( $k ) ) {
+        $budget -= strlen( $k ) + 3;
+      }
+      $value[ $k ] = self::cut_leaves( $inner, $max, $removed, $depth + 1, $budget );
+    }
+    if ( $dropped ) {
+      $removed += $dropped_bytes;
+      $value['__gmcp_omitted'] = $dropped . ' more entries (' . $dropped_bytes . ' bytes) were not examined or recorded';
+    }
+    return $value;
+  }
+
+  /**
+  * The bytes a value holds, strings by length and anything else by a few bytes, without reading
+  * the strings. For the size a caller reports about what it chose not to look at. Bounded in
+  * depth; a deeper structure counts as the depth limit's worth.
+  */
+  public static function weigh( $value, int $depth = 0 ): int {
+    if ( is_string( $value ) ) {
+      return strlen( $value );
+    }
+    if ( is_object( $value ) ) {
+      $value = get_object_vars( $value );
+    }
+    if ( !is_array( $value ) ) {
+      return 8;
+    }
+    if ( $depth > 64 ) {
+      return 64;
+    }
+    $sum = 8;
+    foreach ( $value as $k => $inner ) {
+      $sum += strlen( (string) $k ) + self::weigh( $inner, $depth + 1 );
+    }
+    return $sum;
+  }
+
+  /**
+  * A copy of a value in which each credential inside a string is replaced by the marker and
+  * everything around it is kept. What the audit log writes for a call's arguments.
+  *
+  * blank_credential_strings() replaces a flagged string whole, which is the right answer when the
+  * string cannot be taken apart (a JSON or serialized blob with a secret-named field in it, and
+  * the journal's undo record, where a partly blanked value could not be restored). For a record
+  * of what a call SAID it is the wrong one, in two ways. A short decoy turned the whole of a post
+  * body into "[redacted]", so a body that began with a script tag and ended with a stray
+  * define('DB_PASSWORD', ...) comment left no trace of the script. And it recorded less than it
+  * knew: the scanner has already found where the secret is.
+  *
+  * So a string that holds_credential() flags structurally (a blob) is still blanked whole, and
+  * any other string has only the spans GMCP_Credential_Scan found replaced. A field name that
+  * looks secret is already blanked by redact(), before this runs.
+  */
+  public static function redact_credential_spans( $value, int $depth = 0 ) {
     if ( $depth > 8 ) {
       return $value;
     }
     if ( is_string( $value ) ) {
-      return self::holds_credential( $value ) ? self::REDACTION_MARKER : $value;
+      return self::holds_credential( $value ) ? self::REDACTION_MARKER : GMCP_Credential_Scan::redact_spans( $value, self::REDACTION_MARKER );
     }
     if ( !is_array( $value ) ) {
       return $value;
     }
     foreach ( $value as $k => $inner ) {
-      $value[ $k ] = self::blank_credential_strings( $inner, $depth + 1 );
+      $value[ $k ] = self::redact_credential_spans( $inner, $depth + 1 );
+    }
+    return $value;
+  }
+
+  /**
+  * Every string leaf that holds a credential, replaced by the marker: one that
+  * holds_credential() flags (a JSON or serialized blob with a secret-named field inside) and
+  * one whose free text carries a pasted secret (GMCP_Credential_Scan), which is what a post
+  * body or an excerpt sent as an argument looks like.
+  *
+  * @param int $window When positive, only that many leading bytes of a string are scanned for
+  *                    free text. For a caller that can record no more than that much of it.
+  */
+  public static function blank_credential_strings( $value, int $depth = 0, int $window = 0 ) {
+    if ( $depth > 8 ) {
+      return $value;
+    }
+    if ( is_string( $value ) ) {
+      return ( self::holds_credential( $value ) || GMCP_Credential_Scan::holds( $value, 1, $window ) ) ? self::REDACTION_MARKER : $value;
+    }
+    if ( !is_array( $value ) ) {
+      return $value;
+    }
+    foreach ( $value as $k => $inner ) {
+      $value[ $k ] = self::blank_credential_strings( $inner, $depth + 1, $window );
     }
     return $value;
   }
@@ -1990,6 +3203,7 @@ class GMCP_Core {
     // archive minted before somebody switched it off is still removed when it lapses.
     GMCP_Tools_Export::boot();
     GMCP_Core::install_trash_meta_net();
+    GMCP_Core::install_personal_data_net();
 
     // How to put back what changed.
     if ( $this->get_option( 'mcp_change_journal' ) ) {

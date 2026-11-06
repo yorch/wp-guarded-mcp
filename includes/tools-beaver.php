@@ -41,10 +41,10 @@ if ( !defined( 'ABSPATH' ) ) {
 *      modules and layout `js`/`css` that are ALREADY STORED. The caller never submits script;
 *      it picks a template that contains one. A module allowlist constrains new input and this
 *      route adds none.
-*   2. The change journal cannot undo a layout write. Its meta restore calls update_post_meta(),
-*      and GMCP_Core::layout_meta_refusal() refuses those keys during a tool call, so the
-*      plugin's own undo would be blocked by the plugin's own guard. A snapshot the tool writes
-*      is not a journal entry either, so wp_undo_change would not find it.
+*   2. The change journal has no record of a layout write to undo. The generic meta tools it
+*      records refuse these keys (GMCP_Core::generic_writer_meta_refusal(); not the net under
+*      WordPress, because the builder writes its own keys from its save hook), and a snapshot
+*      this group wrote would not be a journal entry, so wp_undo_change would not find it.
 *   3. A module allowlist does not prove non-executable content: `text`, `button` and `heading`
 *      all take values that can carry markup or a link, and nothing here has read Beaver's
 *      renderers to say otherwise.
@@ -225,6 +225,20 @@ class GMCP_Tools_Beaver {
       return $this->error( $r, 'A post id is required.' );
     }
     $post = get_post( $post_id );
+    // Reports the post's title, type and status, so it is a reader of the post and asks the same
+    // two read policies every generic reader does: a form submission (or anything hanging from
+    // one) and, below admin, an order or another plugin's configuration. Below admin the answer
+    // is the one a post that does not exist gets, word for word, so ids cannot be walked to learn
+    // which are guarded. @see GMCP_Core::post_read_guard().
+    if ( $post ) {
+      $held = GMCP_Core::post_read_guard( $post_id );
+      if ( $held !== true ) {
+        if ( GMCP_Core::caller_access_level() === 'admin' ) {
+          return $this->error( $r, $held, GMCP_Core::read_refusal_code( $post_id, $held ) );
+        }
+        $post = null;
+      }
+    }
     if ( !$post ) {
       return $this->json( $r, [ 'builder' => $this->builder_state(), 'layout' => null, 'note' => 'No post with id ' . $post_id . ' exists on this site.' ] );
     }

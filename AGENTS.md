@@ -43,7 +43,15 @@ point every future submission at an address it chose, on a plugin that stores no
 at all. The guard is wired into the two existing ones (`commerce_post_guard` for writes,
 `commerce_post_read_guard` for non-admin reads) rather than a third pair of call sites, and it
 covers creating or retyping into the type. Stream's alert rules (`wp_stream_alerts`) are listed
-for the same reason: a rule set to a disabled status stops that alert firing.
+for the same reason: a rule set to a disabled status stops that alert firing. So is
+`wpforms-template`, a saved user template: the plugin registers it on Lite, reads its
+`post_content` through the same `wpforms_decode()` as a form's, and makes new forms from it, so
+a list naming `wpforms` alone left the same document one post type away. The reads are asked
+twice: `commerce_post_read_guard()` follows the post's parents (a revision of a form holds the
+form's JSON), and `read_excluded_post_types()` carries the same types below admin for the SQL
+readers that cannot ask a guard row by row, and `resource_is_guarded()` reads the same list so a
+REST route one of them takes over is not turned into tools (none of the three is `show_in_rest`
+today, so that one is a guard for a future registration, measured only with a stand-in type).
 
 **A drafts-only key is held by the post, not by the tool.** `GMCP_Core::drafts_only_guard()`
 (through `post_write_guard()` for the generic writers) is asked by every tool that writes a
@@ -58,12 +66,82 @@ every sentence that describes it (refusal text, key label, README, readme.txt, g
 say so rather than "anything that is live". Media attached to no post is refused for edits as
 well as deletes, because a live page may be showing it and nothing can find which.
 
+**A read policy about a post belongs to the post, and follows what hangs from it.**
+`GMCP_Core::post_read_guard()` (the form-submission policy at every level, the commerce read
+policy below admin) judges a post as the nearest guarded post above it through `post_parent`,
+because a revision of a submission, a file attached to one and a comment on one are ordinary
+rows of another type that pass any check made on their own type. Every tool that returns a
+post, its meta, its comments, its terms, its media or its title asks it, and so do the REST
+tools, the briefing, the resources, the featured image in the snapshot and the target of a menu
+item. Below admin it answers a submission with the sentence a post that does not exist gets
+(`post_not_found_text()`), so a key that can only read cannot walk ids and map which are
+submissions and which hang from one; a tool that has its own "not found" wording uses the same
+function for both. A listing never fetches a page and then drops rows, and never pages by loading
+rows up to its offset to skip the unreadable ones: it leaves them out in SQL
+(`unreadable_post_clauses()`, joins and not nested subqueries: the SQLite driver overflows its
+parser on seven nested `EXISTS`), through `with_readable_posts_sql()` and
+`with_readable_comments_sql()` for the listing tools so the offset is the database's (measured:
+offset 40,000 of 50,000 posts took 13 s and 210 MB when the offset was paid for in PHP), and keeps
+`collect_readable()` as the row-by-row backstop, bounded in rows looked at independently of the
+offset. The change records go through `GMCP_Changes::record()` and
+carry a submission as an id with `[withheld]` values, judged on the state before the write as
+well as after it, because `wp_list_changes` is a read-level tool and names a post by its title.
+A new reader of any of these asks the guard; `smoke-forms.sh` block 0c seeds a submission with a
+revision, an upload, a comment and a term and calls every reader with a read-only key.
+
+**A write policy about a post belongs to the post's tree, and the read policy depends on it.**
+A read guard judges a post by what it hangs from, so anything that changes `post_parent`,
+`comment_post_ID` or a value that points at a post (a featured image, a menu item's target) is
+a way round every read guard at once. So the form-submission policy is symmetric with the
+commerce one: `GMCP_Core::personal_data_write_guard()` (asked from `commerce_post_guard()`,
+which every generic writer already asks, and by the media and comment tools that never did)
+refuses every generic write to a submission and to anything in its tree, at every access level;
+`tree_move_guard()` and `comment_write_guard()` refuse a write that moves a post or comment into
+or out of a submission's or an order's tree, which also stops a key hiding its own page under
+one; `pointer_meta_refusal()` refuses `_thumbnail_id` and the `_menu_item_*` keys pointing into
+one (judged on the key as the database compares it, see the next invariant); and `install_personal_data_net()` asks the same of every writer that goes through
+WordPress while a tool call is in flight (insert and attachment data, post meta by key and by
+id, term assignment, deletion, comment update, creation and removal), for what hangs FROM a
+submission and not for the submission's own row, because a form plugin writes that itself from
+hooks a tool call fires (Flamingo saves a contact whenever a profile is saved, which broke
+`wp_update_user` when the net refused it). A new tool that writes a
+post, its meta, its terms or a comment asks the guard; the net is the backstop, not the plan.
+`smoke-forms.sh` block 0c attacks each route with a read-write key and reads the STORED row, and
+a test-only tool registered by its mu-plugin writes through WordPress with the net taken out to
+show that the change records hold when a writer asks nothing.
+
+**A policy about a meta key is about the key as the database compares it.** `wp_postmeta.meta_key`
+is compared by its collation, `utf8mb4_unicode_520_ci` on a stock WordPress, which ignores accents,
+case, combining marks, soft hyphens, zero-width and control characters and trailing spaces and
+expands `ß` to `ss`. So `update_post_meta( $id, '_thumbnaíl_id', 9 )` writes the existing
+`_thumbnail_id` row, and a rule that compared `strtolower( rtrim( $key ) )` refused one spelling and
+stored the other (measured on MariaDB with a read-write key: a form submission's upload became a
+page's featured image, and an accent inside `_wp_trash_meta_` rewrote a trashed post's purge stamp
+so the daily purge deleted it). SQLite compares exactly, so no suite run there can see it.
+`GMCP_Meta_Key::folds()` (`GMCP_Core::meta_key_fold()`) is the one answer, and
+`pointer_meta_refusal()` and `protected_meta_refusal()` ask it; a new policy keyed on a meta key
+asks it too. Resolving the key through the database is not enough (with no row yet the write files
+a new one under the accented spelling that every later query for the real name matches). The
+table is measured from the database by `.dev/build-meta-key-fold.php`, not written from Unicode
+tables; rebuild `includes/meta-key-fold-map.php` with it, and run `.dev/test-meta-key-fold.php`
+(with `GMCP_FOLD_DSN` to check the fold against a live server in both directions) and the
+MariaDB-only block in `smoke.sh`, which says it skipped on SQLite.
+
+**A tool that answers failure over a write that happened is a defect, and the REST tools were one.**
+The controller inserts a row and then applies the featured image, parent-like fields and meta, and
+the nets throw from that tail. `GMCP_Core::rest_write_refusal()` asks the pointer, parent and meta
+policies before the controller is called (like `create_one_post()` does for `meta_input`), and
+`GMCP_Tools_Rest::handle_call()` deletes a row its own create inserted if a net still refuses from
+inside the controller, and says so. A new create or update path that writes in two steps pre-checks
+the second step or undoes the first; `smoke-forms.sh` asserts the table, not the reply.
+
 **A deletion is not always a delete tool.** WordPress deletes on markers it reads from
 ordinary rows: `wp_scheduled_delete()` removes every post with an old `_wp_trash_meta_time`
 and `wp_delete_auto_drafts()` every old auto-draft. So `GMCP_Core::status_write_refusal()`
 refuses a status of `trash` or `auto-draft` in the write tools (and `spam` on a comment, which
 Akismet deletes after fifteen days), `protected_meta_refusal()`
-refuses the `_wp_trash_meta_` keys in every meta writer (with a net under the WordPress
+refuses the `_wp_trash_meta_` keys in every meta writer, in any spelling the database reads as the
+same key (with a net under the WordPress
 meta functions for writers that are not ours), and `GMCP_Approvals::classify_call()` reads
 the arguments as well as the tool's name. A write-level key that can reach any of them has a
 delete tool, whatever the README calls the level.
@@ -110,10 +188,57 @@ there, which is the failure this whole file is about.
 **Credential-shaped data never reaches the journal, the audit log, or the debug
 error_log.** `user_pass` is dropped unconditionally, and
 `GMCP_Core::field_looks_secret()` is the single answer both subsystems ask, so the
-two cannot drift apart. The debug `error_log` at `server.php:604` routes tool
-arguments through `GMCP_Core::redact()` for the same reason: it is a third channel
-the same credential can reach, and a channel with no redaction is a leak waiting
-for the first caller that passes a secret.
+two cannot drift apart. The debug `error_log` is a third channel the same credential
+can reach, and a channel with no redaction is a leak waiting for the first caller
+that passes a secret. So every debug line that prints something a client sent goes
+through `GMCP_Core::log_text()` (`log_line()` for a string), and so does every line
+`GMCP_Logging` writes, so a line added later without the helper is still covered. In a log
+over-redacting is fine and under-redacting is not, so it is the widest of the channels: whitespace of
+every kind (tab, newline, carriage return, vertical tab, form feed, the Unicode line and paragraph
+separators, the no-break and other fixed-width spaces) becomes one plain space BEFORE any scrub reads
+the line, so a separator with a tab in it is still a separator and a newline in a request value cannot
+start a forged second log line; any other control character is shown as a visible escape,
+`GMCP_Diag_Util::scrub_log_line()` removes the vendor key shapes, PEM blocks, URL user
+information, JWTs, escaped JSON, `define()` lines and `pw=`, and the whole value after a
+secret-named key goes, an unquoted one to `&` or the end of the line and a quoted one to its
+closing quote, where a backslash and the character after it count as one (an escaped quote does not end
+a value). It reads one line of at most 2,500 bytes of a value, and a call's arguments only up to a
+byte budget (see the audit log doc), so the cost does not grow with how many leaves a client sends. Every `error_log()` in `includes/` is checked by a tripwire in
+`.dev/test-credential-channels.php`: one that prints `$reason`, an exception message or a request
+parameter without `log_text()` fails it. A bare token with no key in front of it and no known
+prefix is not recognised by any of this, and nothing in the docs claims it is.
+
+**Free text is judged as text, in one place.** `holds_credential()` reads field names and opens
+only values that begin as JSON or serialized data, so a post body with `{"api_key":"..."}` or a
+`define('DB_PASSWORD', ...)` line in the middle of it passed. `GMCP_Credential_Scan` is the text
+test, and the journal (`unsafe_to_keep()`, `post_previous()`, `label()`), `GMCP_Changes::describe()`,
+the audit log's arguments, target and reply, `redact_reversible()` and the approval queue's stored and
+printed view of a call (`GMCP_Approvals::view_value()`, per string value) all ask it. It also says
+WHERE (`spans()`), and the audit log's arguments blank only those spans, so a decoy cannot wipe a
+whole value from the log; the approval screen does the same, because it is the one place a person
+decides on what they read: only the matched stretch is replaced, the string's path is listed and
+`[hidden values present: N]` is appended (a JSON or serialized blob with a secret-named field inside
+is still replaced whole, and each string is judged alone, so a secret split across two arguments is
+not recognised by the view). The journal keeps its whole-field drop, because a partly blanked value
+cannot be restored. The aggressive assignment scrub (any value after a secret-named key) belongs to
+the debug log only: in a record of what a call said it blanked ordinary prose. A value that is a
+documented placeholder (`password_here`, `YOUR_TOKEN_HERE`, `********`, `<token>`, `${UPPER_SNAKE}` or
+`$UPPER_SNAKE` in capitals only, `user:pass@`) is not a credential, with a counterpart test for each that a
+real-looking value under the same name still is: `'$uperS3cret99'` and `${db_pass}` are not placeholders.
+What the scanner reads through is listed in `docs/guardrails.md`: quote escapes, a backslash and the
+character after it counting as one inside a quoted value, array-index and `define()` assignments, names of
+any length. What it does not find is listed there too (a value split over several arguments, base64, a bare
+token). Its false positives are measured on a prose corpus, and the classes that remain are named.
+The short one-line columns (the journal's `what` and `label()`, the audit log's change summary, target and
+reply) ask the wider `GMCP_Core::looks_credentialed()` (the scanner plus the assignment rule), because
+`password: hunter2` and `smtp_pwd=hunter` passed the scanner and were recorded in the clear in a column read
+by a read-level tool; over-redacting a label is the cheap direction. The journal's decision whether to KEEP a
+value for undo stays the narrow scanner (`unsafe_to_keep()`): a value it refuses to keep is a value it cannot
+restore. A stored `what` is re-checked when entries are listed, because it outlives the code that wrote it. A post field that
+fails is left out of `previous` and named in `redacted_fields`; a placeholder is never stored, because
+undo would write it over live content. Tune it against false positives as hard as against misses: an
+ordinary body that says "password" must stay undoable, and `.dev/journal-pure.php` holds that control.
+Undo also refuses to restore a status `status_write_refusal()` refuses (`trash`, `auto-draft`).
 
 **There is no restore tool, at any access level.** Backups can be started and read. That is
 deliberate and not an omission to be helpfully filled in.

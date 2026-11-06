@@ -69,6 +69,31 @@ fi
 OUT=$(mktemp -d)
 pass=0; fail=0
 
+# Whether this site's WP-Cron loopback is live: does a front-page request make the site call
+# its own wp-cron.php and run a due event? The backup sections depend on the answer in
+# opposite directions. UpdraftPlus's "reads as finished" check needs the loopback live, because
+# its resumptions are only ever run by it; Backuply's queue-then-run checks need it blocked,
+# because with it live the queued job runs by itself before the assertion looks (measured: the
+# queued hook gone, no archive counted, the job still reading as running). Which it is depends
+# on the stack (a published port the container cannot reach, a host that blocks loopback,
+# DISABLE_WP_CRON), not on the plugin, so the suite measures it and says so rather than
+# failing groups that cannot hold. Prints "live" or "blocked".
+loopback_state() {
+  docker compose exec -T cli wp eval 'wp_clear_scheduled_hook( "gmcp_smoke_loopback_probe" ); wp_schedule_single_event( time() - 5, "gmcp_smoke_loopback_probe" );' >/dev/null 2>&1
+  curl -sS -o /dev/null --max-time 20 "$BASE/?gmcp_loopback_probe=$RANDOM" 2>/dev/null
+  local _
+  for _ in 1 2 3 4 5 6 7 8; do
+    if [ "$(docker compose exec -T cli wp eval 'echo wp_next_scheduled( "gmcp_smoke_loopback_probe" ) ? "pending" : "ran";' 2>/dev/null | tr -d '\r\n')" = "ran" ]; then
+      echo live; return
+    fi
+    sleep 1
+  done
+  docker compose exec -T cli wp eval 'wp_clear_scheduled_hook( "gmcp_smoke_loopback_probe" );' >/dev/null 2>&1
+  echo blocked
+}
+LOOPBACK=$(loopback_state)
+echo "  ....  WP-Cron loopback is $LOOPBACK on this site; the backup sections that cannot hold under the other state are skipped with a message, not failed"
+
 call() { # call <file> <json>
   curl -sS -X POST "$URL" \
     -H "Authorization: Bearer $TOK" \
@@ -175,6 +200,12 @@ reset_state() {
   # product fault, and it is what the rest of this function exists to prevent.
   docker compose exec -T cli wp plugin activate updraftplus >/dev/null 2>&1
   docker compose exec -T cli wp plugin deactivate backuply >/dev/null 2>&1
+  # A backup a previous run queued and nothing ran. With the WP-Cron loopback blocked the
+  # job stays on its cron hook for good, and the tool then (correctly) refuses to start a
+  # second one: "starting succeeds" failed on every run after the first on such a stack, a
+  # leftover presenting as a fault in the tool. These are the hooks the adapters read as
+  # "in flight", and the only state the refusal looks at.
+  docker compose exec -T cli wp eval 'foreach ( [ "updraft_backup_resume", "updraft_backupnow_backup_all", "updraft_backupnow_backup_database", "updraft_backupnow_backup", "backuply_backup_cron" ] as $h ) { wp_unschedule_hook( $h ); }' >/dev/null 2>&1
 }
 reset_state
 
@@ -1620,15 +1651,26 @@ call jb_new '{"jsonrpc":"2.0","id":220,"method":"tools/call","params":{"name":"w
 JB_ID=$(py "import json,sys,re;print(re.search(r'\d+',json.load(sys.stdin)['result']['content'][0]['text']).group())" jb_new)
 call jb_edit "{\"jsonrpc\":\"2.0\",\"id\":221,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_update_post\",\"arguments\":{\"ID\":$JB_ID,\"post_title\":\"Renamed\"}}}"
 call jb_list '{"jsonrpc":"2.0","id":222,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+# The assertions below are about the POST, not about the tool name. Publishing or deleting a
+# published post makes WordPress core rewrite the wp_calendar_block_has_published_posts
+# option during the same call, and the journal rightly records that option under the tool
+# that was running. Counting by tool name alone read that incidental row as "the creation
+# is journalled" on a WordPress that does the rewrite on every publish. A post's own entry
+# is the one whose description begins "Post ".
 # The control. Without it, "creation absent" would pass on an empty journal for any reason.
 check "an edit is journalled" \
   "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_update_post'))" jb_list)" "1"
 check "a creation is not, which the readmes now say" \
-  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_create_post'))" jb_list)" "0"
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_create_post' and x['what'].startswith('Post ')))" jb_list)" "0"
 call jb_del "{\"jsonrpc\":\"2.0\",\"id\":223,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_delete_post\",\"arguments\":{\"ID\":$JB_ID,\"force\":true}}}"
 call jb_list2 '{"jsonrpc":"2.0","id":224,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{}}}'
+# A post's own custom fields are not the post: with Beaver Builder active, deleting a post makes the
+# builder write and remove its layout keys on the row being deleted, and the journal rightly lists
+# those under the tool that was running ('Post "x" custom field "_fl_builder_data" removed'). Counting
+# them read an unrelated plugin's bookkeeping as "the deletion is journalled" (measured: 4 entries).
+# The control is the line above: an edit of the same post is counted, so the filter is not what hides it.
 check "nor is a deletion" \
-  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_delete_post'))" jb_list2)" "0"
+  "$(py "import json,sys;e=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(sum(1 for x in e if x['tool']=='wp_delete_post' and x['what'].startswith('Post ') and 'custom field' not in x['what']))" jb_list2)" "0"
 # The audit log is the complete record, which is the reason the readmes can point at it.
 check "but the audit log has all three" \
   "$(docker compose exec -T cli wp eval 'global $wpdb;echo (int)$wpdb->get_var("SELECT COUNT(DISTINCT tool) FROM {$wpdb->prefix}gmcp_audit WHERE tool IN (\"wp_create_post\",\"wp_update_post\",\"wp_delete_post\")");' 2>/dev/null | tr -d '\r\n')" "3"
@@ -1766,8 +1808,12 @@ for _ in $(seq 1 60); do
   sleep 5
 done
 call bk_status3 '{"jsonrpc":"2.0","id":236,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
-check "CONTROL: and reads as finished once UpdraftPlus is done" \
-  "$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(d['running'])" bk_status3)" "False"
+if [ "$LOOPBACK" = live ]; then
+  check "CONTROL: and reads as finished once UpdraftPlus is done" \
+    "$(py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print(d['running'])" bk_status3)" "False"
+else
+  echo "  SKIP  CONTROL: reads as finished once UpdraftPlus is done: the WP-Cron loopback is blocked, so nothing runs the job's resumptions and it cannot finish on its own"
+fi
 
 # The two-step confirmation reports the situation rather than gating on it.
 call bk_confirm '{"jsonrpc":"2.0","id":232,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"akismet/akismet.php"}}}'
@@ -1798,6 +1844,8 @@ docker compose exec -T cli wp eval '
   @unlink( BACKUPLY_BACKUP_DIR . "backuply_backup_log.php" );
 ' >/dev/null 2>&1
 
+LOOPBACK_BKY=$(loopback_state)
+echo "  ....  WP-Cron loopback is $LOOPBACK_BKY with Backuply the only provider"
 call bky_status '{"jsonrpc":"2.0","id":240,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
 bky() { py "import json,sys;d=json.loads(json.load(sys.stdin)['result']['content'][0]['text']);print($1)" "$2"; }
 check "Backuply is detected once UpdraftPlus is out of the way" "$(bky "d['provider']" bky_status)" "Backuply"
@@ -1808,8 +1856,12 @@ call bky_start '{"jsonrpc":"2.0","id":241,"method":"tools/call","params":{"name"
 check "starting succeeds" "$(verdict bky_start)" "ok"
 # The reply is the tool being polite about what it asked for. This is the evidence that it
 # asked: a job queued on the hook Backuply itself runs backups from.
+if [ "$LOOPBACK_BKY" = blocked ]; then
 check "and really queues Backuply's own backup hook" \
   "$(docker compose exec -T cli wp cron event list --fields=hook 2>/dev/null | grep -c backuply_backup_cron)" "1"
+else
+  echo "  SKIP  really queues Backuply's own backup hook: the WP-Cron loopback is live, so the queued job has already run by the time it is looked for"
+fi
 call bky_queued '{"jsonrpc":"2.0","id":242,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
 check "and a queued job reads as in flight, never as a backup that exists" \
   "$(bky "str(d['running']) + ',' + str(d['last_completed'])" bky_queued)" "True,None"
@@ -1825,7 +1877,18 @@ check "and the refusal says which refusal it is" "$(refusal bky_again | grep -c 
 # Apache listens on 80 inside the container, so the loopback spawn_cron fires goes
 # nowhere. That is a property of the stack and not of the tool, which is why the check
 # above asserts the job was queued and the ones below assert what running it produces.
+if [ "$LOOPBACK_BKY" = blocked ]; then
 docker compose exec -T cli wp cron event run backuply_backup_cron >/dev/null 2>&1
+# Backuply writes a backup in time slices and carries on from one slice to the next over the
+# WP-Cron loopback. On a small site one slice finishes it, which is what these checks were
+# written against; on a site with a large plugins directory the first slice stops part way
+# (measured: the job record names the file it stopped at, no archive exists) and, with the
+# loopback blocked, nothing ever resumes it. That is a property of the site's size, not of
+# the tool, so the precondition is measured: did running the job once leave an archive?
+BKY_ARCHIVES=$(docker compose exec -T cli wp eval 'echo count( glob( BACKUPLY_BACKUP_DIR . "backups-*/*.tar.gz" ) );' 2>/dev/null | tr -d '\r\n')
+if [ "$BKY_ARCHIVES" = "0" ]; then
+  echo "  SKIP  the checks on a finished Backuply job (archive on disk, status count, finished-not-running, succeeded, failed-run reading, confirmation text): one run of the job left no archive, so this site is too large for Backuply to finish in a single slice with the loopback blocked"
+else
 call bky_done '{"jsonrpc":"2.0","id":244,"method":"tools/call","params":{"name":"wp_backup_status","arguments":{}}}'
 check "running the job leaves a real archive on disk" \
   "$(docker compose exec -T cli wp eval 'echo count( glob( BACKUPLY_BACKUP_DIR . "backups-*/*.tar.gz" ) );' 2>/dev/null | tr -d '\r\n')" "1"
@@ -1846,6 +1909,10 @@ check "and the summary says not to rely on it" \
 # The confirmation line names whichever provider was found, not a hardcoded one.
 call bky_confirm '{"jsonrpc":"2.0","id":246,"method":"tools/call","params":{"name":"wp_delete_plugin","arguments":{"plugin":"akismet/akismet.php"}}}'
 check "a destructive confirmation carries Backuply's state too" "$(refusal bky_confirm | grep -c 'Backuply backup')" "1"
+fi
+else
+  echo "  SKIP  running the queued Backuply job, the archive it leaves, the failed-run reading and the confirmation that carries its state: the WP-Cron loopback is live, so the site runs the job itself, concurrently with these checks, and what they count is not what they were written to look at"
+fi
 
 # Adding a provider must not move an existing site onto it. UpdraftPlus is listed first
 # and stays first.
@@ -1946,6 +2013,23 @@ check "control: the timestamps to order by are actually distinct" \
   "$(lb "str(len({b['completed'] for b in d['backups'] if b['completed']}) >= 2)" lb_two)" "True"
 check "and they come back newest first" \
   "$(lb "str([b['completed'] for b in d['backups'] if b['completed']] == sorted([b['completed'] for b in d['backups'] if b['completed']], reverse=True))" lb_two)" "True"
+# The same assertion, made deterministic. Backuply's own list is ordered by the timestamp in
+# the info filename (when a backup started) while btime is when it finished, so a long backup
+# that began first and ended last comes back second. Whether the check above met that depended
+# on timing: it passed on a small site and failed on one large enough for a full backup to
+# outlast a database-only one. Two records are planted here with the inversion built in, the
+# control proves Backuply itself orders them by start, and the tool must not.
+docker compose exec -T cli bash -c 'D=$(ls -d /var/www/html/wp-content/backuply/backups_info-*); A=$(ls -d /var/www/html/wp-content/backuply/backups-*);
+printf "<?php exit();?>\n{\"name\":\"wp__2026-09-20_00-00-00\",\"backup_dir\":\"1\",\"backup_db\":\"1\",\"ext\":\"tar.gz\",\"size\":1,\"btime\":1900000000}" > "$D/wp__2026-09-20_00-00-00.php"
+printf "partial" > "$A/wp__2026-09-20_00-00-00.tar.gz"
+printf "<?php exit();?>\n{\"name\":\"wp__2026-09-21_00-00-00\",\"backup_dir\":\"1\",\"backup_db\":\"1\",\"ext\":\"tar.gz\",\"size\":1,\"btime\":1899999000}" > "$D/wp__2026-09-21_00-00-00.php"
+printf "partial" > "$A/wp__2026-09-21_00-00-00.tar.gz"' >/dev/null 2>&1
+check "control: Backuply itself lists the one that started later first, though it finished earlier" \
+  "$(docker compose exec -T cli wp eval '$n = []; foreach ( (array) backuply_get_backups_info() as $i ) { if ( is_object( $i ) ) { $n[] = (string) $i->name; } } $a = array_search( "wp__2026-09-21_00-00-00", $n, true ); $b = array_search( "wp__2026-09-20_00-00-00", $n, true ); echo ( $a !== false && $b !== false && $a < $b ) ? "orders-by-start" : "unexpected:" . implode( ",", $n );' 2>/dev/null | tr -d '\r\n')" "orders-by-start"
+call lb_inv '{"jsonrpc":"2.0","id":263,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{"limit":100}}}'
+check "and the tool lists them by when they finished, newest first" \
+  "$(lb "str([b['completed'] for b in d['backups'] if b['completed']][:2])" lb_inv)" "[1900000000, 1899999000]"
+docker compose exec -T cli bash -c 'rm -f /var/www/html/wp-content/backuply/backups_info-*/wp__2026-09-2[01]_00-00-00.php /var/www/html/wp-content/backuply/backups-*/wp__2026-09-2[01]_00-00-00.tar.gz' >/dev/null 2>&1
 TOTAL=$(py "import json,sys;print(json.loads(json.load(sys.stdin)['result']['content'][0]['text'])['total'])" lb_two)
 call lb_one '{"jsonrpc":"2.0","id":253,"method":"tools/call","params":{"name":"wp_list_backups","arguments":{"limit":1}}}'
 check "a capped listing says it was capped and how many exist" "$(lb "str(d['shown']) + ',' + str(d['truncated']) + ',' + str(d['total'])" lb_one)" "1,True,$TOTAL"
@@ -2662,10 +2746,27 @@ tc_groups() { # tc_groups <admin 0|1> <woo 0|1>
     $o["mcp_tools_core"] = true;
     $o["mcp_tools_admin"] = '"$1"' ? true : false;
     $o["mcp_tools_woo"]   = '"$2"' ? true : false;
-    // The export group is always available once its switch is on, so it is not one of the
-    // groups the table counts and must be off for this count: leaving it on would move every
-    // number for a reason that has nothing to do with the content/admin/woo surface.
+    // The two optional groups whose tool names carry no prefix the counter can exclude: the
+    // generated REST tools (list_pages, create_posts, ...) and the Subscriptions tools. Left
+    // as found they move every number in the table, and they are found switched on whenever
+    // an earlier block, another suite or a person on this site left them that way.
+    $o["mcp_tools_rest"] = false;
+    $o["mcp_tools_woo_subscriptions"] = false;
+    // The export group has its own switch and is not one the table counts; left on it would
+    // move every number for a reason unrelated to the content/admin/woo surface.
     $o["mcp_tools_export"] = false;
+    update_option( "gmcp_options", $o, false );' >/dev/null 2>&1
+}
+tc_unprefixed_groups() { # prints "<rest>,<subscriptions>" as stored: 1 when switched on
+  docker compose exec -T cli wp eval '
+    $o = get_option( "gmcp_options", [] );
+    echo ( ! empty( $o["mcp_tools_rest"] ) ? 1 : 0 ), ",", ( ! empty( $o["mcp_tools_woo_subscriptions"] ) ? 1 : 0 );' 2>/dev/null | tr -d '\r\n'
+}
+tc_restore_unprefixed() { # tc_restore_unprefixed <rest 0|1> <subscriptions 0|1>
+  docker compose exec -T cli wp eval '
+    $o = get_option( "gmcp_options", [] );
+    $o["mcp_tools_rest"] = '"$1"' ? true : false;
+    $o["mcp_tools_woo_subscriptions"] = '"$2"' ? true : false;
     update_option( "gmcp_options", $o, false );' >/dev/null 2>&1
 }
 # Optional groups are excluded by tool-name prefix, because the table counts only the groups
@@ -2673,8 +2774,9 @@ tc_groups() { # tc_groups <admin 0|1> <woo 0|1>
 # the count moves with whatever happens to be installed, which is the drift the table exists
 # to catch. Current prefixes: elementor_ (free and Pro), kirki_, yoast_, acf_, wsal_, gf_
 # (Gravity Forms), ld_ (LearnDash), redirection_ (Redirection), pll_ (Polylang), rankmath_ and aioseo_
-# (includes/tools-seo.php), cf7_, fluentform_ and ninjaform_ (includes/tools-forms.php). WooCommerce Subscriptions is wcs_ and is deliberately not
-# listed, because this block never switches that group on.
+# (includes/tools-seo.php), cf7_, fluentform_ and ninjaform_ (includes/tools-forms.php), wpforms_, wf_ (Wordfence), stream_ and beaver_. WooCommerce Subscriptions
+# is wcs_ and is deliberately not listed, because tc_groups() switches that group off, as it does
+# the generated REST group, whose tool names carry no prefix at all.
 tc_count() { # tc_count <secret>
   curl -sS -X POST "$URL" -H "Authorization: Bearer $1" \
     -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
@@ -2714,6 +2816,15 @@ case "$(tc_doc admin 1)" in
   ''|'no such row') echo "  FAIL  the access-level table could not be parsed"; fail=$((fail+1));;
 esac
 
+TC_UNPREFIXED_WAS=$(tc_unprefixed_groups)
+tc_groups 0 0
+# The precondition, asserted: the counts below are only the table's if neither group is on.
+check "precondition: the REST and Subscriptions groups are off while counting" "$(tc_unprefixed_groups)" "0,0"
+# And a control that the probe sees the problem it guards against: with the REST group on,
+# the same counter must move off the documented number.
+tc_restore_unprefixed 1 0
+check "control: with the REST group on the content-only count is not the documented one" \
+  "$([ "$(tc_count "$TC_ADMIN")" != "$(tc_doc admin 1)" ] && echo moved || echo same)" "moved"
 tc_groups 0 0
 check "content only, admin level"     "$(tc_count "$TC_ADMIN")" "$(tc_doc admin 1)"
 check "content only, readwrite"       "$(tc_count "$TC_RW")"    "$(tc_doc readwrite 1)"
@@ -2735,6 +2846,10 @@ else
   echo "  ....  WooCommerce column not checked: the plugin is not active on this site"
 fi
 tc_groups 1 0
+# Put the two groups back as this block found them, so the later blocks and the next suite
+# see the site the way it was.
+tc_restore_unprefixed "${TC_UNPREFIXED_WAS%%,*}" "${TC_UNPREFIXED_WAS##*,}"
+check "the REST and Subscriptions groups are as they were before the count" "$(tc_unprefixed_groups)" "$TC_UNPREFIXED_WAS"
 gmcp_clear_other_keys "smoke suite"
 
 echo "-- scheduled events --"
@@ -3216,6 +3331,23 @@ d=json.loads(raw) if raw else {}
 d=d if isinstance(d,dict) else {}
 print(",".join(str(g["post"]) for g in sorted(d.values(), key=lambda g:g["post"])))'; }
 pv_status() { curl -sS -o "$OUT/pv_body" -w '%{http_code}' "$BASE$1"; }
+# Counts a marker where the post body is rendered, not across the whole page: an SEO plugin
+# emits the body as og:description, twitter:description and in its JSON-LD graph, so a plain
+# `grep -c` on the page returns 2 or more on a site with one active while the body it is
+# asserting is present exactly once. Inside the content element when the theme has one; if it
+# has none, the page with its <meta>, <script> and <title> elements removed, which is where
+# those plugins put the copies.
+pv_body_count() { python3 - "$OUT/pv_body" "$1" <<'PYEOF'
+import re, sys
+html = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+m = re.search(r'<div[^>]*class="[^"]*entry-content[^"]*"[^>]*>(.*?)</div>', html, re.S)
+if m:
+    scope = m.group(1)
+else:
+    scope = re.sub(r'<(script|title)\b.*?</\1>|<meta\b[^>]*>', '', html, flags=re.S | re.I)
+print(scope.count(sys.argv[2]))
+PYEOF
+}
 docker compose exec -T cli wp option delete gmcp_preview_links >/dev/null 2>&1
 
 PV_A=$(docker compose exec -T cli wp post create --post_status=draft --post_title="PV alpha" --post_content="PVMARK-ALPHA" --porcelain 2>/dev/null | tr -d '\r\n')
@@ -3232,7 +3364,7 @@ check "stored state: the token itself is not in the row" "$(pv_stored | grep -c 
 check "control: that grep finds a token in text that holds it" "$(echo "x$PV_TOKEN" | grep -c "$PV_TOKEN")" "1"
 
 check "the draft shows with its token" "$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_TOKEN")" "200"
-check "...and the body is the draft" "$(grep -c PVMARK-ALPHA "$OUT/pv_body")" "1"
+check "...and the body is the draft" "$(pv_body_count PVMARK-ALPHA)" "1"
 check "without the token the same URL is a 404" "$(pv_status "/?p=$PV_A&post_type=post")" "404"
 check "...and shows nothing" "$(grep -c PVMARK-ALPHA "$OUT/pv_body")" "0"
 check "the token does not open another draft" "$(pv_status "/?p=$PV_B&post_type=post&gmcp_preview=$PV_TOKEN")" "404"
@@ -3313,6 +3445,76 @@ check "stored state: and the store is empty" "$(pv_posts)" ""
 kcall pv_make4 "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":416,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
 PV_LAST=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_make4)
 
+# A token is shown once and never again, to anyone. Three keys of different strength each make a
+# link and open it, and then every place the plugin writes to, and every tool that reads, is
+# searched for those exact tokens. The creation replies are the control: they DO hold their
+# token, so a zero below is a probe that can see one. (The 40-hex shape is not searched across
+# the whole options table: other plugins store 40-hex values there, so only this plugin's own
+# stores are asked about the shape.)
+K_PV_DO=$(docker compose exec -T cli wp eval '$a=GMCP_Tokens::create("Preview drafts-only","readwrite",0,[],0,true);echo $a["secret"];' 2>/dev/null | tr -d '\r\n')
+case "$K_PV_DO" in gmcp_*) ;; *) echo "  FAIL  could not mint the drafts-only key for the preview-token block"; fail=$((fail+1));; esac
+PV_DBG_WAS=$(docker compose exec -T cli wp eval 'echo empty( get_option( "gmcp_options", [] )["mcp_debug_mode"] ) ? "off" : "on";' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_debug_mode"]=true;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_preview_links >/dev/null 2>&1
+kcall pv_t_rw "$K_PV_RW" "{\"jsonrpc\":\"2.0\",\"id\":470,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+kcall pv_t_do "$K_PV_DO" "{\"jsonrpc\":\"2.0\",\"id\":471,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_A}}}"
+call pv_t_adm "{\"jsonrpc\":\"2.0\",\"id\":472,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_create_preview_link\",\"arguments\":{\"post_id\":$PV_B}}}"
+check "a drafts-only key can make a link for a draft" "$(verdict pv_t_do)" "ok"
+PV_T1=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_t_rw)
+PV_T2=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_t_do)
+PV_T3=$(py "import json,re,sys;t=json.load(sys.stdin)['result']['content'][0]['text'];print(re.search(r'gmcp_preview=([a-f0-9]{40})',t).group(1))" pv_t_adm)
+check "control: three tokens were extracted" "${#PV_T1}${#PV_T2}${#PV_T3}" "404040"
+check "control: each token opens its post (the opening is part of the run being searched)" \
+  "$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_T1")-$(pv_status "/?p=$PV_A&post_type=post&gmcp_preview=$PV_T2")-$(pv_status "/?p=$PV_B&post_type=post&gmcp_preview=$PV_T3")" "200-200-200"
+for who in rw do adm; do
+  case $who in rw) key="$K_PV_RW";; do) key="$K_PV_DO";; adm) key="$TOK";; esac
+  kcall "pv_lc_$who" "$key" '{"jsonrpc":"2.0","id":473,"method":"tools/call","params":{"name":"wp_list_changes","arguments":{"limit":200}}}'
+  kcall "pv_ga_$who" "$key" '{"jsonrpc":"2.0","id":474,"method":"tools/call","params":{"name":"wp_get_audit_log","arguments":{"limit":500}}}'
+  kcall "pv_go_$who" "$key" '{"jsonrpc":"2.0","id":475,"method":"tools/call","params":{"name":"wp_get_option","arguments":{"key":"gmcp_preview_links","raw":true}}}'
+done
+check "control: wp_list_changes answers for all three keys" "$(verdict pv_lc_rw)-$(verdict pv_lc_do)-$(verdict pv_lc_adm)" "ok-ok-ok"
+check "a write-level key cannot read the audit log" "$(verdict pv_ga_rw)" "error"
+check "a drafts-only key cannot read the audit log" "$(verdict pv_ga_do)" "error"
+check "control: an admin key can, and the log holds the link-making calls" "$(verdict pv_ga_adm)-$(grep -c 'wp_create_preview_link' "$OUT/pv_ga_adm" | awk '{print ($1>0)?"yes":"no"}')" "ok-yes"
+check "no key can read the stored link table through the option tool" "$(verdict pv_go_rw)-$(verdict pv_go_do)-$(verdict pv_go_adm)" "error-error-error"
+PV_REPLY_HITS=0
+for f in pv_lc_rw pv_lc_do pv_lc_adm pv_ga_rw pv_ga_do pv_ga_adm pv_go_rw pv_go_do pv_go_adm; do
+  PV_REPLY_HITS=$((PV_REPLY_HITS + $(grep -c -e "$PV_T1" -e "$PV_T2" -e "$PV_T3" "$OUT/$f")))
+done
+check "no token in the reply of wp_list_changes, wp_get_audit_log or wp_get_option, for any of the three keys" "$PV_REPLY_HITS" "0"
+check "control: the same grep finds the token in the reply that created it" \
+  "$(grep -c -e "$PV_T1" "$OUT/pv_t_rw")$(grep -c -e "$PV_T2" "$OUT/pv_t_do")$(grep -c -e "$PV_T3" "$OUT/pv_t_adm")" "111"
+PV_SCAN=$(docker compose exec -T cli wp eval '
+  global $wpdb;
+  $tokens = explode( " ", "'"$PV_T1 $PV_T2 $PV_T3"'" );
+  $n = static function ( string $h ) use ( $tokens ) { $c = 0; foreach ( $tokens as $t ) { $c += substr_count( $h, $t ); } return $c; };
+  $hex = static function ( string $h ) { return (int) preg_match_all( "/(?<![a-f0-9])[a-f0-9]{40}(?![a-f0-9])/", $h ); };
+  $audit = ""; foreach ( $wpdb->get_results( "SELECT * FROM {$wpdb->prefix}gmcp_audit", ARRAY_A ) as $r ) { $audit .= wp_json_encode( $r ) . "\n"; }
+  $opts = ""; foreach ( $wpdb->get_results( "SELECT option_name, option_value FROM {$wpdb->options}" ) as $r ) { $opts .= $r->option_name . "\n" . $r->option_value . "\n"; }
+  $meta = ""; foreach ( $wpdb->get_results( "SELECT meta_key, meta_value FROM {$wpdb->postmeta}" ) as $r ) { $meta .= $r->meta_key . "\n" . $r->meta_value . "\n"; }
+  $journal = serialize( get_option( "gmcp_journal", [] ) );
+  $links = serialize( get_option( "gmcp_preview_links", [] ) );
+  $dbg = (string) ini_get( "error_log" ); $dbg = $dbg !== "" && is_readable( $dbg ) ? (string) file_get_contents( $dbg ) : "";
+  $hashes = 0; foreach ( $tokens as $t ) { $hashes += isset( ( (array) get_option( "gmcp_preview_links", [] ) )[ hash( "sha256", $t ) ] ) ? 1 : 0; }
+  echo implode( "|", [ $n( $audit ), $hex( $audit ), $n( $journal ), $hex( $journal ), $n( $opts ), $n( $meta ), $n( $links ), $hex( $links ), $n( $dbg ), $hex( $dbg ), $hashes, substr_count( $audit, "wp_create_preview_link" ), substr_count( $dbg, "wp_create_preview_link" ) ] );' 2>/dev/null | tr -d '\r\n')
+IFS='|' read -r S_AUDIT S_AUDIT_HEX S_JOURNAL S_JOURNAL_HEX S_OPTS S_META S_LINKS S_LINKS_HEX S_DBG S_DBG_HEX S_HASHES S_AUDIT_CALLS S_DBG_CALLS <<< "$PV_SCAN"
+check "control: the scan ran (it counted the audit rows that made the links)" "$([ "${S_AUDIT_CALLS:-0}" -ge 3 ] && echo yes || echo no)" "yes"
+check "control: the stored table holds the SHA-256 of each of the three tokens (the probe finds a link by its hash)" "${S_HASHES:-x}" "3"
+check "stored state: no token in any column of any audit row" "${S_AUDIT:-x}" "0"
+check "stored state: no 40-hex value in the audit table at all" "${S_AUDIT_HEX:-x}" "0"
+check "stored state: no token in the change journal" "${S_JOURNAL:-x}" "0"
+check "stored state: no 40-hex value in the change journal" "${S_JOURNAL_HEX:-x}" "0"
+check "stored state: no token anywhere in the options table (the journal and the link table included)" "${S_OPTS:-x}" "0"
+check "stored state: no token in post meta" "${S_META:-x}" "0"
+check "stored state: the link table holds hashes only (no token, no 40-hex value)" "${S_LINKS:-x}/${S_LINKS_HEX:-x}" "0/0"
+if [ "${S_DBG_CALLS:-0}" -ge 1 ]; then
+  check "stored state: no token in the debug log, which printed these calls" "${S_DBG}/${S_DBG_HEX}" "0/0"
+else
+  echo "  ....  debug-log half not checked: the debug log holds none of these calls (no writable error_log file on this stack)"
+fi
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_debug_mode"]='"$([ "$PV_DBG_WAS" = on ] && echo true || echo false)"';update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+docker compose exec -T cli wp option delete gmcp_preview_links >/dev/null 2>&1
+
 # Fetch policy. The refusals are deterministic and need no network.
 fetch_verdict() { # fetch_verdict <url> -> "refused" when the POLICY refused, "admitted" otherwise
   call pv_f "{\"jsonrpc\":\"2.0\",\"id\":420,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_fetch_page\",\"arguments\":{\"url\":\"$1\"}}}"
@@ -3383,6 +3585,94 @@ if [ "${PV_DIRECT%%|*}" = "200" ]; then
   check "a site configured to proxy its own host (WP_PROXY_HOST) is refused, not routed around" "$PV_WPPROXY" "refused"
 else
   echo "  ....  proxy bypass not checked: the site could not fetch its own front page here (${PV_DIRECT})"
+fi
+
+# The transport. Only cURL can pin, so when WordPress would use another transport the tool must
+# refuse BEFORE a request is made, not send it unpinned and throw the answer away. Two ways to
+# change the transport are exercised: Requests' public transport cache, and an action that sets
+# the transport for one request. The recording transport counts how often it was asked to send;
+# the control forces the same transport onto an ordinary request and must see it counted, or a
+# zero below could be a probe that cannot see anything.
+PV_TRANSPORT=$(docker compose exec -T cli wp eval '
+  if ( ! class_exists( "WpOrg\\Requests\\Requests" ) ) { echo "skip"; return; }
+  class H4Rec implements \WpOrg\Requests\Transport {
+    public static $n = 0;
+    public function request( $url, $headers = [], $data = [], $options = [] ) { self::$n++; return ( new \WpOrg\Requests\Transport\Fsockopen() )->request( $url, $headers, $data, $options ); }
+    public function request_multiple( $requests, $options ) { self::$n++; return []; }
+    public static function test( $capabilities = [] ) { return true; }
+  }
+  $force = static function ( &$url, &$headers, &$data, &$type, &$options ) { $options["transport"] = "H4Rec"; };
+  add_action( "requests-requests.before_request", $force, 10, 5 );
+  wp_remote_get( home_url( "/" ), [ "timeout" => 3 ] );
+  $control = H4Rec::$n;
+  H4Rec::$n = 0;
+  global $gmcp_core;
+  $t = new GMCP_Tools_Diagnostics( $gmcp_core );
+  $r = $t->handle_call( null, "wp_fetch_page", [ "url" => home_url( "/" ) ], 1 );
+  $hook_n = H4Rec::$n;
+  $hook_err = ! empty( $r["result"]["isError"] ) && strpos( (string) $r["result"]["content"][0]["text"], "not cURL" ) !== false ? "refused" : "not-refused";
+  remove_action( "requests-requests.before_request", $force, 10 );
+  \WpOrg\Requests\Requests::$transport = [ serialize( [ "ssl" => false ] ) => "WpOrg\\Requests\\Transport\\Fsockopen", serialize( [ "ssl" => true ] ) => "WpOrg\\Requests\\Transport\\Fsockopen" ];
+  $handed = 0;
+  add_filter( "pre_http_request", static function ( $pre ) use ( &$handed ) { $handed++; return $pre; } );
+  $r = $t->handle_call( null, "wp_fetch_page", [ "url" => home_url( "/" ) ], 1 );
+  $cache_err = ! empty( $r["result"]["isError"] ) && strpos( (string) $r["result"]["content"][0]["text"], "not cURL" ) !== false ? "refused" : "not-refused";
+  echo $control . "|" . $hook_n . "|" . $hook_err . "|" . $handed . "|" . $cache_err;' 2>/dev/null | tr -d '\r\n')
+if [ "$PV_TRANSPORT" = "skip" ]; then
+  echo "  ....  transport check not run: this WordPress has no WpOrg\\Requests"
+else
+  IFS='|' read -r PV_T_CONTROL PV_T_HOOKN PV_T_HOOKERR PV_T_HANDED PV_T_CACHEERR <<< "$PV_TRANSPORT"
+  check "control: a request forced onto the recording transport is counted by it" "$([ "${PV_T_CONTROL:-0}" -ge 1 ] && echo yes || echo no)" "yes"
+  check "a transport swapped in by an action: the tool refuses" "$PV_T_HOOKERR" "refused"
+  check "...and that transport was never asked to send" "$PV_T_HOOKN" "0"
+  check "the transport cache set to a non-cURL transport: the tool refuses" "$PV_T_CACHEERR" "refused"
+  check "...before the HTTP API was handed a request at all" "$PV_T_HANDED" "0"
+fi
+
+# The pin must not depend on the URL string. The HTTP library upper-cases percent escapes before
+# the request hooks run, so a guard that compared the URL it was handed with the one that was
+# checked was skipped for any lowercase escape, and a transport forced to something other than
+# cURL then SENT the request; only the reply was discarded afterwards. The recording transport
+# below really sends (through fsockopen), so a count of 1 is a request that reached the site. The
+# plain path is the control: it has always been refused, and the forced-transport control shows
+# the probe counts a sent request. The cURL leg proves the fix did not stop the ordinary
+# lowercase-escape fetch.
+PV_ESC=$(docker compose exec -T cli wp eval '
+  if ( ! class_exists( "WpOrg\\Requests\\Requests" ) ) { echo "skip"; return; }
+  class F3Rec implements \WpOrg\Requests\Transport {
+    public static $n = 0;
+    public function request( $url, $headers = [], $data = [], $options = [] ) { self::$n++; return ( new \WpOrg\Requests\Transport\Fsockopen() )->request( $url, $headers, $data, $options ); }
+    public function request_multiple( $requests, $options ) { self::$n++; return []; }
+    public static function test( $capabilities = [] ) { return true; }
+  }
+  global $gmcp_core;
+  $t = new GMCP_Tools_Diagnostics( $gmcp_core );
+  $fetch = static function ( $path ) use ( $t ) {
+    $r = $t->handle_call( null, "wp_fetch_page", [ "url" => home_url( $path ) ], 1 );
+    return (string) ( $r["result"]["content"][0]["text"] ?? "" );
+  };
+  $out = [];
+  $j = json_decode( $fetch( "/caf%c3%a9-probe/" ), true );
+  $out[] = is_array( $j ) ? ( $j["connection"] ?? "-" ) : "error";
+  $force = static function ( &$url, &$headers, &$data, &$type, &$options ) { $options["transport"] = "F3Rec"; };
+  add_action( "requests-requests.before_request", $force, 10, 5 );
+  wp_remote_get( home_url( "/f3-control-probe/" ), [ "timeout" => 3 ] );
+  $out[] = F3Rec::$n;
+  foreach ( [ "/f3-plain-probe/", "/caf%c3%a9-f3-probe/", "/caf%c3%a9-%e2%82%ac-f3/?q=%c3%a9&r=%C3%A9" ] as $path ) {
+    F3Rec::$n = 0;
+    $txt = $fetch( $path );
+    $out[] = F3Rec::$n . ":" . ( strpos( $txt, "Nothing was sent" ) !== false ? "refused" : "other" );
+  }
+  echo implode( "|", $out );' 2>/dev/null | tr -d '\r\n')
+if [ "$PV_ESC" = "skip" ]; then
+  echo "  ....  escape-spelling pin check not run: this WordPress has no WpOrg\\Requests"
+else
+  IFS='|' read -r PV_E_CURL PV_E_CONTROL PV_E_PLAIN PV_E_LOWER PV_E_MIXED <<< "$PV_ESC"
+  check "control: the probe transport counts a request that is really sent" "$([ "${PV_E_CONTROL:-0}" -ge 1 ] && echo yes || echo no)" "yes"
+  check "with the cURL transport a lowercase escape is still fetched, pinned" "$PV_E_CURL" "direct (no proxy), pinned to the address that was checked"
+  check "a plain path on a non-cURL transport: refused, nothing sent" "$PV_E_PLAIN" "0:refused"
+  check "a lowercase percent escape on a non-cURL transport: refused, nothing sent" "$PV_E_LOWER" "0:refused"
+  check "mixed-case escapes in path and query on a non-cURL transport: refused, nothing sent" "$PV_E_MIXED" "0:refused"
 fi
 
 # The error log tool.
@@ -3838,6 +4128,49 @@ if grep -q wordpress_logged_in "$AP_JAR"; then
   check "CONTROL: the audit scan does see a harmless argument of the same call" "$(leaked_audit ap@example.test)" "1"
   ap_decide decline "$AP_R7"
   check "(cleanup) the user request is declined" "$(ap_status "$AP_R7")" "declined"
+
+  echo "   -- a credential written into free text is not shown either --"
+  # The field name here is innocent ("value") and the text is a tagline with a wp-config line in
+  # it: the structural tests pass it, the audit log's text test blanks it, and the queue used to
+  # store and print it. The control is an ordinary tagline, which must be shown in full.
+  AP_SECRET_TXT="Our tagline. define('DB_PASSWORD', 'Hunter2-rv3-secret');"
+  AP_PLAIN_TXT="Our ordinary tagline about passwords and keys"
+  # The tagline as it stands now, read rather than assumed: earlier blocks in a whole-suite run leave
+  # their own value in it, so a fixed expectation passes only when this block is run alone.
+  AP_DESC_BEFORE=$(ap_eval 'echo get_option("blogdescription");')
+  ap_call ap_ft1 wp_update_option "{\"key\":\"blogdescription\",\"value\":\"Our tagline. define('DB_PASSWORD', 'Hunter2-rv3-secret');\"}"
+  AP_R8=$(ap_rid ap_ft1)
+  ap_call ap_ft2 wp_update_option "{\"key\":\"blogdescription\",\"value\":\"$AP_PLAIN_TXT\"}"
+  AP_R9=$(ap_rid ap_ft2)
+  check "both calls are held" "$(ap_state ap_ft1)/$(ap_state ap_ft2)" "awaiting_human_approval/awaiting_human_approval"
+  check "CONTROL: the stored view of the ordinary tagline holds it in full" \
+    "$(ap_q 'SELECT args_view LIKE \"%'"$AP_PLAIN_TXT"'%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R9")" "1"
+  check "CONTROL: ...and it lists nothing as hidden" "$(ap_q 'SELECT args_redacted FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R9")" "[]"
+  check "the stored view of the credential-bearing tagline does not hold the secret" \
+    "$(ap_q 'SELECT args_view LIKE \"%Hunter2-rv3-secret%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8")" "0"
+  # Only the secret itself is hidden now. The whole string used to be replaced, which let a decoy that
+  # merely looked like a credential make any argument unreadable to the person approving it, so the
+  # words around the secret stay readable and the view says that something is hidden and how many.
+  check "  the words around it stay readable (the tagline and the constant's NAME)" \
+    "$(ap_q 'SELECT args_view LIKE \"%Our tagline.%\" AND args_view LIKE \"%DB_PASSWORD%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8")" "1"
+  check "  and the view says one value is hidden in it" \
+    "$(ap_q 'SELECT args_view LIKE \"%[hidden values present: 1]%\" FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8")" "1"
+  check "  and lists the value as hidden" "$(ap_q 'SELECT args_redacted FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8")" '["value"]'
+  check "the approval is still bound to the real arguments (the keyed hash covers the secret)" \
+    "$(ap_eval 'global $wpdb; $m=(string)$wpdb->get_var("SELECT args_mac FROM {$wpdb->prefix}gmcp_approvals WHERE id='"$AP_R8"'");
+      $a=["key"=>"blogdescription","value"=>"Our tagline. define('"'"'DB_PASSWORD'"'"', '"'"'Hunter2-rv3-secret'"'"');"];
+      echo $m === hash_hmac("sha256","wp_update_option\x1f".GMCP_Approvals::canonical_json($a),wp_salt("auth")) ? "bound" : "DIFFERENT";')" "bound"
+  AP_PAGE=$(curl -sS -b "$AP_JAR" "$BASE/wp-admin/admin.php?page=guarded-mcp-approvals" 2>/dev/null)
+  check "CONTROL: the page shows the ordinary tagline" "$([ "$(printf '%s' "$AP_PAGE" | grep -c "$AP_PLAIN_TXT")" -ge 1 ] && echo yes || echo no)" "yes"
+  check "the page does not show the secret" "$(printf '%s' "$AP_PAGE" | grep -c 'Hunter2-rv3-secret')" "0"
+  check "the page says a value is hidden yet part of the approval, and names it" \
+    "$(printf '%s' "$AP_PAGE" | grep -c 'is still part of what you approve:</strong> &quot;value&quot;')" "1"
+  check "the audit log does not hold the secret" "$(leaked_audit Hunter2-rv3-secret)" "0"
+  check "the option was not written by a held call" "$(ap_eval 'echo get_option("blogdescription");')" "$AP_DESC_BEFORE"
+  check "CONTROL: the value read before the held calls is one the suite set (the probe reads a real value)" "$([ -n "$AP_DESC_BEFORE" ] && echo set || echo empty)" "set"
+  ap_decide decline "$AP_R8"
+  ap_decide decline "$AP_R9"
+  check "(cleanup) both requests are declined" "$(ap_status "$AP_R8")/$(ap_status "$AP_R9")" "declined/declined"
 
   echo "   -- an account the agent made cannot approve for the agent --"
   # The attack: with the mode at "deletes" an admin key created an administrator with a

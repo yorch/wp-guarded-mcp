@@ -53,6 +53,13 @@ if ( !defined( 'ABSPATH' ) ) {
 * because the name check is not enough: woocommerce_stripe_settings is an innocuous name
 * holding a live secret_key, and matching only on the name would journal it in full.
 *
+* The same goes for free text. A post body is prose, and a settings snippet or a pasted
+* wp-config line inside it names no field, so field names alone passed it. Every kind now
+* also asks GMCP_Credential_Scan about the strings it would keep, and a post field that
+* fails is left out of the entry and named in redacted_fields: the rest of the edit stays
+* undoable and nothing is stored in the field's place, because an undo would write a
+* placeholder over live content.
+*
 * This is a heuristic and it is not retroactive. A site that adds an option to
 * gmcp_protected_options later gets a correct refusal at revert time, but the plaintext
 * already recorded stays in the row until the log rolls past it. Clear the journal after
@@ -215,6 +222,14 @@ class GMCP_Journal {
       return;
     }
     $kind = (string) ( $change['kind'] ?? '' );
+    // A record whose values were withheld (a post that is, or was before this write, part of a
+    // form submission's tree) holds markers where the previous values were. Recording one
+    // would offer an undo that writes the markers over the post, and the post may no longer
+    // look like a submission's now, so the current state cannot be what decides this.
+    // @see GMCP_Changes::withhold_personal_data()
+    if ( !empty( $change['withheld'] ) ) {
+      return;
+    }
     if ( $kind === 'meta' ) {
       $this->observe_meta( $change );
     }
@@ -269,7 +284,7 @@ class GMCP_Journal {
       self::record( [
         'kind' => 'option',
         'key' => $key,
-        'what' => "Option \"{$key}\" created",
+        'what' => 'Option "' . self::label( $key, 120 ) . '" created',
         'previous' => null,
         'absent' => true,
         'tool' => (string) ( $change['tool'] ?? '' ),
@@ -291,11 +306,13 @@ class GMCP_Journal {
     $entry = [
       'kind' => 'option',
       'key' => $key,
-      'what' => "Option \"{$key}\" changed",
+      'what' => 'Option "' . self::label( $key, 120 ) . '" changed',
       'tool' => (string) ( $change['tool'] ?? '' ),
       'call' => (string) ( $change['call'] ?? '' ),
     ];
-    if ( GMCP_Core::holds_credential( $old ) ) {
+    // The budget is asked first: holds_credential() walks the whole value, and a value too large to
+    // be read is one that is not kept, whatever the walk would have said.
+    if ( !GMCP_Credential_Scan::within_budget( $old ) || GMCP_Core::holds_credential( $old ) || GMCP_Credential_Scan::holds( $old ) ) {
       // Keep the shape with the secret-looking leaves blanked, rather than dropping the
       // value whole. Dropping was costing every option that merely contains a field named
       // key, author or password-something its undo, which on an Elementor build is most of
@@ -360,7 +377,7 @@ class GMCP_Journal {
       'ID' => $post_id,
       'key' => $meta_key,
       'what' => ucfirst( (string) ( $change['subject'] ?? 'post' ) ) . ' "'
-        . mb_substr( (string) ( $change['label'] ?? '' ), 0, 60 ) . '" custom field "'
+        . self::label( (string) ( $change['label'] ?? '' ) ) . '" custom field "'
         . $meta_key . '" ' . $verb,
       'absent' => empty( $change['existed'] ),
       'tool' => (string) ( $change['tool'] ?? '' ),
@@ -406,8 +423,7 @@ class GMCP_Journal {
   private static function meta_body( array $entry, $previous ): array {
     $post_id = (int) $entry['ID'];
     $meta_key = (string) $entry['key'];
-    if ( GMCP_Core::field_looks_secret( $meta_key )
-      || GMCP_Core::holds_credential( $previous, 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+    if ( GMCP_Core::field_looks_secret( $meta_key ) || self::unsafe_to_keep( $previous ) ) {
       $entry['redacted'] = true;
       return $entry;
     }
@@ -488,13 +504,12 @@ class GMCP_Journal {
         'kind' => 'themod',
         'row' => $row,
         'key' => $one['key'],
-        'what' => 'Theme setting "' . mb_substr( $one['key'], 0, 60 ) . '" of "' . mb_substr( $theme, 0, 60 ) . '" ' . $verb,
+        'what' => 'Theme setting "' . self::label( (string) $one['key'], 60 ) . '" of "' . self::label( (string) $theme, 60 ) . '" ' . $verb,
         'absent' => $one['absent'],
         'tool' => (string) ( $change['tool'] ?? '' ),
         'call' => (string) ( $change['call'] ?? '' ),
       ];
-      if ( GMCP_Core::field_looks_secret( $one['key'] )
-        || GMCP_Core::holds_credential( $one['from'], 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+      if ( GMCP_Core::field_looks_secret( $one['key'] ) || self::unsafe_to_keep( $one['from'] ) ) {
         // The same two tests as a meta value. The key is not restorable and says why; the
         // rest of the row is unaffected, which the whole-row entry could not offer.
         $entry['redacted'] = true;
@@ -570,12 +585,12 @@ class GMCP_Journal {
       'ID' => (int) ( $change['id'] ?? 0 ),
       'taxonomy' => $taxonomy,
       'what' => ucfirst( (string) ( $change['subject'] ?? 'term' ) ) . ' "'
-        . mb_substr( (string) ( $change['label'] ?? '' ), 0, 60 ) . '" changed: ' . implode( ', ', $fields ),
+        . self::label( (string) ( $change['label'] ?? '' ) ) . '" changed: ' . implode( ', ', $fields ),
       'fields' => $fields,
       'tool' => (string) ( $change['tool'] ?? '' ),
       'call' => (string) ( $change['call'] ?? '' ),
     ];
-    if ( GMCP_Core::holds_credential( $previous, 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+    if ( self::unsafe_to_keep( $previous ) ) {
       $entry['redacted'] = true;
     }
     else {
@@ -591,12 +606,19 @@ class GMCP_Journal {
     if ( ( $change['op'] ?? '' ) !== 'updated' || $taxonomy === '' || !isset( $pair['from'] ) ) {
       return;
     }
+    // A record about a form submission reaches this point with its values withheld, and what
+    // is left in 'from' is not a list of term ids: recording it would offer an undo that sets
+    // a submission's terms to nothing. Only that case is refused here. A commerce post stays
+    // recorded, so the undo path's own guard answers for it with its reason.
+    if ( GMCP_Core::personal_data_post_guard( (int) ( $change['id'] ?? 0 ) ) !== true ) {
+      return;
+    }
     self::record( [
       'kind' => 'termrel',
       'ID' => (int) ( $change['id'] ?? 0 ),
       'taxonomy' => $taxonomy,
       'what' => ucfirst( (string) ( $change['subject'] ?? 'post' ) ) . ' "'
-        . mb_substr( (string) ( $change['label'] ?? '' ), 0, 60 ) . '" terms in "' . $taxonomy . '" changed',
+        . self::label( (string) ( $change['label'] ?? '' ) ) . '" terms in "' . $taxonomy . '" changed',
       'previous' => self::storable( array_values( array_map( 'intval', (array) $pair['from'] ) ) ),
       'tool' => (string) ( $change['tool'] ?? '' ),
       'call' => (string) ( $change['call'] ?? '' ),
@@ -625,14 +647,21 @@ class GMCP_Journal {
       'kind' => 'post',
       'ID' => (int) ( $change['id'] ?? 0 ),
       'what' => ucfirst( (string) ( $change['subject'] ?? 'post' ) ) . ' "'
-        . mb_substr( (string) ( $change['label'] ?? '' ), 0, 60 ) . '" changed: ' . implode( ', ', $changed ),
+        . self::label( (string) ( $change['label'] ?? '' ) ) . '" changed: ' . implode( ', ', $changed ),
       'fields' => $changed,
       'previous' => [],
       'tool' => (string) ( $change['tool'] ?? '' ),
       'call' => (string) ( $change['call'] ?? '' ),
     ];
+    $values = [];
     foreach ( $change['fields'] as $field => $pair ) {
-      $entry['previous'][ $field ] = self::storable( $pair['from'] ?? null );
+      $values[ $field ] = $pair['from'] ?? null;
+    }
+    [ $entry['previous'], $dropped ] = self::post_previous( $values );
+    if ( $dropped ) {
+      // Named, so the listing and the refusal can say which part was never recorded. The
+      // value is not here and is not anywhere else in the entry.
+      $entry['redacted_fields'] = $dropped;
     }
     if ( self::oversized( $entry['previous'] ) ) {
       $entry['note'] = 'Part of the previous version was too large to keep, so reverting will restore only what fits.';
@@ -680,6 +709,70 @@ class GMCP_Journal {
     return $out;
   }
 
+  /**
+  * A title or name as it may appear in an entry's "what" line: cut to length, and withheld
+  * when it is itself credential-shaped. The line is shown by wp_list_changes and copied
+  * into the next undo's own line, and a post title is the one piece of free text it quotes.
+  */
+  private static function label( string $text, int $len = 60 ): string {
+    $cut = mb_substr( $text, 0, $len );
+    // The wider test (GMCP_Core::looks_credentialed()), not the scanner alone. A title of
+    // "smtp_pwd=hunter" was quoted in the entry, and wp_list_changes is a read-level tool.
+    // Over-redacting a label is the cheap direction. This is NOT how the journal decides whether
+    // to keep a value for undo (unsafe_to_keep() is, and stays, the precise scanner): a value it
+    // refuses to keep is a value it cannot put back.
+    return GMCP_Core::looks_credentialed( $cut ) ? '[redacted]' : $cut;
+  }
+
+  /**
+  * A whole "what" line as it may be stored and shown: itself, or a plain sentence when it holds
+  * something credential-shaped.
+  *
+  * Applied when an entry is recorded (so an undo's "Undo of: ..." line, which copies the original's,
+  * cannot carry one forward) and again when entries are listed, because a stored entry outlives
+  * the code that wrote it: one recorded before the label was checked this way can still name a
+  * post by a title that is a credential.
+  */
+  private static function safe_what( string $what ): string {
+    return GMCP_Core::looks_credentialed( $what ) ? 'A change whose description held something credential-shaped (withheld).' : $what;
+  }
+
+  /**
+  * Whether a value is unsafe to keep a copy of: a secret-named field anywhere in it, or free
+  * text carrying one (a pasted wp-config line, a JSON snippet, an Authorization header).
+  *
+  * The one question every kind asks of a value it is about to store. holds_credential() alone
+  * judges names and opens only values that BEGIN as JSON or serialized data, so a post body
+  * with {"api_key":"..."} in the middle of it was copied whole. @see GMCP_Credential_Scan.
+  */
+  private static function unsafe_to_keep( $value ): bool {
+    return GMCP_Credential_Scan::holds( $value );
+  }
+
+  /**
+  * Post fields split into what may be kept and what may not.
+  *
+  * Per field, so one credential-shaped body does not take the title's undo with it, and so the
+  * thing dropped is dropped and never replaced: a placeholder stored in `previous` would be
+  * written over live content by the undo, which is the failure the option path's refill()
+  * exists to prevent. A field left out of `previous` is simply not restored.
+  *
+  * @param array $values field => value
+  * @return array{0:array,1:string[]} [ what may be kept, the names of the fields that were dropped ]
+  */
+  private static function post_previous( array $values ): array {
+    $keep = [];
+    $dropped = [];
+    foreach ( $values as $field => $value ) {
+      if ( self::unsafe_to_keep( $value ) ) {
+        $dropped[] = (string) $field;
+        continue;
+      }
+      $keep[ $field ] = self::storable( $value );
+    }
+    return [ $keep, $dropped ];
+  }
+
   /** Big previous values are described rather than copied, so the option stays small. */
   private static function storable( $value ) {
     $size = strlen( maybe_serialize( $value ) );
@@ -705,6 +798,9 @@ class GMCP_Journal {
 
   private static function record( array $entry ): void {
     $entry['t'] = time();
+    if ( isset( $entry['what'] ) ) {
+      $entry['what'] = self::safe_what( (string) $entry['what'] );
+    }
     $entry['tool'] = (string) ( $entry['tool'] ?? '' );
     $entry['call'] = (string) ( $entry['call'] ?? GMCP_Changes::call_id() );
     // Minted here unless the caller already has one. A meta entry writes its snapshot row
@@ -740,6 +836,15 @@ class GMCP_Journal {
     $log = is_array( $log ) ? $log : [];
     $out = [];
     foreach ( array_slice( array_reverse( $log ), 0, $limit ) as $entry ) {
+      // An entry written before records about form submissions were withheld names the post by
+      // its title, which is the visitor's subject line. Rewritten on the way out rather than
+      // trusted to have been written clean, because the stored row outlives the code that
+      // wrote it.
+      $what = self::safe_what( (string) ( $entry['what'] ?? '' ) );
+      if ( in_array( $entry['kind'] ?? '', [ 'post', 'meta', 'termrel' ], true ) && !empty( $entry['ID'] )
+        && GMCP_Core::personal_data_post_guard( (int) $entry['ID'] ) !== true ) {
+        $what = 'A form submission (#' . (int) $entry['ID'] . ') was changed. Its title and values are not shown.';
+      }
       $row = [
         'id' => $entry['id'] ?? '',
         'when' => gmdate( 'Y-m-d H:i', (int) ( $entry['t'] ?? 0 ) ) . ' GMT',
@@ -747,7 +852,7 @@ class GMCP_Journal {
         // Entries sharing a call came from one tool call. A page build writes several
         // things and they read as unrelated events without this.
         'call' => $entry['call'] ?? '',
-        'what' => $entry['what'] ?? '',
+        'what' => $what,
         'reversible' => self::reversible( $entry ) === true,
       ];
       // An undo is an entry too. Naming what it reversed is what lets a caller see that
@@ -762,7 +867,7 @@ class GMCP_Journal {
       // Said out loud rather than left to be discovered. "Reversible" on its own would
       // promise a restore this entry cannot give, and a caller deciding whether to undo
       // needs to know the credential-shaped fields will stay as they are.
-      elseif ( !empty( $entry['partly_redacted'] ) ) {
+      elseif ( !empty( $entry['partly_redacted'] ) || !empty( $entry['redacted_fields'] ) ) {
         $row['partial_restore'] = 'Fields that looked like credentials were never recorded. '
           . 'Everything else goes back; those are left exactly as they are now.';
       }
@@ -815,7 +920,7 @@ class GMCP_Journal {
     if ( $why !== true ) {
       return $why;
     }
-    if ( isset( $entry['after_state'] ) && self::state_of( $entry ) !== $entry['after_state'] ) {
+    if ( isset( $entry['after_state'] ) && !self::state_matches( $entry ) ) {
       return 'It has changed since that undo was made, so putting the earlier copy back would discard the newer change. Read the current value and make the edit again if it is still wanted.';
     }
     return true;
@@ -833,6 +938,9 @@ class GMCP_Journal {
   * types it knows, and undoable_post() says no for anything this journal does not record.
   */
   private static function not_journalled_refusal( int $post_id ): string {
+    if ( GMCP_Core::personal_data_post_guard( $post_id ) !== true ) {
+      return 'It belongs to a form submission, personal data this journal neither shows nor restores: the previous values of such a post are not kept, and an entry written before that was the case is not put back either.';
+    }
     return 'It belongs to a ' . self::post_type_label( $post_id ) . ', which the generic post tools do not write and this journal does not revert. '
       . 'Putting an order or a subscription back with a plain post write skips every status transition, stock and payment hook the shop runs, so the site and the payment gateway would disagree. '
       . 'Use the WooCommerce tools to change it.';
@@ -948,6 +1056,9 @@ class GMCP_Journal {
         if ( !self::too_large( $value ) ) {
           return true;
         }
+      }
+      if ( !empty( $entry['redacted_fields'] ) ) {
+        return 'The previous value looked like it held a credential, so it was never stored.';
       }
       return 'Every previous value was too large to keep.';
     }
@@ -1239,17 +1350,20 @@ class GMCP_Journal {
   * Not a copy of anything: a hash, so it can be stored for every kind without a size
   * budget and without a second place for a value to leak from. 'absent' is its own state.
   */
-  private static function state_of( array $entry ): string {
+  private static function state_of( array $entry, bool $legacy = false ): string {
+    $h = static function ( bool $exists, $value ) use ( $legacy ): string {
+      return self::state_hash( $exists, $value, $legacy );
+    };
     $kind = (string) ( $entry['kind'] ?? '' );
     if ( $kind === 'option' ) {
       $none = '__gmcp_absent__' . bin2hex( random_bytes( 4 ) );
       $value = get_option( (string) $entry['key'], $none );
-      return self::state_hash( $value !== $none, $value );
+      return $h( $value !== $none, $value );
     }
     if ( $kind === 'meta' ) {
       $exists = metadata_exists( 'post', (int) $entry['ID'], (string) $entry['key'] );
       if ( !$exists ) {
-        return self::state_hash( false, null );
+        return $h( false, null );
       }
       // Every row, not the first. get_post_meta( ..., true ) is one row, so a row added by
       // somebody else after an undo was invisible to the staleness check, and reverting the
@@ -1257,7 +1371,7 @@ class GMCP_Journal {
       // (entries already on record carry that hash), and several rows hash as a list under a
       // wrapper key so one row holding an array can never collide with several rows.
       $rows = (array) get_post_meta( (int) $entry['ID'], (string) $entry['key'], false );
-      return self::state_hash( true, count( $rows ) > 1 ? [ self::META_ROWS => array_values( $rows ) ] : ( $rows ? reset( $rows ) : null ) );
+      return $h( true, count( $rows ) > 1 ? [ self::META_ROWS => array_values( $rows ) ] : ( $rows ? reset( $rows ) : null ) );
     }
     if ( $kind === 'post' ) {
       $values = [];
@@ -1265,13 +1379,13 @@ class GMCP_Journal {
         $value = get_post_field( (string) $field, (int) $entry['ID'], 'raw' );
         $values[ $field ] = is_scalar( $value ) ? (string) $value : $value;
       }
-      return self::state_hash( true, $values );
+      return $h( true, $values );
     }
     if ( $kind === 'themod' ) {
       $row = get_option( (string) $entry['row'], [] );
       $row = is_array( $row ) ? $row : [];
       $key = (string) $entry['key'];
-      return self::state_hash( array_key_exists( $key, $row ), $row[ $key ] ?? null );
+      return $h( array_key_exists( $key, $row ), $row[ $key ] ?? null );
     }
     if ( $kind === 'term' ) {
       $term = get_term( (int) $entry['ID'], (string) $entry['taxonomy'] );
@@ -1282,17 +1396,53 @@ class GMCP_Journal {
       foreach ( (array) ( $entry['fields'] ?? [] ) as $field ) {
         $values[ $field ] = is_scalar( $term->$field ) ? (string) $term->$field : $term->$field;
       }
-      return self::state_hash( true, $values );
+      return $h( true, $values );
     }
     if ( $kind === 'termrel' ) {
-      return self::state_hash( true, GMCP_Changes::term_ids_of( (int) $entry['ID'], (string) $entry['taxonomy'] ) );
+      return $h( true, GMCP_Changes::term_ids_of( (int) $entry['ID'], (string) $entry['taxonomy'] ) );
     }
     return 'unknown';
   }
 
-  /** The fingerprint itself. Pure. */
-  public static function state_hash( bool $exists, $value ): string {
-    return $exists ? 'v:' . md5( serialize( $value ) ) : 'absent';
+  /**
+  * The fingerprint itself. Pure, given the site's salt.
+  *
+  * Keyed: an HMAC under wp_salt(). It used to be md5( serialize( $value ) ), unsalted, stored as
+  * after_state for an undone entry. That is a fingerprint of the live value (a stored option, a
+  * post field, a meta row) kept in a second place that anyone able to read the journal could
+  * test guesses against offline: a low-entropy value, such as a short password-like string, is
+  * confirmed by hashing candidates. The key makes the stored string useless away from this site.
+  * Truncated to 128 bits, which is ample for "did it change since" and keeps the row small.
+  *
+  * $legacy computes the old unsalted form, 'v:' and an md5, for one purpose only: an entry already
+  * on record carries that string, and state_matches() accepts it until the journal rolls past it
+  * (forty entries at most). Nothing writes it any more.
+  */
+  public static function state_hash( bool $exists, $value, bool $legacy = false ): string {
+    if ( !$exists ) {
+      return 'absent';
+    }
+    $blob = serialize( $value );
+    if ( $legacy ) {
+      return 'v:' . md5( $blob );
+    }
+    return 'h:' . substr( hash_hmac( 'sha256', $blob, wp_salt( 'auth' ) . 'gmcp-journal-state' ), 0, 32 );
+  }
+
+  /**
+  * Whether an undo entry's target is still in the state the undo left it in.
+  *
+  * Compares the keyed fingerprint. An entry recorded before the key existed holds the old md5
+  * form, and is compared in that form, so upgrading does not make every undone entry read as
+  * "changed since" and refuse to be undone again. 'absent', 'gone' and 'unknown' are plain words
+  * in both forms.
+  */
+  private static function state_matches( array $entry ): bool {
+    $stored = (string) ( $entry['after_state'] ?? '' );
+    if ( hash_equals( self::state_of( $entry ), $stored ) ) {
+      return true;
+    }
+    return strpos( $stored, 'v:' ) === 0 && hash_equals( self::state_of( $entry, true ), $stored );
   }
 
   /**
@@ -1430,7 +1580,7 @@ class GMCP_Journal {
         $redo['previous'] = null;
         $redo['absent'] = true;
       }
-      elseif ( GMCP_Core::holds_credential( $current ) ) {
+      elseif ( !GMCP_Credential_Scan::within_budget( $current ) || GMCP_Core::holds_credential( $current ) || GMCP_Credential_Scan::holds( $current ) ) {
         // What the undo is about to overwrite holds a credential. It is not copied, for the
         // reason an ordinary entry does not copy one, so this undo cannot itself be undone.
         $redo['previous'] = null;
@@ -1480,8 +1630,7 @@ class GMCP_Journal {
       $had = array_key_exists( $key, $current_row );
       $redo = [ 'kind' => 'themod', 'row' => $row, 'key' => $key, 'absent' => !$had ];
       if ( $had ) {
-        if ( GMCP_Core::field_looks_secret( $key )
-          || GMCP_Core::holds_credential( $current_row[ $key ], 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+        if ( GMCP_Core::field_looks_secret( $key ) || self::unsafe_to_keep( $current_row[ $key ] ) ) {
           $redo['redacted'] = true;
         }
         else {
@@ -1540,7 +1689,7 @@ class GMCP_Journal {
       // overwrote is whatever the term held a moment ago, which may be a credential that was
       // written after the entry being undone (observe_term() judges the value it records and
       // this is the same value one step later). Judged the same way, and not copied.
-      if ( GMCP_Core::holds_credential( $redo_previous, 0, self::SNAPSHOT_CREDENTIAL_DEPTH ) ) {
+      if ( self::unsafe_to_keep( $redo_previous ) ) {
         $redo['redacted'] = true;
         $done .= ' The value it replaced looked like it held a credential, so that is not recorded and this undo cannot be undone.';
       }
@@ -1581,7 +1730,8 @@ class GMCP_Journal {
       $post_id = (int) $entry['ID'];
       $restored = [];
       $redo_fields = [];
-      $redo_previous = [];
+      $redo_values = [];
+      $refused = [];
       $fields = [ 'ID' => $post_id ];
       foreach ( (array) ( $entry['fields'] ?? [] ) as $field ) {
         if ( !array_key_exists( $field, (array) $entry['previous'] ) ) {
@@ -1600,11 +1750,23 @@ class GMCP_Journal {
         if ( self::too_large( $value ) ) {
           continue;
         }
+        // The statuses no write tool may set are not set by an undo either. WordPress deletes
+        // on them from a daily job: a trashed post that still carries its old trash stamp, an
+        // auto-draft older than a week. An undo of "published an auto-draft" would write the
+        // status back and hand the clean-up a deletion, through a tool that never deletes.
+        if ( $field === 'post_status' && GMCP_Core::status_write_refusal( $value ) !== null ) {
+          $refused[] = 'status';
+          continue;
+        }
         $fields[ $field ] = $value;
         $restored[] = str_replace( 'post_', '', $field );
         $redo_fields[] = $field;
-        $redo_previous[ $field ] = self::storable( get_post_field( $field, $post_id, 'raw' ) );
+        $redo_values[ $field ] = get_post_field( $field, $post_id, 'raw' );
       }
+      // What the undo is about to overwrite is what reverting the undo would put back, and it
+      // is judged exactly as a recorded value is: it may be a credential written after the
+      // entry being undone. Dropped field by field, never replaced by a placeholder.
+      [ $redo_previous, $redo_dropped ] = self::post_previous( $redo_values );
       if ( count( $fields ) > 1 ) {
         // Slashed, because wp_insert_post() unslashes what it is given and these are the
         // raw values off the WP_Post, exactly as stored. Unslashed, every backslash in the
@@ -1622,13 +1784,20 @@ class GMCP_Journal {
       $done = $restored
         ? 'Restored the ' . implode( ', ', array_unique( $restored ) ) . ' of post ' . $post_id . '.'
         : 'Nothing was left to restore on post ' . $post_id . '.';
-      return [
-        'ok' => true,
-        'message' => $done,
-        'redo' => $redo_fields
-          ? [ 'kind' => 'post', 'ID' => $post_id, 'fields' => $redo_fields, 'previous' => $redo_previous ]
-          : null,
-      ];
+      if ( $refused ) {
+        $done .= ' The earlier status was left as it is: it is "trash" or "auto-draft", which WordPress deletes on, and the write level does not delete. Use wp_delete_post.';
+      }
+      $redo = null;
+      if ( $redo_fields ) {
+        $redo = [ 'kind' => 'post', 'ID' => $post_id, 'fields' => $redo_fields, 'previous' => $redo_previous ];
+        if ( $redo_dropped ) {
+          $redo['redacted_fields'] = $redo_dropped;
+          $done .= ' What it replaced in ' . implode( ', ', array_map( function ( $f ) {
+            return str_replace( 'post_', '', $f );
+          }, $redo_dropped ) ) . ' looked like it held a credential, so that is not recorded and cannot be put back by undoing this.';
+        }
+      }
+      return [ 'ok' => true, 'message' => $done, 'redo' => $redo ];
     }
 
     return $fail( 'Unknown change type.' );

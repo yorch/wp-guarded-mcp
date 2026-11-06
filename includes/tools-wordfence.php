@@ -209,7 +209,7 @@ class GMCP_Tools_Wordfence {
       ],
       'wf_lockouts' => [
         'name' => 'wf_lockouts',
-        'description' => 'List the IP addresses Wordfence has blocked, newest first: the address, the kind of block, the reason, when it was blocked and last seen, how many times it was seen, and when the block expires. Only the block types that name one address are listed — manual and automatic IP blocks, and lockouts — because a country or pattern block stores an all-zero address and a rate block is a rule rather than a blocked host; those are counted by type in wf_status instead. Admin level and not read level, because an IP address is a fact about a person rather than about the site, and this group deliberately returns no address at all to a read key. "Active" means the block has not expired yet. The block parameters are not returned: they are a serialised structure whose shape belongs to Wordfence, and reading one out is how a reader ends up printing whatever a future version puts in it. If nothing matches this returns an empty list with a note saying so, which is a real answer rather than a failure.',
+        'description' => 'List the IP addresses Wordfence has blocked, newest first: the address, the kind of block, the reason, when it was blocked and last seen, how many times it was seen, and when the block expires. Only the block types that name one address are listed — manual and automatic IP blocks, and lockouts — because a country or pattern block stores an all-zero address and a rate block is a rule rather than a blocked host; those are counted by type in wf_status instead. Admin level and not read level, because an IP address is a fact about a person rather than about the site, and this group deliberately returns no address at all to a read key. "Active" means the block has not expired yet. The block parameters are not returned: they are a serialised structure whose shape belongs to Wordfence, and reading one out is how a reader ends up printing whatever a future version puts in it. The reason of a login lockout ends in what the visitor typed at the login form, which regularly is a mistyped password or an email address, so for Wordfence\'s three templates that carry typed text (login failures, password-reset failures, an invalid username) that text is replaced with [withheld: typed text] and the fixed wording is kept; a reason of any other shape is returned as stored. If nothing matches this returns an empty list with a note saying so, which is a real answer rather than a failure.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -437,7 +437,7 @@ class GMCP_Tools_Wordfence {
         'ip' => $this->readable_ip( (string) $row['IP'] ),
         'type' => (int) $row['type'],
         'type_name' => self::BLOCK_TYPES[ (int) $row['type'] ] ?? ( 'unknown:' . (int) $row['type'] ),
-        'reason' => (string) $row['reason'],
+        'reason' => $this->reason_without_typed_text( (string) $row['reason'] ),
         'blocked' => $this->iso( (int) $row['blockedTime'] ),
         'last_seen' => (int) $row['lastAttempt'] > 0 ? $this->iso( (int) $row['lastAttempt'] ) : null,
         'hits' => (int) $row['blockedHits'],
@@ -451,7 +451,7 @@ class GMCP_Tools_Wordfence {
       'offset' => $offset,
       'truncated' => $truncated,
       'lockouts' => $out_rows,
-      'withheld' => [ 'parameters' ],
+      'withheld' => [ 'parameters', 'typed text inside a login lockout reason' ],
     ];
     if ( $truncated ) {
       $out['next_offset'] = $offset + count( $out_rows );
@@ -802,6 +802,43 @@ class GMCP_Tools_Wordfence {
 
   private function iso( int $timestamp ): string {
     return $timestamp > 0 ? gmdate( 'c', $timestamp ) : '';
+  }
+
+  /**
+  * A lockout's reason, with what a visitor typed at a login form taken out of it.
+  *
+  * Wordfence writes the reason as a sentence and puts the text the visitor entered at the end of
+  * it, in quotes: the last username tried at the login form, the last username or email entered
+  * at the password-reset form, or a username that does not exist (waf/wfWAFBlockConstants.php,
+  * the three templates ending in %2$s or %s). That field regularly holds a mistyped password or
+  * an email address, which is why the WP Activity Log group withholds the same text, and a
+  * reply is copied into this plugin's own audit log where it cannot be taken back.
+  *
+  * Matched to the end of the string rather than to the next quote, because the typed text can
+  * contain one (Wordfence's own pattern for reading it back stops at the first, so a password
+  * with an apostrophe in it would leave its tail behind). Only these three templates are
+  * recognised: a reason of any other shape is returned as stored, since nothing marks which
+  * part of it a person wrote, and the tool description says so.
+  */
+  private function reason_without_typed_text( string $reason ): string {
+    $marker = "'[withheld: typed text]'";
+    $patterns = [
+      '/(The last username they tried to sign in with was: ).*\z/s' => '$1' . $marker,
+      '/(The last username or email they entered before getting locked out was: ).*\z/s' => '$1' . $marker,
+      '/(\AUsed an invalid username ).*( to try to sign in)\z/s' => '$1' . $marker . '$2',
+    ];
+    foreach ( $patterns as $pattern => $replacement ) {
+      $out = preg_replace( $pattern, $replacement, $reason, 1, $count );
+      if ( $out === null ) {
+        // A reason the regex engine could not read (bad UTF-8 can do it with some patterns) is
+        // withheld whole rather than returned unjudged.
+        return '[withheld: typed text]';
+      }
+      if ( $count > 0 ) {
+        return $out;
+      }
+    }
+    return $reason;
   }
 
   /**

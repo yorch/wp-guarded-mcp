@@ -81,14 +81,26 @@ class GMCP_Resources {
 
     // Recent posts and pages by name, so the attach menu is useful without the person
     // having to know an ID. Everything else is reachable through the template.
-    $recent = get_posts( [
-      'post_type' => [ 'post', 'page' ],
-      'post_status' => [ 'publish', 'draft', 'pending', 'private' ],
-      'numberposts' => self::LISTING,
-      'orderby' => 'modified',
-      'order' => 'DESC',
-      'suppress_filters' => false,
-    ] );
+    // Named in the attach menu by title, so the same question as reading it. The types above
+    // are post and page, which carry no policy of their own, but a page can hang from a post
+    // that does. Skipped while the list is filled, not dropped from a fixed window.
+    $recent = GMCP_Core::collect_readable(
+      function ( int $from, int $size ) {
+        return get_posts( [
+          'post_type' => [ 'post', 'page' ],
+          'post_status' => [ 'publish', 'draft', 'pending', 'private' ],
+          'numberposts' => $size,
+          'offset' => $from,
+          'orderby' => 'modified',
+          'order' => 'DESC',
+          'suppress_filters' => false,
+        ] );
+      },
+      function ( $row ) {
+        return GMCP_Core::post_read_guard( (int) $row->ID ) === true;
+      },
+      self::LISTING
+    );
     foreach ( $recent as $post ) {
       $out[] = [
         'uri' => 'gmcp://post/' . $post->ID,

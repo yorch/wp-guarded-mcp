@@ -40,6 +40,8 @@ spl_autoload_register( function ( $class ) {
     'GMCP_Tools_Admin' => '/includes/tools-admin.php',
     'GMCP_Tools_Diagnostics' => '/includes/tools-diagnostics.php',
     'GMCP_Diag_Util' => '/includes/diagnostics-util.php',
+    'GMCP_Credential_Scan' => '/includes/credential-scan.php',
+    'GMCP_Meta_Key' => '/includes/meta-key.php',
     'GMCP_Preview' => '/includes/preview.php',
     'GMCP_Audit' => '/includes/audit.php',
     'GMCP_Audit_Table' => '/includes/audit-table.php',

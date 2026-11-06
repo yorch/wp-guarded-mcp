@@ -455,9 +455,13 @@ class GMCP_Approvals {
   *   - Every key in one canonical order (the schema's own arguments first, then by name,
   *     objects sorted all the way down), so the same call always reads the same way.
   *   - Nothing is cut: a view past VIEW_MAX, or nested past VIEW_DEPTH, refuses the call.
-  *   - What is hidden is counted and named. A credential-shaped field, a string holding one,
-  *     or a preview-link token shows as "[redacted]" and its path is listed, so the person
-  *     knows a value they cannot see is part of what they approve.
+  *   - What is hidden is counted and named. A credential-shaped field, or a JSON or serialized
+  *     blob with one inside, shows as "[redacted]" and its path is listed. In any other string
+  *     only the stretch the scanner matched, or a preview-link token, is replaced by "[redacted]",
+  *     the rest of the string stays readable, "[hidden values present: N]" is appended to it and
+  *     its path is listed, so the person knows a value they cannot see is part of what they
+  *     approve and can still read what surrounds it. A secret split across two arguments is not
+  *     recognised here: each string is judged on its own.
   *   - Characters that reorder or hide text (bidirectional controls, zero-width marks) are
   *     shown as escapes, so a string cannot read as something it is not.
   *
@@ -536,11 +540,41 @@ class GMCP_Approvals {
       $value = get_object_vars( $value );
     }
     if ( is_string( $value ) ) {
-      if ( GMCP_Core::scrub_preview_tokens( $value ) !== $value || GMCP_Core::holds_credential( $value, 0, 12 ) ) {
-        $redacted[] = $path === '' ? '(value)' : $path;
+      // Three tests, because each reads a different thing: a credential named by its field or
+      // packed in JSON or serialized data, a preview token, and one written into free text (a
+      // wp-config line in a tagline). The stored arguments the approval is bound to are untouched.
+      //
+      // What is hidden differs by test. A blob that holds a secret-named field is replaced whole:
+      // it cannot be taken apart. Anything else has only the matched stretches replaced, and the
+      // rest stays readable, with a count appended. This screen is the one place a person decides
+      // on what they read, and it used to replace a whole string when the scanner matched anywhere
+      // in it, so a decoy that merely looked like a credential ("... <!-- see Basic HTML/CSS 101 -->")
+      // made the script tag next to it unreadable, and an agent that knew that could make any
+      // argument unreadable to the person approving it.
+      $path_label = $path === '' ? '(value)' : $path;
+      if ( GMCP_Core::holds_credential( $value, 0, 12 ) ) {
+        $redacted[] = $path_label;
         return GMCP_Core::REDACTION_MARKER;
       }
-      return $value;
+      $shown = GMCP_Core::scrub_preview_tokens( $value );
+      if ( $shown === GMCP_Core::UNSCRUBBABLE ) {
+        $redacted[] = $path_label;
+        return GMCP_Core::REDACTION_MARKER;
+      }
+      $hidden = 0;
+      if ( $shown !== $value ) {
+        $hidden += max( 1, substr_count( $shown, GMCP_Core::REDACTION_MARKER ) - substr_count( $value, GMCP_Core::REDACTION_MARKER ) );
+      }
+      $spans = GMCP_Credential_Scan::spans( $shown );
+      if ( $spans ) {
+        $hidden += count( $spans );
+        $shown = GMCP_Credential_Scan::redact_spans( $shown, GMCP_Core::REDACTION_MARKER );
+      }
+      if ( $hidden === 0 ) {
+        return $value;
+      }
+      $redacted[] = $path_label;
+      return $shown . ' [hidden values present: ' . $hidden . ']';
     }
     if ( !is_array( $value ) ) {
       return $value;
@@ -755,8 +789,10 @@ class GMCP_Approvals {
       'tool_class' => $class,
       'args_mac' => $mac,
       // Exactly the text the screen prints, and the names of what it hides. Built by
-      // build_view() from the same credential test the audit log uses, so what a person
-      // reads here and what the log keeps cannot disagree about what a credential is.
+      // build_view() from the credential tests the audit log uses (field names, structured
+      // values, and GMCP_Credential_Scan for free text), so what a person reads here and what
+      // the log keeps agree about what a credential is. Agree is not a promise of identical:
+      // the log also judges the whole argument list as one text, and this judges each value.
       'args_view' => $view['text'],
       'args_redacted' => wp_json_encode( $view['redacted'] ),
     ] );

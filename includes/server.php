@@ -252,7 +252,7 @@ class GMCP_Server {
     $stray = ob_get_clean();
     if ( is_string( $stray ) && trim( $stray ) !== '' ) {
       if ( $this->logging ) {
-        error_log( '[Guarded MCP] Discarded stray output before the REST body: ' . mb_substr( trim( $stray ), 0, 500 ) );
+        error_log( '[Guarded MCP] Discarded stray output before the REST body: ' . mb_substr( GMCP_Core::log_text( trim( $stray ) ), 0, 500 ) );
       }
       // A fresh buffer, so anything printed later in the request is discarded too rather
       // than appended to the body about to be sent.
@@ -409,7 +409,7 @@ class GMCP_Server {
         } );
         GMCP_Tokens::touch( $key['id'] );
         if ( $this->logging ) {
-          error_log( '[Guarded MCP] 🔐 Key auth OK: ' . $key['label'] );
+          error_log( '[Guarded MCP] 🔐 Key auth OK: ' . GMCP_Core::log_text( $key['label'] ) );
         }
         return true;
       }
@@ -588,7 +588,9 @@ class GMCP_Server {
     if ( $method === 'initialize' || empty( $session_id ) ) {
       $session_id = wp_generate_uuid4();
       if ( $this->logging ) {
-        error_log( '[Guarded MCP] 🆔 Direct session initialized: ' . $session_id );
+        // A session id is a handle a client presents again, so it is logged by its first
+        // eight characters, as the SSE and termination lines already do.
+        error_log( '[Guarded MCP] 🆔 Direct session initialized: ' . GMCP_Core::log_text( substr( $session_id, 0, 8 ) ) . '...' );
       }
     }
 
@@ -603,8 +605,8 @@ class GMCP_Server {
           $client_info = $params['clientInfo'] ?? null;
 
           if ( $this->logging && $client_info ) {
-            $client_name = $client_info['name'] ?? 'unknown';
-            $client_version = $client_info['version'] ?? 'unknown';
+            $client_name = GMCP_Core::log_text( $client_info['name'] ?? 'unknown' );
+            $client_version = GMCP_Core::log_text( $client_info['version'] ?? 'unknown' );
             error_log( "[Guarded MCP] Client: {$client_name} v{$client_version}" );
           }
 
@@ -615,7 +617,7 @@ class GMCP_Server {
           }
           else if ( $requested_version && $requested_version !== $this->protocol_version ) {
             if ( $this->logging ) {
-              GMCP_Logging::warn( "[Guarded MCP] Client requested unsupported protocol version {$requested_version}" );
+              GMCP_Logging::warn( '[Guarded MCP] Client requested unsupported protocol version ' . GMCP_Core::log_text( $requested_version ) );
             }
           }
 
@@ -655,7 +657,7 @@ class GMCP_Server {
 
           // Debug logging for tools/list
           if ( $this->logging ) {
-            $user_agent = isset( $_SERVER['HTTP_USER_AGENT'] ) ? sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) ) : 'unknown';
+            $user_agent = isset( $_SERVER['HTTP_USER_AGENT'] ) ? GMCP_Core::log_text( sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) ) ) : 'unknown';
             error_log( '[Guarded MCP Direct] 📋 tools/list requested by: ' . $user_agent );
             error_log( '[Guarded MCP Direct] 📊 Returning ' . count( $tools ) . ' tools' );
             if ( count( $tools ) > 0 ) {
@@ -680,19 +682,19 @@ class GMCP_Server {
           $arguments = $params['arguments'] ?? [];
 
           if ( $this->logging ) {
-            error_log( '[Guarded MCP Direct] 🔧 tools/call - Tool: ' . $tool );
-            error_log( '[Guarded MCP Direct] 🔧 tools/call - Arguments: ' . wp_json_encode( GMCP_Core::redact_call_args( is_array( $arguments ) ? $arguments : [] ) ) );
+            error_log( '[Guarded MCP Direct] 🔧 tools/call - Tool: ' . GMCP_Core::log_text( $tool ) );
+            error_log( '[Guarded MCP Direct] 🔧 tools/call - Arguments: ' . GMCP_Core::log_text( GMCP_Core::log_call_args( is_array( $arguments ) ? $arguments : [] ) ) );
           }
 
           try {
             $reply = $this->execute_tool( $tool, $arguments, $id );
             if ( $this->logging ) {
-              error_log( '[Guarded MCP Direct] ✅ tools/call - Success for tool: ' . $tool );
+              error_log( '[Guarded MCP Direct] ✅ tools/call - Success for tool: ' . GMCP_Core::log_text( $tool ) );
             }
           }
           catch ( Exception $e ) {
             if ( $this->logging ) {
-              error_log( '[Guarded MCP Direct] ❌ tools/call - Error: ' . $e->getMessage() );
+              error_log( '[Guarded MCP Direct] ❌ tools/call - Error: ' . GMCP_Core::log_text( $e->getMessage() ) );
             }
             throw $e;
           }
@@ -788,7 +790,7 @@ class GMCP_Server {
           // Check if it's a notification (no id)
           if ( $id === null && strpos( $method, 'notifications/' ) === 0 ) {
             if ( $this->logging ) {
-              error_log( '[Guarded MCP] 📨 Notification received: ' . $method );
+              error_log( '[Guarded MCP] 📨 Notification received: ' . GMCP_Core::log_text( $method ) );
             }
             return $this->attach_session_header( new WP_REST_Response( null, 204 ), $session_id );
           }
@@ -808,7 +810,7 @@ class GMCP_Server {
     }
     catch ( Throwable $e ) {
       if ( $this->logging ) {
-        error_log( '[Guarded MCP] ❌ Exception in handle_direct_jsonrpc: ' . $e->getMessage() );
+        error_log( '[Guarded MCP] ❌ Exception in handle_direct_jsonrpc: ' . GMCP_Core::log_text( $e->getMessage() ) );
       }
 
       $error_response = new WP_REST_Response( [
@@ -831,7 +833,7 @@ class GMCP_Server {
     $response->header( 'Mcp-Session-Id', $session_id );
 
     if ( $this->logging ) {
-      error_log( '[Guarded MCP] 🪪 Response session header: ' . $session_id );
+      error_log( '[Guarded MCP] 🪪 Response session header: ' . GMCP_Core::log_text( substr( $session_id, 0, 8 ) ) . '...' );
     }
 
     return $response;
@@ -897,7 +899,7 @@ class GMCP_Server {
 
     // Log the request if debugging is enabled
     if ( $this->logging && isset( $data['method'] ) ) {
-      error_log( '[Guarded MCP HTTP] ↓ ' . $data['method'] );
+      error_log( '[Guarded MCP HTTP] ↓ ' . GMCP_Core::log_text( $data['method'] ) );
     }
 
     // Reuse the existing direct JSON-RPC handler
@@ -923,7 +925,7 @@ class GMCP_Server {
     $session_id = !empty( $session_header ) ? sanitize_text_field( $session_header ) : wp_generate_uuid4();
 
     if ( $this->logging ) {
-      error_log( '[Guarded MCP HTTP] 📡 SSE stream opened for session: ' . substr( $session_id, 0, 8 ) . '...' );
+      error_log( '[Guarded MCP HTTP] 📡 SSE stream opened for session: ' . GMCP_Core::log_text( substr( $session_id, 0, 8 ) ) . '...' );
     }
 
     // Set up SSE output
@@ -1081,7 +1083,7 @@ class GMCP_Server {
     $session_id = sanitize_text_field( $session_header );
 
     if ( $this->logging ) {
-      error_log( '[Guarded MCP HTTP] 🗑️ Session terminated: ' . substr( $session_id, 0, 8 ) . '...' );
+      error_log( '[Guarded MCP HTTP] 🗑️ Session terminated: ' . GMCP_Core::log_text( substr( $session_id, 0, 8 ) ) . '...' );
     }
 
     // Queue kill signal for any active SSE streams
@@ -1719,22 +1721,26 @@ class GMCP_Server {
       // Let other modules handle their tools
       if ( $this->logging ) {
         // Log tool calls with more context
+        // Each preview is scrubbed before it is cut. Cutting first left "smtp_pwd=hun" in the
+        // log when the secret was longer than the window, and the head of a secret is still
+        // the secret. The tool name is client text too.
+        $tool_text = GMCP_Core::log_text( $tool );
         $args_preview = '';
         if ( !empty( $args ) ) {
           // Show key args for common tools
           if ( isset( $args['ID'] ) ) {
-            $args_preview = ' (ID: ' . $args['ID'] . ')';
+            $args_preview = ' (ID: ' . GMCP_Core::log_text( $args['ID'] ) . ')';
           }
           elseif ( isset( $args['query'] ) ) {
-            $args_preview = ' (query: "' . substr( $args['query'], 0, 30 ) . '...")';
+            $args_preview = ' (query: "' . mb_substr( GMCP_Core::log_text( $args['query'] ), 0, 30 ) . '...")';
           }
           elseif ( isset( $args['message'] ) ) {
-            $args_preview = ' (message: "' . substr( $args['message'], 0, 30 ) . '...")';
+            $args_preview = ' (message: "' . mb_substr( GMCP_Core::log_text( $args['message'] ), 0, 30 ) . '...")';
           }
         }
         // Log to both error log and UI
-        error_log( '[Guarded MCP] 🛠️ ' . $tool . $args_preview );
-        $this->log( '🛠️ Tool: ' . $tool . $args_preview );
+        error_log( '[Guarded MCP] 🛠️ ' . $tool_text . $args_preview );
+        $this->log( '🛠️ Tool: ' . $tool_text . $args_preview );
       }
       $filtered = apply_filters( 'gmcp_callback', null, $tool, $args, $id, $this );
 
@@ -1904,19 +1910,16 @@ class GMCP_Server {
     if ( $stored === null ) {
       return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired download token.' ], 403 );
     }
-    // EXPIRY IS CHECKED HERE, not by get_transient(). Reading the row directly is what makes
-    // consumption atomic, and it also bypasses the expiry check that get_transient() performs:
-    // a token whose row has not been garbage-collected yet would otherwise stay redeemable past
-    // its five minutes. Measured on this stack: the row outlives the timeout by hours.
-    $expires = (int) get_option( '_transient_timeout_' . $key, 0 );
-    if ( $expires > 0 && $expires < time() ) {
-      $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", $row ) );
-      delete_option( '_transient_timeout_' . $key );
-      return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired download token.' ], 403 );
-    }
+    // Expiry is enforced HERE. This path reads the row directly instead of through
+    // get_transient(), which is the only thing that notices a lapsed timeout: WordPress leaves an
+    // expired transient in the options table until something asks for it or the daily cleanup
+    // runs, so without this check "expires after 5 minutes" was true of the reply and false of the
+    // endpoint (measured: a token whose timeout was ten minutes in the past still streamed the
+    // file). A row with no timeout is refused too, since this plugin always writes one.
+    $timeout = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", '_transient_timeout_' . $key ) );
     $won = (int) $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", $row, $stored ) );
     delete_option( '_transient_timeout_' . $key );
-    if ( $won !== 1 ) {
+    if ( $won !== 1 || $timeout === null || (int) $timeout < time() ) {
       return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired download token.' ], 403 );
     }
     $data = maybe_unserialize( $stored );

@@ -207,6 +207,79 @@ case "$RO" in
   *) echo "  ....  read-level checks skipped: could not mint a read key" ;;
 esac
 
+echo "-- the layout is read through the same guards every other reader asks --"
+# 1. A reader that lists EVERY meta key never asked about the layout key by name, and returned it.
+#    The control is the stored layout (the marker is in the row) and an ordinary key in the same reply.
+call gm_all "$(tc wp_get_post_meta '{"ID":'"$PID"'}')"
+check "CONTROL: the generic reader of every key answers, and lists an ordinary key" "$(has gm_all "probe_ordinary_key")" "yes"
+check "listing every meta key does NOT return the layout's script" "$(has gm_all "LEAKMARK-$MARK-JS")" "no"
+check "and does not return the layout settings' css" "$(has gm_all "LEAKCSS-$MARK-VALUE")" "no"
+check "the layout key is listed as withheld, not silently dropped" "$(has gm_all "withheld: page builder layout")" "yes"
+call gm_snap "$(tc wp_get_post_snapshot '{"ID":'"$PID"'}')"
+check "CONTROL: the snapshot answers with the post's ordinary meta" "$(has gm_snap "probe_ordinary_key")" "yes"
+check "the post snapshot does NOT return the layout's script" "$(has gm_snap "LEAKMARK-$MARK-JS")" "no"
+# 2. The key as the database compares it. Refused whatever the collation, so SQLite (which compares
+#    exactly) and MariaDB (which does not) give the same answer; the stored value is read back.
+BEFORE_LAYOUT=$(dbq "SELECT MD5(meta_value) FROM wp_postmeta WHERE post_id=$PID AND meta_key='_fl_builder_data'")
+call gm_acc_r "$(tc wp_get_post_meta '{"ID":'"$PID"',"key":"_fl_builder_dáta"}')"
+check "reading the layout under an accented spelling of its key is refused" "$(verdict gm_acc_r)" "error"
+check "and the refusal names the builder, so it is the layout guard that answered" "$(has gm_acc_r "page builder layout")" "yes"
+call gm_acc_w "$(tc wp_update_post_meta '{"ID":'"$PID"',"key":"_fl_builder_dáta","value":"x"}')"
+check "writing the layout under an accented spelling of its key is refused" "$(verdict gm_acc_w)" "error"
+call gm_sp_w "$(tc wp_update_post_meta '{"ID":'"$PID"',"key":"_fl_builder_data ","value":"x"}')"
+check "and under a trailing space" "$(verdict gm_sp_w)" "error"
+check "STORED: the layout row is byte-for-byte what it was" \
+  "$(dbq "SELECT MD5(meta_value) FROM wp_postmeta WHERE post_id=$PID AND meta_key='_fl_builder_data'")" "$BEFORE_LAYOUT"
+# 3. A form submission is personal data. beaver_layout reports a post's title, type and status, so
+#    it asks the post read policy, and below admin the answer is the one a missing id gets.
+SUBID=$(wpc eval 'echo wp_insert_post([ "post_title" => "Sender '"$MARK"'", "post_type" => "flamingo_inbound", "post_status" => "publish" ]);')
+case "$SUBID" in ''|*[!0-9]*) echo "  FAIL  could not seed a submission"; fail=$((fail+1)); SUBID=0 ;; esac
+RW=$(gmcp_make_key "smoke beaver readwrite" readwrite)
+MISSING=$((SUBID + 900000))
+check "CONTROL: the submission exists and is published" \
+  "$(dbq "SELECT CONCAT(post_type,'/',post_status) FROM wp_posts WHERE ID=$SUBID")" "flamingo_inbound/publish"
+check "CONTROL: the id used as 'missing' really does not exist" "$(dbq "SELECT COUNT(*) FROM wp_posts WHERE ID=$MISSING")" "0"
+for K in "$RO" "$RW"; do
+  callas "$K" lay_sub "$(tc beaver_layout '{"ID":'"$SUBID"'}')"
+  callas "$K" lay_miss "$(tc beaver_layout '{"ID":'"$MISSING"'}')"
+  check "a non-admin key does not get the submission's title from beaver_layout" "$(has lay_sub "Sender $MARK")" "no"
+  check "and the answer is the one a missing id gets, word for word" \
+    "$(py 'import json,sys,re
+t=json.load(sys.stdin).get("result",{}).get("content",[{}])[0].get("text","")
+print(re.sub(r"\d+","N",t))' "" lay_sub)" \
+    "$(py 'import json,sys,re
+t=json.load(sys.stdin).get("result",{}).get("content",[{}])[0].get("text","")
+print(re.sub(r"\d+","N",t))' "" lay_miss)"
+done
+check "CONTROL: the missing-id answer is the 'no post' note, so the comparison is not of two empty strings" "$(has lay_miss "No post with id")" "yes"
+check "CONTROL: the same key does read an ordinary page's title" \
+  "$(callas "$RO" lay_ok "$(tc beaver_layout '{"ID":'"$PID"'}')"; has lay_ok "Beaver probe $MARK")" "yes"
+call lay_sub_admin "$(tc beaver_layout '{"ID":'"$SUBID"'}')"
+check "an admin key is told why, and still does not get the title" "$(has lay_sub_admin "form submission")" "yes"
+check "  ...the admin refusal carries no layout" "$(has lay_sub_admin "Sender $MARK")" "no"
+wpc eval 'wp_delete_post( '"$SUBID"', true );' >/dev/null 2>&1
+
+echo "-- an ordinary save of a builder page still works while the layout rules are armed --"
+# The builder copies a page's layout onto the revision from its own save_post hook. A refusal of the
+# layout keys in the net under WordPress's meta functions threw from inside that hook: the title was
+# written and the tool answered "failed". The rules belong to the generic meta TOOLS, not to that net.
+LAYOUT_BEFORE=$(dbq "SELECT MD5(meta_value) FROM wp_postmeta WHERE post_id=$PID AND meta_key='_fl_builder_data'")
+RW2=$(gmcp_make_key "smoke beaver readwrite save" readwrite)
+callas "$RW2" bb_save "$(tc wp_update_post '{"ID":'"$PID"',"fields":{"post_content":"saved through a tool '"$MARK"'"}}')"
+check "wp_update_post on a builder page succeeds" "$(verdict bb_save)" "ok"
+check "STORED: the new content is in the post" "$(dbq "SELECT IF(post_content LIKE '%saved through a tool $MARK%', 'yes', 'no') FROM wp_posts WHERE ID=$PID")" "yes"
+check "STORED: the layout is byte-for-byte what it was" \
+  "$(dbq "SELECT MD5(meta_value) FROM wp_postmeta WHERE post_id=$PID AND meta_key='_fl_builder_data'")" "$LAYOUT_BEFORE"
+check "CONTROL: the builder's own hook wrote the layout key onto a revision during that call (the write a net would refuse)" \
+  "$(dbq "SELECT IF(COUNT(*) > 0, 'yes', 'no') FROM wp_postmeta m JOIN wp_posts p ON p.ID = m.post_id WHERE p.post_parent=$PID AND p.post_type='revision' AND m.meta_key='_fl_builder_data'")" "yes"
+callas "$RW2" bb_dup "$(tc wp_duplicate_post '{"ID":'"$PID"'}')"
+check "wp_duplicate_post of a builder page answers" "$(verdict bb_dup)" "ok"
+DUPID=$(dbq "SELECT MAX(ID) FROM wp_posts WHERE post_type='page' AND post_title LIKE '%Beaver probe $MARK%' AND ID <> $PID")
+check "CONTROL: the copy exists" "$([ -n "$DUPID" ] && [ "$DUPID" != "NULL" ] && echo yes || echo no)" "yes"
+check "STORED: the layout was not copied onto it" "$(dbq "SELECT COUNT(*) FROM wp_postmeta WHERE post_id=$DUPID AND meta_key LIKE '\\_fl\\_builder%'")" "0"
+check "and the reply says which keys were skipped" "$(has bb_dup "_fl_builder_data")" "yes"
+wpc eval 'wp_delete_post( '"${DUPID:-0}"', true );' >/dev/null 2>&1
+
 echo "-- templates --"
 call tpl "$(tc beaver_templates '{}')"
 check "templates answers" "$(verdict tpl)" "ok"

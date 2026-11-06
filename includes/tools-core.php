@@ -512,6 +512,11 @@ class GMCP_Tools_Core {
       if ( $protected !== null ) {
         return $protected;
       }
+      // Writers only, and not through the net: @see GMCP_Core::generic_writer_meta_refusal().
+      $generic = GMCP_Core::generic_writer_meta_refusal( $key );
+      if ( $generic !== null ) {
+        return $generic;
+      }
     } else {
       // Reads too, for this one family: a builder layout is not a trash timestamp. Reading it
       // hands over the content and, for the html module, script; the builder group reports the
@@ -583,7 +588,17 @@ class GMCP_Tools_Core {
   * for the real one.
   */
   private function readable_meta( string $key, $value ) {
-    return GMCP_Core::field_looks_secret( $key ) ? GMCP_Core::REDACTION_MARKER : $value;
+    if ( GMCP_Core::field_looks_secret( $key ) ) {
+      return GMCP_Core::REDACTION_MARKER;
+    }
+    // The readers that list EVERY key (wp_get_post_meta without a key, wp_snapshot) never asked
+    // meta_key_allowed(), so a page builder's layout, refused by name, came back in the list: the
+    // whole serialized tree including an html module's script (measured with a read key on a
+    // Beaver Builder page). The same answer here, for the key as the database compares it.
+    if ( GMCP_Core::layout_meta_refusal( $key ) !== null ) {
+      return '[withheld: page builder layout]';
+    }
+    return $value;
   }
 
   /**
@@ -935,6 +950,14 @@ class GMCP_Tools_Core {
         $skipped[ $key ] = 'is the schedule WordPress deletes posts by, so it is never copied onto another post';
         continue;
       }
+      if ( GMCP_Core::layout_meta_refusal( (string) $key ) !== null ) {
+        $skipped[ $key ] = 'is a page builder layout, which the generic tools neither read nor write';
+        continue;
+      }
+      if ( GMCP_Core::attachment_file_meta_refusal( (string) $key ) !== null ) {
+        $skipped[ $key ] = 'names the file an attachment serves, so it is never copied onto another post';
+        continue;
+      }
       if ( !$overwrite && metadata_exists( 'post', $to, $key ) ) {
         $skipped[ $key ] = 'already set on post #' . $to . '; pass overwrite to replace it';
         continue;
@@ -1119,9 +1142,14 @@ class GMCP_Tools_Core {
       // Before the post exists, so a refused key leaves nothing half made. The net under
       // update_post_metadata would stop it too, but only after wp_insert_post() had stored the row.
       foreach ( array_keys( $meta_input ) as $meta_k ) {
-        $protected = GMCP_Core::protected_meta_refusal( (string) $meta_k );
+        $protected = GMCP_Core::protected_meta_refusal( (string) $meta_k ) ?? GMCP_Core::generic_writer_meta_refusal( (string) $meta_k );
         if ( $protected !== null ) {
           return new WP_Error( 'gmcp_protected_meta', $protected . ' Nothing was created.' );
+        }
+        // A value that points at a post this key may not use (a featured image, a menu target).
+        $pointer = GMCP_Core::pointer_meta_refusal( (string) $meta_k, $meta_input[ $meta_k ], 0 );
+        if ( $pointer !== null ) {
+          return new WP_Error( 'gmcp_pointer_meta', $pointer . ' Nothing was created.' );
         }
       }
       // JSON for an array is decoded here as every other meta writer decodes it, so the
@@ -2481,7 +2509,9 @@ class GMCP_Tools_Core {
     // different key than the write would describe the wrong comment.
     $id = (int) ( $a['comment_ID'] ?? 0 );
     $comment = get_comment( $id );
-    if ( !$comment ) {
+    // A comment on a post the caller may not read is not described, and is answered as one
+    // that is not there: the preview prints its author and its text.
+    if ( !$comment || ( (int) $comment->comment_post_ID > 0 && GMCP_Core::post_read_guard( (int) $comment->comment_post_ID ) !== true ) ) {
       $r = $this->error( $r, 'No comment with ID ' . $id . '.', -32602 );
       return $r;
     }
@@ -2595,12 +2625,26 @@ class GMCP_Tools_Core {
     // wp_alter_post and the previews are readers too. A regular-expression replace answers
     // "how many places matched" (an oracle over the body of a message), and a preview of an
     // update or a delete prints the title and the start of the body it is about to change.
-    $reads_one = in_array( $tool, [ 'wp_get_post', 'wp_get_post_snapshot', 'wp_get_post_meta', 'wp_read_post_meta_chunk', 'wp_alter_post' ], true )
+    //
+    // wp_get_post_terms and wp_add_post_terms are on it for the same reason: the terms of a
+    // submission say which form it came through, and the second one's reply lists the terms
+    // the post now holds, which is a read of them. It asks post_read_guard(), the
+    // personal-data policy and the commerce read policy together, and both follow the post's
+    // parents: a revision, an upload or a child of a guarded post is judged as the post it
+    // hangs from. @see GMCP_Core::post_chain_types().
+    $reads_one = in_array( $tool, [ 'wp_get_post', 'wp_get_post_snapshot', 'wp_get_post_meta', 'wp_read_post_meta_chunk', 'wp_alter_post', 'wp_get_post_terms', 'wp_add_post_terms' ], true )
       || ( !empty( $a['preview'] ) && in_array( $tool, [ 'wp_update_post', 'wp_delete_post' ], true ) );
     if ( $reads_one ) {
-      $held = GMCP_Core::personal_data_post_guard( (int) ( $a['ID'] ?? 0 ) );
+      $read_id = (int) ( $a['ID'] ?? 0 );
+      // A post that is not there and a post this caller may not read get the same sentence and
+      // the same code, answered here for every tool in the list so no tool's own "not found"
+      // wording can tell them apart. @see GMCP_Core::post_read_guard().
+      if ( $read_id > 0 && !get_post( $read_id ) ) {
+        return $this->error( $r, GMCP_Core::post_not_found_text( $read_id ), -32602 );
+      }
+      $held = GMCP_Core::post_read_guard( $read_id );
       if ( $held !== true ) {
-        return $this->error( $r, $held, -32600 );
+        return $this->error( $r, $held, GMCP_Core::read_refusal_code( $read_id, $held ) );
       }
     }
     elseif ( $tool === 'wp_get_posts' ) {
@@ -2880,12 +2924,29 @@ class GMCP_Tools_Core {
           $args['paged'] = max( 1, intval( $a['paged'] ) );
         }
         $list = [];
-        foreach ( get_comments( $args ) as $c ) {
-          // Order notes are comments on the order post, and they quote the order: status
-          // changes, refunds, the customer's own note. Same rule as reading the order.
-          if ( (int) $c->comment_post_ID > 0 && GMCP_Core::commerce_post_read_guard( (int) $c->comment_post_ID ) !== true ) {
-            continue;
-          }
+        // Order notes are comments on the order post, and they quote the order: status
+        // changes, refunds, the customer's own note. Same rule as reading the order.
+        // Comments on a form submission are the same: they sit on a post whose body no
+        // generic reader returns, and ask the same question, personal-data policy included.
+        // Left out in SQL, so the offset is the database's, then judged row by row as the
+        // backstop and skipped while the page is filled, so a short page does not say one was
+        // left out. The cache domain is its own because WP_Comment_Query keys its cache on the
+        // arguments and not on the SQL a filter added, so a result built under this filter must
+        // not be served to a query without it, nor the other way round.
+        $c_limit = (int) $args['number'];
+        $c_skip = isset( $args['offset'] ) ? (int) $args['offset'] : ( isset( $args['paged'] ) ? ( (int) $args['paged'] - 1 ) * $c_limit : 0 );
+        unset( $args['offset'], $args['paged'] );
+        foreach ( GMCP_Core::with_readable_comments_sql( function () use ( $args, $c_limit, $c_skip ) {
+          return GMCP_Core::collect_readable(
+            function ( int $from, int $size ) use ( $args, $c_skip ) {
+              return get_comments( [ 'offset' => $c_skip + $from, 'number' => $size, 'cache_domain' => 'gmcp_readable' ] + $args );
+            },
+            function ( $row ) {
+              return !( (int) $row->comment_post_ID > 0 && GMCP_Core::post_read_guard( (int) $row->comment_post_ID ) !== true );
+            },
+            $c_limit
+          );
+        } ) as $c ) {
           $list[] = [
             'comment_ID' => $c->comment_ID,
             'comment_post_ID' => $c->comment_post_ID,
@@ -2902,6 +2963,11 @@ class GMCP_Tools_Core {
       case 'wp_create_comment':
         if ( empty( $a['post_id'] ) || empty( $a['comment_content'] ) ) {
           $r = $this->error( $r, 'post_id & comment_content required', -32602 );
+          break;
+        }
+        $comment_held = GMCP_Core::comment_write_guard( 0, intval( $a['post_id'] ), 'Creating' );
+        if ( $comment_held !== true ) {
+          $r = $this->error( $r, $comment_held, -32600 );
           break;
         }
         $ins = [
@@ -2929,6 +2995,17 @@ class GMCP_Tools_Core {
           break;
         }
         $c = [ 'comment_ID' => intval( $a['comment_ID'] ) ];
+        // The post the comment is on, and the one `fields` would move it to. A comment is read
+        // as the post it is on, so moving one out of a submission's tree makes it readable.
+        $comment_held = GMCP_Core::comment_write_guard(
+          intval( $a['comment_ID'] ),
+          ( !empty( $a['fields'] ) && is_array( $a['fields'] ) && isset( $a['fields']['comment_post_ID'] ) && is_scalar( $a['fields']['comment_post_ID'] ) ) ? (int) $a['fields']['comment_post_ID'] : null,
+          'Updating'
+        );
+        if ( $comment_held !== true ) {
+          $r = $this->error( $r, $comment_held, -32600 );
+          break;
+        }
         // wp_update_comment() hands a comment_approved of "trash" to wp_trash_comment(), which
         // is a deletion that WordPress completes on its own schedule. wp_delete_comment is the
         // tool that says so, and the one an approval can hold.
@@ -2976,6 +3053,11 @@ class GMCP_Tools_Core {
           break;
         }
         $comment_id = intval( $a['comment_ID'] );
+        $comment_held = GMCP_Core::comment_write_guard( $comment_id, null, 'Deleting' );
+        if ( $comment_held !== true ) {
+          $r = $this->error( $r, $comment_held, -32600 );
+          break;
+        }
         $done = wp_delete_comment( $comment_id, !empty( $a['force'] ) );
         if ( $done ) {
           $after = get_comment( $comment_id );
@@ -3590,18 +3672,34 @@ class GMCP_Tools_Core {
           $q['date_query'] = [ $date ];
         }
         $rows = [];
-        foreach ( get_posts( $q ) as $p ) {
-          // "any" can still reach a commerce row: WordPress expands it to the registered
-          // types not excluded from search, which says nothing about a type registered by a
-          // plugin that sets it differently. Filtered per row rather than trusted.
-          if ( GMCP_Core::commerce_post_read_guard( $p ) !== true ) {
-            continue;
-          }
-          // The same for a form submission: the type check above only sees a type named in
-          // the request, and "any" names none.
-          if ( GMCP_Core::personal_data_post_guard( (int) $p->ID ) !== true ) {
-            continue;
-          }
+        // "any" can still reach a commerce row: WordPress expands it to the registered
+        // types not excluded from search, which says nothing about a type registered by a
+        // plugin that sets it differently. Filtered per row rather than trusted.
+        //
+        // Both policies, and both follow the post's parents: a revision or a media row of
+        // a submission is an ordinary type on its own, and naming "revision" or
+        // "attachment" as the type reached it through a check that only saw the name.
+        //
+        // Left out in SQL, so the offset and the paging are the database's and cost nothing
+        // extra: a listing that loaded every row up to its offset to skip the unreadable ones
+        // took 13 seconds and 210 MB for an offset of 40,000, and ran for over a minute for
+        // ten million. The guard still judges each row that comes back, as the backstop, and
+        // skips what it refuses while the page is filled so that a short page does not say
+        // a row was left out. @see GMCP_Core::with_readable_posts_sql(), collect_readable().
+        $list_limit = (int) $q['posts_per_page'];
+        $list_skip = isset( $q['offset'] ) ? (int) $q['offset'] : ( isset( $q['paged'] ) ? ( (int) $q['paged'] - 1 ) * $list_limit : 0 );
+        unset( $q['offset'], $q['paged'] );
+        foreach ( GMCP_Core::with_readable_posts_sql( function () use ( $q, $list_limit, $list_skip ) {
+          return GMCP_Core::collect_readable(
+            function ( int $from, int $size ) use ( $q, $list_skip ) {
+              return get_posts( [ 'offset' => $list_skip + $from, 'posts_per_page' => $size, 'suppress_filters' => false, 'no_found_rows' => true ] + $q );
+            },
+            function ( $row ) {
+              return GMCP_Core::post_read_guard( (int) $row->ID ) === true;
+            },
+            $list_limit
+          );
+        } ) as $p ) {
           $rows[] = [
             'ID' => $p->ID,
             'post_title' => $p->post_title,
@@ -3621,7 +3719,7 @@ class GMCP_Tools_Core {
         }
         $p = get_post( intval( $a['ID'] ) );
         if ( !$p ) {
-          $r = $this->error( $r, 'Post not found', -32602 );
+          $r = $this->error( $r, GMCP_Core::post_not_found_text( intval( $a['ID'] ) ), -32602 );
           break;
         }
         $one_read = GMCP_Core::commerce_post_read_guard( $p );
@@ -3655,7 +3753,7 @@ class GMCP_Tools_Core {
         $p = get_post( $post_id );
 
         if ( !$p ) {
-          $r = $this->error( $r, 'Post not found', -32602 );
+          $r = $this->error( $r, GMCP_Core::post_not_found_text( $post_id ), -32602 );
           break;
         }
         $snap_read = GMCP_Core::commerce_post_read_guard( $p );
@@ -3731,7 +3829,9 @@ class GMCP_Tools_Core {
         // Include featured image
         if ( in_array( 'thumbnail', $include ) ) {
           $thumb_id = get_post_thumbnail_id( $post_id );
-          if ( $thumb_id ) {
+          // The file a featured image names is judged as the post it hangs from, like any other
+          // read of media: an upload of a form submission is not shown because a page holds it.
+          if ( $thumb_id && GMCP_Core::post_read_guard( (int) $thumb_id ) === true ) {
             $snapshot['thumbnail'] = [
               'ID' => $thumb_id,
               'url' => wp_get_attachment_url( $thumb_id ),
@@ -3920,16 +4020,17 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'No post with ID ' . intval( $a['ID'] ?? 0 ) . '.', -32602 );
           break;
         }
+        // The source is read and its content and meta carried across, so the read policies
+        // apply to it as they would to wp_get_post: a form submission, or an order below admin.
+        // Asked first, so that below admin a submission is answered as a post that is not there.
+        $dup_read = GMCP_Core::post_read_guard( (int) $src->ID );
+        if ( $dup_read !== true ) {
+          $r = $this->error( $r, $dup_read, GMCP_Core::read_refusal_code( (int) $src->ID, $dup_read ) );
+          break;
+        }
         $commerce = GMCP_Core::commerce_post_guard( $src->ID, 'Duplicating' );
         if ( $commerce !== true ) {
           $r = $this->error( $r, $commerce, -32600 );
-          break;
-        }
-        // The source is read and its content and meta carried across, so the read policies
-        // apply to it as they would to wp_get_post: a form submission, or an order below admin.
-        $dup_read = GMCP_Core::post_read_guard( (int) $src->ID );
-        if ( $dup_read !== true ) {
-          $r = $this->error( $r, $dup_read, -32600 );
           break;
         }
         // The source is only read, so a live page may be copied by a drafts-only key; what
@@ -4236,6 +4337,16 @@ class GMCP_Tools_Core {
           }
         }
 
+        // What a post hangs from decides who may read it, so a parent that moves it into or out
+        // of a submission's (or an order's) tree is refused. @see GMCP_Core::tree_move_guard().
+        if ( array_key_exists( 'post_parent', $fields ) ) {
+          $moved = GMCP_Core::tree_move_guard( $post_id, is_scalar( $fields['post_parent'] ) ? (int) $fields['post_parent'] : 0 );
+          if ( $moved !== true ) {
+            $r = $this->error( $r, $moved, -32600 );
+            break;
+          }
+        }
+
         // A status that is a deletion in waiting. Judged on what the call asks for, before
         // anything is written. @see GMCP_Core::status_write_refusal().
         $status_why = array_key_exists( 'post_status', $fields ) ? GMCP_Core::status_write_refusal( $fields['post_status'] ) : null;
@@ -4342,6 +4453,12 @@ class GMCP_Tools_Core {
             $meta_why = $this->meta_key_allowed( (string) $meta_k );
             if ( $meta_why !== true ) {
               $meta_refusal = $meta_why;
+              break;
+            }
+            // A value that points at a post this key may not use (a featured image, a menu target).
+            $pointer_why = GMCP_Core::pointer_meta_refusal( (string) $meta_k, $meta_input[ $meta_k ], $post_id );
+            if ( $pointer_why !== null ) {
+              $meta_refusal = $pointer_why;
               break;
             }
           }
@@ -4659,6 +4776,19 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, $bad_key . ' Nothing was written.', -32602 );
           break;
         }
+        // A value that is another post's id and that something renders or reads from (a
+        // featured image, a menu item's target). Before any pair is written, as the keys are.
+        foreach ( $pairs as $k => $v ) {
+          $pointer_why = GMCP_Core::pointer_meta_refusal( (string) $k, $v, $pid );
+          if ( $pointer_why !== null ) {
+            $bad_key = $pointer_why;
+            break;
+          }
+        }
+        if ( $bad_key !== null ) {
+          $r = $this->error( $r, $bad_key . ' Nothing was written.', -32600 );
+          break;
+        }
         $meta_lines = [ 'Meta updated for post #' . $pid ];
         foreach ( $pairs as $k => $v ) {
           // Key and value are slashed for the same reason and by different routes.
@@ -4736,7 +4866,11 @@ class GMCP_Tools_Core {
         // copyable onto a draft of the caller's own. The read policies apply to the source.
         $source_read = GMCP_Core::post_read_guard( $from_id );
         if ( $source_read !== true ) {
-          $r = $this->error( $r, $source_read, -32600 );
+          // Below admin a source this key may not read is answered as one that is not there,
+          // in this tool's own words for that.
+          $r = $source_read === GMCP_Core::post_not_found_text( $from_id )
+            ? $this->error( $r, 'No source post with ID ' . $from_id . '.', -32602 )
+            : $this->error( $r, $source_read, -32600 );
           break;
         }
         // The target is the write.
@@ -5049,6 +5183,14 @@ class GMCP_Tools_Core {
           break;
         }
         $media_id = isset( $a['media_id'] ) ? intval( $a['media_id'] ) : 0;
+        // A featured image is shown on the page that holds it and returned by the snapshot, so
+        // a visitor's upload, or one hanging from an order, is not something to set. The net
+        // under update_post_meta asks the same question. @see GMCP_Core::pointer_meta_refusal().
+        $thumb_why = $media_id ? GMCP_Core::pointer_meta_refusal( '_thumbnail_id', $media_id, $post_id ) : null;
+        if ( $thumb_why !== null ) {
+          $r = $this->error( $r, $thumb_why, -32600 );
+          break;
+        }
         if ( $media_id ) {
           $done = set_post_thumbnail( $post_id, $media_id );
           if ( $done ) {
@@ -5076,6 +5218,11 @@ class GMCP_Tools_Core {
 
       case 'wp_get_terms':
         $tax = sanitize_key( $a['taxonomy'] );
+        $tax_held = GMCP_Core::personal_data_taxonomy_guard( $tax );
+        if ( $tax_held !== true ) {
+          $r = $this->error( $r, $tax_held, -32600 );
+          break;
+        }
         $args = [
           'taxonomy' => $tax,
           'hide_empty' => false,
@@ -5278,7 +5425,21 @@ class GMCP_Tools_Core {
           $q['date_query'] = [ $d ];
         }
         $list = [];
-        foreach ( get_posts( $q ) as $m ) {
+        // A file attached to a form submission or an order is what a visitor uploaded, and
+        // is judged as the post it hangs from. Media attached to nothing is ordinary. Left out in
+        // SQL, then judged row by row as the backstop and skipped while the page is filled, so a
+        // short page does not say a row was left out. @see GMCP_Core::with_readable_posts_sql().
+        foreach ( GMCP_Core::with_readable_posts_sql( function () use ( $q ) {
+          return GMCP_Core::collect_readable(
+            function ( int $from, int $size ) use ( $q ) {
+              return get_posts( [ 'offset' => $from, 'posts_per_page' => $size, 'suppress_filters' => false, 'no_found_rows' => true ] + $q );
+            },
+            function ( $row ) {
+              return GMCP_Core::post_read_guard( (int) $row->ID ) === true;
+            },
+            (int) $q['posts_per_page']
+          );
+        } ) as $m ) {
           $list[] = [ 'ID' => $m->ID, 'title' => $m->post_title, 'url' => wp_get_attachment_url( $m->ID ) ];
         }
         $this->add_result_text( $r, wp_json_encode( $list, JSON_PRETTY_PRINT ) );
@@ -5388,6 +5549,17 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'No attachment with ID ' . $att . '. This tool serves media only.', -32602 );
           break;
         }
+        // The two read policies about a post come first, because a file hangs from the post it
+        // is attached to: an upload to a form submission (or to one of its revisions) is what a
+        // visitor sent, and an attachment to an order is a customer's. A submission is
+        // published as far as WordPress is concerned, so the parent test below let a read key
+        // through (measured). Below admin the answer is the one a missing attachment gets, word
+        // for word, so ids cannot be walked to learn which are guarded. @see GMCP_Core::post_read_guard().
+        $held = GMCP_Core::post_read_guard( $att );
+        if ( $held !== true ) {
+          $r = $this->error( $r, GMCP_Core::caller_access_level() === 'admin' ? $held : 'No attachment with ID ' . $att . '. This tool serves media only.', GMCP_Core::caller_access_level() === 'admin' ? -32600 : -32602 );
+          break;
+        }
         // The authorization decision is made HERE, because this is the only place the caller's
         // level exists: the download endpoint is authenticated by the token alone and carries
         // no identity to make it with. A file attached to something unpublished is admin-only.
@@ -5439,6 +5611,13 @@ class GMCP_Tools_Core {
           $r = $this->error( $r, 'No attachment with ID ' . intval( $a['ID'] ) . '. This tool edits media only; use wp_update_post for other posts.', -32602 );
           break;
         }
+        // A file that hangs from a form submission is the visitor's upload, and nothing here
+        // edits it. @see GMCP_Core::personal_data_write_guard().
+        $upload_guard = GMCP_Core::personal_data_write_guard( intval( $a['ID'] ), 'Updating' );
+        if ( $upload_guard !== true ) {
+          $r = $this->error( $r, $upload_guard, -32600 );
+          break;
+        }
         // $removing is true although this edits: the title, caption and alt text of a file with
         // no parent change what every live page showing it displays, and nothing here can find
         // those pages. Only media attached to a draft is the key's to edit.
@@ -5483,6 +5662,11 @@ class GMCP_Tools_Core {
         // the template guard that wp_delete_post asks.
         if ( get_post_type( $media_id ) !== 'attachment' ) {
           $r = $this->error( $r, 'No attachment with ID ' . $media_id . '. This tool deletes media only; use wp_delete_post for other posts.', -32602 );
+          break;
+        }
+        $upload_guard = GMCP_Core::personal_data_write_guard( $media_id, 'Deleting' );
+        if ( $upload_guard !== true ) {
+          $r = $this->error( $r, $upload_guard, -32600 );
           break;
         }
         $drafts = GMCP_Core::drafts_only_guard( $media_id, 'Deleting', '', true );

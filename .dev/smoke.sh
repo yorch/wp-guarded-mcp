@@ -446,7 +446,11 @@ check "and carries no author email" "$(grep -c 'author_email' "$OUT/rcmt" || tru
 
 call init2 '{"jsonrpc":"2.0","id":35,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
 check "server reports its real version" \
-  "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["serverInfo"]["version"])' init2)" "1.0.0"
+  "$(py 'import json,sys;print(json.load(sys.stdin)["result"]["serverInfo"]["version"])' init2)" \
+  "$(docker compose exec -T cli wp eval 'echo GMCP_VERSION;' 2>/dev/null | tr -d '\r\n')"
+# CONTROL for the line above: the expected value is a version, not an empty string that an empty reply would equal.
+check "CONTROL: the expected version was read from the plugin and looks like one" \
+  "$(docker compose exec -T cli wp eval 'echo preg_match( "/^[0-9]+\\.[0-9]+\\.[0-9]+/", GMCP_VERSION );' 2>/dev/null | tr -d '\r\n')" "1"
 check "tools, prompts and resources are all declared" \
   "$(py 'import json,sys;c=json.load(sys.stdin)["result"]["capabilities"];print(",".join(sorted(c)))' init2)" "prompts,resources,tools"
 
@@ -673,6 +677,7 @@ CR=$(docker compose exec -T cli wp eval '
   $o = wp_insert_post(["post_title"=>"Order probe","post_type"=>"shop_order","post_status"=>"wc-processing"]);
   update_post_meta($o,"_billing_email","pii-probe@example.test");
   wp_insert_comment(["comment_post_ID"=>$o,"comment_content"=>"NOTEPIIPROBE","comment_approved"=>1,"comment_type"=>"order_note"]);
+  wp_insert_comment(["comment_post_ID"=>$o,"comment_content"=>"NOTEPIIPROBE","comment_approved"=>1,"comment_type"=>"gmcp_probe_note"]);
   $p = wp_insert_post(["post_title"=>"Secret meta probe","post_status"=>"draft"]);
   update_post_meta($p,"api_key","SECRETMETAPROBE");
   update_post_meta($p,"plain_probe","VISIBLEPROBE");
@@ -698,7 +703,11 @@ check "and each of those is refused rather than answered empty" \
   "$(for f in cr_meta cr_chunk cr_snap cr_one; do verdict $f; done | sort -u | tr -d '\n')" "error"
 rcall cr_notes wp_get_comments "{\"post_id\":$CR_ORDER,\"status\":\"all\"}"
 call cr_notes_ctl "{\"jsonrpc\":\"2.0\",\"id\":422,\"method\":\"tools/call\",\"params\":{\"name\":\"wp_get_comments\",\"arguments\":{\"post_id\":$CR_ORDER,\"status\":\"all\"}}}"
-check "CONTROL: an admin key sees the order note" "$(grep -c NOTEPIIPROBE "$OUT/cr_notes_ctl")" "1"
+# Two notes are seeded on purpose. With WooCommerce active it hides every order_note comment
+# from comment queries, even an administrator's, so a control that depended on that type
+# measured whether Woo was installed rather than whether the probe can find a note. The
+# second note has a type nothing filters, so the control holds with or without Woo.
+check "CONTROL: an admin key sees a note on the order" "$(grep -c NOTEPIIPROBE "$OUT/cr_notes_ctl")" "1"
 check "a readonly key does not" "$(grep -c NOTEPIIPROBE "$OUT/cr_notes")" "0"
 rcall cr_ok wp_get_post_meta "{\"ID\":$CR_POST}"
 check "CONTROL: a readonly key still reads an ordinary post's meta" "$(grep -c VISIBLEPROBE "$OUT/cr_ok")" "1"
@@ -880,7 +889,7 @@ echo "-- the dynamic REST tools --"
 # every later run of every other suite is testing.
 REST_WAS=$(docker compose exec -T cli wp eval 'echo !empty(get_option("gmcp_options",[])["mcp_tools_rest"]) ? "1" : "0";' 2>/dev/null | tr -d '\r\n')
 docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]); $o["mcp_tools_rest"]=true; update_option("gmcp_options",$o,false);' >/dev/null 2>&1
-docker compose exec -T cli wp transient delete gmcp_tools_cache_v5 >/dev/null 2>&1
+docker compose exec -T cli wp eval 'delete_transient( GMCP_Tools_Rest::CACHE_KEY );' >/dev/null 2>&1
 call rlist '{"jsonrpc":"2.0","id":90,"method":"tools/list"}'
 check "the REST group appears when switched on" \
   "$(py 'import json,sys;n={t["name"] for t in json.load(sys.stdin)["result"]["tools"]};print(sorted({"list_pages","get_pages","create_pages","update_pages","delete_pages"}-n) or True)' rlist)" "True"
@@ -1007,7 +1016,7 @@ docker compose exec -T cli wp eval '
 call up_again '{"jsonrpc":"2.0","id":100,"method":"tools/list"}'
 check "and it does not fire again on the next request" \
   "$(py 'import json,sys;print("zz_sentinel2" in {t["name"] for t in json.load(sys.stdin)["result"]["tools"]})' up_again)" "True"
-docker compose exec -T cli wp transient delete gmcp_tools_cache_v5 >/dev/null 2>&1
+docker compose exec -T cli wp eval 'delete_transient( GMCP_Tools_Rest::CACHE_KEY );' >/dev/null 2>&1
 docker compose exec -T cli wp post delete "$RF_ID" --force >/dev/null 2>&1
 # Quoted, and it was not: the shell substitutes REST_WAS bare, so (1==='1') compares an
 # int against a string under PHP's strict operator and is always false. The restore then
@@ -1844,6 +1853,515 @@ oauth_refresh_scope oq_good "mcp:readonly"
 check "a refresh that names the read-only scope does not lower a full grant either" "$(oauth_tools oq_good)" "True True"
 callk o_c "$(cat "$OUT/oq_ro.tok")" "$(tool_json 57 wp_update_post "{\"ID\":$DO_LIVE,\"fields\":{\"post_title\":\"DO oauth write 3\"}}")"
 check "and after all those refreshes the read-only grant still cannot write" "$(verdict o_c)/$(ptitle $DO_LIVE)" "error/DO oauth write"
+
+echo "-- the debug log: no request value reaches error_log in the clear --"
+# The debug log is the channel an operator reads without thinking about credentials. It
+# printed the first thirty characters of a query or message, the whole of a string
+# argument, the client's self-reported name, and the redirect_uri of an authorize request,
+# each as it arrived. Measured before the fix: "smtp_pwd=<secret>" in a tool argument went
+# into the log intact, because redact() judged a string only by the preview-link rule.
+#
+# Five secrets, each sent through a different request path, each unique to this run. The
+# marker travels in the same values and must come back out of the log, so a log that was
+# never written, or a mu-plugin that did not take, cannot pass the absence checks.
+DL_RUN=$(python3 -c 'import secrets;print(secrets.token_hex(6))')
+DL_MARK="errlogprobe$DL_RUN"
+DL_ARG=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
+DL_BEARER=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
+DL_QUERY=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
+DL_GRANT=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
+DL_CLIENT=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
+DL_WAS=$(wpe 'global $gmcp_core; echo $gmcp_core->get_option("mcp_debug_mode") ? "on" : "off";')
+wpe 'global $gmcp_core; $o = $gmcp_core->get_all_options(true); $o["mcp_debug_mode"] = true; $gmcp_core->update_options($o);' >/dev/null
+# php -S and the web container both take error_log from the ini at request time, so an
+# mu-plugin that sets it is enough. The file lives in /tmp inside the container, not under
+# wp-content, so nothing web-reachable is left behind even if the cleanup below fails.
+docker compose exec -T wp sh -c 'rm -f /tmp/gmcp-errlog-probe.log' >/dev/null 2>&1
+docker exec -u 0 "${COMPOSE_PROJECT_NAME:-wptest}-wp-1" mkdir -p /var/www/html/wp-content/mu-plugins
+docker compose exec -T wp sh -c 'cat > /var/www/html/wp-content/mu-plugins/errlog-probe.php <<"PHPEOF"
+<?php
+ini_set( "error_log", "/tmp/gmcp-errlog-probe.log" );
+PHPEOF'
+# 1. A tool argument: a query with the secret in its key=value form, a message with a
+#    bearer credential in it, and the tool name carrying the marker.
+call dl_arg '{"jsonrpc":"2.0","id":90,"method":"tools/call","params":{"name":"dlprobe_'"$DL_MARK"'","arguments":{"query":"'"$DL_MARK"' smtp_pwd='"$DL_ARG"'","message":"'"$DL_MARK"' Bearer '"$DL_BEARER"'"}}}'
+# 2. The client's self-reported name, from initialize.
+call dl_client '{"jsonrpc":"2.0","id":91,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"'"$DL_MARK"' smtp_pwd='"$DL_CLIENT"'","version":"1"}}}'
+# 3. A query string: the authorize endpoint logs redirect_uri, and this one carries the
+#    marker and a key=value credential in its own query. The request is refused further on,
+#    which does not matter: the line is written before any check.
+curl -sS -o /dev/null "$BASE/wp-json/mcp/v1/oauth/authorize?response_type=code&client_id=probe&redirect_uri=https%3A%2F%2Fexample.test%2Fcb%3F$DL_MARK%26smtp_pwd%3D$DL_QUERY&scope=mcp&code_challenge=x&code_challenge_method=S256&state=s"
+# 4. A form field: the token endpoint logs grant_type, here a bearer credential in it.
+curl -sS -o /dev/null -X POST "$BASE/wp-json/mcp/v1/oauth/token" --data-urlencode "grant_type=Bearer $DL_GRANT" --data-urlencode "client_id=$DL_MARK"
+# 5. The authorize endpoint answers before anyone is logged in and builds its refusal line from the
+#    request: a response_type that carries a line break and a forged log line, and a client_id
+#    that carries a key=value credential. Both reach log_authorize_refusal(), which printed them
+#    raw: the first as a SECOND log line, the second in the clear.
+DL_FORGE="forgedline$DL_RUN"
+DL_CLIENT2=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
+curl -sS -o /dev/null "$BASE/wp-json/mcp/v1/oauth/authorize?response_type=tok%0A%5BGuarded%20MCP%5D%20$DL_FORGE%20pretends%20to%20be%20a%20log%20line&client_id=probe&redirect_uri=https%3A%2F%2Fexample.test%2Fcb&scope=mcp&code_challenge=x&code_challenge_method=S256&state=s"
+curl -sS -o /dev/null "$BASE/wp-json/mcp/v1/oauth/authorize?response_type=code&client_id=unknown_smtp_pwd%3D$DL_CLIENT2&redirect_uri=https%3A%2F%2Fexample.test%2Fcb&scope=mcp&code_challenge=x&code_challenge_method=S256&state=s"
+# The probes are done. Read the log, then put the site back, then compare: a guard test
+# must not leave the debug option, the mu-plugin or the log file behind.
+docker compose exec -T wp cat /tmp/gmcp-errlog-probe.log > "$OUT/errlog.txt" 2>/dev/null
+docker compose exec -T wp sh -c 'rm -f /tmp/gmcp-errlog-probe.log /var/www/html/wp-content/mu-plugins/errlog-probe.php' >/dev/null 2>&1
+wpe 'global $gmcp_core; $o = $gmcp_core->get_all_options(true); $o["mcp_debug_mode"] = '"$([ "$DL_WAS" = on ] && echo true || echo false)"'; $gmcp_core->update_options($o);' >/dev/null
+# CONTROLS first: the marker reached the log from each path, so the absence checks below
+# are reading a log that was written.
+check "CONTROL: the marker reaches the log from a tool argument and the tool name" \
+  "$([ "$(grep -c -- "dlprobe_$DL_MARK" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+check "CONTROL: the marker reaches the log from the client name" \
+  "$([ "$(grep -c -- "Client: $DL_MARK" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+check "CONTROL: the marker reaches the log from the authorize query string" \
+  "$([ "$(grep -c -- "example.test/cb?$DL_MARK" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+check "CONTROL: the marker reaches the log from the token form" \
+  "$([ "$(grep -c -- "client_id=$DL_MARK\|grant_type=Bearer" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+# The redacted form is the proof that a value was scrubbed rather than the line dropped.
+check "CONTROL: a secret was replaced by the marker, not the line dropped" \
+  "$([ "$(grep -c -- 'smtp_pwd=\[redacted\]' "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+check "a tool argument's secret is absent from the log" "$(grep -c -- "$DL_ARG" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "a bearer credential in an argument is absent from the log" "$(grep -c -- "$DL_BEARER" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "a secret in the client's self-reported name is absent from the log" "$(grep -c -- "$DL_CLIENT" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "a secret in an authorize query string is absent from the log" "$(grep -c -- "$DL_QUERY" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "a bearer credential in a token form field is absent from the log" "$(grep -c -- "$DL_GRANT" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "CONTROL: the forged text reached the log (on the refusal line, as an escape)" \
+  "$([ "$(grep -c -- "Authorize refused: unsupported response_type: tok.*$DL_FORGE" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+check "a line break in a request value does not start a second log line" "$(grep -c -- "^\[Guarded MCP\] $DL_FORGE" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "CONTROL: the unknown-client refusal line was written, with the client_id name in it" \
+  "$([ "$(grep -c -- "unknown client_id unknown_smtp_pwd" "$OUT/errlog.txt" 2>/dev/null)" -ge 1 ] && echo yes || echo no)" "yes"
+check "a credential in a refused authorize request's client_id is absent from the log" "$(grep -c -- "$DL_CLIENT2" "$OUT/errlog.txt" 2>/dev/null)" "0"
+check "the debug option is back as it was" \
+  "$(wpe 'global $gmcp_core; echo $gmcp_core->get_option("mcp_debug_mode") ? "on" : "off";')" "$DL_WAS"
+
+echo "-- the audit log's two scrubs agree: key=value text and shaped text in one argument --"
+# Two passes read the same string leaves: the debug-log scrub (a secret-named key followed by a
+# separator, and Bearer/Basic) and the credential scan (shapes that identify themselves, and a
+# secret-named assignment with a quoted value). They run one after the other in storable_args(),
+# and neither may leave a value behind, nor stack the marker into "[redacted: [redacted]]".
+AS_ROW=$(wpe '$j = GMCP_Audit::storable_args( [ "message" => "smtp_pwd=hunter2zz and Bearer abcdefghijklmnop12345678 ok", "query" => "x_api_key=k3yk3yk3y9 here", "note" => "nothing to hide here" ] ); echo $j;')
+check "audit args: the key=value secret is gone" "$(printf %s "$AS_ROW" | grep -c 'hunter2zz\|k3yk3yk3y9')" "0"
+check "audit args: the bearer value is gone" "$(printf %s "$AS_ROW" | grep -c 'abcdefghijklmnop12345678')" "0"
+check "audit args: no stacked marker" "$(printf %s "$AS_ROW" | grep -c 'redacted: \[redacted\|\[redacted\]\]')" "0"
+check "audit args: control, an argument with nothing in it is kept whole" "$(printf %s "$AS_ROW" | grep -c 'nothing to hide here')" "1"
+
+echo "-- a padded call is still recorded: the scrub runs after the tool, over every argument --"
+# storable_args() runs from gmcp_tool_called, after the tool has changed the site. A scrub that is
+# quadratic in the length of an argument made a call with a large one slow enough to hit
+# max_execution_time (and to take half a minute even where there is no limit), so the option was
+# written and the audit row never was. The padding is an argument the tool ignores, 560 KB of a
+# word that is itself one of the credential patterns: the worst case for the old expression.
+#
+# Asserted on stored state: the option holds the new value (the tool ran, so the probe is live) AND
+# the table gained exactly one row for the call, within a time bound the old code exceeded.
+PAD_WAS=$(wpe 'echo get_option("blogdescription");')
+PAD_A_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_activity_log"] ?? 0 ? 1 : 0;')
+wpe '$o=get_option("gmcp_options",[]);$o["mcp_activity_log"]=true;update_option("gmcp_options",$o,false);' >/dev/null
+PAD_MARK="padprobe$(python3 -c 'import secrets;print(secrets.token_hex(5))')"
+PAD_FIRST=$(wpe 'global $wpdb; echo (int) $wpdb->get_var("SELECT COALESCE(MAX(id),0) FROM " . GMCP_Audit::table());')
+python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wp_update_option","arguments":{"key":"blogdescription","value":sys.argv[1],"zz":"pass"*140000}}}))' "$PAD_MARK" > "$OUT/pad.json"
+PAD_T0=$(date +%s)
+curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' -d @"$OUT/pad.json" -o "$OUT/pad_resp"
+PAD_SECS=$(( $(date +%s) - PAD_T0 ))
+check "CONTROL: the padded call's request really was large" "$([ "$(wc -c < "$OUT/pad.json")" -gt 500000 ] && echo yes || echo no)" "yes"
+check "CONTROL: the tool ran (the option holds the new value)" "$(wpe 'wp_cache_flush(); echo get_option("blogdescription");')" "$PAD_MARK"
+check "the padded call left exactly one audit row" "$(wpe 'global $wpdb; echo (int) $wpdb->get_var( "SELECT COUNT(*) FROM " . GMCP_Audit::table() . " WHERE id > '"$PAD_FIRST"' AND tool = \"wp_update_option\"" );')" "1"
+check "the whole call, row included, took under 20 seconds (took ${PAD_SECS}s)" "$([ "$PAD_SECS" -lt 20 ] && echo yes || echo no)" "yes"
+check "the row names the option, and says the arguments were cut and how large they were" \
+  "$(wpe 'global $wpdb; $a = (string) $wpdb->get_var( "SELECT args FROM " . GMCP_Audit::table() . " WHERE id > '"$PAD_FIRST"' AND tool = \"wp_update_option\" ORDER BY id DESC LIMIT 1" ); $j = json_decode( $a, true ); echo ( $j["__gmcp_truncated"] ?? 0 ) > 560000 && strpos( $j["preview"] ?? "", "blogdescription" ) !== false ? "yes" : "no:" . substr( $a, 0, 80 );')" "yes"
+wpe 'update_option("blogdescription", '"$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$PAD_WAS")"');$o=get_option("gmcp_options",[]);$o["mcp_activity_log"]=('"$PAD_A_WAS"'===1);update_option("gmcp_options",$o,false);' >/dev/null
+check "put back: the description is as it was" "$(wpe 'wp_cache_flush(); echo get_option("blogdescription");')" "$PAD_WAS"
+
+echo "-- audit arguments: ordinary text is recorded as written, and a decoy does not wipe the value --"
+# The audit log's arguments are a record of what a call SAID. An assignment scrub that blanked any
+# value after a word like "password" or "author" stored "To reset your password: [redacted] the link
+# we sent. Our author: [redacted] Doe." for an ordinary post, and approval events recorded their
+# caller as "key:[redacted]". And a short define() comment at the end of a body turned the WHOLE
+# body, script tag included, into "[redacted]". Asserted on the stored rows.
+AR_A_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_activity_log"] ?? 0 ? 1 : 0;')
+wpe '$o=get_option("gmcp_options",[]);$o["mcp_activity_log"]=true;update_option("gmcp_options",$o,false);' >/dev/null
+AR_FIRST=$(wpe 'global $wpdb; echo (int) $wpdb->get_var("SELECT COALESCE(MAX(id),0) FROM " . GMCP_Audit::table());')
+AR_PROSE='To reset your password: click the link we sent. Our author: Jane Doe.'
+AR_DECOY='<script src="https://evil.example/x.js"></script><p>AR Hello</p><!-- define("DB_PASSWORD","arabcd") -->'
+for AR_BODY in "$AR_PROSE" "$AR_DECOY"; do
+  python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wp_create_post","arguments":{"post_title":"AR probe","post_status":"draft","post_content":sys.argv[1]}}}))' "$AR_BODY" > "$OUT/ar.json"
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d @"$OUT/ar.json" -o "$OUT/ar_resp"
+done
+ar_args() { # ar_args <which, 1 = oldest of the two> -> the stored args of that wp_create_post row
+  wpe 'global $wpdb; echo (string) $wpdb->get_var( "SELECT args FROM " . GMCP_Audit::table() . " WHERE id > '"$AR_FIRST"' AND tool = \"wp_create_post\" ORDER BY id ASC LIMIT 1 OFFSET '"$(( $1 - 1 ))"'" );'
+}
+AR_ROW1=$(ar_args 1)
+AR_ROW2=$(ar_args 2)
+check "CONTROL: both posts were created (the probes ran)" "$(wpe 'echo count( get_posts( [ "title" => "AR probe", "post_status" => "draft", "numberposts" => -1 ] ) );')" "2"
+check "CONTROL: both calls left a row" "$([ -n "$AR_ROW1" ] && [ -n "$AR_ROW2" ] && echo yes || echo no)" "yes"
+check "ordinary prose that mentions a password and an author is recorded as written" "$(printf %s "$AR_ROW1" | grep -c 'To reset your password: click the link we sent. Our author: Jane Doe.')" "1"
+check "the decoy's script tag and paragraph are recorded" "$(printf %s "$AR_ROW2" | grep -c 'evil.example/x.js.*AR Hello')" "1"
+check "the decoy's password is not" "$(printf %s "$AR_ROW2" | grep -c 'arabcd')" "0"
+check "the decoy's argument is not blanked whole" "$(printf %s "$AR_ROW2" | grep -c '"post_content":"\[redacted\]"')" "0"
+check "what stands where the password was is the marker" "$(printf %s "$AR_ROW2" | grep -c 'DB_PASSWORD.*\[redacted\]')" "1"
+wpe 'GMCP_Audit::record_event( [ "tool" => "approval:probe", "actor" => 1, "args" => [ "request" => 7, "caller" => "key:12", "note" => "smtp_pwd=arhunter2x9" ] ] );' >/dev/null
+AR_EV=$(wpe 'global $wpdb; echo (string) $wpdb->get_var( "SELECT args FROM " . GMCP_Audit::table() . " WHERE tool = \"approval:probe\" ORDER BY id DESC LIMIT 1" );')
+check "CONTROL: the event row was written" "$([ -n "$AR_EV" ] && echo yes || echo no)" "yes"
+check "an event keeps its caller as the key id it is" "$(printf %s "$AR_EV" | grep -c '"caller":"key:12"')" "1"
+check "an event still blanks a credential in another argument" "$(printf %s "$AR_EV" | grep -c 'arhunter2x9')" "0"
+wpe 'foreach ( get_posts( [ "title" => "AR probe", "post_status" => "any", "numberposts" => -1 ] ) as $p ) { wp_delete_post( $p->ID, true ); } $o=get_option("gmcp_options",[]);$o["mcp_activity_log"]=('"$AR_A_WAS"'===1);update_option("gmcp_options",$o,false);' >/dev/null
+check "put back: the probe posts are gone" "$(wpe 'echo count( get_posts( [ "title" => "AR probe", "post_status" => "any", "numberposts" => -1 ] ) );')" "0"
+
+echo "-- one-line descriptions: an assignment-shaped title, value or target is withheld in every column --"
+# The arguments column of an audit row, the changes column, the target column and the journal's one
+# line (shown by wp_list_changes, a read-level tool) each took their own test, and they disagreed:
+# wp_update_option {blogdescription: "password: ..."} had its argument scrubbed and its change
+# recorded as written, and a post titled "smtp_pwd=..." was quoted in the journal line, the changes
+# column and the target. Asserted on the stored rows, each with a control that finds a plain value
+# of the same kind in the same column. The journal keeps the OVERWRITTEN title for undo (that test
+# is the narrow one), so only the descriptions are checked for the secret, never the undo record.
+IL_J_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_change_journal"] ?? 0 ? 1 : 0;')
+IL_A_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_activity_log"] ?? 0 ? 1 : 0;')
+IL_DESC_WAS=$(wpe 'echo get_option("blogdescription");')
+wpe '$o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=true;$o["mcp_activity_log"]=true;update_option("gmcp_options",$o,false);delete_option("gmcp_journal");' >/dev/null
+IL_FIRST=$(wpe 'global $wpdb; echo (int) $wpdb->get_var("SELECT COALESCE(MAX(id),0) FROM " . GMCP_Audit::table());')
+IL_POST=$(wpe 'echo wp_insert_post(["post_title"=>"IL base post","post_status"=>"draft","post_content"=>"IL body"]);')
+il_call() { # il_call <tool> <arguments-json>
+  python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":sys.argv[1],"arguments":json.loads(sys.argv[2])}}))' "$1" "$2" > "$OUT/il.json"
+  curl -sS -X POST "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d @"$OUT/il.json" -o "$OUT/il_resp"
+}
+il_call wp_update_post '{"ID":'"$IL_POST"',"fields":{"post_title":"smtp_pwd=ilhunterq"}}'
+check "CONTROL: the title was written (the call ran)" "$(ptitle "$IL_POST")" "smtp_pwd=ilhunterq"
+il_call wp_update_post '{"ID":'"$IL_POST"',"fields":{"post_title":"IL plain title"}}'
+il_call wp_update_option '{"key":"blogdescription","value":"password: ilsecret9"}'
+check "CONTROL: the option value was written" "$(wpe 'wp_cache_flush(); echo get_option("blogdescription");')" "password: ilsecret9"
+il_call wp_update_option '{"key":"blogdescription","value":"IL plain description"}'
+il_call wp_create_post '{"post_title":"smtp_pwd=iltargetq","post_status":"draft"}'
+il_call wp_create_post '{"post_title":"IL plain target","post_status":"draft"}'
+IL_COLS() { # every column the audit log keeps except the arguments, for the rows of this block
+  wpe 'global $wpdb; $t = GMCP_Audit::table(); echo implode( "|", (array) $wpdb->get_col( "SELECT CONCAT_WS(\"|\", COALESCE(changes,\"\"), target, detail) FROM $t WHERE id > '"$IL_FIRST"' ORDER BY id" ) );'
+}
+IL_ROWS=$(IL_COLS)
+IL_LINES=$(wpe 'foreach ( GMCP_Journal::recent( 40 ) as $e ) { echo $e["what"], "|"; }')
+callk il_list "$TOK" "$(tool_json 2 wp_list_changes '{"limit":40}')"
+check "CONTROL: the audit rows were written, and carry a plain title in the changes column" "$(printf %s "$IL_ROWS" | grep -c 'IL plain title')" "1"
+check "CONTROL: a plain target is recorded in the target column" "$(printf %s "$IL_ROWS" | grep -c 'IL plain target')" "1"
+check "CONTROL: the journal describes the edits it recorded" "$(printf %s "$IL_LINES" | grep -c 'IL plain title')" "1"
+check "CONTROL: wp_list_changes answers with the journal's lines" "$([ "$(grep -c 'IL plain title' "$OUT/il_list")" -ge 1 ] && echo yes || echo no)" "yes"
+for IL_SECRET in ilhunterq ilsecret9 iltargetq; do
+  check "audit changes, target and reply: $IL_SECRET is not recorded" "$(printf %s "$IL_ROWS" | grep -c "$IL_SECRET")" "0"
+  check "journal one-line descriptions: $IL_SECRET is not recorded" "$(printf %s "$IL_LINES" | grep -c "$IL_SECRET")" "0"
+  check "wp_list_changes: $IL_SECRET is not repeated" "$(grep -c "$IL_SECRET" "$OUT/il_list")" "0"
+done
+check "CONTROL: the title each edit overwrote is still kept for undo (the narrow test), so both entries are reversible" \
+  "$(wpe 'wp_set_current_user( 1 ); add_filter( "gmcp_can_call_tool", "__return_true" ); $r = []; foreach ( GMCP_Journal::recent( 40 ) as $e ) { if ( $e["tool"] === "wp_update_post" ) { $r[] = $e["reversible"] ? "yes" : "no"; } } echo count( $r ) >= 2 ? implode( ",", array_unique( $r ) ) : "too few";')" "yes"
+wpe 'foreach ( get_posts( [ "title" => "smtp_pwd=iltargetq", "post_status" => "any", "numberposts" => -1 ] ) as $p ) { wp_delete_post( $p->ID, true ); } foreach ( get_posts( [ "title" => "IL plain target", "post_status" => "any", "numberposts" => -1 ] ) as $p ) { wp_delete_post( $p->ID, true ); } wp_delete_post( '"$IL_POST"', true ); update_option( "blogdescription", '"$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$IL_DESC_WAS")"' ); delete_option( "gmcp_journal" ); $o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=('"$IL_J_WAS"'===1);$o["mcp_activity_log"]=('"$IL_A_WAS"'===1);update_option("gmcp_options",$o,false);' >/dev/null
+check "put back: the fixtures are gone and the description is as it was" "$(wpe 'wp_cache_flush(); echo count( get_posts( [ "s" => "iltarget", "post_status" => "any", "numberposts" => -1 ] ) ), "/", get_option("blogdescription") === '"$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$IL_DESC_WAS")"' ? "same" : "changed";')" "0/same"
+
+echo "-- a form submission and a credential in one call: the withholding comes first --"
+# The change record for a personal-data post is withheld whole before anything else judges it, and
+# an ordinary post edited in the same call still gets the credential scan. Asserted on what the
+# journal option and the audit summary hold, with the ordinary post as the control that the
+# probe can find a value that SHOULD be kept.
+GS_OUT=$(wpe 'register_post_type( "flamingo_inbound", [ "public" => false ] ); wp_set_current_user( 1 ); add_filter( "gmcp_can_call_tool", "__return_true" ); update_option( "gmcp_journal", [], false );
+do_action( "gmcp_tool_start", "wp_update_post" );
+$g = wp_insert_post( [ "post_type" => "flamingo_inbound", "post_status" => "publish", "post_title" => "GSSUBJ one", "post_content" => "gsbody" ] );
+$o = wp_insert_post( [ "post_type" => "post", "post_status" => "draft", "post_title" => "gs plain probe", "post_content" => "gs ord body" ] );
+do_action( "gmcp_tool_called" ); do_action( "gmcp_tool_start", "wp_update_post" );
+wp_update_post( [ "ID" => $g, "post_title" => "smtp_pwd=gshunter7A GSSUBJ two", "post_content" => "define(\"DB_PASSWORD\",\"gssecretB99\") GSBODY2" ] );
+wp_update_post( [ "ID" => $o, "post_title" => "gs ord smtp_pwd=gshunter7C", "post_content" => "gs ord body 2" ] );
+$sum = (string) GMCP_Changes::summarise( GMCP_Changes::captured(), 16000 ); do_action( "gmcp_tool_called" );
+$all = json_encode( get_option( "gmcp_journal" ) ) . $sum;
+foreach ( [ "GSSUBJ", "GSBODY2", "gshunter7A", "gssecretB99", "gshunter7C" ] as $n ) { echo $n, "=", substr_count( $all, $n ), ";"; }
+echo "ctl=", substr_count( $all, "gs plain probe" ), ";";
+$log = get_option( "gmcp_journal" ); $log[] = [ "id" => "gslegx", "t" => time(), "kind" => "post", "ID" => $g, "what" => "x", "fields" => [ "post_title" ], "previous" => [ "post_title" => "x" ], "tool" => "wp_update_post", "call" => "z" ]; update_option( "gmcp_journal", $log, false );
+$r = GMCP_Journal::revert( "gslegx" ); echo "legacy=", var_export( $r["ok"], true ), ";";
+wp_delete_post( $g, true ); wp_delete_post( $o, true ); update_option( "gmcp_journal", [], false );')
+check "submission title and body, and both credentials, are in neither the journal nor the summary" "$(printf %s "$GS_OUT" | grep -o 'GSSUBJ=[0-9]*;GSBODY2=[0-9]*;gshunter7A=[0-9]*;gssecretB99=[0-9]*;gshunter7C=[0-9]*')" "GSSUBJ=0;GSBODY2=0;gshunter7A=0;gssecretB99=0;gshunter7C=0"
+check "control: the ordinary post's harmless title is kept (journal previous + summary from)" "$(printf %s "$GS_OUT" | grep -o 'ctl=[0-9]*')" "ctl=2"
+check "a stored entry for a submission is refused on revert" "$(printf %s "$GS_OUT" | grep -o 'legacy=[a-z]*')" "legacy=false"
+
+echo "-- a credential in a post body never reaches the journal or the audit log --"
+# holds_credential() judges field NAMES and opens only a value that BEGINS as JSON or serialized
+# data. A post body is prose, so a settings snippet, a pasted wp-config line or an Authorization
+# header inside it went into the journal option and the audit table verbatim: as the previous
+# value an undo keeps, as the value an undo overwrites, as the call's own arguments and as the
+# one-line change summary. Asserted on the stored rows, never on a reply. Every "is absent"
+# check has a control that finds a value of the same kind that SHOULD be there.
+JC_J_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_change_journal"] ?? 0 ? 1 : 0;')
+JC_A_WAS=$(wpe 'echo get_option("gmcp_options",[])["mcp_activity_log"] ?? 0 ? 1 : 0;')
+wpe '$o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=true;$o["mcp_activity_log"]=true;update_option("gmcp_options",$o,false);delete_option("gmcp_journal");' >/dev/null
+K_JC=$(wpe '$a=GMCP_Tokens::create("jc admin","admin",0,[]);echo $a["secret"];')
+JC_POST=$(wpe 'echo wp_insert_post(["post_title"=>"JC journal post","post_status"=>"draft","post_content"=>"JC original body","post_excerpt"=>"JC original excerpt"]);')
+JC_FIRST_AUDIT=$(wpe 'global $wpdb; echo (int) $wpdb->get_var("SELECT COALESCE(MAX(id),0) FROM " . GMCP_Audit::table());')
+check "CONTROL: the key and the post exist" "$([ "${K_JC#gmcp_}" != "$K_JC" ] && [ "$JC_POST" -gt 0 ] && echo yes || echo no)" "yes"
+
+JC_S_JSON='sk_live_JCLEAKjson7Qz81'
+JC_S_DEF='JCLeakDefine9xTq'
+JC_S_BEARER='jcLeakBearer5aB3dE7gH9jK'
+# The JSON field names are written out here, not taken from a variable, so what the post holds
+# is what an agent would paste.
+jc_update() { # jc_update <id> <field> <value>
+  callk jc "$K_JC" "$(python3 -c 'import json,sys;print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wp_update_post","arguments":{"ID":int(sys.argv[1]),"fields":{sys.argv[2]:sys.argv[3]}}}}))' "$1" "$2" "$3")"
+}
+jc_field() { wpe "wp_cache_flush(); echo get_post_field('$2', $1);"; }
+jc_entry() { # jc_entry <field-name>  -> id of the newest journal entry that names it
+  wpe 'foreach ( GMCP_Journal::recent( 40 ) as $e ) { if ( strpos( $e["what"], "'"$1"'" ) !== false ) { echo $e["id"]; break; } }'
+}
+
+# 1. content: clean -> credential -> clean. The second call's PREVIOUS value is the credential.
+jc_update "$JC_POST" post_content "Notes {\"api_key\":\"$JC_S_JSON\"} end"
+check "CONTROL: the credential body really was written" "$(jc_field "$JC_POST" post_content | grep -c "$JC_S_JSON")" "1"
+jc_update "$JC_POST" post_content "JC second body"
+# 2. a pasted wp-config line, as the excerpt, then as content
+jc_update "$JC_POST" post_excerpt "define('DB_PASSWORD','$JC_S_DEF');"
+jc_update "$JC_POST" post_excerpt "JC second excerpt"
+# 3. an Authorization header
+jc_update "$JC_POST" post_content "Send Authorization: Bearer $JC_S_BEARER with every request"
+jc_update "$JC_POST" post_content "JC third body"
+
+JC_JOURNAL_HAS() { wpe 'echo strpos( serialize( get_option( "gmcp_journal", [] ) ), "'"$1"'" ) === false ? "absent" : "present";'; }
+JC_AUDIT_HAS() { wpe 'global $wpdb; $t = GMCP_Audit::table(); echo (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $t WHERE id > %d AND CONCAT_WS(\"|\", args, COALESCE(changes,\"\"), detail, target) LIKE %s", '"$JC_FIRST_AUDIT"', "%'"$1"'%" ) );'; }
+check "CONTROL: the journal probe finds a value that was kept (an earlier body)" "$(JC_JOURNAL_HAS 'JC original body')" "present"
+check "CONTROL: the audit probe finds a value that was recorded (an ordinary argument)" "$([ "$(JC_AUDIT_HAS 'JC second body')" -ge 1 ] && echo yes || echo no)" "yes"
+check "CONTROL: the audit log recorded these calls at all" "$([ "$(wpe 'global $wpdb; echo (int) $wpdb->get_var( "SELECT COUNT(*) FROM " . GMCP_Audit::table() . " WHERE tool = \"wp_update_post\" AND id > '"$JC_FIRST_AUDIT"'" );')" -ge 6 ] && echo yes || echo no)" "yes"
+for s in "$JC_S_JSON" "$JC_S_DEF" "$JC_S_BEARER"; do
+  check "journal: $s is not stored" "$(JC_JOURNAL_HAS "$s")" "absent"
+  check "audit log (args, changes, detail, target): $s is not stored" "$(JC_AUDIT_HAS "$s")" "0"
+done
+callk jc_list "$K_JC" "$(tool_json 2 wp_list_changes '{"limit":40}')"
+check "CONTROL: wp_list_changes answers and lists the post's changes" "$([ "$(grep -c 'JC journal post' "$OUT/jc_list")" -gt 0 ] && echo yes || echo no)" "yes"
+check "wp_list_changes does not repeat a credential" "$(grep -c -e "$JC_S_JSON" -e "$JC_S_DEF" -e "$JC_S_BEARER" "$OUT/jc_list")" "0"
+
+# The entry whose previous value was the credential cannot be put back, and says why; the
+# post keeps the content it has.
+JC_ENTRY_CRED=$(wpe 'foreach ( get_option( "gmcp_journal", [] ) as $e ) { if ( ( $e["ID"] ?? 0 ) == '"$JC_POST"' && ! empty( $e["redacted_fields"] ) && in_array( "post_content", $e["redacted_fields"], true ) ) { echo $e["id"]; break; } }')
+check "the entry that would have kept a credential body is on record and marked withheld" "$([ -n "$JC_ENTRY_CRED" ] && echo yes || echo no)" "yes"
+check "  and is listed as not reversible" "$(wpe 'foreach ( GMCP_Journal::recent( 40 ) as $e ) { if ( $e["id"] === "'"$JC_ENTRY_CRED"'" ) { echo $e["reversible"] ? "reversible" : "not"; } }')" "not"
+JC_BEFORE=$(jc_field "$JC_POST" post_content)
+callk jc "$K_JC" "$(tool_json 3 wp_undo_change "{\"id\":\"$JC_ENTRY_CRED\"}")"
+check "  and an undo of it is refused and the post is unchanged" "$(verdict jc)/$(jc_field "$JC_POST" post_content)" "error/$JC_BEFORE"
+
+# What an undo OVERWRITES is judged as well: this edit has a clean previous body and replaces a
+# credential, so undoing it overwrites a credential, which is the one write that could copy it
+# into the undo's own record.
+jc_update "$JC_POST" post_content "Again {\"api_key\":\"$JC_S_JSON\"} here"
+JC_E1=$(jc_entry post_content)
+callk jc "$K_JC" "$(tool_json 4 wp_undo_change "{\"id\":\"$JC_E1\"}")"
+check "CONTROL: the undo of that edit goes through and restores the clean body" "$(verdict jc)/$(jc_field "$JC_POST" post_content)" "ok/JC third body"
+check "the credential the undo overwrote is not in the journal" "$(JC_JOURNAL_HAS "$JC_S_JSON")" "absent"
+check "and no undo ever wrote a placeholder over live content" "$(wpe 'echo get_post_field("post_content", '"$JC_POST"') === "[redacted]" || get_post_field("post_excerpt", '"$JC_POST"') === "[redacted]" ? "WROTE" : "never";')" "never"
+JC_REDO=$(wpe 'foreach ( get_option( "gmcp_journal", [] ) as $e ) { if ( ( $e["undoes"] ?? "" ) === "'"$JC_E1"'" ) { echo $e["id"]; } }')
+check "CONTROL: the undo is itself on record" "$([ -n "$JC_REDO" ] && echo yes || echo no)" "yes"
+callk jc "$K_JC" "$(tool_json 5 wp_undo_change "{\"id\":\"$JC_REDO\"}")"
+check "reverting that undo cannot restore the credential body, and the post keeps its content" "$(verdict jc)/$(jc_field "$JC_POST" post_content)" "error/JC third body"
+
+# The false-positive control: an ordinary body that only uses the word is journalled and undone
+# byte for byte. A scanner that refused it would pass every leak check above and ruin undo.
+JC_PROSE='Pick a strong password and never share your password. Keep the secret key and API key safe. Password: required. The token is shown once.'
+jc_update "$JC_POST" post_content "$JC_PROSE"
+jc_update "$JC_POST" post_content "JC after prose"
+JC_E2=$(jc_entry post_content)
+check "CONTROL: the prose body was kept, whole, as the previous value" "$(JC_JOURNAL_HAS 'Pick a strong password and never share your password')" "present"
+callk jc "$K_JC" "$(tool_json 6 wp_undo_change "{\"id\":\"$JC_E2\"}")"
+check "an undo restores it exactly" "$(verdict jc)/$([ "$(jc_field "$JC_POST" post_content)" = "$JC_PROSE" ] && echo identical || echo different)" "ok/identical"
+
+# A title that is itself a credential is not quoted in the entry's one-line description.
+jc_update "$JC_POST" post_title "define('DB_PASSWORD','$JC_S_DEF');"
+jc_update "$JC_POST" post_title "JC journal post"
+check "a title holding a credential is not quoted in a \"what\" line, the audit changes, or the target" "$(JC_JOURNAL_HAS "$JC_S_DEF")/$(JC_AUDIT_HAS "$JC_S_DEF")" "absent/0"
+
+# 3. Statuses WordPress deletes on are not restored by an undo.
+JC_AD=$(wpe 'echo wp_insert_post(["post_title"=>"JC old autodraft","post_status"=>"auto-draft","post_content"=>"JC autodraft body","post_date"=>gmdate("Y-m-d H:i:s",time()-30*DAY_IN_SECONDS),"post_date_gmt"=>gmdate("Y-m-d H:i:s",time()-30*DAY_IN_SECONDS)]);')
+JC_AD_CTRL=$(wpe 'echo wp_insert_post(["post_title"=>"JC control autodraft","post_status"=>"auto-draft","post_content"=>"x","post_date"=>gmdate("Y-m-d H:i:s",time()-30*DAY_IN_SECONDS),"post_date_gmt"=>gmdate("Y-m-d H:i:s",time()-30*DAY_IN_SECONDS)]);')
+check "CONTROL: both old auto-drafts exist as auto-drafts" "$(pstatus $JC_AD)/$(pstatus $JC_AD_CTRL)" "auto-draft/auto-draft"
+callk jc "$K_JC" "$(tool_json 7 wp_update_post "{\"ID\":$JC_AD,\"fields\":{\"post_status\":\"draft\",\"post_title\":\"JC promoted\"}}")"
+check "CONTROL: the tool promoted it out of auto-draft" "$(pstatus $JC_AD)" "draft"
+JC_E3=$(jc_entry "JC promoted")
+[ -z "$JC_E3" ] && JC_E3=$(wpe 'foreach ( get_option( "gmcp_journal", [] ) as $e ) { if ( ( $e["kind"] ?? "" ) === "post" && ( $e["ID"] ?? 0 ) == '"$JC_AD"' ) { echo $e["id"]; break; } }')
+check "CONTROL: that promotion is on record" "$([ -n "$JC_E3" ] && echo yes || echo no)" "yes"
+callk jc "$K_JC" "$(tool_json 8 wp_undo_change "{\"id\":\"$JC_E3\"}")"
+check "the undo does not set it back to auto-draft" "$(pstatus $JC_AD)" "draft"
+wpe 'wp_delete_auto_drafts();' >/dev/null
+check "the daily auto-draft clean-up leaves it standing" "$(wpe 'echo get_post('"$JC_AD"') ? "present" : "gone";')" "present"
+check "CONTROL: the same clean-up does delete an old auto-draft nobody promoted" "$(wpe 'echo get_post('"$JC_AD_CTRL"') ? "present" : "gone";')" "gone"
+
+# The same for a post an undo would send back to the trash.
+JC_TR=$(wpe 'echo wp_insert_post(["post_title"=>"JC trashed","post_status"=>"publish","post_content"=>"x"]);')
+wpe 'wp_trash_post('"$JC_TR"');' >/dev/null
+check "CONTROL: the post is in the trash with its trash stamp" "$(pstatus $JC_TR)/$(wpe 'echo get_post_meta('"$JC_TR"', "_wp_trash_meta_time", true) ? "stamped" : "unstamped";')" "trash/stamped"
+callk jc "$K_JC" "$(tool_json 10 wp_update_post "{\"ID\":$JC_TR,\"fields\":{\"post_status\":\"draft\",\"post_title\":\"JC untrashed\"}}")"
+check "CONTROL: the tool took it out of the trash" "$(pstatus $JC_TR)" "draft"
+JC_E4=$(wpe 'foreach ( get_option( "gmcp_journal", [] ) as $e ) { if ( ( $e["kind"] ?? "" ) === "post" && ( $e["ID"] ?? 0 ) == '"$JC_TR"' && isset( $e["previous"]["post_status"] ) ) { echo $e["id"]; break; } }')
+check "CONTROL: it is on record, and what it would put back is the status trash" "$([ -n "$JC_E4" ] && echo yes || echo no)/$(wpe 'foreach ( get_option( "gmcp_journal", [] ) as $e ) { if ( $e["id"] === "'"$JC_E4"'" ) { echo $e["previous"]["post_status"] ?? "none"; } }')" "yes/trash"
+callk jc "$K_JC" "$(tool_json 11 wp_undo_change "{\"id\":\"$JC_E4\"}")"
+check "the undo does not send it back to the trash" "$(pstatus $JC_TR)" "draft"
+
+# A forged entry naming fields outside the recorder's list is skipped, field by field.
+JC_FORGE_ID=$(wpe 'echo wp_insert_post(["post_title"=>"JC forge target","post_status"=>"draft","post_type"=>"post","post_content"=>"x","post_author"=>1]);')
+wpe 'update_option( "gmcp_journal", [ [ "id" => "jcforged01", "t" => time(), "tool" => "wp_update_post", "call" => "jcforgedcall", "kind" => "post", "ID" => '"$JC_FORGE_ID"', "what" => "forged", "fields" => [ "post_title", "post_type", "post_author", "post_date", "post_password" ], "previous" => [ "post_title" => "JC restored title", "post_type" => "page", "post_author" => 99, "post_date" => "1970-01-01 00:00:00", "post_password" => "forgedpw" ] ] ], false );' >/dev/null
+callk jc "$K_JC" "$(tool_json 9 wp_undo_change '{"id":"jcforged01"}')"
+check "CONTROL: the forged entry's watched field was restored" "$(verdict jc)/$(ptitle $JC_FORGE_ID)" "ok/JC restored title"
+check "post_type, author, password and date were not written by the undo" "$(wpe 'wp_cache_flush(); $p = get_post('"$JC_FORGE_ID"'); echo $p->post_type, "|", $p->post_author, "|", $p->post_password === "" ? "nopw" : "PW", "|", substr($p->post_date, 0, 4) === "1970" ? "EPOCH" : "date-kept";')" "post|1|nopw|date-kept"
+
+# Put the site back.
+wpe 'foreach ( [ '"$JC_POST"', '"$JC_TR"', '"$JC_AD"', '"$JC_AD_CTRL"', '"$JC_FORGE_ID"' ] as $i ) { wp_delete_post( $i, true ); } foreach ( GMCP_Tokens::all() as $t ) { if ( $t["label"] === "jc admin" ) { GMCP_Tokens::revoke( $t["id"] ); } } delete_option( "gmcp_journal" ); $o=get_option("gmcp_options",[]);$o["mcp_change_journal"]=('"$JC_J_WAS"'===1);$o["mcp_activity_log"]=('"$JC_A_WAS"'===1);update_option("gmcp_options",$o,false);' >/dev/null
+check "put back: the fixtures are gone" "$(wpe 'echo count( get_posts( [ "post_type" => "any", "post_status" => "any", "numberposts" => -1, "s" => "JC " ] ) );')" "0"
+
+echo "-- a meta key is judged as the database compares it: accents, case, spaces and invisible characters --"
+# wp_postmeta.meta_key is compared by its column's collation, utf8mb4_unicode_520_ci on a stock WordPress:
+# accent-insensitive, case-insensitive, blind to combining marks and zero-width characters, and it
+# ignores trailing spaces. So update_metadata() filed a write for "_thumbnaíl_id" under the existing
+# "_thumbnail_id" row, and a policy that compared the typed spelling refused the right one and stored the
+# other. SQLite compares exactly, so none of this exists there: the block says so and skips, rather than
+# passing checks that could not have failed. Every claim is asserted on the STORED row, the public page,
+# or the post's survival of the trash purge, never on the reply.
+MK_FOLDS=$(wpe 'global $wpdb; $wpdb->suppress_errors( true ); echo $wpdb->get_var( "SELECT CONVERT(0xc3ad USING utf8mb4) COLLATE utf8mb4_unicode_520_ci = CHAR( 105 )" ) === "1" ? "folds" : "exact";')
+if [ "$MK_FOLDS" != "folds" ]; then
+  echo "  SKIP  this database compares meta keys exactly (SQLite, or a binary collation): the accent and case fold does not exist here, so nothing below could fail. Run this suite against MariaDB or MySQL."
+else
+K_MK=$(wpe '$a=GMCP_Tokens::create("mk writer","readwrite",0,[]);echo $a["secret"];')
+check "CONTROL: the suite minted a readwrite key for the block" "$([ -n "$K_MK" ] && echo yes || echo no)" "yes"
+MK_IDS=$(wpe '
+  $sub = wp_insert_post( [ "post_type" => "flamingo_inbound", "post_status" => "publish", "post_title" => "MK submission" ] );
+  $att = wp_insert_post( [ "post_type" => "attachment", "post_status" => "inherit", "post_parent" => $sub, "post_title" => "MK submission upload", "post_mime_type" => "image/png", "guid" => home_url( "/mk-att.png" ) ] );
+  update_post_meta( $att, "_wp_attached_file", "mk-att.png" );
+  $ok = wp_insert_post( [ "post_type" => "attachment", "post_status" => "inherit", "post_title" => "MK ordinary upload", "post_mime_type" => "image/png", "guid" => home_url( "/mk-ok.png" ) ] );
+  update_post_meta( $ok, "_wp_attached_file", "mk-ok.png" );
+  $pg = wp_insert_post( [ "post_type" => "post", "post_status" => "publish", "post_title" => "MK page", "post_content" => "MK body" ] );
+  $pg2 = wp_insert_post( [ "post_type" => "post", "post_status" => "publish", "post_title" => "MK page two", "post_content" => "MK body two" ] );
+  echo "$sub $att $ok $pg $pg2";')
+read -r MK_SUB MK_ATT MK_OK MK_PG MK_PG2 <<< "$MK_IDS"
+check "CONTROL: the fixtures exist (a submission, its upload, an ordinary upload, two public posts)" "$([ -n "$MK_PG2" ] && echo yes || echo no)" "yes"
+mk_thumb() { wpe 'wp_cache_flush(); global $wpdb; $v = $wpdb->get_var( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s ORDER BY meta_id LIMIT 1", '"$1"', "_thumbnail_id" ) ); echo $v === null ? "none" : $v;'; }
+mk_rows() { wpe 'wp_cache_flush(); global $wpdb; echo (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s", '"$1"', "'"$2"'" ) );'; }
+mk_page_has() { curl -sSL "$BASE/?p=$1" | grep -c "$2"; }
+
+# A. A featured image. The real one first, so there is an existing "_thumbnail_id" row to hit.
+callk mk0 "$K_MK" "$(tool_json 1 wp_set_featured_image "{\"post_id\":$MK_PG,\"media_id\":$MK_OK}")"
+check "CONTROL: the ordinary upload became the page's featured image" "$(verdict mk0)/$(mk_thumb $MK_PG)" "ok/$MK_OK"
+check "CONTROL: the public page renders that image (so the probe below can see a rendered file)" "$([ "$(mk_page_has $MK_PG mk-ok.png)" -ge 1 ] && echo yes || echo no)" "yes"
+callk mk1 "$K_MK" "$(tool_json 2 wp_update_post_meta "{\"ID\":$MK_PG,\"key\":\"_thumbnail_id\",\"value\":\"$MK_ATT\"}")"
+check "CONTROL: the exact spelling pointed at a submission's upload is refused" "$(verdict mk1)/$(mk_thumb $MK_PG)" "error/$MK_OK"
+MK_THUMB_VARIANTS='_thumbna\u00edl_id|_THUMBNA\u00cdL_ID|_thumbnail_id  |_thumbnai\u0301l_id|_thumb\u200bnail_id|_thumbnail_\u0131d|\uff3fthumbnail_id|_thumbnail_\uff49d|_thumb\u00adnail_id'
+IFS='|' read -r -a MK_VARS <<< "$MK_THUMB_VARIANTS"
+MK_N=10
+for MK_V in "${MK_VARS[@]}"; do
+  MK_N=$((MK_N+1))
+  callk mkv "$K_MK" "$(tool_json $MK_N wp_update_post_meta "{\"ID\":$MK_PG,\"key\":\"$MK_V\",\"value\":\"$MK_ATT\"}")"
+  check "STORED: the page's featured image is still the ordinary upload after a write under the spelling [$MK_V]" "$(mk_thumb $MK_PG)" "$MK_OK"
+  # Put it back through core, outside any tool call, so one variant's result cannot decide the next one's.
+  wpe 'delete_post_meta( '"$MK_PG"', "_thumbnail_id" ); update_post_meta( '"$MK_PG"', "_thumbnail_id", '"$MK_OK"' ); global $wpdb; $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key <> %s AND meta_key LIKE %s", '"$MK_PG"', "_thumbnail_id", "\\_thumb%" ) );' >/dev/null
+done
+check "STORED: still exactly one row the database reads as _thumbnail_id on the page" "$(mk_rows $MK_PG _thumbnail_id)" "1"
+check "the public page still shows the ordinary image" "$([ "$(mk_page_has $MK_PG mk-ok.png)" -ge 1 ] && echo yes || echo no)" "yes"
+check "and does not render the submission's upload" "$(mk_page_has $MK_PG mk-att.png)" "0"
+# The same value through meta_input, the batch tool and the featured-image tool with an accent-free key is covered
+# by smoke-forms.sh; here the accent goes in through the other generic route that takes a key.
+callk mkb "$K_MK" "$(tool_json 40 wp_update_post "{\"ID\":$MK_PG,\"meta_input\":{\"_thumbnaíl_id\":\"$MK_ATT\"}}")"
+check "STORED: meta_input under an accented spelling did not repoint the image either" "$(mk_thumb $MK_PG)" "$MK_OK"
+# The journal's undo replays through the same WordPress meta functions. An entry naming the accented key (forged
+# here, because the guarded writers can no longer record one) must not repoint the image when undone.
+MK_JOURNAL_WAS=$(wpe 'echo get_option( "gmcp_options", [] )["mcp_change_journal"] ?? 0 ? 1 : 0;')
+wpe '$o = get_option( "gmcp_options", [] ); $o["mcp_change_journal"] = true; update_option( "gmcp_options", $o, false );' >/dev/null
+wpe '$m = new ReflectionMethod( "GMCP_Journal", "meta_body" ); $m->setAccessible( true ); $e = $m->invoke( null, [ "kind" => "meta", "ID" => '"$MK_PG"', "key" => "_thumbna\u{00ED}l_id", "what" => "MK forged", "absent" => false, "id" => "mkforged01", "tool" => "wp_update_post_meta", "call" => "mkforgedcall", "t" => time() ], "'"$MK_ATT"'" ); update_option( "gmcp_journal", [ $e ], false );' >/dev/null
+check "CONTROL: the forged entry has a snapshot to replay" "$(wpe 'echo get_option( "gmcp_journal", [] )[0]["snapshot"] ?? 0 ? "yes" : "no";')" "yes"
+callk mku "$K_MK" "$(tool_json 39 wp_undo_change '{"id":"mkforged01"}')"
+check "STORED: undoing an entry for the accented key did not repoint the image" "$(mk_thumb $MK_PG)" "$MK_OK"
+wpe 'delete_option( "gmcp_journal" ); $o = get_option( "gmcp_options", [] ); $o["mcp_change_journal"] = ( '"$MK_JOURNAL_WAS"' === 1 ); update_option( "gmcp_options", $o, false );' >/dev/null
+# No existing row: a refused write must not leave a row under the accented spelling, because every query that asks
+# for "_thumbnail_id" matches it through the same collation.
+callk mkn "$K_MK" "$(tool_json 41 wp_update_post_meta "{\"ID\":$MK_PG2,\"key\":\"_thumbnaíl_id\",\"value\":\"$MK_ATT\"}")"
+check "STORED: with no featured image yet, the accented write left no row the database reads as _thumbnail_id" "$(verdict mkn)/$(mk_rows $MK_PG2 _thumbnail_id)" "error/0"
+check "the second page renders no submission file" "$(mk_page_has $MK_PG2 mk-att.png)" "0"
+# Controls on the other side of the fold: an unrelated accented key is an ordinary key.
+callk mkc "$K_MK" "$(tool_json 42 wp_update_post_meta "{\"ID\":$MK_PG2,\"key\":\"café_note\",\"value\":\"kept\"}")"
+check "CONTROL: an unrelated accented key (café_note) is still writable and stored under its own spelling" "$(verdict mkc)/$(wpe 'echo get_post_meta('"$MK_PG2"', "café_note", true);')/$(mk_rows $MK_PG2 'café_note')" "ok/kept/1"
+callk mkc2 "$K_MK" "$(tool_json 43 wp_update_post_meta "{\"ID\":$MK_PG2,\"key\":\"_thumbnail_ie\",\"value\":\"$MK_ATT\"}")"
+check "CONTROL: a key one letter off _thumbnail_id is an ordinary key" "$(verdict mkc2)" "ok"
+
+# B. A menu item's target: the same fold over the _menu_item_* family.
+MK_ITEM=$(wpe '
+  $m = wp_create_nav_menu( "MK menu" );
+  echo wp_update_nav_menu_item( $m, 0, [ "menu-item-object-id" => '"$MK_PG2"', "menu-item-object" => "post", "menu-item-type" => "post_type", "menu-item-status" => "publish" ] );')
+check "CONTROL: a menu item pointing at the ordinary page exists" "$(wpe 'echo (int) get_post_meta('"$MK_ITEM"', "_menu_item_object_id", true);')" "$MK_PG2"
+callk mm0 "$K_MK" "$(tool_json 50 wp_update_post_meta "{\"ID\":$MK_ITEM,\"key\":\"_menu_item_object_id\",\"value\":\"$MK_ATT\"}")"
+check "CONTROL: the exact spelling, pointed at a submission's upload, is refused" "$(verdict mm0)/$(wpe 'wp_cache_flush(); echo (int) get_post_meta('"$MK_ITEM"', "_menu_item_object_id", true);')" "error/$MK_PG2"
+MK_N=50
+for MK_V in '_menu_item_obj\u00e9ct_id' '_MENU_ITEM_OBJECT_ID' '_menu_item_object_id ' '_menu_item_object\u200b_id' '_menu_item_object_\u0131d'; do
+  MK_N=$((MK_N+1))
+  callk mmv "$K_MK" "$(tool_json $MK_N wp_update_post_meta "{\"ID\":$MK_ITEM,\"key\":\"$MK_V\",\"value\":\"$MK_ATT\"}")"
+  check "STORED: the menu item still points at the ordinary page after a write under [$MK_V]" "$(wpe 'wp_cache_flush(); echo (int) get_post_meta('"$MK_ITEM"', "_menu_item_object_id", true);')" "$MK_PG2"
+  wpe 'update_post_meta( '"$MK_ITEM"', "_menu_item_object_id", '"$MK_PG2"' );' >/dev/null
+done
+check "the public navigation names no submission upload" "$(wpe 'wp_cache_flush(); $i = wp_setup_nav_menu_item( get_post( '"$MK_ITEM"' ) ); echo strpos( (string) $i->title . (string) $i->url, "submission upload" ) === false ? "clean" : "LEAKS";')" "clean"
+
+# C. The deletion schedule. A trashed post is purged when its _wp_trash_meta_time is old enough, so a key the
+# database reads as that name, written with an accent INSIDE the part a byte comparison of the prefix looked at,
+# was a way to bring a person's trashed post forward to the next cron run.
+MK_TR=$(wpe '$id = wp_insert_post( [ "post_type" => "post", "post_status" => "publish", "post_title" => "MK trashed by a person" ] ); wp_trash_post( $id ); echo $id;')
+MK_TR2=$(wpe '$id = wp_insert_post( [ "post_type" => "post", "post_status" => "publish", "post_title" => "MK trashed control" ] ); wp_trash_post( $id ); echo $id;')
+check "CONTROL: both posts are in the trash with a trash stamp" "$(pstatus $MK_TR)/$(pstatus $MK_TR2)/$(mk_rows $MK_TR _wp_trash_meta_time)" "trash/trash/1"
+MK_N=60
+for MK_V in '_wp_tr\u00e1sh_meta_time' '_wp_trash\u0301_meta_time' '_WP_TRASH_META_TIME' '_wp_trash_meta_time ' '_wp_trash\u200b_meta_time' '_wp\uff3ftrash_meta_time' '_wp_tra\u00dfh_meta_time'; do
+  MK_N=$((MK_N+1))
+  callk mkt "$K_MK" "$(tool_json $MK_N wp_update_post_meta "{\"ID\":$MK_TR,\"key\":\"$MK_V\",\"value\":\"1\"}")"
+  check "STORED: after a write under [$MK_V] the post has one row the database reads as _wp_trash_meta_time, holding a current time and not 1" "$(mk_rows $MK_TR _wp_trash_meta_time)/$(wpe 'wp_cache_flush(); global $wpdb; echo (int) $wpdb->get_var( $wpdb->prepare( "SELECT MIN( CAST( meta_value AS UNSIGNED ) ) FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s", '"$MK_TR"', "_wp_trash_meta_time" ) ) > 1000000000 ? "current" : "TAMPERED";')" "1/current"
+  # Back to what core wrote, whatever the variant did, so the next one starts from the same place.
+  wpe 'global $wpdb; $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key LIKE %s", '"$MK_TR"', "\\_wp%trash%meta%" ) ); $wpdb->insert( $wpdb->postmeta, [ "post_id" => '"$MK_TR"', "meta_key" => "_wp_trash_meta_time", "meta_value" => time() ] ); $wpdb->insert( $wpdb->postmeta, [ "post_id" => '"$MK_TR"', "meta_key" => "_wp_trash_meta_status", "meta_value" => "publish" ] ); wp_cache_flush();' >/dev/null
+done
+# The control that makes the purge a probe: a stamp written by core's own API IS purged, by the same call.
+wpe 'global $wpdb; $wpdb->update( $wpdb->postmeta, [ "meta_value" => 1 ], [ "post_id" => '"$MK_TR2"', "meta_key" => "_wp_trash_meta_time" ] ); wp_cache_flush(); wp_scheduled_delete();' >/dev/null
+check "CONTROL: the daily purge deletes a trashed post whose stamp is old (the probe can find a purge)" "$(wpe 'echo get_post('"$MK_TR2"') ? "present" : "purged";')" "purged"
+check "the daily purge left the person's trashed post alone" "$(wpe 'echo get_post('"$MK_TR"') ? "present" : "purged";')" "present"
+
+# Put the site back.
+wpe 'foreach ( [ '"$MK_SUB"', '"$MK_ATT"', '"$MK_OK"', '"$MK_PG"', '"$MK_PG2"', '"$MK_TR"', '"$MK_TR2"', '"$MK_ITEM"' ] as $i ) { if ( get_post( $i ) ) { wp_delete_post( $i, true ); } } foreach ( wp_get_nav_menus() as $m ) { if ( $m->name === "MK menu" ) { wp_delete_nav_menu( $m->term_id ); } } foreach ( GMCP_Tokens::all() as $t ) { if ( $t["label"] === "mk writer" ) { GMCP_Tokens::revoke( $t["id"] ); } }' >/dev/null
+check "put back: the fixtures are gone" "$(wpe 'echo count( get_posts( [ "post_type" => "any", "post_status" => "any", "numberposts" => -1, "s" => "MK " ] ) );')" "0"
+fi
+
+echo "-- a listing pages in the database: more than the scan bound of unreadable rows, and an offset that costs nothing --"
+# The listings used to skip the rows a key may not read in PHP, a window at a time, so a run of more than
+# 5000 consecutive unreadable rows at the head left a short page, and an offset was paid for by loading every
+# row up to it (measured with 50,000 posts and a read-only key: 13 seconds and 210 MB for offset 40,000, over
+# a minute for ten million). They are left out in SQL now, so the offset is the database's. The unreadable
+# rows are 5,200 uploads and comments that hang from a form submission, newest first, so they sit at the head
+# of every listing; three ordinary uploads and comments sit behind them.
+PG_N=5200
+PG_SUB=$(wpe 'echo wp_insert_post( [ "post_type" => "flamingo_inbound", "post_status" => "publish", "post_title" => "PGB submission" ] );')
+PG_POST=$(wpe 'echo wp_insert_post( [ "post_type" => "post", "post_status" => "publish", "post_title" => "PGB ordinary post" ] );')
+wpe 'foreach ( [ 1, 2, 3 ] as $i ) { $d = "2001-01-0$i 00:00:00"; $a = wp_insert_post( [ "post_type" => "attachment", "post_status" => "inherit", "post_title" => "PGB ordinary upload $i", "post_mime_type" => "image/png", "post_date" => $d, "post_date_gmt" => $d, "guid" => home_url( "/pgb-ordinary-$i.png" ) ] ); wp_insert_comment( [ "comment_post_ID" => '"$PG_POST"', "comment_content" => "PGB ordinary comment $i", "comment_approved" => 1, "comment_date" => $d, "comment_date_gmt" => $d ] ); }' >/dev/null
+# Every column named, because a hand-built row that leaves out a NOT NULL column reads back differently on the
+# other engine, and 5,200 wp_insert_post calls take ten minutes on a site with tens of thousands of posts.
+PG_MADE=$(wpe 'global $wpdb; $n = 0; for ( $i = 0; $i < '"$PG_N"'; $i++ ) { $d = gmdate( "Y-m-d H:i:s", 4102444800 - $i ); $n += (int) $wpdb->insert( $wpdb->posts, [ "post_author" => 1, "post_date" => $d, "post_date_gmt" => $d, "post_content" => "", "post_title" => "PGB submission upload $i", "post_excerpt" => "", "post_status" => "inherit", "comment_status" => "closed", "ping_status" => "closed", "post_password" => "", "post_name" => "pgb-submission-upload-$i", "to_ping" => "", "pinged" => "", "post_modified" => $d, "post_modified_gmt" => $d, "post_content_filtered" => "", "post_parent" => '"$PG_SUB"', "guid" => "", "menu_order" => 0, "post_type" => "attachment", "post_mime_type" => "image/png", "comment_count" => 0 ] ); $wpdb->insert( $wpdb->comments, [ "comment_post_ID" => '"$PG_SUB"', "comment_author" => "a", "comment_author_email" => "", "comment_author_url" => "", "comment_author_IP" => "", "comment_date" => $d, "comment_date_gmt" => $d, "comment_content" => "PGB submission comment $i", "comment_karma" => 0, "comment_approved" => "1", "comment_agent" => "", "comment_type" => "comment", "comment_parent" => 0, "user_id" => 0 ] ); } wp_cache_flush(); echo $n;')
+check "CONTROL: $PG_N uploads and $PG_N comments hang from the submission, all newer than the ordinary ones" "$PG_MADE" "$PG_N"
+PG_RO=$(wpe '$a=GMCP_Tokens::create("pg readonly","readonly",0,[]);echo $a["secret"];')
+check "CONTROL: the three ordinary uploads and comments exist" "$(wpe 'global $wpdb; echo (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_title LIKE \"PGB ordinary upload %\"" ), "/", (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_content LIKE \"PGB ordinary comment %\"" );')" "3/3"
+occurrences() { grep -o "$1" "$OUT/$2" | wc -l | tr -d ' '; } # the reply is one JSON line, so grep -c would count lines
+n_rows() { py 'import json,sys;print(len(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])))' "$1"; }
+callk pg1 "$PG_RO" "$(tool_json 1 wp_get_media '{"limit":3,"search":"PGB"}')"
+check "wp_get_media: a page of three behind $PG_N unreadable rows is the three ordinary uploads" "$(n_rows pg1)/$(occurrences 'PGB ordinary upload' pg1)" "3/3"
+check "and none of the submission's" "$(occurrences 'PGB submission upload' pg1)" "0"
+callk pg2 "$PG_RO" "$(tool_json 2 wp_get_posts '{"post_type":"attachment","post_status":"inherit","limit":3,"search":"PGB"}')"
+check "wp_get_posts of attachments: the same" "$(n_rows pg2)/$(occurrences 'PGB ordinary upload' pg2)/$(occurrences 'PGB submission upload' pg2)" "3/3/0"
+callk pg3 "$PG_RO" "$(tool_json 3 wp_get_posts '{"post_type":"attachment","post_status":"inherit","limit":1,"offset":1,"search":"PGB"}')"
+callk pg3a "$PG_RO" "$(tool_json 4 wp_get_posts '{"post_type":"attachment","post_status":"inherit","limit":3,"search":"PGB"}')"
+check "an offset still counts readable rows: offset 1 is the second row of the full list (and is a row: an empty page on both sides would agree)" \
+  "$(n_rows pg3)/$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0]["ID"])' pg3)" \
+  "1/$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[1]["ID"])' pg3a)"
+callk pg4 "$PG_RO" "$(tool_json 5 wp_get_comments '{"limit":3,"status":"all","search":"PGB"}')"
+check "wp_get_comments: a page of three behind $PG_N comments on a submission is the three ordinary comments" "$(n_rows pg4)/$(occurrences 'PGB ordinary comment' pg4)/$(occurrences 'PGB submission comment' pg4)" "3/3/0"
+callk pg5 "$PG_RO" "$(tool_json 6 wp_get_comments '{"limit":1,"offset":1,"status":"all","search":"PGB"}')"
+callk pg5a "$PG_RO" "$(tool_json 7 wp_get_comments '{"limit":3,"status":"all","search":"PGB"}')"
+check "a comment offset counts readable rows too" \
+  "$(n_rows pg5)/$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[0]["comment_ID"])' pg5)" \
+  "1/$(py 'import json,sys;print(json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])[1]["comment_ID"])' pg5a)"
+PG_T0=$(date +%s)
+callk pg6 "$PG_RO" "$(tool_json 8 wp_get_posts '{"post_type":"any","limit":5,"offset":10000000}')"
+PG_T1=$(date +%s)
+check "an offset of ten million answers an empty page, not an error" "$(verdict pg6)/$(n_rows pg6)" "ok/0"
+check "and quickly (took $((PG_T1-PG_T0))s, under 20)" "$([ $((PG_T1-PG_T0)) -lt 20 ] && echo yes || echo no)" "yes"
+callk pg7 "$PG_RO" "$(tool_json 9 wp_get_comments '{"limit":3,"offset":10000000}')"
+check "wp_get_comments with an offset of ten million answers an empty page" "$(verdict pg7)/$(n_rows pg7)" "ok/0"
+wpe 'global $wpdb; $wpdb->query( "DELETE FROM {$wpdb->posts} WHERE post_title LIKE \"PGB %\"" ); $wpdb->query( "DELETE FROM {$wpdb->comments} WHERE comment_content LIKE \"PGB %\"" ); wp_cache_flush(); foreach ( GMCP_Tokens::all() as $t ) { if ( $t["label"] === "pg readonly" ) { GMCP_Tokens::revoke( $t["id"] ); } }' >/dev/null
+check "put back: the seeded rows are gone" "$(wpe 'global $wpdb; echo (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_title LIKE \"PGB %\"" ) + (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_content LIKE \"PGB %\"" );')" "0"
 
 # Put the site back: the fixtures, the keys, the grants. A guard test must not leave them.
 wpe 'foreach(get_posts(["post_status"=>"any","post_type"=>["post","page","attachment"],"numberposts"=>-1,"s"=>"DO "]) as $p){ if(strpos($p->post_title,"DO ")===0){wp_delete_post($p->ID,true);} } foreach(wp_get_nav_menus() as $m){ if($m->name==="DO net menu"){wp_delete_nav_menu($m->term_id);} } foreach(GMCP_Tokens::all() as $t){ if(in_array($t["label"],["drafts only writer","plain writer","drafts only admin","pre-flag writer","do admin"],true)){GMCP_Tokens::revoke($t["id"]);} } global $wpdb; $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_tokens WHERE client_id IN (SELECT client_id FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\")"); $wpdb->query("DELETE FROM {$wpdb->prefix}gmcp_oauth_clients WHERE client_name=\"drafts test\"");' >/dev/null

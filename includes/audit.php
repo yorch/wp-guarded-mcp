@@ -269,11 +269,22 @@ class GMCP_Audit {
   *
   * Restored only at the top level and only for scalars, so a nested "key" inside a
   * settings array is still redacted and the change journal's stricter test is untouched.
+  * What the name itself says is judged by its shape afterwards (redact_credential_spans), so a
+  * "key" that is a vendor credential is still hidden. One list for every channel: the debug
+  * log and the approval view read GMCP_Core::IDENTIFIER_ARGS.
   */
-  const IDENTIFIER_ARGS = [ 'key', 'meta_key', 'option_key' ];
+  const IDENTIFIER_ARGS = GMCP_Core::IDENTIFIER_ARGS;
 
   /** Arguments as they will be stored: redacted, size-capped, and honest about both. */
   public static function storable_args( array $args, bool $failed = false ): string {
+    // No leaf can be stored in full: the encoded call is capped at MAX_ARGS, and past that only
+    // a short preview is kept. So no leaf is read past that cap plus a margin for the JSON around
+    // it. This runs from gmcp_tool_called, after the tool has run, so time spent here on text that
+    // cannot be stored is time the row can fail to be written in. $cut_off keeps the recorded
+    // size honest: it is the size of the call the agent sent, not of the copy examined here.
+    $cut_off = 0;
+    $budget = self::MAX_ARGS + 1024;
+    $args = GMCP_Core::cut_leaves( $args, self::MAX_ARGS + 1024, $cut_off, 0, $budget );
     foreach ( self::NEVER_RECORD as $field ) {
       if ( array_key_exists( $field, $args ) ) {
         $args[ $field ] = '[redacted]';
@@ -304,6 +315,13 @@ class GMCP_Audit {
         }
       }
     }
+    // Free text as well as names: wp_update_post's content, excerpt and title are strings
+    // that start with a tag or a word, so redact() above, which judges field names, keeps
+    // them whole, and a body with {"api_key":"..."} or a pasted define('DB_PASSWORD', ...) in
+    // it was written to this table verbatim. What is replaced is the credential, not the
+    // string: a decoy at the end of a post body used to blank the whole of it. Leaves were cut
+    // to what can be stored above, so the scan reads no more than that.
+    $redacted = GMCP_Core::redact_credential_spans( $redacted );
     $json = wp_json_encode( $redacted, JSON_UNESCAPED_SLASHES );
     if ( $json === false ) {
       return '{"__gmcp":"arguments could not be encoded"}';
@@ -314,7 +332,7 @@ class GMCP_Audit {
       // Truncated rather than dropped, and the original size recorded, so a reader can
       // tell a large call from a missing one.
       return wp_json_encode( [
-        '__gmcp_truncated' => strlen( $json ),
+        '__gmcp_truncated' => strlen( $json ) + $cut_off,
         'preview' => mb_substr( $json, 0, $failed ? 1000 : 2000 ),
       ], JSON_UNESCAPED_SLASHES );
     }
@@ -352,7 +370,7 @@ class GMCP_Audit {
       'client' => mb_substr( (string) ( $call['client_name'] ?: ( $call['client_id'] ?? '' ) ), 0, 191 ),
       'auth_method' => mb_substr( (string) ( $call['auth_method'] ?? '' ), 0, 32 ),
       'tool' => mb_substr( (string) $call['tool'], 0, 64 ),
-      'target' => $this->target( $args ),
+      'target' => self::scrub_text( $this->target( $args ), '[redacted]' ),
       'outcome' => $failed ? 'refused' : 'ok',
       'ms' => (int) ( $call['duration_ms'] ?? 0 ),
       'args' => self::storable_args( $args, $failed ),
@@ -382,8 +400,9 @@ class GMCP_Audit {
   * a multisite network's blogs have no reason to queue behind one another. If the lock
   * cannot be had in five seconds the row is written anyway, because an entry that might sit
   * on a fork is a better outcome than an entry that does not exist; the timeout is logged.
-  * A server with no GET_LOCK (some SQLite drop-ins) answers null and is treated as having
-  * no lock to take, silently.
+  * A server with no GET_LOCK answers something that is neither '1' nor '0' and is treated as
+  * having no lock to take, silently: null from a server that errors on the call, and the
+  * string '1=1' from the SQLite drop-in (measured), which reads the call as a comparison.
   *
   * @param array $row the columns, without prev_hash and hash.
   */
@@ -403,7 +422,7 @@ class GMCP_Audit {
     $wpdb->suppress_errors( $noisy );
     $locked = ( (string) $got === '1' );
     if ( (string) $got === '0' ) {
-      error_log( '[Guarded MCP] audit chain lock not obtained within 5 seconds for ' . $row['tool']
+      error_log( '[Guarded MCP] audit chain lock not obtained within 5 seconds for ' . GMCP_Core::log_text( $row['tool'] )
         . '; writing the entry unserialised, so the chain may fork here.' );
     }
 
@@ -454,8 +473,10 @@ class GMCP_Audit {
       // older than the code, which the constructor tries to rule out. Say so loudly
       // rather than returning quietly, because the alternative is a log that is wrong
       // and looks intact.
-      error_log( '[Guarded MCP] audit entry NOT recorded for ' . $row['tool'] . ': '
-        . ( $wpdb->last_error ?: 'the database reported no error' ) );
+      // last_error is the database's own text, which on a duplicate key or a rejected value
+      // can quote the row it was writing: the arguments are in that row.
+      error_log( '[Guarded MCP] audit entry NOT recorded for ' . GMCP_Core::log_text( $row['tool'] ) . ': '
+        . GMCP_Core::log_text( $wpdb->last_error ?: 'the database reported no error' ) );
     }
   }
 
@@ -487,6 +508,26 @@ class GMCP_Audit {
   }
 
   /**
+  * An event's arguments as the table may keep them: read as text for credentials the same way a
+  * call's are (spans blanked, the rest kept), except that "caller" is kept as it is.
+  *
+  * The caller is who asked, named by a key's id or label ("key:3"): an identity, shown to the
+  * administrator who answers the request, and not a secret. It is neither judged nor blanked,
+  * where the assignment scrub that used to run over every string stored it as "key:[redacted]".
+  */
+  public static function event_args( array $given ): array {
+    $caller = isset( $given['caller'] ) && is_scalar( $given['caller'] ) ? mb_substr( (string) $given['caller'], 0, 191 ) : null;
+    unset( $given['caller'] );
+    $unused = 0;
+    $budget = self::MAX_ARGS + 1024;
+    $args = GMCP_Core::redact_credential_spans( GMCP_Core::redact( GMCP_Core::cut_leaves( $given, self::MAX_ARGS + 1024, $unused, 0, $budget ) ) );
+    if ( $caller !== null ) {
+      $args['caller'] = $caller;
+    }
+    return $args;
+  }
+
+  /**
   * Write a row that is not a tool call.
   *
   * The approval queue has events no tool call describes: a person approving a request
@@ -510,7 +551,7 @@ class GMCP_Audit {
       return;
     }
     $actor = (int) ( $fields['actor'] ?? 0 );
-    $args = GMCP_Core::redact( is_array( $fields['args'] ?? null ) ? $fields['args'] : [] );
+    $args = self::event_args( is_array( $fields['args'] ?? null ) ? $fields['args'] : [] );
     $json = wp_json_encode( $args, JSON_UNESCAPED_SLASHES );
     self::append( [
       'ts' => gmdate( 'Y-m-d H:i:s' ),
@@ -524,7 +565,7 @@ class GMCP_Audit {
       'ms' => 0,
       'args' => $json === false ? '{}' : mb_substr( $json, 0, self::MAX_ARGS ),
       'changes' => null,
-      'detail' => mb_substr( GMCP_Core::scrub_preview_tokens( wp_strip_all_tags( (string) ( $fields['detail'] ?? '' ) ) ), 0, 1000 ),
+      'detail' => mb_substr( GMCP_Core::scrub_preview_tokens( self::plain_text( mb_substr( (string) ( $fields['detail'] ?? '' ), 0, 8000 ) ) ), 0, 1000 ),
     ] );
   }
 
@@ -549,11 +590,45 @@ class GMCP_Audit {
     // margin is wide enough that the second cut, not the first, decides the result for
     // anything but text that is almost entirely markup, where a shorter line is the
     // right answer anyway.
-    $text = wp_strip_all_tags( mb_substr( $text, 0, 8000 ) );
+    $text = self::plain_text( mb_substr( $text, 0, 8000 ) );
     // A preview link is a bearer credential and its tool's reply is where it is handed out.
     // The reply is recorded here, so the token is cut out of it: an audit log that holds a
     // working link to an unpublished post is a second place that link can be read from.
-    return mb_substr( GMCP_Core::scrub_preview_tokens( $text ), 0, 1000 );
+    return self::scrub_text( mb_substr( GMCP_Core::scrub_preview_tokens( $text ), 0, 1000 ), '[redacted: the reply held something credential-shaped]' );
+  }
+
+  /**
+  * Text with its tags removed, for the columns that keep a reply or a message.
+  *
+  * wp_strip_all_tags() runs two PCRE passes and does not check them: when PCRE gives up,
+  * preg_replace() returns null and the function hands back "", so a reply it could not read was
+  * recorded as an empty detail, the one column that says why a call was refused. A result that
+  * is empty for text that was not is retried with strip_tags(), which uses no regular
+  * expression. Script and style CONTENT then stays in the text, which is harmless in a column
+  * that is only ever shown as text.
+  */
+  private static function plain_text( string $text ): string {
+    $plain = wp_strip_all_tags( $text );
+    if ( $plain === '' && trim( $text ) !== '' ) {
+      $plain = trim( strip_tags( $text ) );
+    }
+    return $plain;
+  }
+
+  /**
+  * A short piece of free text as the log may keep it: itself, or $instead when it carries a
+  * credential. For the columns that hold text a tool was handed or answered with (the target
+  * a call names, the reply's first thousand characters), which no field name classifies.
+  * Only text already cut to its storable length is passed, so the scan is bounded.
+  *
+  * Judged by GMCP_Core::looks_credentialed(), the scanner plus the debug log's assignment rule:
+  * these columns are short, and a reply or a target that reads "password: hunter2" was recorded
+  * in the clear because the scanner alone does not call that a credential. Over-redacting a
+  * reply costs a line of explanation; the arguments column, which is read for what the call
+  * said, uses the scanner alone and blanks only the span.
+  */
+  public static function scrub_text( string $text, string $instead ): string {
+    return $text !== '' && GMCP_Core::looks_credentialed( $text ) ? $instead : $text;
   }
 
   /**

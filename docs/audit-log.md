@@ -51,12 +51,75 @@ because the credential patterns are written for field names inside a value,
 where `key` signals a secret, and at the top level of a call it is the name of
 the thing being changed.
 
+Names are not the only signal. A post body, an excerpt or a title is a string that
+begins with a tag or a word, so `redact()` keeps it whole, and a body with a pasted
+`{"api_key": "..."}`, a `define( 'DB_PASSWORD', '...' )` line or an Authorization
+header in it used to be stored verbatim. Every string leaf of the arguments is now
+also read as text (`GMCP_Credential_Scan`), and what is replaced by `[redacted]` is the
+credential and not the string: the scanner reports where each one is, so a post body
+that holds one define() line records everything around it. (Blanking the whole string
+let a short decoy at the end of a body, `<!-- define("DB_PASSWORD","abcd") -->`, erase
+a script tag in front of it from the log; the changes column describes anything over
+120 characters by its size alone, so nothing else would have shown it.) A string that
+is a JSON or serialized blob with a secret-named field inside cannot be taken apart and
+is still blanked whole. The target column, the first thousand characters of the reply
+the entry keeps (which then reads as withheld) and the short values and post label of
+the change summary are not cut up: each is replaced whole when it holds one, and for
+those short columns the test is wider than the arguments' (see below). It is a
+heuristic: it finds the shapes people paste, such as quoted `name = value` pairs under a
+secret-ended name, unquoted ones whose value looks like a token (six characters or more
+with a digit, or sixteen without), bearer and basic headers, URL user information, private
+key blocks and the common key prefixes, and it does not find a secret that is a bare word,
+or an unquoted lowercase word under a secret-named key with no digit in it. The debug log
+does take that last one; see `docs/guardrails.md`. A value that is plainly what a template
+writes where a secret goes (`password_here`, `YOUR_TOKEN_HERE`, `********`, `<token>`,
+`${DB_PASS}` or `$DB_PASS` in capitals only, `user:pass@host`) is not a credential, so WordPress's
+own sample config line does not cost a post its undo; `'$uperS3cret99'` is a password that starts
+with a dollar sign and is flagged. The scanner also reads PHP array-index assignments
+(`$cfg['db_password'] = '...'`), names of any length, and quoted values that hold escapes (an
+escaped quote, Gutenberg's `&`, a backslash path, text escaped twice, `=&gt;` in a code block);
+what it does not find (a value split across arguments, base64, a bare token) and the prose it
+still flags are listed in `docs/guardrails.md`. Ordinary prose that mentions a password is recorded as
+written, and so is a caller named by a key id: the approval events' `caller` is an
+identity, not a secret, and is never blanked.
+
+The short columns use a wider test than the arguments do. A target, a reply, a short changed
+value and a post label are read to see what happened, not to see what was said, so a string
+there is withheld when the scanner flags it OR when it reads like an assignment under a
+secret-named word (`GMCP_Core::looks_credentialed()`). The scanner alone passed
+`smtp_pwd=hunter` (six lowercase letters, no digit) and `password: hunter2` in a changed value,
+and the same call's arguments column said `password: [redacted]` while its changes column said
+`"to":"password: hunter2"`. The cost is a title such as "Reset your password: easy guide"
+showing as `[redacted]` in a label, which is chosen over the alternative. The journal uses the
+same wider test for the line it shows for an entry (and re-checks a stored line when it lists
+it), but not for deciding whether to keep a value for undo: that stays the narrow scanner, so
+an ordinary title about passwords is still put back byte for byte.
+
 One credential has no field name to give it away: a draft preview link, whose
 token rides in a URL. `redact()` therefore also scrubs the `gmcp_preview`
 parameter (whichever spelling of its name PHP maps to it) out of any string it is
 handed, and the reply text the entry keeps is
 scrubbed the same way, so the tool that hands a link out does not also write it
 into the log.
+
+The scrubs run after the tool has run, over every string of the call, so they have to
+be fast on text an agent controls and honest when they cannot finish. No string is
+read past 64,000 bytes plus a margin, because no more than that can be stored, and a
+call cut that way records the size it really had (`__gmcp_truncated`). That bounds each
+leaf and not their number, and the scrubs cost about as much per leaf as per byte, so the
+walk also has a byte budget of 65,024 bytes for the whole call: each leaf is read until the
+budget is spent, the rest of that array is dropped unread, and an `__gmcp_omitted` entry says
+how many entries and bytes went unexamined (so a call of a million one-character strings
+records a truncation and its real size, in about 0.3 s instead of 2.5 s, and a million
+secret-looking assignments in 0.3 s instead of 17 s, with the JIT off). The change journal
+applies a node and byte budget to a value before it walks it (100,000 nodes, 8 MiB of strings),
+and treats a value over it as NOT safe to keep, never as clean: that entry has no undo copy.
+The expressions are linear in the length of the text, a private key block is searched for its end
+once, not once per line (17,500 unterminated lines took 3.4 s, now 0.1 s), all measured with the
+regular-expression JIT on and off (`.dev/test-redact-timing.php`): an earlier form was quadratic,
+and a 560 KB argument made the tool's effect land with no row written at all. When the engine does
+give up on a string, the record says `[unscrubbable text withheld]`; it never records
+an empty string in place of text it could not read.
 
 ### What was called is not what changed
 
@@ -73,8 +136,8 @@ as its size: "the title changed, and the body went from 1.4 KB to 1.6 KB" is the
 useful sentence, and a field that did not change is simply absent. And some of
 those values are passwords. Anything credential-shaped is recorded as
 `[redacted]` on both sides, judged by the same `gmcp_credential_field_patterns`
-the change journal uses, so the log says a password was changed without saying
-to what.
+the change journal uses and, for the short text it does keep, by the same text test,
+so the log says a password was changed without saying to what.
 
 ### Each row hashes the one before it
 
