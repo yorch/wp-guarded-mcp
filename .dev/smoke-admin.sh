@@ -2757,16 +2757,17 @@ tc_groups() { # tc_groups <admin 0|1> <woo 0|1>
     $o["mcp_tools_export"] = false;
     update_option( "gmcp_options", $o, false );' >/dev/null 2>&1
 }
-tc_unprefixed_groups() { # prints "<rest>,<subscriptions>" as stored: 1 when switched on
+tc_unprefixed_groups() { # prints "<rest>,<subscriptions>,<export>" as stored: 1 when switched on
   docker compose exec -T cli wp eval '
     $o = get_option( "gmcp_options", [] );
-    echo ( ! empty( $o["mcp_tools_rest"] ) ? 1 : 0 ), ",", ( ! empty( $o["mcp_tools_woo_subscriptions"] ) ? 1 : 0 );' 2>/dev/null | tr -d '\r\n'
+    echo ( ! empty( $o["mcp_tools_rest"] ) ? 1 : 0 ), ",", ( ! empty( $o["mcp_tools_woo_subscriptions"] ) ? 1 : 0 ), ",", ( ! empty( $o["mcp_tools_export"] ) ? 1 : 0 );' 2>/dev/null | tr -d '\r\n'
 }
-tc_restore_unprefixed() { # tc_restore_unprefixed <rest 0|1> <subscriptions 0|1>
+tc_restore_unprefixed() { # tc_restore_unprefixed <rest 0|1> <subscriptions 0|1> <export 0|1>
   docker compose exec -T cli wp eval '
     $o = get_option( "gmcp_options", [] );
     $o["mcp_tools_rest"] = '"$1"' ? true : false;
     $o["mcp_tools_woo_subscriptions"] = '"$2"' ? true : false;
+    $o["mcp_tools_export"] = '"$3"' ? true : false;
     update_option( "gmcp_options", $o, false );' >/dev/null 2>&1
 }
 # Optional groups are excluded by tool-name prefix, because the table counts only the groups
@@ -2816,13 +2817,19 @@ case "$(tc_doc admin 1)" in
   ''|'no such row') echo "  FAIL  the access-level table could not be parsed"; fail=$((fail+1));;
 esac
 
+# The export switch is forced ON for the snapshot, whatever the stack had, so that the restore at the
+# end of the block is measured: with it found off, "restored" and "left off" are the same state and the
+# check below could not tell them apart. The stack's own value is put back after that check.
+TC_UNPREFIXED_ORIG=$(tc_unprefixed_groups)
+tc_restore_unprefixed "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f1)" "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f2)" 1
 TC_UNPREFIXED_WAS=$(tc_unprefixed_groups)
+check "CONTROL: the export group is on before the count, so its restore can be told from leaving it off" "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f3)" "1"
 tc_groups 0 0
 # The precondition, asserted: the counts below are only the table's if neither group is on.
-check "precondition: the REST and Subscriptions groups are off while counting" "$(tc_unprefixed_groups)" "0,0"
+check "precondition: the REST, Subscriptions and export groups are off while counting" "$(tc_unprefixed_groups)" "0,0,0"
 # And a control that the probe sees the problem it guards against: with the REST group on,
 # the same counter must move off the documented number.
-tc_restore_unprefixed 1 0
+tc_restore_unprefixed 1 0 0
 check "control: with the REST group on the content-only count is not the documented one" \
   "$([ "$(tc_count "$TC_ADMIN")" != "$(tc_doc admin 1)" ] && echo moved || echo same)" "moved"
 tc_groups 0 0
@@ -2846,10 +2853,12 @@ else
   echo "  ....  WooCommerce column not checked: the plugin is not active on this site"
 fi
 tc_groups 1 0
-# Put the two groups back as this block found them, so the later blocks and the next suite
-# see the site the way it was.
-tc_restore_unprefixed "${TC_UNPREFIXED_WAS%%,*}" "${TC_UNPREFIXED_WAS##*,}"
-check "the REST and Subscriptions groups are as they were before the count" "$(tc_unprefixed_groups)" "$TC_UNPREFIXED_WAS"
+# Put the three groups back as this block found them, so the later blocks and the next suite
+# see the site the way it was. The export switch was left off by tc_groups() and not restored,
+# so a stack that had it on lost it for every suite after this one.
+tc_restore_unprefixed "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f1)" "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f2)" "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f3)"
+check "the REST, Subscriptions and export groups are as they were before the count" "$(tc_unprefixed_groups)" "$TC_UNPREFIXED_WAS"
+tc_restore_unprefixed "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f1)" "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f2)" "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f3)"
 gmcp_clear_other_keys "smoke suite"
 
 echo "-- scheduled events --"
