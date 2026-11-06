@@ -398,11 +398,28 @@ them as withheld, and a key is judged the way the database compares it, so an ac
 space-padded spelling is the same key. `beaver_layout` reports a post's title, type and status, so
 it asks the same read policy the generic readers do: a form submission, and below admin an order
 or another plugin's configuration, answers as a post that does not exist. There is no tool that
-writes layout data at any level: it would be persistent script injection with no restore tool
-behind it, the same reasoning that keeps a Custom Code writer out of the Elementor Pro group.
-The one write is `beaver_clear_cache`, which deletes the generated CSS/JS so the builder
-regenerates them — derived files, admin level, and it says so when the site enqueues the
-builder's CSS inline and there is nothing to delete. There is no tool that applies or imports a
+edits or replaces an existing layout, and none that accepts layout settings from the caller: it
+would be persistent script injection, the same reasoning that keeps a Custom Code writer out of
+the Elementor Pro group. The writes are `beaver_clear_cache`, which deletes the generated CSS/JS
+so the builder regenerates them — derived files, admin level, and it says so when the site
+enqueues the builder's CSS inline and there is nothing to delete — and, behind a second switch
+(`mcp_tools_beaver_write`, off by default), `beaver_create_page`. That tool makes a NEW page from
+a typed list of four module types (heading, rich text, button, photo) and has no argument that
+names an existing post. The builder's own writer applies no sanitising, so the tool cleans every
+value itself: text through `wp_kses_post` or as plain text, a link as an absolute http(s) URL with
+a host and no user information or a path on the site (judged after sanitising, so a tab inside
+`//` is still refused), a fixed set of heading tags, and a photo only by attachment id, which must
+be an image and must be one a featured image could use (a form submission's upload is refused).
+`bb_js_code`, `bb_css_code`, `custom_attributes`, `attributes`, `popup`, `lightbox_content_html`,
+`photo_url` and `photo_src` are refused by name. It takes at most 50 modules, 100,000 bytes in a
+field and 400,000 in all. The page is made as a draft and made public last; the reply is the
+stored layout read from the table, and a page whose layout did not store as built is deleted
+again before the tool answers. It is admin level and classed as a site change by the approval queue
+(held in its wider mode, not in the deletes-only one). The change journal records the layout rows it writes and can undo them, but it has no
+entry for the creation of a page, which comes off with `wp_delete_post`. A rich-text line that is
+only a URL becomes a link, because the module would otherwise fetch it as an embed when the page
+renders. Not covered: what a caller writes in rich text is theirs (a link in a post body can point
+anywhere), and a theme or plugin that renders the module's output differently. There is no tool that applies or imports a
 template: applying a saved one is reversible, importing one rewrites the design system from an
 archive built elsewhere in a single call.
 
@@ -689,7 +706,7 @@ docker run --rm -v "$PWD":/app -w /app php:8.1-cli sh -c 'for f in includes/*.ph
 ```
 
 A throwaway WordPress for testing lives in `.dev/` (see that directory's README). It carries
-twenty-one suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
+twenty-two suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
 previews; `smoke-admin.sh` for the administration tools, the change journal, named keys and
 every guard around them, which rebuilds `.htaccess` partway through and is the destructive
 one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor tools;
@@ -701,6 +718,7 @@ WP Activity Log tools; `smoke-redirection.sh` for the Redirection tools; `smoke-
 for the Polylang tools; `smoke-seo.sh` for the Rank Math and All in One SEO tools;
 `smoke-forms.sh` for the form-submission tools; `smoke-wordfence.sh` for the Wordfence tools;
 `smoke-stream.sh` for the Stream tools; `smoke-beaver.sh` for the Beaver Builder tools;
+`smoke-beaver-write.sh` for the tool that builds a Beaver Builder page;
 `smoke-download.sh` for the one-time download endpoint; and `smoke-export.sh` for the site
 files manifest, the approval-gated archive and its one-time endpoint. `smoke-seo.sh`,
 `smoke-forms.sh`, `smoke-polylang.sh` and `smoke-redirection.sh` were written without a

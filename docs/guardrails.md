@@ -1571,6 +1571,34 @@ asks is written down here.
   write through it replaced the stored layout. Not covered: another plugin's own reader, a
   layout kept under a key a site has not added to the filter, and a builder other than the one
   listed.
+- **`beaver_create_page` is the one tool that writes a layout, and it only creates.** It has no
+  argument that names an existing post. The builder's writer (`FLBuilderModel::update_layout_data()`)
+  applies no capability check, no kses and no `sanitize_settings()`, so the tool is the only
+  control and accepts four module types with a fixed set of fields each. Checked, with the control
+  that proves each check can see what it looks for (`smoke-beaver-write.sh`, which renders the
+  page it builds): a settings key that is a raw sink (`bb_js_code`, `bb_css_code`,
+  `custom_attributes`, `attributes`, `popup`, `lightbox_content_html`, `photo_url`, `photo_src`) is
+  refused by name; a link is judged after sanitising and in the form a browser reads it (a tab
+  inside `//`, `/\`, `http:host`, `user@host` and `javascript:` are refused, an absolute http(s)
+  URL or a path on the site is stored); a photo asks `pointer_meta_refusal( '_thumbnail_id' )` and
+  `post_read_guard()` (a form submission's upload was accepted before: measured), must be an image,
+  and its address is derived from the id; a rich-text line that is only a URL becomes a link,
+  because the module's renderer would fetch it as an embed (measured with the oEmbed filter);
+  50 modules, 100,000 bytes a field and 400,000 in all; the post type is fixed, and the commerce,
+  form-submission and drafts-only questions are asked anyway, so a site that extends one of those
+  lists with `page` is obeyed. The page is created as a draft, the layout is written, and the reply
+  is built from the row read through `$wpdb` (the builder's reader returns the array its writer
+  cached in the same request): if the stored layout is not the one built, or the write threw, the
+  page is deleted before the tool answers, and when even the deletion fails the reply names the
+  page. A page is made public last. It needs `edit_pages` (and `publish_pages` to publish). An
+  admin key only: a readwrite key and a drafts-only key (capped below admin) are refused. The
+  approval queue classes it as a site change, from its registration. The change journal records the
+  three layout rows as custom fields added and can undo and redo them (the redo restores the value
+  the tool sanitised, nothing a caller picks); it has no entry for the creation, so the page comes
+  off with `wp_delete_post`. Not covered: what a caller writes in rich text is theirs, a link in it
+  can point anywhere, and a theme or plugin that renders the modules differently is outside it.
+  There is no `GMCP_Core` flag that permits layout writes: an earlier `with_layout_write()` was
+  removed because nothing read it, and a permission nothing enforces reads as a guard.
 - **`beaver_layout` is a reader of the post it names.** It returns a title, a type and a status,
   so it asks `post_read_guard()`: below admin a form submission, anything hanging from one, an
   order or another plugin's configuration answers exactly as a missing id does; admin is told why.

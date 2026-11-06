@@ -101,6 +101,7 @@ docker compose exec -T cli wp plugin install wordfence --activate
 
 docker compose exec -T cli wp plugin install beaver-builder-lite-version --activate
 ./smoke-beaver.sh     # the Beaver Builder tools; needs Beaver Builder (Lite is enough)
+./smoke-beaver-write.sh  # the tool that builds a Beaver page; renders it; needs Beaver Builder (Lite is enough)
 
 ./smoke-download.sh   # the one-time download endpoint; needs nothing beyond the plugin
 ./smoke-export.sh     # the site-file manifest, the approval-gated archive and its one-time endpoint
