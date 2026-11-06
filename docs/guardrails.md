@@ -1622,8 +1622,9 @@ one-time URL.
   `personal_data_upload`. The last asks the database, through the same tree the read guards judge
   (`GMCP_Core::unreadable_post_clauses()`): every attachment whose `post_parent` chain reaches a
   form-submission type, with its generated sizes, the original of a scaled image, edit backups and
-  alternative formats, plus anything beside one of them that starts with its name (`photo.jpg.webp`
-  next to `photo.jpg`; `photos.jpg` is not matched). `wp_download_request` refuses such a file at
+  alternative formats, plus anything in the same directory whose name begins with one of their
+  names followed by a dot or a dash (`photo.jpg.webp`, `photo-300x200.jpg` and also `photo-final.jpg`,
+  which is more than a derivative and is withheld on purpose; `photos.jpg` is not matched). `wp_download_request` refuses such a file at
   every level, and an archive of uploads would otherwise have been the other door. If the
   database cannot be asked, the walk is refused, not treated as "none". A site extends the lists
   with `gmcp_export_private_names` and `gmcp_export_private_directories`; the filters are merged

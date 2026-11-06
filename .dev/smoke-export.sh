@@ -429,6 +429,7 @@ check "CONTROL: the backslash and non-UTF-8 names exist on disk too" \
 call "$TOK" wh_man "$(tc wp_export_request '{"root":"uploads","path":"'"$WD"'"}')"
 check "the manifest answers" "$(verdict wh_man)" "ok"
 check "CONTROL: the two ordinary files are counted" "$(jget wh_man file_count)" "2"
+# The paths in a manifest are relative to the path it was asked about, so the names passed here are bare.
 excl_reason() { py 'import json,sys
 d=json.loads(json.load(sys.stdin)["result"]["content"][0]["text"])
 want=sys.argv[1]
@@ -449,8 +450,6 @@ done
 call "$TOK" wh_direct_ok "$(tc wp_export_request '{"root":"uploads","path":"'"$WD/normal.txt"'"}')"
 check "CONTROL: naming the ordinary file directly is accepted" "$(verdict wh_direct_ok)" "ok"
 
-# The paths in a manifest are relative to the path it was asked about, which is why the names above
-# are bare.
 # pull_zip <tag> <path> <outfile>: manifest, held pull, approval on the screen, approved pull, download.
 pull_zip() {
   call "$TOK" "$1_m" "$(tc wp_export_request '{"root":"uploads","path":"'"$2"'"}')"
