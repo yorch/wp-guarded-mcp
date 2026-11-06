@@ -732,30 +732,6 @@ check( 'control: an ordinary uploads path is untouched', $sp( 'see wp-content/up
 check( 'control: a short path segment after /download/ is untouched', $sp( 'https://x/download/readme' ), 'https://x/download/readme' );
 check( 'control: the word download alone is untouched', $sp( 'a download of the report' ), 'a download of the report' );
 check( 'control: a bare /upload/ path outside the plugin route is untouched', $sp( "https://x/upload/{$dl}" ), "https://x/upload/{$dl}" );
-// The upload and export endpoints hand out a token in the path for the same reason the
-// download one does, and their replies are copied into the same audit log. Each check has
-// a control on a nearby ordinary URL, so "the token is gone" cannot be the scrubber
-// replacing the whole string.
-foreach ( [
-  'upload' => "https://x/wp-json/mcp/v1/upload/$tok",
-  'export' => "https://x/wp-json/mcp/v1/export/$tok",
-  'download' => "https://x/wp-json/mcp/v1/download/$tok",
-] as $route => $text ) {
-  $out = $sp( $text );
-  check( "scrubbed: a $route token (token gone)", strpos( $out, $tok ) === false, true );
-  check( "  ...and the route is kept ($route)", strpos( $out, "/$route/[redacted]" ) !== false, true );
-}
-check( 'control: an ordinary URL is untouched', $sp( 'https://x/wp-json/mcp/v1/http' ), 'https://x/wp-json/mcp/v1/http' );
-check( 'control: a token-shaped word is untouched', $sp( 'upload your files here' ), 'upload your files here' );
-// A tool reply is JSON, and wp_json_encode escapes the slashes. Scrubbing only the plain
-// spelling left the token in the log while the unit test, written from the same reading of
-// the code as the code under test, agreed with it.
-foreach ( [ 'upload', 'download', 'export' ] as $route ) {
-  $escaped = 'http:\/\/x\/wp-json\/mcp\/v1\/' . $route . '\/' . $tok;
-  $out = $sp( $escaped );
-  check( "scrubbed: a JSON-escaped $route token (token gone)", strpos( $out, $tok ) === false, true );
-  check( "  ...and the escaped route is kept ($route)", strpos( $out, '\\/' . $route . '\\/[redacted]' ) !== false, true );
-}
 
 echo "-- scrub_log_line: shapes found missing in review --\n";
 $sec = 'Zx9Qw3Lp7Rt2';
@@ -783,6 +759,30 @@ foreach ( $rev as $label => [ $text, $leak, $want ] ) {
 }
 check( 'control: curly quotes round a harmless value are kept', GMCP_Diag_Util::scrub_log_line( 'title: “Hello there” and more', [] ), 'title: “Hello there” and more' );
 check( 'control: an element not named like a secret keeps its CDATA', GMCP_Diag_Util::scrub_log_line( '<title><![CDATA[Hello]]></title>', [] ), '<title><![CDATA[Hello]]></title>' );
+// The upload and export endpoints hand out a token in the path for the same reason the
+// download one does, and their replies are copied into the same audit log. Each check has
+// a control on a nearby ordinary URL, so "the token is gone" cannot be the scrubber
+// replacing the whole string.
+foreach ( [
+  'upload' => "https://x/wp-json/mcp/v1/upload/$tok",
+  'export' => "https://x/wp-json/mcp/v1/export/$tok",
+  'download' => "https://x/wp-json/mcp/v1/download/$tok",
+] as $route => $text ) {
+  $out = $sp( $text );
+  check( "scrubbed: a $route token (token gone)", strpos( $out, $tok ) === false, true );
+  check( "  ...and the route is kept ($route)", strpos( $out, "/$route/[redacted]" ) !== false, true );
+}
+check( 'control: an ordinary URL is untouched', $sp( 'https://x/wp-json/mcp/v1/http' ), 'https://x/wp-json/mcp/v1/http' );
+check( 'control: a token-shaped word is untouched', $sp( 'upload your files here' ), 'upload your files here' );
+// A tool reply is JSON, and wp_json_encode escapes the slashes. Scrubbing only the plain
+// spelling left the token in the log while the unit test, written from the same reading of
+// the code as the code under test, agreed with it.
+foreach ( [ 'upload', 'download', 'export' ] as $route ) {
+  $escaped = 'http:\/\/x\/wp-json\/mcp\/v1\/' . $route . '\/' . $tok;
+  $out = $sp( $escaped );
+  check( "scrubbed: a JSON-escaped $route token (token gone)", strpos( $out, $tok ) === false, true );
+  check( "  ...and the escaped route is kept ($route)", strpos( $out, '\\/' . $route . '\\/[redacted]' ) !== false, true );
+}
 
 printf( "\n  %d passed, %d failed\n", $pass, $fail );
 exit( $fail === 0 ? 0 : 1 );

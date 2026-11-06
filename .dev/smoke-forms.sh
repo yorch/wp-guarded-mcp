@@ -762,6 +762,13 @@ check "CONTROL: an audit row does quote the ordinary upload (the probe sees a ro
   "$(wpe 'global $wpdb;$t=GMCP_Audit::table();echo (int) $wpdb->get_var("SELECT COUNT(*) FROM $t WHERE changes LIKE \"%'"$M2"'-ctl-att%\"")>0?"quoted":"none";')" "quoted"
 check "STORED: and no journal snapshot was kept for it" \
   "$(wpe 'global $wpdb;echo (int) $wpdb->get_var("SELECT COUNT(*) FROM ".GMCP_Journal::snapshot_table()." WHERE post_id='"$SUBATT"'");')" "0"
+# The two redaction layers must not undo each other: the entry withheld for the submission is
+# not rewritten into a stored record by the wider text test that judges every other entry, and
+# the ordinary upload is still recorded (the control that the journal here records anything).
+check "STORED: the journal holds no entry for the submission's upload at all (withheld, not rewritten)" \
+  "$(wpe '$n=0;foreach(get_option(GMCP_Journal::OPTION,[]) as $e){if((int)($e["ID"]??0)==='"$SUBATT"')$n++;}echo $n;')" "0"
+check "CONTROL: and it holds one for the ordinary upload (the probe counts entries)" \
+  "$(wpe '$n=0;foreach(get_option(GMCP_Journal::OPTION,[]) as $e){if((int)($e["ID"]??0)==='"$CTLATT"')$n++;}echo $n>0?"some":"none";')" "some"
 wpe 'wp_update_post(["ID"=>'"$CTLATT"',"post_parent"=>'"$CTL"']);GMCP_Journal::clear();' >/dev/null
 if [ "$JOURNAL_WAS2" = unset ]; then
   wpe '$o=get_option("gmcp_options",[]);unset($o["mcp_change_journal"]);update_option("gmcp_options",$o,false);' >/dev/null

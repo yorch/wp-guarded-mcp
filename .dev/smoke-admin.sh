@@ -4135,6 +4135,9 @@ if grep -q wordpress_logged_in "$AP_JAR"; then
   # store and print it. The control is an ordinary tagline, which must be shown in full.
   AP_SECRET_TXT="Our tagline. define('DB_PASSWORD', 'Hunter2-rv3-secret');"
   AP_PLAIN_TXT="Our ordinary tagline about passwords and keys"
+  # The tagline as it stands now, read rather than assumed: earlier blocks in a whole-suite run leave
+  # their own value in it, so a fixed expectation passes only when this block is run alone.
+  AP_DESC_BEFORE=$(ap_eval 'echo get_option("blogdescription");')
   ap_call ap_ft1 wp_update_option "{\"key\":\"blogdescription\",\"value\":\"Our tagline. define('DB_PASSWORD', 'Hunter2-rv3-secret');\"}"
   AP_R8=$(ap_rid ap_ft1)
   ap_call ap_ft2 wp_update_option "{\"key\":\"blogdescription\",\"value\":\"$AP_PLAIN_TXT\"}"
@@ -4163,7 +4166,8 @@ if grep -q wordpress_logged_in "$AP_JAR"; then
   check "the page says a value is hidden yet part of the approval, and names it" \
     "$(printf '%s' "$AP_PAGE" | grep -c 'is still part of what you approve:</strong> &quot;value&quot;')" "1"
   check "the audit log does not hold the secret" "$(leaked_audit Hunter2-rv3-secret)" "0"
-  check "the option was not written by a held call" "$(ap_eval 'echo get_option("blogdescription") === "reset" ? "unchanged" : "CHANGED";')" "unchanged"
+  check "the option was not written by a held call" "$(ap_eval 'echo get_option("blogdescription");')" "$AP_DESC_BEFORE"
+  check "CONTROL: the value read before the held calls is one the suite set (the probe reads a real value)" "$([ -n "$AP_DESC_BEFORE" ] && echo set || echo empty)" "set"
   ap_decide decline "$AP_R8"
   ap_decide decline "$AP_R9"
   check "(cleanup) both requests are declined" "$(ap_status "$AP_R8")/$(ap_status "$AP_R9")" "declined/declined"

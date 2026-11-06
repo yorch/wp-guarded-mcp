@@ -1933,7 +1933,6 @@ check "a credential in a refused authorize request's client_id is absent from th
 check "the debug option is back as it was" \
   "$(wpe 'global $gmcp_core; echo $gmcp_core->get_option("mcp_debug_mode") ? "on" : "off";')" "$DL_WAS"
 
-
 echo "-- the audit log's two scrubs agree: key=value text and shaped text in one argument --"
 # Two passes read the same string leaves: the debug-log scrub (a secret-named key followed by a
 # separator, and Bearer/Basic) and the credential scan (shapes that identify themselves, and a

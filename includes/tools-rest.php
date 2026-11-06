@@ -174,7 +174,7 @@ class GMCP_Tools_Rest {
   * Installed around the REST dispatch of a list call. The listing is built by WordPress's own
   * query, and its rows are filtered by what _fields leaves in them, so an id-based filter on
   * the rows afterwards would miss every call that does not ask for the id. The SQL is the one
-  * the other listings and scans use. @see GMCP_Core::unreadable_post_sql()
+  * the other listings and scans use. @see GMCP_Core::unreadable_post_clauses()
   */
   public function exclude_unreadable_posts( $where ) {
     global $wpdb;
