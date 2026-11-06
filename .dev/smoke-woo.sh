@@ -497,6 +497,208 @@ else
   echo "  SKIP  subscription guard checks: WooCommerce Subscriptions is not active"
 fi
 
+echo "-- an order is an order under either storage, and so are its notes --"
+# An order is a row in wp_posts only when the legacy storage is on. With high-performance
+# order storage it is a row in wc_orders and wp_posts holds a placeholder (or, on a shop that
+# enabled the storage before WooCommerce reserved ids, nothing, or an ordinary post that took
+# the id). Every generic guard used to be asked of the post row's TYPE, so an order whose post
+# row was missing or ordinary was judged by nothing, and its notes, which are comments on that
+# id, were writable by a write-level key through the comment tools in EVERY storage mode, the
+# placeholder included. Each hostile call below is judged by the stored state, taken before and
+# after: a refusal in the reply proves nothing, a write that landed is what matters.
+#   A  an ordinary order (a legacy shop_order post, or an HPOS order with its placeholder)
+#   B  HPOS only: an order whose id is ALSO an ordinary page (what an id collision looks like)
+#   C  HPOS only: an order with no wp_posts row at all
+#   D  HPOS only: an order whose id is also an attachment
+ON_CODE=$(cat <<'ONPHP'
+global $wpdb;
+$hpos = \Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled();
+foreach ( $wpdb->get_col( "SELECT ID FROM {$wpdb->posts} WHERE post_title LIKE 'ORDNOTE %'" ) as $p ) { wp_delete_post( (int) $p, true ); }
+$wpdb->query( "DELETE FROM {$wpdb->comments} WHERE comment_content LIKE 'ORDNOTE-%'" );
+$mk = function ( $tag ) {
+  $o = wc_create_order();
+  $o->set_billing_email( 'ordnote-' . $tag . '@example.test' );
+  $o->set_status( 'processing' ); $o->save();
+  $o->add_order_note( 'ORDNOTE-private-' . $tag );
+  // A comment of a type nothing filters, so a reader has something to find that does not
+  // depend on WooCommerce hiding order_note from every comment query.
+  wp_insert_comment( [ 'comment_post_ID' => $o->get_id(), 'comment_content' => 'ORDNOTE-visible-' . $tag, 'comment_approved' => 1, 'comment_type' => 'gmcp_probe_note' ] );
+  return $o->get_id();
+};
+$out = [ 'hpos' => $hpos ? 1 : 0, 'A' => $mk( 'a' ) ];
+if ( $hpos ) {
+  $b = $mk( 'b' ); $c = $mk( 'c' ); $d = $mk( 'd' );
+  $wpdb->update( $wpdb->posts, [ 'post_type' => 'page', 'post_status' => 'publish', 'post_title' => 'ORDNOTE colliding page', 'post_content' => 'ORDNOTE page body' ], [ 'ID' => $b ] );
+  clean_post_cache( $b );
+  $wpdb->delete( $wpdb->posts, [ 'ID' => $c ] );
+  clean_post_cache( $c );
+  // D: the same, with an attachment at the id, which the media tools (not the post tools) reach.
+  $wpdb->update( $wpdb->posts, [ 'post_type' => 'attachment', 'post_status' => 'inherit', 'post_mime_type' => 'image/png', 'post_title' => 'ORDNOTE colliding media' ], [ 'ID' => $d ] );
+  clean_post_cache( $d );
+  $out['B'] = $b; $out['C'] = $c; $out['D'] = $d;
+}
+$out['PAGE'] = wp_insert_post( [ 'post_title' => 'ORDNOTE control page', 'post_content' => 'ORDNOTE control body', 'post_status' => 'publish', 'post_type' => 'page' ] );
+$k = function ( $label, $level ) {
+  foreach ( GMCP_Tokens::all() as $t ) { if ( ( $t['label'] ?? '' ) === $label ) { GMCP_Tokens::revoke( $t['id'] ); } }
+  $a = get_users( [ 'role' => 'administrator', 'number' => 1, 'orderby' => 'ID', 'order' => 'ASC' ] );
+  $r = GMCP_Tokens::create( $label, $level, 0, [], $a ? $a[0]->ID : 0 );
+  return $r['secret'];
+};
+$out['RW'] = $k( 'ordnote rw', 'readwrite' );
+$out['RO'] = $k( 'ordnote ro', 'readonly' );
+echo "ONJSON" . wp_json_encode( $out );
+ONPHP
+)
+# Handed over as the argument of wp eval, not as a file: copying a file into the container
+# needs a command the other suites do not, and the argument works on every stack they run on.
+ON_JSON=$(docker compose exec -T cli wp eval "$ON_CODE" 2>/dev/null | tr -d '\r' | grep -o 'ONJSON.*' | sed 's/^ONJSON//')
+onj() { printf '%s' "$ON_JSON" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('$1',''))"; }
+ON_HPOS=$(onj hpos); ON_A=$(onj A); ON_B=$(onj B); ON_C=$(onj C); ON_D=$(onj D); ON_PAGE=$(onj PAGE); ON_RW=$(onj RW); ON_RO=$(onj RO)
+check "CONTROL: the fixture exists, and says which storage it ran on" "$([ -n "$ON_A" ] && [ -n "$ON_PAGE" ] && case "$ON_RW$ON_RO" in *gmcp_*gmcp_*) echo yes;; esac)" "yes"
+echo "    storage under test: $([ "$ON_HPOS" = 1 ] && echo 'high-performance order storage' || echo 'legacy posts storage')"
+# What is stored for an id: its post row, its comments (type, status and text), its post meta,
+# and whether WooCommerce still has an order there.
+onsnap() { # onsnap <id>
+  docker compose exec -T cli wp eval 'global $wpdb; $id = '"$1"';
+    $row = $wpdb->get_var( "SELECT CONCAT(post_type,\"|\",post_status,\"|\",post_title) FROM {$wpdb->posts} WHERE ID=$id" );
+    $cm = $wpdb->get_col( "SELECT CONCAT(comment_ID,\":\",comment_type,\":\",comment_approved,\":\",comment_content) FROM {$wpdb->comments} WHERE comment_post_ID=$id ORDER BY comment_ID" );
+    $pm = $wpdb->get_col( "SELECT CONCAT(meta_key,\"=\",meta_value) FROM {$wpdb->postmeta} WHERE post_id=$id ORDER BY meta_id" );
+    echo ( $row ?: "no-post" ), " ;comments=", count( $cm ), ":", md5( implode( "|", $cm ) ), " ;meta=", count( $pm ), ":", md5( implode( "|", $pm ) ), " ;order=", wc_get_order( $id ) ? 1 : 0;' 2>/dev/null | tr -d '\r\n'
+}
+onnote() { # onnote <order id> <tag>: the id of the order note
+  docker compose exec -T cli wp eval 'global $wpdb; echo (int) $wpdb->get_var( $wpdb->prepare( "SELECT comment_ID FROM {$wpdb->comments} WHERE comment_post_ID=%d AND comment_type=\"order_note\" AND comment_content=%s", '"$1"', "ORDNOTE-private-'"$2"'" ) );' 2>/dev/null | tr -d '\r\n'
+}
+ontool() { # ontool <file> <key> <tool> <arguments json>
+  kcall "$1" "$2" "{\"jsonrpc\":\"2.0\",\"id\":430,\"method\":\"tools/call\",\"params\":{\"name\":\"$3\",\"arguments\":$4}}"
+}
+# The positive controls first, so the absences below mean something. A key that can write
+# changes an ordinary page and comments on it; a key that can only read sees a comment on one;
+# an admin key sees the colliding page in a listing.
+ontool on_ctl_w "$ON_RW" wp_update_post "{\"ID\":$ON_PAGE,\"fields\":{\"post_title\":\"ORDNOTE control page edited\"}}"
+check "CONTROL: a write-level key edits an ordinary page" \
+  "$(verdict on_ctl_w)/$(docker compose exec -T cli wp eval "echo get_post($ON_PAGE)->post_title;" 2>/dev/null | tr -d '\r\n')" "ok/ORDNOTE control page edited"
+ontool on_ctl_c "$ON_RW" wp_create_comment "{\"post_id\":$ON_PAGE,\"comment_content\":\"ORDNOTE-ordinary-comment\"}"
+check "CONTROL: and comments on it, which is stored" \
+  "$(verdict on_ctl_c)/$(docker compose exec -T cli wp eval 'global $wpdb; echo (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_post_ID=%d AND comment_content=%s", '"$ON_PAGE"', "ORDNOTE-ordinary-comment" ) );' 2>/dev/null | tr -d '\r\n')" "ok/1"
+ontool on_ctl_r "$ON_RO" wp_get_comments "{\"post_id\":$ON_PAGE}"
+check "CONTROL: a read-only key reads a comment on an ordinary page" "$(grep -c 'ORDNOTE-ordinary-comment' "$OUT/on_ctl_r")" "1"
+
+ON_IDS="$ON_A"
+[ "$ON_HPOS" = 1 ] && ON_IDS="$ON_A $ON_B $ON_C $ON_D"
+if [ "$ON_HPOS" = 1 ]; then
+  ontool on_ctl_list_ro "$ON_RO" wp_get_posts '{"post_type":"page","search":"ORDNOTE","post_status":"any"}'
+  ontool on_ctl_list_ad "$TOK" wp_get_posts '{"post_type":"page","search":"ORDNOTE","post_status":"any"}'
+  check "CONTROL: an admin key lists the colliding page" "$(grep -c 'ORDNOTE colliding page' "$OUT/on_ctl_list_ad")" "1"
+  check "and a read-only key lists the ordinary one" "$(grep -c 'ORDNOTE control page' "$OUT/on_ctl_list_ro")" "1"
+  check "but not the page that shares its id with an order" "$(grep -c 'ORDNOTE colliding page' "$OUT/on_ctl_list_ro")" "0"
+fi
+
+for T in $ON_IDS; do
+  case "$T" in
+    "$ON_A") L=A ;; "$ON_B") L=B ;; "$ON_C") L=C ;; "$ON_D") L=D ;;
+  esac
+  N=$(onnote "$T" "$(echo $L | tr 'A-Z' 'a-z')")
+  check "CONTROL ($L): the order note to attack exists" "$([ "$N" -gt 0 ] 2>/dev/null && echo yes)" "yes"
+  BEFORE=$(onsnap "$T")
+  check "CONTROL ($L): the snapshot sees the order" "$(echo "$BEFORE" | grep -c ';order=1')" "1"
+  # Reads. A read-only key gets neither the post nor its meta nor its comments, and an admin
+  # key's comment listing still finds the visible comment (the control for the absence).
+  ontool on_r_post "$ON_RO" wp_get_post "{\"ID\":$T}"
+  ontool on_r_meta "$ON_RO" wp_get_post_meta "{\"ID\":$T}"
+  ontool on_r_com "$ON_RO" wp_get_comments "{\"post_id\":$T,\"status\":\"all\"}"
+  ontool on_r_com_t "$ON_RO" wp_get_comments "{\"post_id\":$T,\"type\":\"gmcp_probe_note\",\"status\":\"all\"}"
+  ontool on_r_com_s "$ON_RO" wp_get_comments '{"search":"ORDNOTE-","status":"all","limit":100}'
+  ontool on_a_com "$TOK" wp_get_comments "{\"post_id\":$T,\"type\":\"gmcp_probe_note\",\"status\":\"all\"}"
+  check "CONTROL ($L): an admin key finds the visible comment on the order" "$(grep -c "ORDNOTE-visible" "$OUT/on_a_com")" "1"
+  check "($L) a read-only key gets no post and no meta for the order's id" \
+    "$(verdict on_r_post)/$(verdict on_r_meta)" "error/error"
+  check "($L) nor any comment on it, by id, by type or by search" \
+    "$(cat "$OUT/on_r_com" "$OUT/on_r_com_t" "$OUT/on_r_com_s" | grep -c "ORDNOTE-visible-$(echo $L | tr 'A-Z' 'a-z')\|ORDNOTE-private-$(echo $L | tr 'A-Z' 'a-z')")" "0"
+  # Writes, as a write-level key.
+  ontool on_w1 "$ON_RW" wp_update_post "{\"ID\":$T,\"fields\":{\"post_title\":\"ORDNOTE hacked\"}}"
+  ontool on_w2 "$ON_RW" wp_update_post_meta "{\"ID\":$T,\"key\":\"ordnote_probe\",\"value\":\"x\"}"
+  ontool on_w3 "$ON_RW" wp_update_comment "{\"comment_ID\":$N,\"fields\":{\"comment_content\":\"ORDNOTE-rewritten\"}}"
+  ontool on_w4 "$ON_RW" wp_update_comment "{\"comment_ID\":$N,\"fields\":{\"comment_type\":\"comment\"}}"
+  ontool on_w5 "$ON_RW" wp_create_comment "{\"post_id\":$T,\"comment_content\":\"ORDNOTE-injected\"}"
+  ontool on_w6 "$ON_RW" wp_update_comment "{\"comment_ID\":$N,\"fields\":{\"comment_approved\":\"0\"}}"
+  ontool on_w7 "$ON_RW" wp_alter_post "{\"ID\":$T,\"field\":\"post_title\",\"search\":\"ORDNOTE\",\"replace\":\"x\"}"
+  ontool on_w8 "$ON_RW" wp_copy_post_meta "{\"from_id\":$ON_PAGE,\"to_id\":$T}"
+  ontool on_w9 "$ON_RW" wp_update_media "{\"ID\":$T,\"title\":\"ORDNOTE retitled\"}"
+  # ...and as an admin key, the one that has the delete tools.
+  ontool on_d1 "$TOK" wp_delete_post "{\"ID\":$T}"
+  ontool on_d2 "$TOK" wp_delete_post "{\"ID\":$T,\"force\":true}"
+  ontool on_d3 "$TOK" wp_delete_comment "{\"comment_ID\":$N,\"force\":true}"
+  ontool on_d4 "$TOK" wp_delete_comment "{\"comment_ID\":$N}"
+  ontool on_d5 "$TOK" wp_delete_post_meta "{\"ID\":$T,\"key\":\"ordnote_probe\"}"
+  ontool on_d6 "$TOK" wp_update_post_meta "{\"ID\":$T,\"key\":\"ordnote_probe\",\"value\":\"y\"}"
+  ontool on_d7 "$TOK" wp_update_comment "{\"comment_ID\":$N,\"fields\":{\"comment_content\":\"ORDNOTE-admin-rewritten\"}}"
+  ontool on_d8 "$TOK" wp_delete_media "{\"ID\":$T}"
+  ontool on_d9 "$TOK" wp_delete_media "{\"ID\":$T,\"force\":true}"
+  ontool on_d10 "$TOK" wp_delete_media "{\"ID\":$T,\"preview\":true}"
+  AFTER=$(onsnap "$T")
+  # The assertion that matters: nothing stored moved, whatever the replies said.
+  check "($L) after every write and delete tried at write and admin level, the stored order, post row, comments and meta are as they were" "$AFTER" "$BEFORE"
+  check "($L) and each of those calls was refused" \
+    "$(for f in on_w1 on_w2 on_w3 on_w4 on_w5 on_w6 on_w7 on_w8 on_w9 on_d1 on_d2 on_d3 on_d4 on_d5 on_d6 on_d7 on_d8 on_d9 on_d10; do verdict $f; done | sort | uniq -c | tr -s ' ' | tr -d '\n')" " 19 error"
+done
+# The generated REST tools are a second generic writer, and at admin level their read policy is
+# silent: the controller only checks that the row has the route's type, which a page that shares an
+# order's id has. Measured before the write policy was asked there: delete_pages at admin trashed it.
+if [ "$ON_HPOS" = 1 ]; then
+  ON_REST_WAS=$(docker compose exec -T cli wp eval 'echo get_option("gmcp_options",[])["mcp_tools_rest"]??"unset";' 2>/dev/null | tr -d '\r\n')
+  docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_rest"]=true;update_option("gmcp_options",$o,false);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null 2>&1
+  BEFORE=$(onsnap "$ON_B")
+  ontool on_rest_ctl "$TOK" get_pages "{\"id\":$ON_PAGE}"
+  check "CONTROL: the generated page tools are on and read an ordinary page" "$(verdict on_rest_ctl)" "ok"
+  ontool on_rest_u "$TOK" update_pages "{\"id\":$ON_B,\"title\":\"ORDNOTE rest hacked\"}"
+  ontool on_rest_d "$TOK" delete_pages "{\"id\":$ON_B}"
+  ontool on_rest_df "$TOK" delete_pages "{\"id\":$ON_B,\"force\":true}"
+  ontool on_rest_w "$ON_RW" update_pages "{\"id\":$ON_B,\"title\":\"ORDNOTE rest hacked\"}"
+  check "(B) the generated tools neither update nor delete a page that shares an order's id" \
+    "$(for f in on_rest_u on_rest_d on_rest_df on_rest_w; do verdict $f; done | sort | uniq -c | tr -s ' ' | tr -d '\n')" " 4 error"
+  check "(B) and what is stored is as it was" "$(onsnap "$ON_B")" "$BEFORE"
+  ontool on_rest_ctl_u "$TOK" update_pages "{\"id\":$ON_PAGE,\"title\":\"ORDNOTE control page again\"}"
+  check "CONTROL: the same tool still updates an ordinary page, and it is stored" \
+    "$(verdict on_rest_ctl_u)/$(docker compose exec -T cli wp eval "echo get_post($ON_PAGE)->post_title;" 2>/dev/null | tr -d '\r\n')" "ok/ORDNOTE control page again"
+  if [ "$ON_REST_WAS" = unset ]; then
+    docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);unset($o["mcp_tools_rest"]);update_option("gmcp_options",$o,false);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null 2>&1
+  else
+    docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_rest"]='"$([ "$ON_REST_WAS" = 1 ] && echo true || echo false)"';update_option("gmcp_options",$o,false);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null 2>&1
+  fi
+fi
+# The control opposite the refusals: WooCommerce's own note tool is how a note is added, and
+# it must still work on the storage under test, or the guard has cut the shop's own writer.
+BEFORE_NOTE=$(onsnap "$ON_A")
+ontool on_wc_note "$TOK" wc_add_order_note "{\"id\":$ON_A,\"note\":\"ORDNOTE-via-woo\"}"
+check "CONTROL: wc_add_order_note still adds a note, and it is stored" \
+  "$(verdict on_wc_note)/$(docker compose exec -T cli wp eval 'global $wpdb; echo (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_post_ID=%d AND comment_type=\"order_note\" AND comment_content=%s", '"$ON_A"', "ORDNOTE-via-woo" ) );' 2>/dev/null | tr -d '\r\n')" "ok/1"
+check "CONTROL: and the snapshot does move when something real is written" \
+  "$([ "$(onsnap "$ON_A")" != "$BEFORE_NOTE" ] && echo moved)" "moved"
+# The order-note rule itself, independent of WooCommerce hiding the type from every comment
+# query: take that filter off, ask the way wp_get_comments asks, and see what a read-only key
+# and an admin key get for an order_note comment that sits on an ordinary page (so the post
+# policy cannot be what hides it).
+check "an order_note is held by its type below admin, WooCommerce's own filter taken off" \
+  "$(docker compose exec -T cli wp eval '
+    remove_filter( "comments_clauses", [ "WC_Comments", "exclude_order_comments" ], 10 );
+    $id = wp_insert_comment( [ "comment_post_ID" => '"$ON_PAGE"', "comment_content" => "ORDNOTE-on-page", "comment_approved" => 1, "comment_type" => "order_note" ] );
+    $ask = function ( $level ) {
+      $f = function () use ( $level ) { return $level; };
+      add_filter( "gmcp_caller_access_level", $f );
+      $n = count( GMCP_Core::with_readable_comments_sql( function () { return get_comments( [ "post_id" => '"$ON_PAGE"', "type" => "order_note", "status" => "all", "cache_domain" => "gmcp_ordnote_" . wp_rand() ] ); } ) );
+      remove_filter( "gmcp_caller_access_level", $f );
+      return $n;
+    };
+    echo "ro=", $ask( "readonly" ), " rw=", $ask( "readwrite" ), " admin=", $ask( "admin" );
+    wp_delete_comment( $id, true );' 2>/dev/null | tr -d '\r\n')" "ro=0 rw=0 admin=1"
+
+docker compose exec -T cli wp eval '
+  foreach ( wc_get_orders( [ "limit" => -1, "return" => "ids", "status" => array_keys( wc_get_order_statuses() ) ] ) as $id ) { $o = wc_get_order( $id ); if ( $o ) { $o->delete( true ); } }
+  global $wpdb;
+  foreach ( $wpdb->get_col( "SELECT ID FROM {$wpdb->posts} WHERE post_title LIKE \"ORDNOTE %\"" ) as $p ) { wp_delete_post( (int) $p, true ); }
+  $wpdb->query( "DELETE FROM {$wpdb->comments} WHERE comment_content LIKE \"ORDNOTE-%\"" );
+  foreach ( GMCP_Tokens::all() as $k ) { if ( in_array( $k["label"] ?? "", [ "ordnote rw", "ordnote ro" ], true ) ) { GMCP_Tokens::revoke( $k["id"] ); } }' >/dev/null 2>&1
+
 echo "-- the switch really is a switch --"
 docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_woo"]=false;update_option("gmcp_options",$o);' >/dev/null 2>&1
 call w_off '{"jsonrpc":"2.0","id":16,"method":"tools/list"}'

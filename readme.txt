@@ -131,7 +131,7 @@ It has not been tested on multisite. The code has network-aware branches, but un
 * Audit log of every tool call, refusals included, with redacted arguments, a tamper-evident hash chain, and automatic pruning.
 * Backup support: start one before a risky change, list what exists and see when one last completed, with UpdraftPlus and Backuply driven directly and a filter for anything else. Listings never include archive filenames, because on both plugins the filename or its folder is what keeps the archive from being downloaded.
 * Connection test on the settings screen and in Site Health, which distinguishes an unreachable endpoint from credentials that never arrived.
-* WooCommerce tools on their own switch: products, stock, orders, order notes, customers and sales figures. No refunds.
+* WooCommerce tools on their own switch: products, stock, orders, order notes, customers and sales figures. No refunds. The generic post and comment tools do not write to an order or to its notes, whichever order storage the shop uses, and do not return them below admin level.
 * Named keys with their own access level, expiry date and tool list, stored hashed.
 * Drafts-only keys, which cannot publish, schedule, or change a post that is already live (posts, their custom fields, term assignments, featured image and attached media; not comments, taxonomy terms, users or options), and a Read-only choice on the OAuth consent screen.
 * A change journal, so a setting or post an agent modified can be put back.

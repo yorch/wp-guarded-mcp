@@ -166,7 +166,11 @@ post, 24 hours by default and 7 days at most. Viewing a preview link is not logg
 **WooCommerce**, off by default, and the switch only appears when the shop is installed:
 products, stock levels, orders, order notes, customers, a sales summary and a store
 briefing. Tools carrying personal data (orders, customers) are `admin`, not `read`;
-products, stock and sales figures stay at `read`. Refunds are not included.
+products, stock and sales figures stay at `read`. Refunds are not included. The generic post
+and comment tools treat an order as WooCommerce's order table does, by its id, whichever storage
+the shop uses: they do not write to an order, to a post or comment that shares its id, or to an
+order note (`wc_add_order_note` adds one), at any access level, and below admin they do not
+return them.
 
 **Elementor**, off by default, and the switch only appears when Elementor is installed:
 theme-builder conditions, regenerating Elementor's CSS, putting a library template on a

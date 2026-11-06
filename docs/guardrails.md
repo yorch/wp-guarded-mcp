@@ -562,6 +562,38 @@ shop owner should make deliberately rather than inherit.
   meta, because High-Performance Order Storage moves orders out of `wp_posts`
   entirely. A tool built on post queries works on a fresh install and returns
   nothing on most real shops.
+- **The generic post tools judge an order by its id, not only by the post row at it.** With
+  High-Performance Order Storage an order is a row in `wc_orders`, and `wp_posts` holds a
+  `shop_order_placehold` row at the same id (or, on a shop that enabled the storage before
+  WooCommerce reserved ids, nothing at all, or an ordinary page that took the id). Every commerce
+  guard used to ask the post row's type, so an order with no post row, or with a page at its id,
+  was judged by nothing. Measured on WooCommerce 11.2.2 with a write-level key: `wp_update_post_meta`
+  wrote a post-meta row against an order that had no post row; `wp_update_post`, `wp_alter_post`,
+  `wp_duplicate_post` and the meta writers changed the page that shared an order's id; and an
+  admin key's `wp_delete_post` (no `force`) trashed that page, which marked every note of the order
+  `post-trashed` so that WooCommerce showed it none (with `force` WooCommerce's own storage check
+  stopped the deletion, which is not something this plugin relies on). `GMCP_Core::hpos_order_type()`
+  asks `wc_orders` directly (so it holds with WooCommerce deactivated) and `post_chain_types()`,
+  `commerce_post_guard()` and the SQL that leaves unreadable rows out (`unreadable_post_clauses()`,
+  now given the column that holds each row's own id) all ask it: a post, a post-meta row or a
+  comment under such an id is held like an order's, writes at every level and reads below admin.
+  What it does not do: it knows WooCommerce's table and no other shop plugin's (another plugin's
+  order TYPES are added with `gmcp_commerce_post_types`, its tables are not read), and a
+  legitimate page that really shares an order's id cannot be edited with the generic tools (it can
+  in wp-admin) until the clash is resolved, which is the price of the rule.
+- **An order note is the order's own record.** Notes are comments of type `order_note` on the order's
+  id, in either storage. `wp_create_comment`, `wp_update_comment` and `wp_delete_comment` (and the
+  preview of the last) refuse a comment on an order's tree, an `order_note` whatever it hangs from,
+  and a write that would make a comment one, at every access level; `wc_add_order_note` is how a note
+  is added, and it goes through WooCommerce, so it is not held. Measured before this at write level,
+  in both storages and on the placeholder row too: `wp_update_comment` rewrote a note's text,
+  retyped it to an ordinary comment, and `wp_create_comment` put a comment on the order. Reading is
+  held the same way as the order: below admin `wp_get_comments` leaves out comments on an order's
+  tree and every `order_note` by type, in SQL, whether or not WooCommerce is there to hide that type
+  from comment queries (it does, with a filter of its own that a deactivated plugin takes with it).
+  The net under WordPress does not close an order's tree to a comment, because WooCommerce writes
+  its own notes while a tool call is in flight; a third-party plugin's comment write is not caught,
+  as with the other nets.
 - A new product is created as a draft unless you ask otherwise, so a product with
   no price is never briefly for sale.
 
@@ -1269,7 +1301,8 @@ re-read.
   `wp_set_featured_image`, `wp_add_post_terms`, the SEO, ACF, Yoast and Elementor writers and the
   journal's undo already ask) and, where no commerce question was ever asked, by `wp_update_media`,
   `wp_delete_media` and `wp_create_comment`, `wp_update_comment` and `wp_delete_comment`
-  (`comment_write_guard()`). `tree_move_guard()` refuses any write that changes `post_parent` of an
+  (`comment_write_guard()`, which for these three tools also closes an order's tree and the
+  `order_note` type, see the WooCommerce section). `tree_move_guard()` refuses any write that changes `post_parent` of an
   existing post when its current chain or the new parent's chain holds a submission type or a
   commerce type, and `comment_write_guard()` the same for `comment_post_ID`, so nothing is moved
   out of a guarded tree (it would become readable) or into one (it would be hidden). A new post
@@ -1484,7 +1517,8 @@ re-read.
     (Gravity Forms entries, WooCommerce Subscriptions, LearnDash, the audit tables of an activity
     log), which are gated by their own tools and levels and not by this guard.
 
-  WooCommerce orders stored as posts ARE covered by `commerce_post_read_guard()` in
+  WooCommerce orders stored as posts, and (by id, see the WooCommerce section) orders in
+  `wc_orders`, ARE covered by `commerce_post_read_guard()` in
   `wp_get_posts`, `wp_get_post`, `wp_get_post_snapshot`, `wp_get_post_meta`,
   `wp_read_post_meta_chunk`, `wp_get_comments`, `wp_get_media`, the copy tools, the resource,
   the REST tools and the template-reference scans, and in the menu readers for an item whose

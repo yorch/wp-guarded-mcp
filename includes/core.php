@@ -800,6 +800,89 @@ class GMCP_Core {
   }
 
   /**
+  * The name of WooCommerce's order table when it exists, or '' when it does not.
+  *
+  * Asked of the database rather than of WooCommerce, so the answer holds with the plugin
+  * deactivated: the rows are still there and still hold orders. Remembered for the request,
+  * because a listing asks it once per row.
+  */
+  private static function hpos_orders_table(): string {
+    static $table = null;
+    if ( $table === null ) {
+      global $wpdb;
+      $name = $wpdb->prefix . 'wc_orders';
+      $table = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $name ) ) ) === $name ? $name : '';
+    }
+    return $table;
+  }
+
+  /**
+  * The commerce type an id has in WooCommerce's own order table, or null when it is not an order there.
+  *
+  * With high-performance order storage an order is a row in wc_orders and not necessarily a
+  * row in wp_posts, and where it has a post row at all, that row is a placeholder that holds
+  * the id (shop_order_placehold). Every policy here is asked of the post row's TYPE, so an
+  * order with no post row at that id, or with an ordinary post at it (a page that took the
+  * id before WooCommerce reserved ids with placeholders, which is how shops that enabled the
+  * storage early came to share ids), was judged by nothing: the post was an ordinary page
+  * and the order's notes, which are comments on that id, hung from it.
+  *
+  * Order notes, items and the downloadable permissions all key on the id and not on the type,
+  * so WooCommerce acts on them for any post written, trashed or deleted under it (trashing the page
+  * hid every note of the order, measured). The id is the thing to judge, so this is asked of the
+  * id, and the answer is a type from commerce_post_types() so the rest of the guards need no
+  * second vocabulary.
+  *
+  * @return string|null A lowercased commerce type, or null.
+  */
+  public static function hpos_order_type( int $id ): ?string {
+    if ( $id <= 0 ) {
+      return null;
+    }
+    $table = self::hpos_orders_table();
+    if ( $table === '' ) {
+      return null;
+    }
+    // Remembered for the request, bounded: a listing asks once per row and once per parent, and the
+    // answer for an id does not change within the one request that is judging it.
+    static $seen = [];
+    if ( !array_key_exists( $id, $seen ) ) {
+      global $wpdb;
+      // $table is the prefix and a literal, checked against SHOW TABLES above.
+      $type = $wpdb->get_var( $wpdb->prepare( "SELECT type FROM `{$table}` WHERE id = %d", $id ) );
+      if ( count( $seen ) >= 4000 ) {
+        $seen = [];
+      }
+      $seen[ $id ] = $type === null || $type === false ? null : strtolower( (string) $type );
+    }
+    $type = $seen[ $id ];
+    if ( $type === null ) {
+      return null;
+    }
+    return self::is_commerce_post_type( $type ) ? $type : 'shop_order';
+  }
+
+  /**
+  * Comment types that are an order's own record, lowercased: WooCommerce's order notes.
+  *
+  * A note is the status history, the payment gateway's transaction messages and what the
+  * customer was told, and it is a comment on the order's id, so it is read as the order is
+  * and not written by the generic comment tools. Filterable as gmcp_order_note_types for a
+  * shop plugin that keeps its own.
+  *
+  * @return string[]
+  */
+  public static function order_note_types(): array {
+    $out = [];
+    foreach ( (array) apply_filters( 'gmcp_order_note_types', [ 'order_note' ] ) as $type ) {
+      if ( is_string( $type ) && $type !== '' ) {
+        $out[] = strtolower( $type );
+      }
+    }
+    return $out ?: [ 'order_note' ];
+  }
+
+  /**
   * Post types that hold another plugin's CONFIGURATION rather than site content.
   *
   * Separate from commerce_post_types() and from personal_data_post_types() because the reason
@@ -907,6 +990,9 @@ class GMCP_Core {
       return $held;
     }
     $type = $post_id > 0 ? get_post_type( $post_id ) : false;
+    // An id that is an order in WooCommerce's own table is an order whatever the post row at
+    // that id says, or even if there is none. @see hpos_order_type().
+    $shared = $post_id > 0 && ( !$type || !self::is_commerce_post_type( $type ) ) ? self::hpos_order_type( $post_id ) : null;
     // Another plugin's configuration row first, because the sentence differs and so does the
     // reason. Asked for the target type as well as the existing one: creating or retyping into
     // one of these types is the same defect reached from the other side.
@@ -915,6 +1001,12 @@ class GMCP_Core {
       if ( $held !== true ) {
         return $held;
       }
+    }
+    if ( $shared !== null ) {
+      return $verb . ' post #' . $post_id . ' through the generic post tools is refused: that id is also ' . self::with_article( $shared )
+        . ' in WooCommerce\'s order table' . ( $type ? ' (the post at it is ' . self::with_article( (string) $type ) . ')' : ' (there is no post at it)' ) . '. '
+        . 'Order notes, items and download permissions are stored against the id and not against a type, so a write, a trash or a deletion under this id reaches the order. '
+        . 'Use the WooCommerce tools, which go through WooCommerce, or edit it in wp-admin.';
     }
     if ( !$type || !self::is_commerce_post_type( $type ) ) {
       if ( $target_type === null || !self::is_commerce_post_type( trim( $target_type ) ) ) {
@@ -1020,16 +1112,31 @@ class GMCP_Core {
   * data and a loop in it must not hang a read.
   *
   * @param int|WP_Post $post
-  * @return string[] Empty when the post does not exist.
+  * @return string[] Empty when the post does not exist and its id is no order's either.
   */
   public static function post_chain_types( $post ): array {
-    $post = $post instanceof WP_Post ? $post : get_post( (int) $post );
+    $row = $post instanceof WP_Post ? $post : get_post( (int) $post );
+    $id = $post instanceof WP_Post ? (int) $post->ID : (int) $post;
     $types = [];
     $seen = [];
-    for ( $depth = 0; $post instanceof WP_Post && $depth < 8 && !isset( $seen[ $post->ID ] ); $depth++ ) {
-      $seen[ $post->ID ] = true;
-      $types[] = strtolower( (string) $post->post_type );
-      $post = $post->post_parent ? get_post( (int) $post->post_parent ) : null;
+    for ( $depth = 0; $id > 0 && $depth < 8 && !isset( $seen[ $id ] ); $depth++ ) {
+      $seen[ $id ] = true;
+      $own = $row instanceof WP_Post ? strtolower( (string) $row->post_type ) : '';
+      // An id that is an order in WooCommerce's own table is one whatever the post row at it
+      // is, or if there is none: said first, so it is the nearest type. Not added where the
+      // row is already a commerce type, so the wording for an ordinary order is unchanged.
+      // @see hpos_order_type().
+      if ( $own === '' || !self::is_commerce_post_type( $own ) ) {
+        $order = self::hpos_order_type( $id );
+        if ( $order !== null ) {
+          $types[] = $order;
+        }
+      }
+      if ( $own !== '' ) {
+        $types[] = $own;
+      }
+      $id = $row instanceof WP_Post ? (int) $row->post_parent : 0;
+      $row = $id > 0 ? get_post( $id ) : null;
     }
     return $types;
   }
@@ -1055,7 +1162,8 @@ class GMCP_Core {
   * SQL for "this post is a held type, or hangs from one", for a query that cannot ask the guard
   * row by row. The types are read_excluded_post_types(), so below admin an order's tree is in
   * it too. $type_col and $parent_col name the columns of the row being judged, so the caller
-  * decides the table alias. The chain is the depth post_chain_types() walks: the row and
+  * decides the table alias, and $id_col names the column holding the row's own id (the posts
+  * table's ID, or a comment's comment_post_ID). The chain is the depth post_chain_types() walks: the row and
   * seven parents above it.
   *
   * Joins, not nested subqueries. Seven EXISTS inside one another is correct on MySQL and
@@ -1066,7 +1174,7 @@ class GMCP_Core {
   *
   * @return array{join: string, where: string} Both empty when no type is excluded.
   */
-  public static function unreadable_post_clauses( string $type_col, string $parent_col, string $alias = 'gmcp_u' ): array {
+  public static function unreadable_post_clauses( string $type_col, string $parent_col, string $alias = 'gmcp_u', string $id_col = '' ): array {
     global $wpdb;
     $in = implode( ',', array_map( function ( $type ) {
       return "'" . esc_sql( $type ) . "'";
@@ -1074,13 +1182,28 @@ class GMCP_Core {
     if ( $in === '' ) {
       return [ 'join' => '', 'where' => '' ];
     }
+    // Below admin an id that is an order in WooCommerce's own table is held whatever the post
+    // row at it is, or if there is none (@see hpos_order_type()). The same join by primary key,
+    // on the id of each row in the chain rather than on a row of the posts table, because the
+    // row that would carry the id may not exist. The caller says which column holds the row's
+    // own id; without it the order table is not consulted, which is the answer for a caller
+    // that has not been taught.
+    $orders = self::caller_access_level() !== 'admin' && $id_col !== '' ? self::hpos_orders_table() : '';
     $joins = '';
     $tests = [ 'LOWER(' . $type_col . ') IN (' . $in . ')' ];
+    if ( $orders !== '' ) {
+      $joins .= " LEFT JOIN `{$orders}` {$alias}o0 ON {$alias}o0.id = {$id_col}";
+      $tests[] = "{$alias}o0.id IS NOT NULL";
+    }
     $up = $parent_col;
     for ( $level = 1; $level <= 7; $level++ ) {
       $a = $alias . $level;
       $joins .= " LEFT JOIN {$wpdb->posts} {$a} ON {$a}.ID = {$up}";
       $tests[] = "COALESCE(LOWER({$a}.post_type),'') IN ({$in})";
+      if ( $orders !== '' ) {
+        $joins .= " LEFT JOIN `{$orders}` {$alias}o{$level} ON {$alias}o{$level}.id = {$up}";
+        $tests[] = "{$alias}o{$level}.id IS NOT NULL";
+      }
       $up = $a . '.post_parent';
     }
     return [ 'join' => $joins, 'where' => 'NOT (' . implode( ' OR ', $tests ) . ')' ];
@@ -1105,11 +1228,11 @@ class GMCP_Core {
   public static function with_readable_posts_sql( callable $run ) {
     $join = static function ( $join ) {
       global $wpdb;
-      return $join . self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l' )['join'];
+      return $join . self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l', "{$wpdb->posts}.ID" )['join'];
     };
     $where = static function ( $where ) {
       global $wpdb;
-      $c = self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l' );
+      $c = self::unreadable_post_clauses( "{$wpdb->posts}.post_type", "{$wpdb->posts}.post_parent", 'gmcp_l', "{$wpdb->posts}.ID" );
       return $c['where'] === '' ? $where : $where . ' AND ' . $c['where'];
     };
     add_filter( 'posts_join', $join, PHP_INT_MAX );
@@ -1135,8 +1258,21 @@ class GMCP_Core {
   public static function with_readable_comments_sql( callable $run ) {
     $clauses = static function ( $clauses ) {
       global $wpdb;
-      $c = self::unreadable_post_clauses( "COALESCE(gmcp_cp.post_type,'')", 'gmcp_cp.post_parent', 'gmcp_cc' );
-      if ( !is_array( $clauses ) || $c['where'] === '' ) {
+      $c = self::unreadable_post_clauses( "COALESCE(gmcp_cp.post_type,'')", 'gmcp_cp.post_parent', 'gmcp_cc', "{$wpdb->comments}.comment_post_ID" );
+      if ( !is_array( $clauses ) ) {
+        return $clauses;
+      }
+      // An order note is the order's own record, so it is held with the order wherever it hangs
+      // from and whether or not WooCommerce is there to hide it from comment queries (it does,
+      // with a filter of its own that a deactivated plugin takes with it). Below admin only,
+      // like the post types. @see order_note_types()
+      if ( self::caller_access_level() !== 'admin' ) {
+        $notes = implode( ',', array_map( function ( $type ) {
+          return "'" . esc_sql( $type ) . "'";
+        }, self::order_note_types() ) );
+        $clauses['where'] = ( ( $clauses['where'] ?? '' ) !== '' ? $clauses['where'] . ' AND ' : '' ) . "{$wpdb->comments}.comment_type NOT IN ({$notes})";
+      }
+      if ( $c['where'] === '' ) {
         return $clauses;
       }
       $clauses['join'] = ( $clauses['join'] ?? '' ) . " LEFT JOIN {$wpdb->posts} gmcp_cp ON gmcp_cp.ID = {$wpdb->comments}.comment_post_ID" . $c['join'];
@@ -2060,12 +2196,27 @@ class GMCP_Core {
   /**
   * Whether a comment may be written, as far as the post it is on (or would be moved to) goes.
   *
-  * @param int      $comment_id  The comment, or 0 for a creation.
-  * @param int|null $new_post_id The post a creation names, or the one an update moves it to.
+  * A form submission's tree is closed to every caller of this, the net included. An order's
+  * tree is closed to the generic comment TOOLS as well ($commerce), because an order note is
+  * the order's own record, and a comment on an order is read, counted and shown as part of it:
+  * the status history, the gateway's messages, what the customer was told. The tools that mean
+  * to write one go through WooCommerce (wc_add_order_note). The net leaves $commerce off,
+  * because WooCommerce writes its own notes while a tool call is in flight and must be let to.
+  *
+  * Judged on the post the comment is on, and also on the comment itself: a note whose order is
+  * gone, or whose id is in no table, is still a note. The type a write would leave it holding
+  * is judged too, since retyping a comment into order_note files it where no comment query looks
+  * and out of one makes an order note an ordinary comment.
+  *
+  * @param int         $comment_id  The comment, or 0 for a creation.
+  * @param int|null    $new_post_id The post a creation names, or the one an update moves it to.
+  * @param bool        $commerce    Close an order's tree and order notes as well. The generic comment tools pass true.
+  * @param string|null $new_type    The comment type the write would leave it with, when it sets one.
   * @return true|string
   */
-  public static function comment_write_guard( int $comment_id, ?int $new_post_id = null, string $verb = 'Changing' ) {
+  public static function comment_write_guard( int $comment_id, ?int $new_post_id = null, string $verb = 'Changing', bool $commerce = false, ?string $new_type = null ) {
     $current = 0;
+    $comment = null;
     if ( $comment_id > 0 ) {
       $comment = get_comment( $comment_id );
       $current = $comment ? (int) $comment->comment_post_ID : 0;
@@ -2076,12 +2227,25 @@ class GMCP_Core {
       $targets[] = (int) $new_post_id;
     }
     foreach ( $targets as $post_id ) {
-      $hit = $post_id > 0 ? self::guarded_tree_hit( $post_id, $moving ) : null;
+      $hit = $post_id > 0 ? self::guarded_tree_hit( $post_id, $moving || $commerce ) : null;
       if ( $hit !== null ) {
+        $is_order = self::is_commerce_post_type( $hit );
         return $verb . ( $comment_id > 0 ? ' comment #' . $comment_id : ' a comment' ) . ' is refused: '
-          . ( $moving ? 'it would be moved into or out of the tree of a ' . $hit : 'it is on a post in the tree of a ' . $hit . ', a form submission' ) . '. '
-          . 'A comment is read as the post it is on, so writing, moving or deleting one on a submission or anything hanging from it is refused at every access level, '
-          . 'for the reason post writes to one are: nothing here changes what the readers keep from a key that can only read.';
+          . ( $moving ? 'it would be moved into or out of the tree of ' . self::with_article( $hit ) : 'it is on a post in the tree of ' . self::with_article( $hit ) . ( $is_order ? ', so it is part of the order\'s own record' : ', a form submission' ) ) . '. '
+          . ( $is_order
+            ? 'A comment on an order is read and shown as the order is, and an order note is its status history and what the customer was told, so the generic comment tools neither write, move nor delete one at any access level. Use wc_add_order_note to add a note; nothing here edits or removes one.'
+            : 'A comment is read as the post it is on, so writing, moving or deleting one on a submission or anything hanging from it is refused at every access level, '
+              . 'for the reason post writes to one are: nothing here changes what the readers keep from a key that can only read.' );
+      }
+    }
+    if ( $commerce ) {
+      $notes = self::order_note_types();
+      $now = $comment ? strtolower( (string) $comment->comment_type ) : '';
+      $then = $new_type === null ? '' : strtolower( trim( $new_type ) );
+      if ( in_array( $now, $notes, true ) || in_array( $then, $notes, true ) ) {
+        return $verb . ( $comment_id > 0 ? ' comment #' . $comment_id : ' a comment' ) . ' is refused: '
+          . ( in_array( $now, $notes, true ) ? 'it is an order note' : 'it would be made an order note' ) . ', part of an order\'s own record. '
+          . 'The generic comment tools neither write, retype nor delete one at any access level; wc_add_order_note adds a note.';
       }
     }
     return true;
