@@ -1505,7 +1505,7 @@ class GMCP_Settings {
               <?php endif; ?>
               <label>
                 <input type="checkbox" name="mcp_tools_export" value="1" <?php checked( !empty( $options['mcp_tools_export'] ) ); ?>>
-                <?php esc_html_e( 'Site files (a manifest of plugins, themes, mu-plugins or uploads, and an archive that only a person can approve)', 'guarded-mcp' ); ?>
+                <?php esc_html_e( 'Site files (a manifest of plugins, themes, mu-plugins or uploads, and an archive that only a person can approve; secrets by file name and form submissions\' uploads are withheld)', 'guarded-mcp' ); ?>
               </label>
               <label>
                 <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>

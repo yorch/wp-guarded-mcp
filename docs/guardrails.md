@@ -1603,6 +1603,76 @@ asks is written down here.
   the debug log share it. A bare token with no route in front of it is not recognised, and the debug
   log was measured not to print a tool's reply.
 
+## Site-file export
+
+`wp_export_request` is off by default (its own switch, no plugin needed), admin level and nothing
+lower: a `readwrite` and a `readonly` key are refused by name and do not see it in `tools/list`
+(measured, with the admin key as the control that the call works). The `manifest` mode walks one of
+four named roots and returns counts, a digest and the exclusions; `pull` is held for a person in
+every approval mode (see Human approval), then builds a zip outside the web root and returns a
+one-time URL.
+
+- **A directory is not a classification of its contents.** The archive used to carry whatever
+  sat in the root. Measured on this stack before the rule: `.env`, `.htpasswd`, `wp-config.php`,
+  a SQL dump, `debug.log` and a PEM key in a fixture directory of uploads were all in the zip.
+  Now withheld, not read, listed in the manifest with a reason, and absent from the archive:
+  `unsafe_name` (not valid UTF-8, a backslash, a control, bidirectional or zero-width character),
+  `private_name` (`GMCP_Tools_Export::PRIVATE_NAME_GLOBS` in every root; in `uploads`, also the
+  directories of `PRIVATE_UPLOAD_DIRS` and their prefixes, at any depth), and
+  `personal_data_upload`. The last asks the database, through the same tree the read guards judge
+  (`GMCP_Core::unreadable_post_clauses()`): every attachment whose `post_parent` chain reaches a
+  form-submission type, with its generated sizes, the original of a scaled image, edit backups and
+  alternative formats, plus anything in the same directory whose name begins with one of their
+  names followed by a dot or a dash (`photo.jpg.webp`, `photo-300x200.jpg` and also `photo-final.jpg`,
+  which is more than a derivative and is withheld on purpose; `photos.jpg` is not matched). `wp_download_request` refuses such a file at
+  every level, and an archive of uploads would otherwise have been the other door. If the
+  database cannot be asked, the walk is refused, not treated as "none". A site extends the lists
+  with `gmcp_export_private_names` and `gmcp_export_private_directories`; the filters are merged
+  over the built-in lists, so they cannot remove an entry. Naming a withheld file or directory in
+  `path` is refused outright rather than answered with an empty tree.
+- **What this does not find.** It is a list of names and a database question, not a content scan:
+  a secret in a file with an ordinary name (`config.php` in a plugin, a `.json` in a theme) is
+  archived. A file that no attachment row points at, in a directory the list does not name, is
+  archived. The directory names are written from memory of each plugin's storage layout and not
+  checked against their source. Files in `plugins`, `themes` and `mu-plugins` are matched by file
+  name only, since a directory called `logs` there is usually code.
+- **A refusal costs a stat, not a read.** The byte cap was checked after a file was hashed, so one
+  4 GiB file cost 19 seconds of reading to be told no (measured; the cost grew with the file). The
+  size from `lstat` is compared first, and a private directory is never entered. The hash of a
+  file also stops one byte past the size the walk saw, so a file that is being appended to cannot
+  keep a pass running.
+- **A name is also a path.** A file called `a\..\..\x` is one file on Linux and a traversal for
+  an extractor that reads a backslash as a separator; it went into the archive as written
+  (measured). A name that is not UTF-8 made the finished archive disagree with the manifest, so one
+  such file refused its whole directory with a message about the tree having changed. Both are
+  `unsafe_name` now.
+- **Nothing to archive is said so.** A tree with no includable entry produced no zip, and the check
+  on the finished archive reported that the tree had changed. The pull refuses first, before a
+  temporary file or a token exists.
+- **A request that dies mid-build leaves no archive.** The temporary file is owned by nothing
+  until its token row exists, and the cleanup that removes it is only scheduled once an archive has
+  been issued. A shutdown callback removes it on the time limit, a fatal or a vanished client.
+- **Tried and stopped.** An agent cannot approve its own pull or read the queue (the approval is
+  taken on the Approvals screen with a logged-in cookie; there is no tool for it); `mode` spelled
+  `Pull`, `"pull "`, `["pull"]` or `true` is refused by the tool and the held spelling is the one
+  the tool accepts; eight simultaneous requests for one token get one archive and seven 403s; an
+  expired row is refused at the endpoint and its archive removed; the export token row cannot be
+  read, written or deleted through the option tools, is not recorded by the change journal, and is
+  absent from the audit log, the debug trace and the database after a pull (the scrubber was also run
+  on the plain, JSON-escaped, doubly JSON-escaped, percent-encoded and plain-permalink forms of the
+  URL, which are the ones the tool can emit; a token pasted bare or with a doubled slash is not
+  recognised, and nothing writes one); `..`, `.`, empty segments, absolute paths, stream wrappers, a
+  symlink in the path and a path in the wrong case are refused; and a
+  400 MB archive streams under a 128 MB `memory_limit`.
+- **Honest limits.** The approval screen shows the root, the path and the digest, not a file list:
+  a person approves "this directory as it was when the agent read it". Between the per-entry
+  re-check and the read `ZipArchive` does at `close()` a writer who can replace a file can still
+  win the race; the closed archive is compared with the manifest's sizes and CRC-32s, which catches
+  an accidental or naive change and not a deliberate collision. A fatal during the build leaves the
+  approval spent. The reply and the audit log never carry the archive; the URL does carry a
+  bearer token for five minutes, and a web server's own access log will have it (the endpoint is a
+  GET).
+
 ## Theme mods
 
 Theme mods are the customizer's storage, and four generic tools cover them:

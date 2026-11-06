@@ -240,6 +240,17 @@ undo would write it over live content. Tune it against false positives as hard a
 ordinary body that says "password" must stay undoable, and `.dev/journal-pure.php` holds that control.
 Undo also refuses to restore a status `status_write_refusal()` refuses (`trash`, `auto-draft`).
 
+**A directory is not a classification of its contents, and an archive of one is a read of all of
+it.** `GMCP_Tools_Export` walks `plugins`, `themes`, `mu-plugins` and `uploads`, and the roots hold
+files whose whole purpose is to stay on the server: dot-files, `wp-config*`, keys, dumps, logs,
+backups, a form plugin's uploaded files, and the files of every attachment that hangs from a form
+submission, which `wp_download_request` refuses at every level. The walk withholds them by name and
+by asking the database (`name_refusal()`, `personal_upload_paths()`, the same tree
+`unreadable_post_clauses()` judges), never reads them, lists them with a reason and keeps them out
+of the digest's reads; a failure to ask the database refuses the walk. A new reader of the file tree
+asks the same two questions. Its limits are in `docs/guardrails.md` (a secret in a file with an
+ordinary name is archived), and no sentence may say the archive holds no secrets.
+
 **There is no restore tool, at any access level.** Backups can be started and read. That is
 deliberate and not an omission to be helpfully filled in.
 

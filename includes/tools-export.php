@@ -41,6 +41,18 @@ if ( !defined( 'ABSPATH' ) ) {
 * retention window, and no field-name redaction can find a secret inside a zip file. The same
 * reason is why the token is scrubbed from that log by {@see GMCP_Diag_Util::scrub_preview_tokens()}.
 *
+* WHAT IS WITHHELD. A directory is not a classification of its contents. Names that hold secrets
+* (dot-files, `wp-config*`, keys, database dumps, logs, backup archives), the private directories
+* of form and shop plugins inside uploads, and every uploaded file that hangs from a form
+* submission are excluded with a reason, not read, and absent from the archive: the whole point
+* of the submission policy elsewhere in this plugin is that a visitor's upload leaves the server
+* only through the form plugin's own screens, and `wp_download_request` already refuses such a
+* file at every level, so an archive of uploads must not be the other door. Names that are not
+* safe inside an archive (not UTF-8, a backslash, a control character) are excluded too.
+* {@see self::name_refusal()} and {@see self::personal_upload_paths()} say exactly what, and
+* what they cannot know (a file no attachment row points at, in a directory this tool does not
+* name).
+*
 * CONTAINMENT. `root` is one of four names, never a path the caller supplies. A `path` is
 * relative, has no empty, `.` or `..` segment, cannot be absolute, and cannot use a PHP stream
 * wrapper. Every component of it is checked with lstat and a symlink is refused rather than
@@ -78,6 +90,47 @@ class GMCP_Tools_Export {
 
   const ROOTS = [ 'plugins', 'themes', 'mu-plugins', 'uploads' ];
 
+  /**
+  * File names that are never exported, in any of the four roots and at any depth.
+  *
+  * A directory is not a classification of its contents: uploads and plugins both collect files
+  * whose whole purpose is to stay on the server. Dot-files (`.env`, `.htpasswd`, `.git`),
+  * `wp-config*`, private keys and keystores, database dumps and SQLite files, logs, editor and
+  * backup leftovers. Matched on the lower-cased name as a glob, `*` only. A match is listed in
+  * the manifest with the reason `private_name` and its bytes are never read, so it is not in the
+  * digest by content either. A site can ADD patterns with `gmcp_export_private_names`; the filter
+  * cannot remove a built-in one, because it is a list of what is withheld and not of what is
+  * allowed.
+  */
+  const PRIVATE_NAME_GLOBS = [
+    '.*', 'wp-config*', 'error_log', 'php_errorlog', '*.log', '*.log.*',
+    '*.sql', '*.sql.*', '*.sqlite', '*.sqlite3', '*.sqlite-*', '*.db', '*.dump',
+    '*.bak', '*.old', '*.orig', '*.save', '*.swp', '*~',
+    '*.pem', '*.key', '*.p12', '*.pfx', '*.jks', '*.keystore', '*.kdbx', '*.ppk', '*.gpg', '*.pgp',
+    'id_rsa*', 'id_dsa*', 'id_ecdsa*', 'id_ed25519*',
+    'auth.json', 'credentials*.json', 'secrets*.json', 'service-account*.json', 'client_secret*.json',
+    '*.wpress',
+  ];
+
+  /**
+  * Directories of the uploads root that hold another plugin's private files, matched on the
+  * lower-cased name at any depth: a form plugin's uploaded files and temporary files, a shop's
+  * paid downloads and logs, backup plugins' archives. Uploads only: in `plugins` and `themes` a
+  * directory called `logs` or `backup` is usually source code. UNVERIFIED: the names are written
+  * from memory of each plugin's storage layout, not checked against their source; a site with
+  * another store adds its directory through `gmcp_export_private_directories`. The files of a
+  * form submission that WordPress knows as attachments are found by the database instead
+  * ({@see self::personal_upload_paths()}), which does not depend on this list.
+  */
+  const PRIVATE_UPLOAD_DIRS = [
+    'wpforms', 'gravity_forms', 'ninja-forms', 'fluentform', 'wpcf7_uploads', 'flamingo',
+    'formidable', 'forminator', 'wc-logs', 'woocommerce_uploads', 'wpallimport', 'sucuri',
+    'updraft', 'backuply', 'ai1wm-backups', 'backwpup', 'wpvividbackups', 'backup', 'backups',
+    'logs', 'private',
+  ];
+  /** Directory-name prefixes with the same meaning (backup plugins add a random suffix). */
+  const PRIVATE_UPLOAD_DIR_PREFIXES = [ 'backwpup', 'updraft', 'wpvivid', 'duplicator', 'backup-', 'backups-' ];
+
   public function __construct() {
     add_filter( 'gmcp_tools', [ $this, 'register_tools' ] );
     add_filter( 'gmcp_callback', [ $this, 'handle_call' ], 10, 4 );
@@ -108,7 +161,7 @@ class GMCP_Tools_Export {
     return [
       'wp_export_request' => [
         'name' => 'wp_export_request',
-        'description' => 'Inspect or export a directory of this site as a manifest or a zip archive. root is one of plugins, themes, mu-plugins or uploads; path is an optional RELATIVE directory or file under it, and defaults to the whole root (uploads means all of uploads). mode=manifest (the default) walks the tree and reports file_count, total_bytes, depth, a manifest_digest and the entries that WOULD be excluded with a reason (symbolic links, hard links, non-regular files, unreadable entries, anything that resolves outside the root). The digest covers every file\'s name, size and contents, so a file rewritten in place after a manifest changes it. It never returns file contents, and it refuses rather than truncating when the tree exceeds 20000 entries or 512 MiB. mode=pull acts on the manifest_digest from a previous manifest call: it recomputes the manifest and refuses if the tree changed, then asks a signed-in administrator to approve THIS exact call on the Approvals screen. Until that person approves it, nothing is archived and no token exists. After approval, repeat the identical call and it builds the archive outside the web root and returns a one-time URL, valid for five minutes, that streams the zip. The archive is never returned in a tool reply, because replies are copied into the audit log. The pull leg always needs human approval, whatever the site\'s approval mode is set to. Admin level.',
+        'description' => 'Inspect or export a directory of this site as a manifest or a zip archive. root is one of plugins, themes, mu-plugins or uploads; path is an optional RELATIVE directory or file under it, and defaults to the whole root (uploads means all of uploads). mode=manifest (the default) walks the tree and reports file_count, total_bytes, depth, a manifest_digest and the entries that WOULD be excluded with a reason (symbolic links, hard links, non-regular files, unreadable entries, anything that resolves outside the root, names that are not safe in an archive, files that are private by name — dot-files, wp-config, keys, database dumps, logs, backups, the private directories of form and shop plugins in uploads — and uploaded files that belong to a form submission). Withheld files are never read and never in an archive. The digest covers every file\'s name, size and contents, so a file rewritten in place after a manifest changes it. It never returns file contents, and it refuses rather than truncating when the tree exceeds 20000 entries or 512 MiB. mode=pull acts on the manifest_digest from a previous manifest call: it recomputes the manifest and refuses if the tree changed, then asks a signed-in administrator to approve THIS exact call on the Approvals screen. Until that person approves it, nothing is archived and no token exists. After approval, repeat the identical call and it builds the archive outside the web root and returns a one-time URL, valid for five minutes, that streams the zip. The archive is never returned in a tool reply, because replies are copied into the audit log. The pull leg always needs human approval, whatever the site\'s approval mode is set to. Admin level.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -198,6 +251,13 @@ class GMCP_Tools_Export {
     if ( !hash_equals( (string) $scan['manifest_digest'], $digest ) ) {
       return $this->error( $r, 'The tree has changed since that manifest, so this pull was not built. Run mode=manifest again, read the exclusions, and pass the new manifest_digest. The approval has to be for the files that are actually there.' );
     }
+    if ( !$scan['files'] && !$scan['directories'] ) {
+      // A zip with no entries is not a file: ZipArchive writes nothing for it, and the check on
+      // the finished archive then failed with a message about the tree having changed. Said
+      // plainly instead, and before anything is created. This is also what a tree whose every
+      // entry is withheld looks like.
+      return $this->error( $r, 'There is nothing to archive: this path holds no file that may be exported (see excluded in the manifest for what was withheld and why), so no archive was built.' );
+    }
     if ( !class_exists( 'ZipArchive' ) ) {
       return $this->error( $r, 'The zip extension is not available on this server, so an archive cannot be built. The manifest is still available.' );
     }
@@ -211,6 +271,17 @@ class GMCP_Tools_Export {
       return $this->error( $r, 'A temporary file could not be created outside the web root, so an archive was not built. The manifest is still available.' );
     }
     @chmod( $tmp, 0600 );
+    // Until the token row exists the file has no owner, and a request that dies here (the PHP
+    // time limit on a large tree, an out-of-memory fatal, a client that went away) ran none of
+    // the unlinks below: the file stayed in the temporary directory, up to 512 MiB, until some
+    // later export call happened to sweep it, and the sweep is only scheduled once an archive
+    // has been issued. A shutdown callback runs on every one of those ends.
+    $keep = false;
+    register_shutdown_function( static function () use ( $tmp, &$keep ) {
+      if ( !$keep ) {
+        GMCP_Tools_Export::unlink_archive( $tmp );
+      }
+    } );
 
     $zip = new ZipArchive();
     $opened = $zip->open( $tmp, ZipArchive::CREATE | ZipArchive::OVERWRITE );
@@ -287,6 +358,7 @@ class GMCP_Tools_Export {
       @unlink( $tmp );
       return $this->error( $r, 'The one-time token could not be stored, so the archive was removed and no URL was issued.' );
     }
+    $keep = true;
     wp_schedule_single_event( time() + self::TOKEN_TTL + MINUTE_IN_SECONDS, self::CRON_HOOK );
 
     $url = rest_url( 'mcp/v1/export/' . $token );
@@ -320,6 +392,25 @@ class GMCP_Tools_Export {
     $max_entries = max( 1, $max_entries );
     $max_bytes = max( 1, $max_bytes );
 
+    // Which files in uploads hang from a form submission. Asked once per walk, before any file
+    // is read, and a failure to ask is a refusal and not an empty set: a walk that could not
+    // tell what is personal data would archive it.
+    $private = null;
+    if ( $root_key === 'uploads' ) {
+      $private = self::personal_upload_paths();
+      if ( $private === null ) {
+        return [ 'refused' => true, 'message' => 'The database could not say which files in uploads belong to form submissions, so nothing was walked. Try again; the manifest and the pull both refuse rather than archive files that might be a visitor\'s.' ];
+      }
+    }
+    $ctx = [
+      'root' => $root_key,
+      'resolved' => $resolved,
+      'private' => $private,
+      // Where the walk's base sits under the root, with a trailing slash, so a path found
+      // below it can be compared with what the database stores (relative to uploads).
+      'prefix' => ( $resolved['kind'] === 'dir' && $resolved['relative'] !== '' ) ? $resolved['relative'] . '/' : '',
+    ];
+
     $included = [];
     $excluded = [];
     $entries_seen = 0;
@@ -332,7 +423,10 @@ class GMCP_Tools_Export {
 
     if ( $resolved['kind'] === 'file' ) {
       $entries_seen = 1;
-      $entry = $this->file_entry( $resolved['base'], $resolved['relative'], $root_key, $resolved, $add_excluded );
+      $entry = $this->file_entry( $resolved['base'], $resolved['relative'], $ctx, $add_excluded, null, $max_bytes );
+      if ( isset( $entry['refuse'] ) ) {
+        return $this->too_large( 'bytes', $entries_seen, $entry['size'], $max_entries, $max_bytes );
+      }
       if ( $entry !== null ) {
         $included[] = $entry;
         $total_bytes += $entry['size'];
@@ -378,6 +472,13 @@ class GMCP_Tools_Export {
               continue;
             }
             if ( $type === 0040000 ) {
+              // Named before it is entered, so a private directory costs the walk nothing: its
+              // entries are neither read nor counted against the caps.
+              $why = self::name_refusal( $name, true, $root_key );
+              if ( $why !== '' ) {
+                $add_excluded( $rel, $why );
+                continue;
+              }
               $depth = max( $depth, $dir_depth + 1 );
               $included[] = [
                 'type' => 'dir',
@@ -393,7 +494,10 @@ class GMCP_Tools_Export {
               $add_excluded( $rel, 'not_regular_file' );
               continue;
             }
-            $entry = $this->file_entry( $path, $rel, $root_key, $resolved, $add_excluded, $lstat );
+            $entry = $this->file_entry( $path, $rel, $ctx, $add_excluded, $lstat, $max_bytes - $total_bytes );
+            if ( isset( $entry['refuse'] ) ) {
+              return $this->too_large( 'bytes', $entries_seen, $total_bytes + $entry['size'], $max_entries, $max_bytes );
+            }
             if ( $entry !== null ) {
               $included[] = $entry;
               $total_bytes += $entry['size'];
@@ -495,10 +599,19 @@ class GMCP_Tools_Export {
   * bytes leave this function; only the two hashes and the identity of the inode go into the
   * manifest, and the pull re-checks all of them as it adds each entry.
   */
-  private function file_entry( string $path, string $rel, string $root_key, array $resolved, callable $add_excluded, ?array $lstat = null ): ?array {
+  private function file_entry( string $path, string $rel, array $ctx, callable $add_excluded, ?array $lstat = null, int $room = PHP_INT_MAX ): ?array {
     $lstat = $lstat ?? @lstat( $path );
     if ( $lstat === false ) {
       $add_excluded( $rel, 'unreadable' );
+      return null;
+    }
+    // Before anything is opened: a private file is withheld, not read and then dropped.
+    $why = self::name_refusal( basename( $rel ), false, (string) $ctx['root'] );
+    if ( $why === '' && $ctx['private'] !== null && self::is_personal_upload( (string) $ctx['prefix'] . $rel, $ctx['private'] ) ) {
+      $why = 'personal_data_upload';
+    }
+    if ( $why !== '' ) {
+      $add_excluded( $rel, $why );
       return null;
     }
     if ( (int) $lstat['nlink'] > 1 ) {
@@ -510,11 +623,18 @@ class GMCP_Tools_Export {
       return null;
     }
     $real = realpath( $path );
-    if ( $real === false || !self::inside( $real, $resolved['base'] ) ) {
+    if ( $real === false || !self::inside( $real, $ctx['resolved']['base'] ) ) {
       $add_excluded( $rel, 'outside_root' );
       return null;
     }
-    $contents = self::hash_contents( $real );
+    // The size is known from the lstat, so a file that would take the walk over the byte cap is
+    // refused here, before a byte of it is read. The check used to run after the hash, which
+    // made the cost of a refusal the size of the largest file: one 4 GiB file kept a worker
+    // reading for 19 seconds to be told no (measured).
+    if ( (int) $lstat['size'] > $room ) {
+      return [ 'refuse' => 'bytes', 'size' => (int) $lstat['size'] ];
+    }
+    $contents = self::hash_contents( $real, (int) $lstat['size'] );
     if ( $contents === null ) {
       $add_excluded( $rel, 'unreadable' );
       return null;
@@ -545,22 +665,30 @@ class GMCP_Tools_Export {
   *
   * @return array{sha256:string,crc32:string}|null Null when the bytes could not be read whole.
   */
-  private static function hash_contents( string $path ): ?array {
+  private static function hash_contents( string $path, int $expected_size ): ?array {
     $fh = @fopen( $path, 'rb' );
     if ( $fh === false ) {
       return null;
     }
     $sha = hash_init( 'sha256' );
     $crc = hash_init( 'crc32b' );
+    $read = 0;
     while ( !feof( $fh ) ) {
-      $chunk = fread( $fh, 1048576 );
+      // Never past one byte beyond the size the walk saw. A file that is being appended to
+      // would otherwise be read for as long as it grows, with no cap anywhere on the pass.
+      $chunk = fread( $fh, (int) min( 1048576, $expected_size - $read + 1 ) );
       if ( $chunk === false || $chunk === '' ) {
         break;
+      }
+      $read += strlen( $chunk );
+      if ( $read > $expected_size ) {
+        fclose( $fh );
+        return null;
       }
       hash_update( $sha, $chunk );
       hash_update( $crc, $chunk );
     }
-    $whole = feof( $fh );
+    $whole = feof( $fh ) && $read === $expected_size;
     fclose( $fh );
     if ( !$whole ) {
       return null;
@@ -615,7 +743,7 @@ class GMCP_Tools_Export {
     if ( (int) $lstat['size'] !== (int) $file['size'] ) {
       return 'entry_size_changed';
     }
-    $contents = self::hash_contents( $path );
+    $contents = self::hash_contents( $path, (int) $file['size'] );
     if ( $contents === null ) {
       return 'entry_unreadable';
     }
@@ -697,6 +825,197 @@ class GMCP_Tools_Export {
     hash_update( $digest, $type . pack( 'N', strlen( $rel ) ) . $rel . pack( 'J', $size ) . pack( 'J', $mtime ) . pack( 'N', strlen( $reason ) ) . $reason . $sha256 . $crc32 );
   }
 
+  /**
+  * Why a name is never exported, or '' when it may be.
+  *
+  * Two different reasons, so the manifest can tell a person which kind of thing was left out:
+  *
+  *   unsafe_name   the name is not valid UTF-8, or holds a backslash, a control character or a
+  *                 bidirectional or zero-width character. A zip entry called `a\..\..\x` is a
+  *                 single file on this server and a path traversal for an extractor that reads a
+  *                 backslash as a separator (measured: it went into the archive as written), and a
+  *                 name that is not UTF-8 made the finished archive disagree with the manifest, so
+  *                 one such file refused the whole directory with a message about the tree
+  *                 changing.
+  *   private_name  {@see self::PRIVATE_NAME_GLOBS}, and for the uploads root
+  *                 {@see self::PRIVATE_UPLOAD_DIRS}.
+  */
+  private static function name_refusal( string $name, bool $is_dir, string $root_key ): string {
+    if ( preg_match( '//u', $name ) !== 1 || preg_match( '/[\x{0}-\x{1F}\x{7F}\\\\\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2066}-\x{2069}\x{FEFF}]/u', $name ) === 1 ) {
+      return 'unsafe_name';
+    }
+    $lower = strtolower( $name );
+    static $patterns = null;
+    if ( $patterns === null ) {
+      $globs = array_merge( self::PRIVATE_NAME_GLOBS, array_map( 'strtolower', array_map( 'strval', (array) apply_filters( 'gmcp_export_private_names', [] ) ) ) );
+      $patterns = [];
+      foreach ( array_unique( $globs ) as $glob ) {
+        $patterns[] = '/^' . str_replace( '\\*', '.*', preg_quote( $glob, '/' ) ) . '$/s';
+      }
+    }
+    foreach ( $patterns as $re ) {
+      if ( preg_match( $re, $lower ) === 1 ) {
+        return 'private_name';
+      }
+    }
+    if ( !$is_dir && preg_match( '/(backup|dump|snapshot).*\.(zip|gz|tgz|tar|bz2|xz|7z|rar)$/', $lower ) === 1 ) {
+      return 'private_name';
+    }
+    if ( $is_dir && $root_key === 'uploads' ) {
+      static $dirs = null;
+      if ( $dirs === null ) {
+        $dirs = array_merge( self::PRIVATE_UPLOAD_DIRS, array_map( 'strtolower', array_map( 'strval', (array) apply_filters( 'gmcp_export_private_directories', [] ) ) ) );
+      }
+      if ( in_array( $lower, $dirs, true ) ) {
+        return 'private_name';
+      }
+      foreach ( self::PRIVATE_UPLOAD_DIR_PREFIXES as $prefix ) {
+        if ( strpos( $lower, $prefix ) === 0 ) {
+          return 'private_name';
+        }
+      }
+    }
+    return '';
+  }
+
+  /** A path as the comparison below wants it: lower case, NFC where the intl extension exists. */
+  private static function fold_path( string $path ): string {
+    $path = ltrim( str_replace( '\\', '/', $path ), '/' );
+    if ( class_exists( 'Normalizer' ) ) {
+      $n = \Normalizer::normalize( $path, \Normalizer::FORM_C );
+      if ( is_string( $n ) ) {
+        $path = $n;
+      }
+    }
+    return function_exists( 'mb_strtolower' ) ? mb_strtolower( $path, 'UTF-8' ) : strtolower( $path );
+  }
+
+  /**
+  * The files in uploads that belong to something a visitor sent: attachments whose
+  * post_parent chain reaches a form-submission post type, the same tree the read guards judge
+  * ({@see GMCP_Core::unreadable_post_clauses()}). `wp_download_request` refuses such a file at
+  * every level, and an archive of the whole of uploads would carry it out by another door.
+  *
+  * What is collected for each attachment: the file itself, every generated size, the original
+  * of a scaled image, the backups of an edited one, and each alternative format a size lists.
+  * Anything else that sits beside one of them and starts with its name (an optimiser's
+  * `photo.jpg.webp`) is matched by stem in is_personal_upload().
+  *
+  * @return array{files:array<string,true>,stems:array<string,true>}|null Null when the database
+  *   could not be asked, which the caller reads as a refusal and never as "none".
+  */
+  private static function personal_upload_paths(): ?array {
+    global $wpdb;
+    if ( !class_exists( 'GMCP_Core' ) ) {
+      return null;
+    }
+    $clauses = GMCP_Core::unreadable_post_clauses( 'gmcp_x.post_type', 'gmcp_x.post_parent', 'gmcp_xu' );
+    $files = [];
+    $stems = [];
+    if ( $clauses['where'] === '' ) {
+      return [ 'files' => $files, 'stems' => $stems ];
+    }
+    $noisy = $wpdb->suppress_errors( true );
+    try {
+      $last = 0;
+      while ( true ) {
+        $ids = $wpdb->get_col( $wpdb->prepare(
+          "SELECT gmcp_x.ID FROM {$wpdb->posts} gmcp_x {$clauses['join']}
+            WHERE gmcp_x.post_type = 'attachment' AND gmcp_x.ID > %d AND NOT ( {$clauses['where']} )
+            ORDER BY gmcp_x.ID ASC LIMIT 500",
+          $last
+        ) );
+        if ( $wpdb->last_error ) {
+          return null;
+        }
+        if ( !$ids ) {
+          break;
+        }
+        foreach ( $ids as $id ) {
+          $id = (int) $id;
+          $last = max( $last, $id );
+          $attached = get_post_meta( $id, '_wp_attached_file', true );
+          $meta = get_post_meta( $id, '_wp_attachment_metadata', true );
+          $backups = get_post_meta( $id, '_wp_attachment_backup_sizes', true );
+          $names = [];
+          if ( is_string( $attached ) && $attached !== '' ) {
+            $names[] = $attached;
+          }
+          $dir = is_string( $attached ) && strpos( $attached, '/' ) !== false ? dirname( $attached ) : '';
+          $add = static function ( $file ) use ( &$names, $dir ) {
+            if ( is_string( $file ) && $file !== '' ) {
+              $names[] = ( $dir !== '' && strpos( $file, '/' ) === false ) ? $dir . '/' . $file : $file;
+            }
+          };
+          if ( is_array( $meta ) ) {
+            $add( $meta['file'] ?? null );
+            $add( $meta['original_image'] ?? null );
+            foreach ( (array) ( $meta['sources'] ?? [] ) as $source ) {
+              $add( is_array( $source ) ? ( $source['file'] ?? null ) : null );
+            }
+            foreach ( (array) ( $meta['sizes'] ?? [] ) as $size ) {
+              if ( !is_array( $size ) ) {
+                continue;
+              }
+              $add( $size['file'] ?? null );
+              foreach ( (array) ( $size['sources'] ?? [] ) as $source ) {
+                $add( is_array( $source ) ? ( $source['file'] ?? null ) : null );
+              }
+            }
+          }
+          foreach ( is_array( $backups ) ? $backups : [] as $backup ) {
+            $add( is_array( $backup ) ? ( $backup['file'] ?? null ) : null );
+          }
+          foreach ( $names as $name ) {
+            $folded = self::fold_path( $name );
+            $files[ $folded ] = true;
+            $base = basename( $folded );
+            $stem = preg_replace( '/\.[^.]*$/', '', $base );
+            $stem = preg_replace( '/-(?:scaled|rotated|e\d+|\d+x\d+)$/', '', (string) $stem );
+            if ( is_string( $stem ) && $stem !== '' ) {
+              $d = dirname( $folded );
+              $stems[ ( $d === '.' ? '' : $d . '/' ) . $stem ] = true;
+            }
+          }
+        }
+      }
+    }
+    finally {
+      $wpdb->suppress_errors( $noisy );
+    }
+    return [ 'files' => $files, 'stems' => $stems ];
+  }
+
+  /** Whether a path under uploads is one of those files, or sits beside one under its name. */
+  private static function is_personal_upload( string $rel_to_uploads, array $private ): bool {
+    $folded = self::fold_path( $rel_to_uploads );
+    if ( isset( $private['files'][ $folded ] ) ) {
+      return true;
+    }
+    if ( !$private['stems'] ) {
+      return false;
+    }
+    $d = dirname( $folded );
+    $dir = $d === '.' ? '' : $d . '/';
+    $base = basename( $folded );
+    // The stem followed by a dot, a dash or the end: `passport` covers `passport.jpg.webp` and
+    // `passport-300x200.jpg`, not `passports.jpg`.
+    foreach ( [ $base, preg_replace( '/\.[^.]*$/', '', $base ) ] as $candidate ) {
+      $candidate = (string) $candidate;
+      while ( $candidate !== '' ) {
+        if ( isset( $private['stems'][ $dir . $candidate ] ) ) {
+          return true;
+        }
+        $cut = max( (int) strrpos( $candidate, '.' ), (int) strrpos( $candidate, '-' ) );
+        if ( $cut <= 0 ) {
+          break;
+        }
+        $candidate = substr( $candidate, 0, $cut );
+      }
+    }
+    return false;
+  }
+
   #endregion
 
   #region Roots and containment
@@ -761,11 +1080,19 @@ class GMCP_Tools_Export {
         if ( $type !== 0040000 ) {
           return [ 'error' => 'That path runs through something that is not a directory.' ];
         }
+        $why = self::name_refusal( $segment, true, $root_key );
+        if ( $why !== '' ) {
+          return [ 'error' => self::withheld_path_error( $why ) ];
+        }
         $cursor = $next;
         continue;
       }
 
       if ( $type === 0040000 ) {
+        $why = self::name_refusal( $segment, true, $root_key );
+        if ( $why !== '' ) {
+          return [ 'error' => self::withheld_path_error( $why ) ];
+        }
         if ( !is_readable( $next ) ) {
           return [ 'error' => 'That directory is not readable by the server.' ];
         }
@@ -774,6 +1101,10 @@ class GMCP_Tools_Export {
       }
       if ( $type !== 0100000 ) {
         return [ 'error' => 'That path is not a regular file or directory, so it is not exported.' ];
+      }
+      $why = self::name_refusal( $segment, false, $root_key );
+      if ( $why !== '' ) {
+        return [ 'error' => self::withheld_path_error( $why ) ];
       }
       if ( (int) $lstat['nlink'] > 1 ) {
         return [ 'error' => 'That path is a hard link. It is refused rather than exported under a name that does not own the file.' ];
@@ -793,6 +1124,13 @@ class GMCP_Tools_Export {
       return [ 'error' => 'That path resolves outside the named root, so it is refused.' ];
     }
     return [ 'base' => $real, 'relative' => implode( '/', $segments ), 'root' => $root_key, 'kind' => 'dir' ];
+  }
+
+  /** The refusal for a `path` that names, or runs through, a name this tool never exports. */
+  private static function withheld_path_error( string $why ): string {
+    return $why === 'unsafe_name'
+      ? 'That path names, or runs through, a file or directory whose name is not safe to put in an archive (it is not UTF-8, or holds a backslash or a control character), so it is not exported.'
+      : 'That path names, or runs through, a file or directory this tool never exports (dot-files, wp-config, keys, database dumps, logs, backups and the private directories of form and shop plugins). Name a path that does not.';
   }
 
   private static function roots(): array {
