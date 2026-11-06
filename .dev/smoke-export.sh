@@ -475,6 +475,50 @@ check "no entry name holds a backslash" \
 check "the archive holds exactly the ordinary entries" \
   "$(python3 -c 'import zipfile,sys; print(",".join(sorted(zipfile.ZipFile(sys.argv[1]).namelist())))' "$OUT/withheld.zip")" "normal.txt,plain-dir/,plain-dir/nested.txt"
 
+echo "-- withheld files: the same secrets under a spelling a short rule misses --"
+# A secret whose name differs trivially from a listed one is the same secret: a trailing dot or
+# space (Windows drops it, an extractor may too), a no-break or ideographic space, a full-width
+# letter or a soft hyphen inside the name, another case, and names no rule had: rotated logs, the
+# SQLite write-ahead files, *.env, compressed dumps, key and certificate stores.
+WD2="export-names-$MARK"
+NAMEPY='
+import json, os, sys
+SECRET = [
+  "dump2.sql ", "debug2.log ", "server2.key.", "cert2.pem.", "cert3.pem. .", "db2.sql ", "db3.sql　",
+  "ｄｕｍｐ.ｓｑｌ", ".en­v", " .env", "PROD.PEM", "Store.JKS", "App.KEYSTORE", "Ca.CRT",
+  "site.sqlite.gz", "db.sqlite3-wal", "db.sqlite3-shm", "wp.sqlite3", "error_log.1", "access_log", "access_log.2.gz",
+  "prod.env", "staging.env.local", "export.dump", "all.sql.gz", "x.pfx", "x.p12", "x.jks", "x.pkcs12", "x.key", "x.csr",
+  "debug.log-20260101", "site-wal", "site-shm",
+]
+ORDINARY = ["catalog.png", "notes.txt", "environment.txt", "envelope.pdf", "dump-notes.txt", "login.txt", "keys.txt", "crtnotes.txt", "photo.jpg", "readme.md"]
+if sys.argv[1] == "create":
+  d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+  for n in SECRET: open(os.path.join(d, n), "w").write("SECRETMARK-" + sys.argv[3] + "\n")
+  for n in ORDINARY: open(os.path.join(d, n), "w").write("NORMAL-" + sys.argv[3] + "\n")
+  print(len(os.listdir(d)))
+else:
+  m = json.load(open(sys.argv[2]))
+  d = json.loads(m["result"]["content"][0]["text"])
+  got = {e["path"]: e["reason"] for e in d.get("excluded", [])}
+  for n in SECRET: print("%s\t%s" % ("S", json.dumps(n)), got.get(n, "-"))
+  for n in ORDINARY: print("%s\t%s" % ("O", json.dumps(n)), got.get(n, "-"))
+'
+check "CONTROL: every spelling exists on disk" "$(dc cli python3 -c "$NAMEPY" create "$UPLOADS/$WD2" "$MARK")" "44"
+call "$TOK" nm_man "$(tc wp_export_request '{"root":"uploads","path":"'"$WD2"'"}')"
+check "the manifest answers" "$(verdict nm_man)" "ok"
+check "CONTROL: the ordinary look-alikes are counted, so the exclusions below are about the names" "$(jget nm_man file_count)" "10"
+python3 -c "$NAMEPY" verify "$OUT/nm_man" > "$OUT/nm_lines.txt"
+while IFS="$(printf '\t')" read -r kind rest; do
+  name=${rest% *}; reason=${rest##* }
+  if [ "$kind" = "S" ]; then check "$name is withheld as private_name" "$reason" "private_name"
+  else check "CONTROL: $name is not withheld" "$reason" "-"; fi
+done < "$OUT/nm_lines.txt"
+check "CONTROL: that loop read every line" "$(wc -l < "$OUT/nm_lines.txt" | tr -d ' ')" "44"
+pull_zip nm "$WD2" "$OUT/names.zip"
+check "CONTROL: the pull produced a zip" "$(python3 -c 'import zipfile,sys; print("yes" if zipfile.is_zipfile(sys.argv[1]) else "no")' "$OUT/names.zip")" "yes"
+check "CONTROL: the ordinary files are in the archive" "$(zip_has "$OUT/names.zip" "NORMAL-$MARK")" "yes"
+check "no spelling of a withheld file reached the archive" "$(zip_has "$OUT/names.zip" "SECRETMARK-$MARK")" "no"
+
 echo "-- a form submission's uploaded files are withheld, whatever directory they sit in --"
 SUB=$(wpq 'register_post_type("flamingo_inbound",["public"=>true,"label"=>"smoke submission"]);echo wp_insert_post(["post_title"=>"export smoke submission","post_type"=>"flamingo_inbound","post_status"=>"publish"]);')
 PNG="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
@@ -561,7 +605,7 @@ wpq 'global $wpdb;foreach($wpdb->get_col("SELECT option_name FROM {$wpdb->option
 echo "-- cleanup: fixtures, rows, and the two options this suite changed --"
 dc cli wp eval 'wp_delete_attachment('"$ATT"', true);' >/dev/null 2>&1
 dc cli sh -c "rm -f '$UPLOADS/export-symlink-$MARK.txt' '$UPLOADS/export-hardlink-source-$MARK.txt' '$UPLOADS/export-hardlink-copy-$MARK.txt' '$UPLOADS/export-big-$MARK.bin'" >/dev/null 2>&1
-dc cli sh -c "rm -rf '$UPLOADS/$WD' '$UPLOADS/export-nothing-$MARK' '$UPLOADS/export-die-$MARK'" >/dev/null 2>&1
+dc cli sh -c "rm -rf '$UPLOADS/$WD' '$UPLOADS/$WD2' '$UPLOADS/export-nothing-$MARK' '$UPLOADS/export-die-$MARK'" >/dev/null 2>&1
 wpq 'foreach(['"$SUBATT"','"$PUBATT"'] as $a){wp_delete_attachment($a,true);}wp_delete_post('"$SUB"',true);' >/dev/null
 dc cli sh -c "rm -f '$UPLOADS/$SUBDIR/$MARK-visitor'* '$UPLOADS/$SUBDIR/$MARK-public'*" >/dev/null 2>&1
 dc wp sh -c "rm -f /tmp/$MARK-outside.txt" >/dev/null 2>&1

@@ -150,8 +150,12 @@ permissions, and return a one-time URL that streams it for five minutes; the arc
 returned in a tool reply, and the token is scrubbed from the audit log. `uploads` means all of
 uploads, which on a real site can contain customer exports — that is why the group is off
 until somebody switches it on. Some things are withheld in every root and are never read:
-dot-files (`.env`, `.htpasswd`), `wp-config*`, private keys and keystores, database dumps and
-SQLite files, logs, backup archives and editor leftovers; in `uploads`, the private directories
+dot-files (`.env`, `.htpasswd`), `*.env`, `wp-config*`, private keys, certificates and keystores
+(`.pem`, `.key`, `.crt`, `.pfx`, `.p12`, `.jks`, `.keystore`, in any case), database dumps and
+SQLite files with their `-wal`, `-shm` and `.gz` companions, logs and their rotations (`error_log.1`,
+`access_log`), backup archives and editor leftovers, matched on the name as a filesystem would take
+it (a trailing dot or space, a no-break space, full-width letters and invisible format characters
+do not make `dump.sql ` another file); in `uploads`, the private directories
 of the common form, shop and backup plugins; and every uploaded file that belongs to a form
 submission (the files `wp_download_request` already refuses at every level), including the sizes
 WordPress generated from it. Naming one of them in `path` is refused. This is a list of names

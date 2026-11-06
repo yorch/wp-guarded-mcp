@@ -95,18 +95,28 @@ class GMCP_Tools_Export {
   *
   * A directory is not a classification of its contents: uploads and plugins both collect files
   * whose whole purpose is to stay on the server. Dot-files (`.env`, `.htpasswd`, `.git`),
-  * `wp-config*`, private keys and keystores, database dumps and SQLite files, logs, editor and
-  * backup leftovers. Matched on the lower-cased name as a glob, `*` only. A match is listed in
+  * `wp-config*`, private keys, certificates and keystores in any case, database dumps and SQLite
+  * files with their `-wal`/`-shm`/`.gz` companions, logs and their rotations, `*.env`, editor and
+  * backup leftovers. Matched as a glob, `*` only, on the NAME AS A FILESYSTEM AND AN OPERATING
+  * SYSTEM READ IT, not as typed ({@see self::match_name()}): `dump.sql ` with a trailing space,
+  * `server.key.` with a trailing dot and `db.sql` followed by a no-break space are the files
+  * their short names say they are, and a rule on the typed spelling let each of them through. A match is listed in
   * the manifest with the reason `private_name` and its bytes are never read, so it is not in the
   * digest by content either. A site can ADD patterns with `gmcp_export_private_names`; the filter
   * cannot remove a built-in one, because it is a list of what is withheld and not of what is
   * allowed.
   */
   const PRIVATE_NAME_GLOBS = [
-    '.*', 'wp-config*', 'error_log', 'php_errorlog', '*.log', '*.log.*',
-    '*.sql', '*.sql.*', '*.sqlite', '*.sqlite3', '*.sqlite-*', '*.db', '*.dump',
+    '.*', 'wp-config*', 'error_log*', 'php_errorlog*', 'access_log*', '*_log', '*_log.*', '*_log-*',
+    '*.log', '*.log.*', '*.log-*',
+    '*.sql', '*.sql.*', '*.dump', '*.dump.*', '*.dmp', '*.mdb', '*.sqlite', '*.sqlite.*', '*.sqlite-*',
+    '*.sqlite3', '*.sqlite3.*', '*.sqlite3-*', '*.db', '*.db.*', '*.db-*', '*.db3', '*.s3db', '*.sdb',
+    '*-wal', '*-shm', '*-journal',
+    '*.env', '*.env.*', '*.envrc', 'htpasswd', '*.htpasswd',
     '*.bak', '*.old', '*.orig', '*.save', '*.swp', '*~',
-    '*.pem', '*.key', '*.p12', '*.pfx', '*.jks', '*.keystore', '*.kdbx', '*.ppk', '*.gpg', '*.pgp',
+    '*.pem', '*.pem.*', '*.key', '*.key.*', '*.crt', '*.cer', '*.der', '*.csr', '*.p7b', '*.p8',
+    '*.p12', '*.pfx', '*.pkcs12', '*.jks', '*.jceks', '*.bks', '*.keystore', '*.truststore',
+    '*.kdbx', '*.ppk', '*.gpg', '*.pgp', '*.asc',
     'id_rsa*', 'id_dsa*', 'id_ecdsa*', 'id_ed25519*',
     'auth.json', 'credentials*.json', 'secrets*.json', 'service-account*.json', 'client_secret*.json',
     '*.wpress',
@@ -844,7 +854,9 @@ class GMCP_Tools_Export {
     if ( preg_match( '//u', $name ) !== 1 || preg_match( '/[\x{0}-\x{1F}\x{7F}\\\\\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2066}-\x{2069}\x{FEFF}]/u', $name ) === 1 ) {
       return 'unsafe_name';
     }
-    $lower = strtolower( $name );
+    // Both readings: the name as typed (so `...` stays hidden by `.*` although it normalises to
+    // nothing) and the name as it is taken for.
+    $reads = array_values( array_unique( [ strtolower( $name ), self::match_name( $name ) ] ) );
     static $patterns = null;
     if ( $patterns === null ) {
       $globs = array_merge( self::PRIVATE_NAME_GLOBS, array_map( 'strtolower', array_map( 'strval', (array) apply_filters( 'gmcp_export_private_names', [] ) ) ) );
@@ -853,29 +865,64 @@ class GMCP_Tools_Export {
         $patterns[] = '/^' . str_replace( '\\*', '.*', preg_quote( $glob, '/' ) ) . '$/s';
       }
     }
-    foreach ( $patterns as $re ) {
-      if ( preg_match( $re, $lower ) === 1 ) {
+    foreach ( $reads as $lower ) {
+      foreach ( $patterns as $re ) {
+        if ( preg_match( $re, $lower ) === 1 ) {
+          return 'private_name';
+        }
+      }
+      if ( !$is_dir && preg_match( '/(backup|dump|snapshot).*\.(zip|gz|tgz|tar|bz2|xz|7z|rar)$/', $lower ) === 1 ) {
         return 'private_name';
       }
-    }
-    if ( !$is_dir && preg_match( '/(backup|dump|snapshot).*\.(zip|gz|tgz|tar|bz2|xz|7z|rar)$/', $lower ) === 1 ) {
-      return 'private_name';
     }
     if ( $is_dir && $root_key === 'uploads' ) {
       static $dirs = null;
       if ( $dirs === null ) {
         $dirs = array_merge( self::PRIVATE_UPLOAD_DIRS, array_map( 'strtolower', array_map( 'strval', (array) apply_filters( 'gmcp_export_private_directories', [] ) ) ) );
       }
-      if ( in_array( $lower, $dirs, true ) ) {
-        return 'private_name';
-      }
-      foreach ( self::PRIVATE_UPLOAD_DIR_PREFIXES as $prefix ) {
-        if ( strpos( $lower, $prefix ) === 0 ) {
+      foreach ( $reads as $lower ) {
+        if ( in_array( $lower, $dirs, true ) ) {
           return 'private_name';
+        }
+        foreach ( self::PRIVATE_UPLOAD_DIR_PREFIXES as $prefix ) {
+          if ( strpos( $lower, $prefix ) === 0 ) {
+            return 'private_name';
+          }
         }
       }
     }
     return '';
+  }
+
+  /**
+  * A file name as the private-name rules should read it: the name a person, a web server or an
+  * operating system would take it for.
+  *
+  * NFKC where the intl extension exists (full-width letters and the Kelvin sign become the plain
+  * ones; without intl the full-width ASCII block is mapped by hand), every format character
+  * removed (a soft hyphen or word joiner inside `.env` leaves it `.env`), then trailing dots and
+  * any kind of space or control character removed, and leading ones too (Windows drops a
+  * trailing dot or space when it creates a file, so `server.key.` is `server.key` there, and a
+  * leading no-break space before `.env` is a thin disguise), then case folded. The archive entry
+  * keeps the real name; this is for matching only.
+  */
+  private static function match_name( string $name ): string {
+    $n = $name;
+    if ( class_exists( 'Normalizer' ) ) {
+      $folded = \Normalizer::normalize( $n, \Normalizer::FORM_KC );
+      if ( is_string( $folded ) ) {
+        $n = $folded;
+      }
+    }
+    else {
+      $n = (string) preg_replace_callback( '/[\x{FF01}-\x{FF5E}]/u', static function ( $m ) {
+        return chr( mb_ord( $m[0], 'UTF-8' ) - 0xFEE0 );
+      }, $n );
+    }
+    $n = (string) preg_replace( '/[\p{Cf}]/u', '', $n );
+    $n = (string) preg_replace( '/^[\s\p{Z}\p{Cc}]+/u', '', $n );
+    $n = (string) preg_replace( '/[\s\p{Z}\p{Cc}.]+$/u', '', $n );
+    return function_exists( 'mb_strtolower' ) ? mb_strtolower( $n, 'UTF-8' ) : strtolower( $n );
   }
 
   /** A path as the comparison below wants it: lower case, NFC where the intl extension exists. */

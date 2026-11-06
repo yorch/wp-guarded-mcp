@@ -1770,6 +1770,20 @@ one-time URL.
   with `gmcp_export_private_names` and `gmcp_export_private_directories`; the filters are merged
   over the built-in lists, so they cannot remove an entry. Naming a withheld file or directory in
   `path` is refused outright rather than answered with an empty tree.
+- **A name is matched as the system takes it, not as it was typed.** `dump.sql ` (trailing space),
+  `server.key.` (trailing dot), `db.sql` followed by a no-break or ideographic space, `ｄｕｍｐ.ｓｑｌ`
+  in full-width letters and `PROD.PEM` were each the file their short name says and each was
+  archived, because the globs were compared with `strtolower( $name )` (measured by an independent
+  review). `GMCP_Tools_Export::match_name()` now reads the name through NFKC (the `intl` extension;
+  without it the full-width ASCII block is mapped by hand and nothing else is folded), drops every
+  format character, strips leading and trailing spaces, control characters and trailing dots, and
+  folds case; a name is matched both as typed and as normalised, so `...` is still a dot-file. The
+  list grew by what the review found no rule for: rotated logs (`error_log*`, `access_log*`,
+  `*_log`, `*.log-*`), the SQLite companions (`*.sqlite3-wal`, `*-wal`, `*-shm`, `*.sqlite.gz`),
+  `*.env`, `*.dump`, and certificate and keystore files in any case. Not covered: a name that
+  differs by a character this does not fold (a look-alike letter from another script is not a
+  `.sql`), a secret kept in a file with an unlisted extension, and the archive entry itself keeps
+  the real name.
 - **What this does not find.** It is a list of names and a database question, not a content scan:
   a secret in a file with an ordinary name (`config.php` in a plugin, a `.json` in a theme) is
   archived. A file that no attachment row points at, in a directory the list does not name, is

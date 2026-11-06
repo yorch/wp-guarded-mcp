@@ -281,7 +281,9 @@ Undo also refuses to restore a status `status_write_refusal()` refuses (`trash`,
 
 **A directory is not a classification of its contents, and an archive of one is a read of all of
 it.** `GMCP_Tools_Export` walks `plugins`, `themes`, `mu-plugins` and `uploads`, and the roots hold
-files whose whole purpose is to stay on the server: dot-files, `wp-config*`, keys, dumps, logs,
+files whose whole purpose is to stay on the server (matched on the name as a system takes it,
+`match_name()`, so a trailing dot, space or no-break space does not make `dump.sql ` another
+file): dot-files, `wp-config*`, keys, dumps, logs,
 backups, a form plugin's uploaded files, and the files of every attachment that hangs from a form
 submission, which `wp_download_request` refuses at every level. The walk withholds them by name and
 by asking the database (`name_refusal()`, `personal_upload_paths()`, the same tree
