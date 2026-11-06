@@ -400,9 +400,14 @@ class GMCP_Audit {
   * a multisite network's blogs have no reason to queue behind one another. If the lock
   * cannot be had in five seconds the row is written anyway, because an entry that might sit
   * on a fork is a better outcome than an entry that does not exist; the timeout is logged.
-  * A server with no GET_LOCK answers something that is neither '1' nor '0' and is treated as
-  * having no lock to take, silently: null from a server that errors on the call, and the
-  * string '1=1' from the SQLite drop-in (measured), which reads the call as a comparison.
+  * A server with no GET_LOCK answers something that is neither '1' nor '0': null from a
+  * server that errors on the call, the string '1=1' from the SQLite drop-in (measured), which
+  * reads the call as a comparison. That is not "no lock needed": two writers still read the same
+  * predecessor and fork the chain, which verify() reports as tampering. So the odd answer is
+  * logged (once per request) and the append falls back to a lock that needs nothing but a unique
+  * key, a row in the options table taken with INSERT IGNORE (the way core serialises its own
+  * upgrades) with a stale-lock takeover, and only if that cannot be had in five seconds either is
+  * the row written unserialised, with a second log line. A row is never dropped for want of a lock.
   *
   * @param array $row the columns, without prev_hash and hash.
   */
@@ -421,9 +426,26 @@ class GMCP_Audit {
     $got = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $name, 5 ) );
     $wpdb->suppress_errors( $noisy );
     $locked = ( (string) $got === '1' );
+    $fallback = null;
     if ( (string) $got === '0' ) {
       error_log( '[Guarded MCP] audit chain lock not obtained within 5 seconds for ' . GMCP_Core::log_text( $row['tool'] )
         . '; writing the entry unserialised, so the chain may fork here.' );
+    }
+    elseif ( !$locked ) {
+      // Neither '1' nor '0': this server has no GET_LOCK (or something between us and it
+      // rewrote the answer). Say what came back, redacted like every other debug line, and
+      // serialise some other way instead of carrying on as if no lock were needed.
+      static $said = false;
+      if ( !$said ) {
+        $said = true;
+        error_log( '[Guarded MCP] audit chain: GET_LOCK answered ' . GMCP_Core::log_text( $got === null ? 'NULL' : 'a value other than 1 or 0: ' . $got )
+          . '; serialising appends with a lock row in the options table instead.' );
+      }
+      $fallback = self::take_row_lock( $name );
+      if ( $fallback === null ) {
+        error_log( '[Guarded MCP] audit chain: the options-table lock was not obtained within 5 seconds for ' . GMCP_Core::log_text( $row['tool'] )
+          . '; writing the entry unserialised, so the chain may fork here.' );
+      }
     }
 
     try {
@@ -464,6 +486,9 @@ class GMCP_Audit {
         $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $name ) );
         $wpdb->suppress_errors( $noisy );
       }
+      elseif ( $fallback !== null ) {
+        self::release_row_lock( $name, $fallback );
+      }
     }
 
     if ( $written === false ) {
@@ -478,6 +503,52 @@ class GMCP_Audit {
       error_log( '[Guarded MCP] audit entry NOT recorded for ' . GMCP_Core::log_text( $row['tool'] ) . ': '
         . GMCP_Core::log_text( $wpdb->last_error ?: 'the database reported no error' ) );
     }
+  }
+
+  /**
+  * The chain lock for a server whose GET_LOCK is not usable: a row in the options table whose
+  * name is unique, so INSERT IGNORE succeeds for exactly one writer at a time on any SQL server.
+  * The value is "<time>:<token>". A lock older than thirty seconds belongs to a request that died
+  * holding it (an insert takes milliseconds) and is taken over with a compare-and-swap UPDATE, so
+  * two takeovers cannot both win. Written with $wpdb directly: no option hooks fire, and the
+  * row is never read through the options cache.
+  *
+  * @return string|null the value to hand to release_row_lock(), or null when not obtained in five seconds.
+  */
+  private static function take_row_lock( string $name ): ?string {
+    global $wpdb;
+    $noisy = $wpdb->suppress_errors( true );
+    try {
+      $deadline = microtime( true ) + 5;
+      do {
+        $mine = time() . ':' . bin2hex( random_bytes( 8 ) );
+        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- the options table name is core's
+        $won = $wpdb->query( $wpdb->prepare( "INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')", $name, $mine ) );
+        if ( $won === 1 ) {
+          return $mine;
+        }
+        $held = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $name ) );
+        if ( is_string( $held ) && (int) $held > 0 && time() - (int) $held > 30 ) {
+          $won = $wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s", $mine, $name, $held ) );
+          if ( $won === 1 ) {
+            return $mine;
+          }
+        }
+        usleep( 20000 );
+      } while ( microtime( true ) < $deadline );
+    }
+    finally {
+      $wpdb->suppress_errors( $noisy );
+    }
+    return null;
+  }
+
+  private static function release_row_lock( string $name, string $mine ): void {
+    global $wpdb;
+    $noisy = $wpdb->suppress_errors( true );
+    // Only the holder's own value: a lock taken over after thirty seconds is not ours to delete.
+    $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", $name, $mine ) );
+    $wpdb->suppress_errors( $noisy );
   }
 
   /**
