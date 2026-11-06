@@ -1787,9 +1787,37 @@ one-time URL.
 - **What this does not find.** It is a list of names and a database question, not a content scan:
   a secret in a file with an ordinary name (`config.php` in a plugin, a `.json` in a theme) is
   archived. A file that no attachment row points at, in a directory the list does not name, is
-  archived. The directory names are written from memory of each plugin's storage layout and not
-  checked against their source. Files in `plugins`, `themes` and `mu-plugins` are matched by file
-  name only, since a directory called `logs` there is usually code.
+  archived. The directory names of the form plugins were read from source (the table below); the
+  shop, backup and generic names are still written from memory and not checked. Files in
+  `plugins`, `themes` and `mu-plugins` are matched by file name only, since a directory called
+  `logs` there is usually code.
+- **Where the form plugins put their files: measured from source, per plugin.** The list in
+  `GMCP_Tools_Export::PRIVATE_UPLOAD_DIRS` was written from memory and was wrong in both
+  directions. The free releases were downloaded from wordpress.org into a scratch directory and
+  READ with grep, never run (Contact Form 7 6.2.4.1, Flamingo 2.6.4, Ninja Forms 3.16.0, WPForms
+  Lite 2.0.4, Fluent Forms 6.2.17, Elementor 4.3.6, JetFormBuilder 3.6.8.1, Everest Forms 3.6.4,
+  Forminator 1.58.4, Formidable 7.0). Gravity Forms is paid and was not obtained.
+
+  | Plugin | Directory under `uploads` | Status |
+  |---|---|---|
+  | Contact Form 7 | `wpcf7_uploads` (`wpcf7_upload_tmp_dir()`); the constant `WPCF7_UPLOADS_TMP_DIR` moves it to a path under `wp-content`, outside uploads | verified in source |
+  | Flamingo | none: it writes no files (the earlier `flamingo` entry was removed) | verified: no upload code |
+  | Ninja Forms | `ninja-forms-tmp` (submission exports), `nf-field-exports`; export CSVs are also written to the dated uploads folder, which no name rule can find | verified in source |
+  | Ninja Forms File Uploads add-on | `ninja-forms` | UNVERIFIED (paid add-on, from memory) |
+  | WPForms Lite | `wpforms` (`wpforms_upload_dir()`: cache, `tmp`, icon choices, Stripe rate-limit files); filterable by `wpforms_upload_root` | verified in source |
+  | Fluent Forms | `fluentform` (the migrator writes there; the scheduler and the URL decoder build `uploads` + `FLUENTFORM_UPLOAD_DIR` + `/temp`) | verified in the free code; the constant is defined in the Pro plugin, which was not read |
+  | Elementor | `elementor` holds generated CSS, thumbnails and import scratch (`tmp`): none of it is a visitor's file, and it is not listed. The forms module that stores submissions' uploads is in Elementor Pro, not obtained | free: verified; Pro forms directory UNVERIFIED and not listed |
+  | JetFormBuilder | `jet-form-builder` (filter `jet-form-builder/file-upload/dir`), with `temp` and an md5-named folder per form and user; its attachments are inserted with a parent of 0 | verified in source |
+  | Everest Forms | `everest_forms_uploads` (per form, plus `tmp`), `Everes-Froms-Entries-CSV-file` (entry exports, spelt so), `evf-logs`; `everest_forms_styles` is generated CSS and is not listed | verified in source |
+  | Forminator | `forminator` (also leftover public exports), `forminator_temp`; the site can set a custom upload root, which is a name of its choosing | verified in source (custom root not findable by name) |
+  | Formidable | `formidable` holds only generated CSS in the free release (`formidable/css`); the upload folder of the Pro file field is from memory | UNVERIFIED for uploads; listed on that memory, which also hides the CSS from an export |
+  | Gravity Forms | `gravity_forms` | UNVERIFIED (paid, not obtained, from memory) |
+  | CFDB7 | `cfdb7_uploads` | inferred: Forminator's importer reads files from it; the plugin itself was not obtained |
+
+  Two consequences worth knowing. The database question (attachments whose parent chain reaches a
+  submission) does not help where a plugin inserts its uploads with a parent of 0, as
+  JetFormBuilder does, so for those the directory name is the only protection. And `wp_download_request`
+  does not ask the directory list at all; it asks the attachment's parent and publication state.
 - **A refusal costs a stat, not a read.** The byte cap was checked after a file was hashed, so one
   4 GiB file cost 19 seconds of reading to be told no (measured; the cost grew with the file). The
   size from `lstat` is compared first, and a private directory is never entered. The hash of a

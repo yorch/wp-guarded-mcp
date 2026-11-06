@@ -124,17 +124,30 @@ class GMCP_Tools_Export {
 
   /**
   * Directories of the uploads root that hold another plugin's private files, matched on the
-  * lower-cased name at any depth: a form plugin's uploaded files and temporary files, a shop's
-  * paid downloads and logs, backup plugins' archives. Uploads only: in `plugins` and `themes` a
-  * directory called `logs` or `backup` is usually source code. UNVERIFIED: the names are written
-  * from memory of each plugin's storage layout, not checked against their source; a site with
-  * another store adds its directory through `gmcp_export_private_directories`. The files of a
-  * form submission that WordPress knows as attachments are found by the database instead
-  * ({@see self::personal_upload_paths()}), which does not depend on this list.
+  * lower-cased name at any depth: a form plugin's uploaded files, temporary files and exports, a
+  * shop's paid downloads and logs, backup plugins' archives. Uploads only: in `plugins` and
+  * `themes` a directory called `logs` or `backup` is usually source code.
+  *
+  * The form-plugin names were read from each plugin's source (the free releases, read with grep and
+  * never run) and the result, per plugin and with what could not be checked, is in
+  * docs/guardrails.md. In short: Contact Form 7 (`wpcf7_uploads`), WPForms (`wpforms`), Fluent Forms
+  * (`fluentform`), Ninja Forms (`ninja-forms-tmp`, `nf-field-exports`), Everest Forms
+  * (`everest_forms_uploads`, `Everes-Froms-Entries-CSV-file`, `evf-logs`), Forminator (`forminator`,
+  * `forminator_temp`) and JetFormBuilder (`jet-form-builder`) were found in source; Gravity Forms
+  * (`gravity_forms`), Ninja Forms' upload add-on (`ninja-forms`), Formidable's upload folder
+  * (`formidable`, which in the free release holds only generated CSS) and the non-form entries are
+  * UNVERIFIED. A directory a plugin lets the site rename (Forminator's custom upload root, a
+  * filtered path) is not found by name, and a site adds its own through
+  * `gmcp_export_private_directories`. The files of a form submission that WordPress knows as
+  * attachments are found by the database instead ({@see self::personal_upload_paths()}), which
+  * does not depend on this list, but only while the attachment's `post_parent` still reaches the
+  * submission: JetFormBuilder, for one, inserts its uploads with a parent of 0.
   */
   const PRIVATE_UPLOAD_DIRS = [
-    'wpforms', 'gravity_forms', 'ninja-forms', 'fluentform', 'wpcf7_uploads', 'flamingo',
-    'formidable', 'forminator', 'wc-logs', 'woocommerce_uploads', 'wpallimport', 'sucuri',
+    'wpforms', 'wpcf7_uploads', 'fluentform', 'ninja-forms-tmp', 'nf-field-exports', 'ninja-forms',
+    'everest_forms_uploads', 'everes-froms-entries-csv-file', 'evf-logs', 'forminator', 'forminator_temp',
+    'jet-form-builder', 'cfdb7_uploads', 'gravity_forms', 'formidable',
+    'wc-logs', 'woocommerce_uploads', 'wpallimport', 'sucuri',
     'updraft', 'backuply', 'ai1wm-backups', 'backwpup', 'wpvividbackups', 'backup', 'backups',
     'logs', 'private',
   ];

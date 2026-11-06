@@ -538,6 +538,32 @@ check "CONTROL: the pull produced a zip" "$(python3 -c 'import zipfile,sys; prin
 check "CONTROL: the ordinary files are in the archive" "$(zip_has "$OUT/names.zip" "NORMAL-$MARK")" "yes"
 check "no spelling of a withheld file reached the archive" "$(zip_has "$OUT/names.zip" "SECRETMARK-$MARK")" "no"
 
+echo "-- withheld directories: the form plugins' upload folders, as read from their source --"
+# The names below come from the plugins' own code (see PRIVATE_UPLOAD_DIRS), at depth, in another
+# case, and with the names a plugin does NOT use (the control that the rule is about the name).
+WD3="export-formdirs-$MARK"
+FORMDIRS="wpcf7_uploads wpforms fluentform ninja-forms-tmp nf-field-exports everest_forms_uploads Everes-Froms-Entries-CSV-file evf-logs forminator forminator_temp jet-form-builder cfdb7_uploads"
+dc cli sh -c "mkdir -p '$UPLOADS/$WD3/plain-dir'
+  printf 'NORMAL-$MARK\n' > '$UPLOADS/$WD3/plain-dir/ok.txt'
+  for d in $FORMDIRS; do mkdir -p '$UPLOADS/$WD3/'\$d '$UPLOADS/$WD3/plain-dir/'\$d; printf 'SECRETMARK-$MARK\n' > '$UPLOADS/$WD3/'\$d/entry.pdf; printf 'SECRETMARK-$MARK\n' > '$UPLOADS/$WD3/plain-dir/'\$d/deep.pdf; done
+  mkdir -p '$UPLOADS/$WD3/WPFORMS' '$UPLOADS/$WD3/flamingo' '$UPLOADS/$WD3/not-a-form-plugin'
+  printf 'SECRETMARK-$MARK\n' > '$UPLOADS/$WD3/WPFORMS/upper.pdf'
+  printf 'NORMAL-$MARK\n' > '$UPLOADS/$WD3/flamingo/free-has-no-upload-dir.txt'
+  printf 'NORMAL-$MARK\n' > '$UPLOADS/$WD3/not-a-form-plugin/ok2.txt'" >/dev/null 2>&1
+call "$TOK" fd_man "$(tc wp_export_request '{"root":"uploads","path":"'"$WD3"'"}')"
+check "the manifest answers" "$(verdict fd_man)" "ok"
+for d in $FORMDIRS; do
+  check "$d is withheld as private_name" "$(excl_reason fd_man "$d")" "private_name"
+  check "$d at depth is withheld as private_name" "$(excl_reason fd_man "plain-dir/$d")" "private_name"
+done
+check "WPFORMS (another case) is withheld as private_name" "$(excl_reason fd_man "WPFORMS")" "private_name"
+check "CONTROL: a directory the plugins do not use is not withheld (flamingo writes no uploads)" "$(excl_reason fd_man "flamingo")" "-"
+check "CONTROL: the ordinary files are counted (3), so the rest are about the names" "$(jget fd_man file_count)" "3"
+pull_zip fd "$WD3" "$OUT/formdirs.zip"
+check "CONTROL: the pull produced a zip" "$(python3 -c 'import zipfile,sys; print("yes" if zipfile.is_zipfile(sys.argv[1]) else "no")' "$OUT/formdirs.zip")" "yes"
+check "CONTROL: the ordinary files are in the archive" "$(zip_has "$OUT/formdirs.zip" "NORMAL-$MARK")" "yes"
+check "no file of a form plugin's directory reached the archive" "$(zip_has "$OUT/formdirs.zip" "SECRETMARK-$MARK")" "no"
+
 echo "-- a form submission's uploaded files are withheld, whatever directory they sit in --"
 SUB=$(wpq 'register_post_type("flamingo_inbound",["public"=>true,"label"=>"smoke submission"]);echo wp_insert_post(["post_title"=>"export smoke submission","post_type"=>"flamingo_inbound","post_status"=>"publish"]);')
 PNG="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
@@ -624,7 +650,7 @@ wpq 'global $wpdb;foreach($wpdb->get_col("SELECT option_name FROM {$wpdb->option
 echo "-- cleanup: fixtures, rows, and the two options this suite changed --"
 dc cli wp eval 'wp_delete_attachment('"$ATT"', true);' >/dev/null 2>&1
 dc cli sh -c "rm -f '$UPLOADS/export-symlink-$MARK.txt' '$UPLOADS/export-hardlink-source-$MARK.txt' '$UPLOADS/export-hardlink-copy-$MARK.txt' '$UPLOADS/export-big-$MARK.bin'" >/dev/null 2>&1
-dc cli sh -c "rm -rf '$UPLOADS/$WD' '$UPLOADS/$WD2' '$UPLOADS/export-nothing-$MARK' '$UPLOADS/export-die-$MARK'" >/dev/null 2>&1
+dc cli sh -c "rm -rf '$UPLOADS/$WD' '$UPLOADS/$WD2' '$UPLOADS/$WD3' '$UPLOADS/export-nothing-$MARK' '$UPLOADS/export-die-$MARK'" >/dev/null 2>&1
 wpq 'foreach(['"$SUBATT"','"$PUBATT"'] as $a){wp_delete_attachment($a,true);}wp_delete_post('"$SUB"',true);' >/dev/null
 dc cli sh -c "rm -f '$UPLOADS/$SUBDIR/$MARK-visitor'* '$UPLOADS/$SUBDIR/$MARK-public'*" >/dev/null 2>&1
 dc wp sh -c "rm -f /tmp/$MARK-outside.txt" >/dev/null 2>&1

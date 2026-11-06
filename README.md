@@ -162,8 +162,9 @@ submission (the files `wp_download_request` already refuses at every level), inc
 WordPress generated from it. Naming one of them in `path` is refused. This is a list of names
 and a database question, not a content scan: a secret in a file with an ordinary name (a
 `config.php` in a plugin) is archived, a file no attachment row points at in a directory the
-list does not name is archived, and the plugin directory names are written from memory of each
-plugin's layout (extend them with `gmcp_export_private_directories` and `gmcp_export_private_names`).
+list does not name is archived, and the form plugins' directory names were read from the source of
+their free releases (the table in `docs/guardrails.md` says which are verified and which, such as
+Gravity Forms and the paid add-ons, are not; extend them with `gmcp_export_private_directories` and `gmcp_export_private_names`).
 A tree whose every entry is withheld has nothing to archive and the pull says so.
 
 **Site administration**, off by default: installing, activating, updating and deleting
