@@ -103,6 +103,10 @@ class GMCP_Core {
     // from clearing the generated CSS/JS, and no tool writes layout data: the html module
     // makes that persistent script injection with no restore behind it.
     'mcp_tools_beaver' => false,
+    // Beaver Builder WRITES: creating a page's layout. A separate switch from the read group, so
+    // a site can have the reader without the writer. Admin level, create-only, and every value
+    // is sanitised by the tool because the builder's own write path applies no sanitisation.
+    'mcp_tools_beaver_write' => false,
     // Site files: a directory manifest, and an archive export that always waits for a person
     // on the Approvals screen. Off by default because a listing is reconnaissance and an
     // archive of uploads can be a customer export; the switch is the site owner's decision,
@@ -1355,6 +1359,42 @@ class GMCP_Core {
   * Asked by the generic meta readers and writers, and by protected_meta_refusal() so the
   * WordPress-level net covers writers that do not come through those tools.
   */
+  /**
+  * Depth counter for a sanctioned layout write.
+  *
+  * A static counter rather than a flag: it is only non-zero inside with_layout_write()'s
+  * callback, it cannot be set from tool arguments, and there is no global switch. The reason it
+  * exists at all is that the journal's restore and the Beaver create tool both write layout meta
+  * through WordPress's own meta functions, and protected_meta_refusal() — which the WordPress
+  * level filter asks for every writer during a tool call — refuses those keys.
+  */
+  private static $layout_write_depth = 0;
+
+  /**
+  * Run a callback with layout-meta writes permitted.
+  *
+  * Deliberately NOT a way to re-open reads: meta_key_allowed() asks layout_meta_refusal()
+  * directly for a read and never comes through protected_meta_refusal(), so nothing here makes
+  * a layout readable through the generic tools.
+  *
+  * @param callable $fn The write, which must do its own sanitising: the builder's write path
+  *                     applies none.
+  * @return mixed Whatever the callback returns.
+  */
+  public static function with_layout_write( callable $fn ) {
+    self::$layout_write_depth++;
+    try {
+      return $fn();
+    } finally {
+      self::$layout_write_depth = max( 0, self::$layout_write_depth - 1 );
+    }
+  }
+
+  /** Whether a sanctioned layout write is in progress in this request. */
+  public static function layout_write_in_progress(): bool {
+    return self::$layout_write_depth > 0;
+  }
+
   public static function layout_meta_refusal( $key ): ?string {
     if ( !is_string( $key ) || $key === '' ) {
       return null;
@@ -1378,6 +1418,11 @@ class GMCP_Core {
     // calls the tools is covered too.
     $layout = self::layout_meta_refusal( $key );
     if ( $layout !== null ) {
+      // A sanctioned write (the Beaver create tool, and later the journal's restore) runs
+      // inside with_layout_write(). Reads do not come through this function at all.
+      if ( self::layout_write_in_progress() ) {
+        return null;
+      }
       return $layout;
     }
     return null;
@@ -2117,6 +2162,12 @@ class GMCP_Core {
     // can answer "the builder is not loaded" rather than the tool being absent.
     if ( $this->get_option( 'mcp_tools_beaver' ) ) {
       new GMCP_Tools_Beaver();
+    }
+
+    // Beaver Builder writes, on their own switch and off by default. Registered whenever the
+    // switch is on; the per-call check refuses when the builder is not loaded.
+    if ( $this->get_option( 'mcp_tools_beaver_write' ) ) {
+      new GMCP_Tools_Beaver_Write();
     }
 
     // Site files. Its own switch, off by default, and the pull leg additionally declares
