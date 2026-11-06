@@ -246,6 +246,11 @@ restore. A stored `what` is re-checked when entries are listed, because it outli
 fails is left out of `previous` and named in `redacted_fields`; a placeholder is never stored, because
 undo would write it over live content. Tune it against false positives as hard as against misses: an
 ordinary body that says "password" must stay undoable, and `.dev/journal-pure.php` holds that control.
+The lists in it (placeholders, key qualifiers, prefixes) are hand-chosen, so
+`.dev/measure-credential-scan.php` measures them over a generated corpus of 3,600 strings
+(`--assert` fails on a miss outside the documented gaps, on any false alarm, and on a documented gap
+that has been closed without being moved out of the list); run it after touching the scanner, and give a
+new entry a sample that fails without it. Never write the corpus to the tree: it holds vendor-shaped keys.
 Undo also refuses to restore a status `status_write_refusal()` refuses (`trash`, `auto-draft`).
 
 **There is no restore tool, at any access level.** Backups can be started and read. That is

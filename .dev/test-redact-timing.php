@@ -172,6 +172,24 @@ function child(): void {
     'base64 words after Basic x 128 KB' => str_repeat( 'Basic dXNlcjpwYXNzMQ== ', 5600 ),
     'URL-encoded JSON open x 80 KB' => str_repeat( '%22token%22%3A%22', 5000 ),
     '[array][index] names x 64 KB' => str_repeat( "\$a['password']['x'] ", 3000 ),
+    // Third review: the input-tag, CLI-user and vendor-prefix rules each get an input that would be
+    // quadratic if the rule were.
+    '<input open x 160 KB' => str_repeat( '<input ', 23000 ),
+    '<input name value open x 96 KB' => str_repeat( '<input name="password" value="', 3100 ),
+    '<input tags with a secret name x 128 KB' => str_repeat( '<input name="api_key" value="x"> ', 3900 ),
+    '<input 1000 attributes' => '<input ' . str_repeat( 'a="b" ', 160 ) . 'name="password" value="Zx9Qw3Lp7Rt2">',
+    'curl -u a: x 64 KB' => str_repeat( 'curl -u a:', 6500 ),
+    '-u x 64 KB' => str_repeat( '-u ', 21000 ),
+    'cli user pairs x 96 KB' => str_repeat( '-u a:Zx9Qw3 ', 8000 ),
+    '://: x 64 KB' => str_repeat( '://:', 16000 ),
+    'empty-user userinfo chain 64 KB' => str_repeat( 'a://:b@', 9000 ),
+    'whsec_ x 64 KB' => str_repeat( 'whsec_', 10000 ),
+    'key- x 64 KB' => str_repeat( 'key-', 16000 ),
+    'SG. x 64 KB' => str_repeat( 'SG.', 21000 ),
+    'telegram digits:AA x 96 KB' => str_repeat( '1234567890:AA', 7400 ),
+    'hooks.slack.com/services/T x 96 KB' => str_repeat( 'hooks.slack.com/services/T', 3700 ),
+    'Authorization: Key x 96 KB' => str_repeat( 'Authorization: Key ', 5000 ),
+    'update_option chain 64 KB' => str_repeat( "update_option('a_token','b') ", 2300 ),
   ];
 
   foreach ( $inputs as $label => $text ) {

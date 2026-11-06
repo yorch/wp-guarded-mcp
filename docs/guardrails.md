@@ -1829,11 +1829,13 @@ escaped quote is taken whole; text that was escaped for embedding is read as wel
 code block, and the spans are mapped back to the original text. `Basic` is a credential when the
 token is the base64 of `user:password` (decoded, printable, with a colon), `Bearer` when it is eight
 characters or more with a digit (or twenty or more letters) and not words joined by hyphens or
-slashes, and an `Authorization:` header is read whole. What it does not find: a value split across
+slashes, and an `Authorization:` header is read whole (the schemes `Basic`, `Bearer`, `Token`, `Digest`,
+`OAuth`, `ApiKey`, `Hawk`, `NTLM`, `Negotiate`, `Bot`, `Key` and `JWT`). What it does not find: a value split across
 several arguments or lines, a credential that is base64 or encrypted and has no name or prefix
 around it, a bare token, a `Basic` credential that is not standard base64 of `user:password`, a
 secret under a name that does not end in a secret word, and an unquoted value under `token`, `secret` or `key`
-that is nothing but short words and numbers joined by hyphens or slashes.
+that is nothing but short words and numbers joined by hyphens or slashes. The measured list, with what is
+fixed and what is not, is under "Measured misses" below.
 
 It is built to avoid the opposite failure as carefully, because a false positive
 costs an undo and the journal exists so that an ordinary edit can be put back. The
@@ -1864,6 +1866,71 @@ flagged and cannot be removed without losing real secrets: a Maps `?key=AIza...`
 is restricted by referrer, but the same prefix is a server secret on other Google services), a
 placeholder that is not on the list (`$Db_pass9`, `${db_pass}`), and any prose that really looks like
 `name=value` with a secret-ended name and a token-shaped value (`password=abc123`, said in a sentence).
+
+Measured misses, and false alarms again (`.dev/measure-credential-scan.php`). The placeholder and
+prose exemptions above were chosen by hand from the cases someone happened to see, so a generator now
+builds the evidence. It fills 180 templates (87 of credentials, 93 of ordinary text) with random names and values (the layouts a credential
+really arrives in: a code block in a post body, a `.env` file, a curl command, JSON, YAML, INI, a PHP
+array, a URL with user information, a log line, a form tag, an option setter, a cookie; and ordinary
+text: prose about passwords and keys, code that names a secret and holds none, forms and setters
+that hold no secret, hashes and ids, plain posts), 3,600 strings at the default size, wrapped in
+a post body half the time. A miss is a credential not found, or found with its bytes outside the
+blanked span (the audit log blanks only the span); a false alarm is ordinary text flagged. Vendor-shaped
+keys are assembled at run time, so the tree holds none, and the corpus is not written out unless
+asked (`--dump`), and must not be committed. Result, on the scanner before and after:
+
+| | credentials missed | ordinary text flagged |
+|---|---|---|
+| before | 584 of 1,740 (33.6%), 304 of them in shapes now fixed | 60 of 1,860 (3.2%) |
+| after | 260 of 1,740 (14.9%), all in the gaps listed below | 0 of 1,860 |
+
+The after row is the same at seven other seeds (5,220 credentials and 5,580 ordinary strings each). The
+ordinary-text side of that table is written by the author of the rules and is near zero because of
+it, so the independent check is the one above, made again: 2,723 documentation and source files on this
+machine (24.8 MB, 537,467 lines), line by line. The scanner flags 69 lines where the previous one
+flagged 127, and none that it did not flag before. The 58 that went were code that reads a secret from
+somewhere (`self.password`, `request.access_token`, `'Bearer ' + token`); what is left is RFC examples
+(correctly), quoted assignments of any value under a secret name (`consumer_secret="consumer.secret"`,
+by policy), and Python type annotations (`private_key: Ed25519PrivateKey`), which cannot be told from
+a value without parsing the language. Fixed because they were measured: `curl -u user:password`
+and `--user`; a URL with no user (`redis://:secret@host`); `<input name="api_key" value="...">` in either
+attribute order (a button's or a checkbox's value is a label, not a secret); `update_option`, `add_option`,
+`set_transient`, `set_theme_mod` and `setItem` with a secret-named key; a bare `pass=` (a log line or
+query string; `Hall pass=2nd-floor` stays prose); `db_pass` and `smtpPass` with a value of hyphenated
+words and digits; a password of mixed-case letters, or of letters and a symbol inside, with no digit
+(`Txmyfk%WbZBu`, ten letters with a capital inside); names ending `pw`, `secret_key_base`,
+`AccountKey`, `STORAGE_KEY`, `SSH_KEY`, `DEPLOY_KEY`, `STRIPE_KEY` and similar (a key is a secret when the
+word before it says what kind, and that list grew); session cookies (`sessionid`, `PHPSESSID`,
+`wordpress_logged_in_<hash>`); keys of other vendors by prefix (`whsec_`, `npm_`, `glpat-`, `shpat_`,
+`SG.`, `dop_v1_`, `hf_`, `key-<32 hex>`, `ya29.`, `xoxe`, a Telegram bot token) and a Slack or Discord
+webhook URL's secret path segment. Fixed false alarms: a value that reads a secret from the environment
+or a variable (`process.env.API_KEY`, `$this->token`, `encryption_algorithm.password`, lowercase
+words joined by underscores or dots after an unquoted name), `'Bearer ' . $token`, `docker run -u
+1000:1000` and `--user www-data:www-data`, `cvs://:pserver:anoncvs@host`, and the words a schema
+or a form puts where a secret would go (`required`, `optional`, `none`, `null`, `hidden`, `redacted`,
+`changeme`, and `password`, `secret`, `token` themselves) now joined the placeholders. The lists are still
+hand-made; what changed is that each entry now has a sample that fails without it.
+
+Still missed, measured, 260 of the 1,740, each pinned by a test that says it is a gap
+(`.dev/journal-pure.php`) so that closing one is a decision and not an accident:
+
+- A secret with no name and no prefix around it: `It is h4PyKX2JRJhpaHDmkXq3GVXdLtiuNLLf.`
+- A password said in a sentence: `The password is hunter49`, `Login with admin / hunter49`.
+- A value not next to its name: a label and an input, a table row (`| password | hunter49 |`), `Username:` and
+  `Password:` on separate lines when the password has a space in it.
+- A short or wordlike unquoted password: `password=letmein`, `DB_PASSWORD: root`. `password=required` is
+  prose and the two cannot be told apart without a dictionary. The same for a passphrase of lowercase
+  words joined by underscores or dots (`password=correct_horse_battery_staple`), which reads as a
+  variable.
+- A password of short hyphenated words and digits after a bare `pass` (`pass=gijn-mgmf-7430`), which has
+  the shape of `Hall pass=2nd-floor`.
+- A base64 or hex value under a name that is not a secret word: `signature=`, `hmac =`, `nonce_value:`.
+- A key of a vendor that is not in the prefix list, and a credential in a vendor's own layout (a
+  connection string that is not a URL and does not say `Password=`).
+
+What a miss costs differs by channel: the journal keeps the value for undo, the audit log records
+it, the approval screen shows it. None of them is a store of secrets by design, and none of this
+makes the scanner a guarantee.
 
 What a post entry does about it is per field. A field that holds one is left out of
 `previous` and named in `redacted_fields`; the other fields of the same edit stay
