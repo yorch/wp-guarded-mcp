@@ -1614,42 +1614,6 @@ class GMCP_Core {
   * Asked by the generic meta readers and writers through generic_writer_meta_refusal(), and
   * NOT by the WordPress-level net: the builder writes these keys from its own save hook.
   */
-  /**
-  * Depth counter for a sanctioned layout write.
-  *
-  * A static counter rather than a flag: it is only non-zero inside with_layout_write()'s
-  * callback, it cannot be set from tool arguments, and there is no global switch. The reason it
-  * exists at all is that the journal's restore and the Beaver create tool both write layout meta
-  * through WordPress's own meta functions, and protected_meta_refusal() — which the WordPress
-  * level filter asks for every writer during a tool call — refuses those keys.
-  */
-  private static $layout_write_depth = 0;
-
-  /**
-  * Run a callback with layout-meta writes permitted.
-  *
-  * Deliberately NOT a way to re-open reads: meta_key_allowed() asks layout_meta_refusal()
-  * directly for a read and never comes through protected_meta_refusal(), so nothing here makes
-  * a layout readable through the generic tools.
-  *
-  * @param callable $fn The write, which must do its own sanitising: the builder's write path
-  *                     applies none.
-  * @return mixed Whatever the callback returns.
-  */
-  public static function with_layout_write( callable $fn ) {
-    self::$layout_write_depth++;
-    try {
-      return $fn();
-    } finally {
-      self::$layout_write_depth = max( 0, self::$layout_write_depth - 1 );
-    }
-  }
-
-  /** Whether a sanctioned layout write is in progress in this request. */
-  public static function layout_write_in_progress(): bool {
-    return self::$layout_write_depth > 0;
-  }
-
   public static function layout_meta_refusal( $key ): ?string {
     if ( !is_string( $key ) || $key === '' ) {
       return null;
