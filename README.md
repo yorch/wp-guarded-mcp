@@ -146,7 +146,8 @@ file contents, and it refuses over 20,000 entries or 512 MiB rather than truncat
 Its `pull` mode takes the digest from a manifest, refuses if the tree has changed, and always
 waits for a signed-in administrator on the Approvals screen, whatever `mcp_approval_mode` is
 set to. Only after that approval does it build a zip outside the web root, with 0600
-permissions, and return a one-time URL that streams it for five minutes; the archive is never
+permissions, and return a one-time URL that streams it for five minutes (a GET spends it; a HEAD,
+which link previewers send, does not); the archive is never
 returned in a tool reply, and the token is scrubbed from the audit log. `uploads` means all of
 uploads, which on a real site can contain customer exports — that is why the group is off
 until somebody switches it on. Some things are withheld in every root and are never read:

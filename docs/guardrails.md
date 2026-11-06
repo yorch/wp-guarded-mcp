@@ -1826,6 +1826,17 @@ one-time URL.
   approval spent. The reply and the audit log never carry the archive; the URL does carry a
   bearer token for five minutes, and a web server's own access log will have it (the endpoint is a
   GET).
+- **A HEAD request does not redeem a one-time URL.** WordPress routes HEAD to the GET handler, and
+  the handler spent the token on the way to answering, so a link previewer, a mail scanner or a
+  chat unfurler that fetched the URL it was shown burned the archive (or the download) before the
+  person it was minted for clicked (measured by an independent review). `handle_export()` and
+  `handle_download()` now answer HEAD from a read-only look at the token (`peek_token()` for the
+  export; the row, its timeout and the attachment's file for the download): 200 with the headers
+  the GET would send and no body, or the same 403, and nothing is deleted, not even an expired
+  row. Single use is for GET, and it is still all a scanner that sends GET gets: a previewer that
+  fetches with GET spends the token and nothing can tell it from a person. `smoke-export.sh` and
+  `smoke-download.sh` assert the rows and the archive after two HEADs, the GET that follows, and
+  HEAD on a spent, an unknown and (for the export) a switched-off token.
 
 ## Theme mods
 

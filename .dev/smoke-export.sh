@@ -304,6 +304,25 @@ check "the archive is outside the web root" \
 check "the archive is mode 0600" \
   "$(dc wp sh -c 'stat -c %a "'"$ARCHIVE_PATH"'"' | tr -d '\r\n')" "600"
 
+echo "-- a HEAD request (a link previewer) does not spend the token or the archive --"
+# WordPress routes HEAD to the GET handler, so the first HEAD used to redeem the token and delete
+# the archive before the person it was minted for had clicked.
+token_rows() { dbq "SELECT COUNT(*) FROM wp_options WHERE option_name = 'gmcp_export_token_$ETOK'"; }
+check "CONTROL: the token row and the archive exist before any request" \
+  "$(token_rows)$(dc wp sh -c 'test -e "'"$ARCHIVE_PATH"'" && echo present || echo gone' | tr -d '\r\n')" "1present"
+HCODE=$(curl -sS -I -o "$OUT/head.hdr" -w '%{http_code}' "$EXPORT_URL" 2>/dev/null)
+check "HEAD with a live token answers 200" "$HCODE" "200"
+check "and says it is a zip" "$(grep -ci '^content-type: application/zip' "$OUT/head.hdr")" "1"
+check "and carries the archive's length" "$(grep -i '^content-length:' "$OUT/head.hdr" | tr -dc '0-9')" "$(dc wp sh -c 'stat -c %s "'"$ARCHIVE_PATH"'"' | tr -d '\r\n')"
+curl -sS -I -o /dev/null "$EXPORT_URL" 2>/dev/null
+check "after two HEADs the token row and the archive are still there" \
+  "$(token_rows)$(dc wp sh -c 'test -e "'"$ARCHIVE_PATH"'" && echo present || echo gone' | tr -d '\r\n')" "1present"
+check "HEAD with an unknown token is refused" "$(curl -sS -I -o /dev/null -w '%{http_code}' "${EXPORT_URL%/*}/deadbeefdeadbeefdeadbeefdeadbeef" 2>/dev/null)" "403"
+set_export 0
+check "HEAD while the group is off is refused" "$(curl -sS -I -o /dev/null -w '%{http_code}' "$EXPORT_URL" 2>/dev/null)" "403"
+check "and did not discard the token the way a GET does" "$(token_rows)" "1"
+set_export 1
+
 echo "-- the archive contains the fixture and not the excluded entries --"
 curl -sS -L -o "$OUT/export.zip" "$EXPORT_URL" 2>/dev/null
 check "CONTROL: the download is a zip file" "$(python3 -c 'import zipfile,sys; print("yes" if zipfile.is_zipfile(sys.argv[1]) else "no")' "$OUT/export.zip")" "yes"

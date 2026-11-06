@@ -1314,6 +1314,40 @@ class GMCP_Tools_Export {
     return [ 'path' => $path, 'filename' => (string) $data['filename'] ];
   }
 
+  /**
+  * Look at a token without spending it: what a HEAD request is answered from.
+  *
+  * A link previewer, a mail scanner or a chat client's unfurler sends HEAD (or GET, which this
+  * cannot tell from a person) to a URL it was shown, and WordPress routes HEAD to the GET
+  * handler. When that handler spent the token on the way to answering, the archive was gone
+  * before the person it was minted for had clicked. This checks everything take_token() checks
+  * and changes nothing: no row is deleted and no file is removed, not even an expired one (the
+  * GET that follows, or the sweep, does that).
+  *
+  * @return array{filename:string,size:int}|array{error:string,status:int}
+  */
+  public static function peek_token( string $token ): array {
+    global $wpdb;
+    $invalid = [ 'error' => 'Invalid or expired export token.', 'status' => 403 ];
+    if ( !preg_match( '/^[A-Za-z0-9]{16,128}$/', $token ) ) {
+      return $invalid;
+    }
+    $stored = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", self::TOKEN_OPTION_PREFIX . $token ) );
+    if ( $stored === null ) {
+      return $invalid;
+    }
+    $data = maybe_unserialize( $stored );
+    if ( !is_array( $data ) || empty( $data['path'] ) || empty( $data['filename'] ) || (int) ( $data['expires'] ?? 0 ) < time() ) {
+      return $invalid;
+    }
+    $path = (string) $data['path'];
+    if ( !self::safe_archive_path( $path ) || is_link( $path ) || !is_file( $path ) || !is_readable( $path ) ) {
+      return [ 'error' => 'That archive is no longer available.', 'status' => 403 ];
+    }
+    $size = filesize( $path );
+    return [ 'filename' => (string) $data['filename'], 'size' => $size === false ? 0 : (int) $size ];
+  }
+
   /** Drop an unspent token and its file, e.g. because the group has been switched off. */
   public static function discard_token( string $token ): void {
     if ( !preg_match( '/^[A-Za-z0-9]{16,128}$/', $token ) ) {

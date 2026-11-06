@@ -76,6 +76,30 @@ t=json.load(sys.stdin).get("result",{}).get("content",[{}])[0].get("text","{}")
 print(json.loads(t).get("download_url",""))' "" mint)
 case "$DL" in http*) echo "  url: ${DL%%/download/*}/download/<token>" ;; *) echo "  FAIL  no download_url in the reply"; fail=$((fail+1)) ;; esac
 
+echo "-- a HEAD request (a link previewer) does not spend the token --"
+# A mail scanner or a chat unfurler sends HEAD before the person clicks, and WordPress routes it
+# to the GET handler. Measured before the fix: the first HEAD consumed the row and the person's
+# own click was answered 403.
+call "$TOK" mintH "$(tc wp_download_request '{"ID":'"$ATT"'}')"
+DLH=$(py 'import json,sys
+t=json.load(sys.stdin).get("result",{}).get("content",[{}])[0].get("text","{}")
+print(json.loads(t).get("download_url",""))' "" mintH)
+TOKH=${DLH##*/}
+rows_h() { dbq "SELECT COUNT(*) FROM wp_options WHERE option_name IN ('_transient_gmcp_download_$TOKH','_transient_timeout_gmcp_download_$TOKH')"; }
+check "CONTROL: the token's two rows exist before any request" "$(rows_h)" "2"
+HCODE=$(curl -sS -I -o "$OUT/head.hdr" -w '%{http_code}' "$DLH" 2>/dev/null)
+check "HEAD with a live token answers 200" "$HCODE" "200"
+check "and names the type the GET would send" "$(grep -ci '^content-type: ' "$OUT/head.hdr")" "1"
+check "and carries the file's length" "$(grep -i '^content-length:' "$OUT/head.hdr" | tr -dc '0-9')" "$(wc -c < "$SRC" | tr -d ' ')"
+check "and the token is still unspent: both rows stand" "$(rows_h)" "2"
+curl -sS -I -o /dev/null "$DLH" 2>/dev/null
+check "a second HEAD changes nothing either" "$(rows_h)" "2"
+curl -sS -L -o "$OUT/got_h.bin" "$DLH" 2>/dev/null
+check "the GET after the HEADs still serves the file" "$(shasum -a 256 "$OUT/got_h.bin" 2>/dev/null | awk '{print $1}')" "$(shasum -a 256 "$SRC" | awk '{print $1}')"
+check "and it spent the token (the rows are gone)" "$(rows_h)" "0"
+check "HEAD on a spent token is refused" "$(curl -sS -I -o /dev/null -w '%{http_code}' "$DLH" 2>/dev/null)" "403"
+check "HEAD on an unknown token is refused" "$(curl -sS -I -o /dev/null -w '%{http_code}' "${DLH%/*}/deadbeefdeadbeefdeadbeefdeadbeef" 2>/dev/null)" "403"
+
 echo "-- the endpoint serves exactly the file --"
 LOCAL_SUM=$(shasum -a 256 "$SRC" | awk '{print $1}')
 curl -sS -L -o "$OUT/got.bin" "$DL" 2>/dev/null

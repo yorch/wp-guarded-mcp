@@ -1901,6 +1901,22 @@ class GMCP_Server {
     $key = 'gmcp_download_' . $token;
     $row = $token === '' ? '' : '_transient_' . $key;
     global $wpdb;
+    // HEAD is answered from the row and spends nothing: a link previewer or a mail scanner sends
+    // one before the person has clicked, and WordPress routes it to this handler. The checks are
+    // the ones below, read-only: the row, its timeout, the attachment and its file.
+    if ( $request->get_method() === 'HEAD' ) {
+      $seen = $row === '' ? null : $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $row ) );
+      $until = $row === '' ? null : $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", '_transient_timeout_' . $key ) );
+      $seen_data = $seen === null ? null : maybe_unserialize( $seen );
+      if ( $seen === null || $until === null || (int) $until < time() || !is_array( $seen_data ) || empty( $seen_data['ID'] ) ) {
+        return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired download token.' ], 403 );
+      }
+      $seen_file = $this->downloadable_file( (int) $seen_data['ID'] );
+      if ( is_wp_error( $seen_file ) ) {
+        return new WP_REST_Response( [ 'success' => false, 'message' => $seen_file->get_error_message() ], 403 );
+      }
+      return $this->head_response( $seen_file[1], (int) filesize( $seen_file[0] ), basename( $seen_file[0] ) );
+    }
     // Read, then consume with a CONDITIONAL delete. A read followed by delete_transient() lets
     // two concurrent requests both see the value and both stream the file, which defeats the
     // one-use promise; here only the request whose DELETE matches the row wins, and the loser
@@ -1940,6 +1956,20 @@ class GMCP_Server {
     header( 'Content-Disposition: attachment; filename="' . sanitize_file_name( basename( $path ) ) . '"' );
     readfile( $path );
     exit;
+  }
+
+  /**
+  * The answer to a HEAD request for a one-time URL: the headers the GET would send and no body.
+  * Never reached with a spent or unknown token, and it spends nothing.
+  */
+  private function head_response( string $mime, int $size, string $filename ): WP_REST_Response {
+    $response = new WP_REST_Response( null, 200 );
+    $response->header( 'X-Content-Type-Options', 'nosniff' );
+    $response->header( 'Content-Type', $mime );
+    $response->header( 'Content-Length', (string) $size );
+    $response->header( 'Content-Disposition', 'attachment; filename="' . sanitize_file_name( $filename ) . '"' );
+    $response->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0' );
+    return $response;
   }
 
   /**
@@ -1995,6 +2025,18 @@ class GMCP_Server {
     $token = (string) $request->get_param( 'token' );
     if ( class_exists( 'GMCP_Tools_Export' ) ) {
       GMCP_Tools_Export::cleanup_expired();
+    }
+    // HEAD is answered from what the token says and spends nothing: a link previewer sends one
+    // before the person has clicked. @see GMCP_Tools_Export::peek_token()
+    if ( $request->get_method() === 'HEAD' ) {
+      if ( !class_exists( 'GMCP_Tools_Export' ) || !GMCP_Tools_Export::enabled() ) {
+        return new WP_REST_Response( [ 'success' => false, 'message' => 'The site-file export group is switched off.' ], 403 );
+      }
+      $seen = GMCP_Tools_Export::peek_token( $token );
+      if ( isset( $seen['error'] ) ) {
+        return new WP_REST_Response( [ 'success' => false, 'message' => $seen['error'] ], (int) ( $seen['status'] ?? 403 ) );
+      }
+      return $this->head_response( 'application/zip', $seen['size'], (string) $seen['filename'] );
     }
     if ( !class_exists( 'GMCP_Tools_Export' ) || !GMCP_Tools_Export::enabled() ) {
       if ( class_exists( 'GMCP_Tools_Export' ) ) {
