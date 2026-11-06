@@ -222,11 +222,16 @@ every kind (tab, newline, carriage return, vertical tab, form feed, the Unicode 
 separators, the no-break and other fixed-width spaces) becomes one plain space BEFORE any scrub reads
 the line, so a separator with a tab in it is still a separator and a newline in a request value cannot
 start a forged second log line; any other control character is shown as a visible escape,
-`GMCP_Diag_Util::scrub_log_line()` removes the vendor key shapes, PEM blocks, URL user
-information, JWTs, escaped JSON, `define()` lines and `pw=`, and the whole value after a
-secret-named key goes, an unquoted one to `&` or the end of the line and a quoted one to its
-closing quote, where a backslash and the character after it count as one (an escaped quote does not end
-a value). It reads one line of at most 2,500 bytes of a value, and a call's arguments only up to a
+the whole value after a secret-named key goes, an unquoted one to `&` or the end of the line and a quoted
+one to its closing quote, where a backslash and the character after it count as one (an escaped quote does
+not end a value), then `GMCP_Credential_Scan` is asked of the line (`try_spans()`, the test the journal and
+the audit log apply, so a vendor shape the scanner knows is never written to the log because the log's own
+list had not heard of it: it had missed a `ya29.` token, the secret of a Slack webhook URL and a Discord
+one), then `GMCP_Diag_Util::scrub_log_line()` removes the vendor key shapes, PEM blocks, URL user
+information, JWTs, escaped JSON, `define()` lines and `pw=`. The three are a union: the debug log is never
+narrower than the scanner, and the scanner's own exemptions (placeholders, a complete code reference) are
+only exemptions of the scanner, not of the log. A scan that gives up withholds the line. It reads one line
+of at most 2,500 bytes of a value, and a call's arguments only up to a
 byte budget (see the audit log doc), so the cost does not grow with how many leaves a client sends. Every `error_log()` in `includes/` is checked by a tripwire in
 `.dev/test-credential-channels.php`: one that prints `$reason`, an exception message or a request
 parameter without `log_text()` fails it. A bare token with no key in front of it and no known
@@ -246,9 +251,16 @@ is still replaced whole, and each string is judged alone, so a secret split acro
 not recognised by the view). The journal keeps its whole-field drop, because a partly blanked value
 cannot be restored. The aggressive assignment scrub (any value after a secret-named key) belongs to
 the debug log only: in a record of what a call said it blanked ordinary prose. A value that is a
-documented placeholder (`password_here`, `YOUR_TOKEN_HERE`, `********`, `<token>`, `${UPPER_SNAKE}` or
+documented placeholder (`password_here`, `YOUR_TOKEN_HERE`, `YourPassword`, `********`, `<token>`, `${UPPER_SNAKE}` or
 `$UPPER_SNAKE` in capitals only, `user:pass@`) is not a credential, with a counterpart test for each that a
 real-looking value under the same name still is: `'$uperS3cret99'` and `${db_pass}` are not placeholders.
+A placeholder is something that cannot be a real value. A word that is also a product's default password
+(`password`, `secret`, `token`, `changeme`: `elastic:changeme`, a shipped `JWT_SECRET='secret'`) is a
+credential under a secret-named key, and the generator once seeded one as ordinary text, so it agreed with
+the list that excused it. A value that reads a secret from somewhere (`process.env.API_KEY`, `$this->secret`)
+is exempt only when it is a COMPLETE code reference, unquoted: a root, then names, nothing else. A quoted
+string is data however much it begins like a lookup (`"this.is.my.password1"`, `'Self.Made#2024'`).
+The scan is linear in the text and has a budget that fails closed: see `docs/guardrails.md`.
 What the scanner reads through is listed in `docs/guardrails.md`: quote escapes, a backslash and the
 character after it counting as one inside a quoted value, array-index and `define()` assignments, names of
 any length. What it does not find is listed there too (a value split over several arguments, base64, a bare

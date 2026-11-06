@@ -1975,9 +1975,17 @@ last word of the name decides, so `passwordLabel` and `placeholder_text` are lab
 and a name that merely contains a pattern (`author`, `keywords`) counts only when its
 value looks like a token. Prose that uses the word "password" is kept whole and
 undone byte for byte, and a block attribute such as `{"authorId":3}` is not touched;
-both are asserted. On a half-megabyte body it takes about 15 to 60 milliseconds,
-measured, and a failure of the regular-expression engine itself answers "yes, a
-credential", never "no".
+both are asserted. The cost is linear in the text. On a half-megabyte body of ordinary text it takes
+about 40 milliseconds with the PCRE JIT and about 180 without, measured; the shapes built to make it
+quadratic (`password=|`, `pw=|` and `password=this.` repeated, a 512 KB value, nested names without a
+space, `curl -ua:` and unterminated `<input` tags, an empty-user URL repeated) take 0.05 to 0.5 s at
+512 KB, JIT on or off, and `.dev/test-redact-timing.php` holds each to 2 s. (This paragraph said 15
+to 60 ms, and the unquoted-assignment rule re-read each value to the end of its run once per
+assignment: `password=|` repeated cost 13 s at 256 KB and 23 to 50 s at 512 KB through `holds()`.) A
+value is now read once, at most 512 bytes of it; a text in which names sit inside the values of other
+names, so that the reads overlap, is allowed four times its own length in value bytes (plus a floor of
+2 KB) and is then answered as a credential, the same fail-closed answer as a failure of the
+regular-expression engine itself, which is "yes, a credential", never "no".
 
 Measured false positives. Ordinary prose that was flagged and is not now: `Course 1: Basic
 HTML/CSS for beginners`, `Basic 2024/2025 membership`, `Season Pass: 2024-2025`, `Day pass:
@@ -2016,6 +2024,7 @@ asked (`--dump`), and must not be committed. Result, on the scanner before and a
 | before | 584 of 1,740 (33.6%), 304 of them in shapes now fixed | 60 of 1,860 (3.2%) |
 | after | 260 of 1,740 (14.9%), all in the gaps listed below | 0 of 1,860 |
 
+(Measured on the generator as it was then; it has since grown, see the result after the next paragraph.)
 The after row is the same at seven other seeds (5,220 credentials and 5,580 ordinary strings each). The
 ordinary-text side of that table is written by the author of the rules and is near zero because of
 it, so the independent check is the one above, made again: 2,723 documentation and source files on this
@@ -2039,9 +2048,56 @@ webhook URL's secret path segment. Fixed false alarms: a value that reads a secr
 or a variable (`process.env.API_KEY`, `$this->token`, `encryption_algorithm.password`, lowercase
 words joined by underscores or dots after an unquoted name), `'Bearer ' . $token`, `docker run -u
 1000:1000` and `--user www-data:www-data`, `cvs://:pserver:anoncvs@host`, and the words a schema
-or a form puts where a secret would go (`required`, `optional`, `none`, `null`, `hidden`, `redacted`,
-`changeme`, and `password`, `secret`, `token` themselves) now joined the placeholders. The lists are still
-hand-made; what changed is that each entry now has a sample that fails without it.
+or a form puts where a secret would go (`required`, `optional`, `none`, `null`, `hidden`, `redacted`)
+now joined the placeholders. The lists are still hand-made; what changed is that each entry now has
+a sample that fails without it.
+
+An independent review then measured what that widening broke, in both directions, and each item
+below is pinned in `.dev/journal-pure.php` with a counterpart of the same shape:
+
+- *Default passwords were placeholders.* `password`, `secret`, `token` and `changeme` had been added to
+  the placeholder words, so `define('DB_PASSWORD','password')`, `JWT_SECRET='secret'`,
+  `{"password":"changeme"}` and `curl -u elastic:changeme` were missed, and the generator had seeded one
+  as ordinary text, so it agreed. They are values again (`change_me` and `CHANGE-ME`, which only a
+  template contains, stay). A placeholder is now something that cannot be a real value: the
+  documented shapes and `YourPassword`-style words.
+- *A code reference was a prefix.* Any value that merely began `this.`, `self.`, `config.`, `Env[`,
+  `options.` or `static::` was exempt, before the quoted check, so `{"password":"this.is.my.password1"}`,
+  `'Self.Made#2024'`, `SMTP_PASSWORD="Env[prod]9xQ"` and `DB_PASSWORD=this.Kx92mQ!` were missed. The exemption
+  now applies to an UNQUOTED value only (a quoted string is data) and only to a complete reference: a root
+  (`process.env`, `$_POST`, `config(`, `getenv(`), then names of lower-case letters, capitals with digits
+  (`API_KEY`) or a capitalised or camelCase word, and nothing else, no digit inside a mixed word and no
+  symbol. The cost: an unquoted `DB_PASSWORD=config.db.password` is still read as a lookup, and so is a
+  passphrase written exactly like one.
+- *Quadratic time*, above.
+- *False alarms that cost an undo.* `STORAGE_KEY='todos-vuejs-2.0'`, `self.primary_key = "product_code"`,
+  `{"primary_key":"order_id"}`, `SESSION_KEY='user'`, `'root_key' => 'menu'`, `"service_key":"billing"`,
+  `"shared_key":"none yet"`, `primary_key: order_id_2`, `?pass=annual2025`, `Password: YourPassword`,
+  `Password: JavaScript`, `"pw":"full"`, `--user deploy:www-data2` and `docker run -u 1000:docker1`. A
+  `storage`, `session`, `shared`, `service`, `primary`, `secondary` or `root` key (and a `session_id`) is a secret name
+  only for a value of sixteen characters or more of one token with a digit and a letter, unless a vendor
+  heads the name (`AZURE_STORAGE_KEY`). A value that is a path (`~/.ssh/id_ed25519.pub`, `/var/www/...`) is
+  not a secret. A bare `pass=` is not a password when the value is a word and a year. Capitalised
+  words run together with no digit or symbol (`YourPassword`, `JavaScript`, `TypeScript`) are not a
+  generated password. An abbreviation (`pw`, `psw`) is not trusted for a short plain word. `-u` and
+  `--user` are read by the command they belong to: after `docker`, `podman`, `chown`, `useradd`,
+  `sudo`, `su`, `kubectl` and the like the pair is a user and a group; after `curl`, `wget`, `http`
+  and the other HTTP and FTP clients it is a password whatever its shape (`curl -u admin:Hunterxy`).
+- *Misses in forms and curl.* A password field's value with a space in it (`correct horse battery 42`)
+  and one with a `>` in it, a tag longer than a thousand bytes, a checkbox, image or radio input named
+  `remember_token` or `api_key` whose value has the shape of a credential (ten characters or more of one
+  token with a digit and a letter; a flag such as `remember` or `1` is still a flag), `curl -uadmin:pass`
+  with no space, a key in the user slot (`curl -u KEY:X`, `curl -u KEY:`), and `redis://:Kx92:mQ7zp@host`
+  (the exemption for `cvs://:pserver:...` is now for the repository access methods only).
+- *The debug log had its own vendor list.* It wrote a Google OAuth token, a Slack webhook's secret
+  segment and a Discord webhook's token that the scanner flags. `log_line()` now asks the scanner as
+  well, as a union with its own rules.
+
+Result on the grown generator (4,180 strings at the default size, 2,040 credentials and 2,140 ordinary
+ones): the scanner as it stood before this review missed 539 credentials (26.4%) and flagged 237
+ordinary strings (11.1%); now it misses 260 (12.7%), every one in a documented gap, and flags none, at
+ten seeds. The ordinary-text figure is zero because the same author wrote the prose; the
+independent figures are the reviewer's probe lists, each pinned by a test.
 
 Still missed, measured, 260 of the 1,740, each pinned by a test that says it is a gap
 (`.dev/journal-pure.php`) so that closing one is a decision and not an accident:
@@ -2059,6 +2115,26 @@ Still missed, measured, 260 of the 1,740, each pinned by a test that says it is 
 - A base64 or hex value under a name that is not a secret word: `signature=`, `hmac =`, `nonce_value:`.
 - A key of a vendor that is not in the prefix list, and a credential in a vendor's own layout (a
   connection string that is not a URL and does not say `Password=`).
+- Left after the fourth review, each a decision and not an oversight:
+  - An unquoted password that is a plain lowercase identifier or dotted words and has no digit
+    (`DB_PASSWORD=prod_wordpress_secret`, `password: my.dog.rex`), because the same shape is a variable
+    read (`password = encryption_algorithm.password`); and an unquoted `config.db.password`-style
+    value, which is read as a lookup.
+  - Capitalised words run together with no digit or symbol and fewer than sixteen characters after
+    an unquoted password name (`Password: correctHorse`), which cannot be told from
+    `Password: JavaScript` (`correctHorseBattery`, at sixteen, is flagged). A mixed-case
+    product name with an acronym in it (`Password: PostgreSQL`) is still flagged.
+  - A password of letters only under `pw` or `psw` of fewer than six characters, and a bare `pass=`
+    whose value is a word and a year (`pass=hunter2024`).
+  - A session id or an ambiguous `<word>_key` with a value under sixteen characters, and one without a digit.
+  - A `-u` or `--user` whose command is neither a known HTTP or FTP client nor a known user:group
+    tool (`docker`, `podman`, `chown`, `useradd`, `sudo`, `su`, `kubectl` and a few more): the pair needs a
+    digit, a symbol or ten characters to count (`-u user:Hunterxy` is missed there), and an attached
+    `-uuser:pass` is read only after an HTTP or FTP client.
+  - A password field whose tag holds a `<` inside a quoted attribute value, or a tag that is never closed.
+  - A credential that the budget refuses is answered as a credential, so these are not misses, but
+    they are false alarms by design: a text in which secret-named assignments nest inside each other's
+    values (`password=password=...` for half a megabyte) is treated as holding one.
 
 What a miss costs differs by channel: the journal keeps the value for undo, the audit log records
 it, the approval screen shows it. None of them is a store of secrets by design, and none of this

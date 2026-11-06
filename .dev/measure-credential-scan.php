@@ -261,6 +261,30 @@ $POS['WordPress options and shortcodes'] = [
   fn() => [ 'update_option( \'acme_' . pick( [ 'api_key', 'secret', 'token', 'password' ] ) . '\', \'' . ( $s = secret_value() ) . '\' );', $s ],
 ];
 
+// ---- the defaults and look-alikes a placeholder list or a code-reference test used to excuse. A real
+// default password (the one a product ships with) is a credential, and a string literal that merely
+// begins like a lookup is data. These were seeded as ordinary text before, which is how the generator
+// agreed with the defect it was written to find.
+$POS['default passwords and lookalike literals'] = [
+  fn() => [ codeblock( "define( 'DB_PASSWORD', '" . ( $s = pick( [ 'password', 'secret', 'changeme', 'token', 'admin123', 'root' ] ) ) . "' );" ), $s ],
+  fn() => [ codeblock( pick( [ 'JWT_SECRET', 'SESSION_SECRET', 'APP_SECRET' ] ) . "='" . ( $s = pick( [ 'secret', 'changeme', 'password' ] ) ) . "'" ), $s ],
+  fn() => [ '{"username":"svc","password":"' . ( $s = pick( [ 'changeme', 'password', 'secret', 'admin' ] ) ) . '"}', $s ],
+  fn() => [ 'curl -u elastic:' . ( $s = pick( [ 'changeme', 'password', 'elastic' . mt_rand( 1, 9 ) ] ) ) . ' https://localhost:9200/_cluster/health', $s ],
+  fn() => [ '{"password": "' . ( $s = pick( [ 'this', 'self', 'config', 'env', 'options' ] ) . '.' . pick( [ 'is.my.', 'Kx', 'Made#' ] ) . mt_rand( 10, 9999 ) ) . '"}', $s ],
+  fn() => [ codeblock( "define( 'DB_PASSWORD', '" . ( $s = pick( [ 'Self', 'Config', 'Env[', 'This' ] ) . pick( [ '.', '::', '' ] ) . alnum( 8 ) . '!' ) . "' );" ), $s ],
+  fn() => [ 'DB_PASSWORD=' . ( $s = pick( [ 'this.', 'self.', 'config.', 'env.' ] ) . alnum( 8 ) . '!' ), $s ],
+  fn() => [ 'redis://:' . ( $s = alnum( 6 ) . ':' . alnum( 8 ) ) . '@' . host() . ':6379', $s ],
+];
+$POS['inputs and curl forms that carry a value'] = [
+  fn() => [ '<input type="password" name="password" value="' . ( $s = pick( [ 'correct horse', 'blue train', 'my long phrase' ] ) . ' ' . mt_rand( 10, 99 ) ) . '">', $s ],
+  fn() => [ '<input type="password" name="password" value="' . ( $s = alnum( 4 ) . '>' . alnum( 5 ) . '!' ) . '">', $s ],
+  fn() => [ '<input class="' . str_repeat( 'w-full ', mt_rand( 140, 200 ) ) . '" type="password" name="password" value="' . ( $s = alnum( 10 ) ) . '">', $s ],
+  fn() => [ '<input type="' . pick( [ 'checkbox', 'image', 'radio' ] ) . '" name="' . pick( [ 'remember_token', 'api_key', 'auth_token' ] ) . '" value="' . ( $s = alnum( mt_rand( 12, 24 ) ) ) . '">', $s ],
+  fn() => [ 'curl -u' . user() . ':' . ( $s = password() ) . ' https://api.example.com/v1/items', $s ],
+  fn() => [ 'curl -u ' . ( $s = alnum( 20 ) ) . pick( [ ':X', ':', ':x' ] ) . ' https://acme.example.com/api/v2/tickets', $s ],
+  fn() => [ 'curl -u ' . user() . ':' . ( $s = ucfirst( chars( 'abcdefghijkmnpqrstuvwxyz', 8 ) ) ) . ' https://api.example.com/', $s ],
+];
+
 // ---- credentials in layouts that are known not to be recognised. They are measured so the gap is a
 // number, not a guess. A class in KNOWN_RESIDUAL is expected to miss; --assert fails if it stops.
 $POS['RESIDUAL bare secret'] = [
@@ -356,7 +380,7 @@ $NEG['code that names a secret but holds none'] = [
   fn() => [ codeblock( 'token: undefined' ) ],
   fn() => [ codeblock( pw_name() . '=' ) ],
   fn() => [ codeblock( key_name() . '=<' . pick( [ 'your key', 'token', 'api-key' ] ) . '>' ) ],
-  fn() => [ codeblock( key_name() . '=' . pick( [ 'YOUR_API_KEY', 'your-api-key-here', 'CHANGE_ME', 'changeme', 'xxxxxxxxxxxx', '********', '${' . strtoupper( key_name() ) . '}', '$API_KEY', '{{ api_key }}' ] ) ) ],
+  fn() => [ codeblock( key_name() . '=' . pick( [ 'YOUR_API_KEY', 'your-api-key-here', 'CHANGE_ME', 'YourApiKey', 'xxxxxxxxxxxx', '********', '${' . strtoupper( key_name() ) . '}', '$API_KEY', '{{ api_key }}' ] ) ) ],
   fn() => [ codeblock( "curl -H \"Authorization: Bearer \$TOKEN\" https://api.example.com/me" ) ],
   fn() => [ codeblock( "curl -H 'Authorization: Bearer <your token>' https://api.example.com/me" ) ],
   fn() => [ codeblock( 'curl -u user:pass https://example.com/' ) ],
@@ -390,12 +414,28 @@ $NEG['forms, flags and setters that hold no secret'] = [
   fn() => [ codeblock( "update_option( 'acme_api_key', '' );" ) ],
   fn() => [ codeblock( "update_option( 'acme_" . pick( [ 'token', 'secret', 'api_key' ] ) . "', \$value );" ) ],
   fn() => [ codeblock( "update_option( 'acme_secret_enabled', 'yes' ); set_transient( 'acme_token_cache', \$data, HOUR_IN_SECONDS );" ) ],
-  fn() => [ codeblock( "update_option( 'acme_api_key', '" . pick( [ 'none', 'required', 'null', 'changeme' ] ) . "' );" ) ],
+  fn() => [ codeblock( "update_option( 'acme_api_key', '" . pick( [ 'none', 'required', 'null', 'CHANGE_ME' ] ) . "' );" ) ],
   fn() => [ codeblock( '"password": "' . pick( [ 'required', 'optional', 'hidden', 'redacted' ] ) . '"' ) ],
   fn() => [ codeblock( "password: " . pick( [ '<password>', '{{ password }}', '[hidden]', 'null', '~' ] ) ) ],
   fn() => [ codeblock( "secret_key_base: <%= ENV[\"SECRET_KEY_BASE\"] %>" ) ],
   fn() => [ around( 'Mind the pass: pass=1 for the first lap, pass=true to skip, and ?pass=false to retry. The hall pass=2nd-floor stays.' ) ],
   fn() => [ around( 'Session id: ' . mt_rand( 1000, 9999 ) . ' for the booking, sessionId 1 of 3, Cookie: consent=accepted; theme=dark; lang=en' ) ],
+];
+$NEG['names that end in key, pass or pw but hold a name, a path or a label'] = [
+  fn() => [ codeblock( "const STORAGE_KEY = 'todos-vuejs-" . mt_rand( 1, 3 ) . ".0'" ) ],
+  fn() => [ codeblock( 'self.primary_key = "' . pick( [ 'product_code', 'order_id', 'sku' ] ) . '"' ) ],
+  fn() => [ '{"table": "orders", "primary_key": "' . pick( [ 'order_id', 'id', 'uuid' ] ) . '"}' ],
+  fn() => [ codeblock( "const SESSION_KEY = '" . pick( [ 'user', 'cart', 'locale' ] ) . "'" ) ],
+  fn() => [ codeblock( "'" . pick( [ 'root_key', 'service_key', 'shared_key', 'secondary_key' ] ) . "' => '" . pick( [ 'menu', 'billing', 'none yet', 'order_id' ] ) . "'," ) ],
+  fn() => [ codeblock( 'primary_key: ' . pick( [ 'order_id_2', 'product_code', 'id' ] ) ) ],
+  fn() => [ codeblock( 'ssh_key: "~/.ssh/id_' . pick( [ 'ed25519', 'rsa' ] ) . '.pub"' ) ],
+  fn() => [ 'PWD=/var/www/html/wp-content' ],
+  fn() => [ around( 'Buy here: https://park.example.com/buy?pass=' . pick( [ 'annual', 'season', 'summer' ] ) . mt_rand( 2020, 2029 ) ) ],
+  fn() => [ 'Username: admin, Password: ' . pick( [ 'YourPassword', 'YourApiKey', 'JavaScript', 'WordPress', 'TypeScript' ] ) ],
+  fn() => [ '{"pw": "' . pick( [ 'full', 'half', 'auto' ] ) . '"}' ],
+  fn() => [ pick( [ 'docker run --user deploy:www-data2 php', 'docker run -u 1000:docker1 image', 'sudo -u www-data:wwwdata2 wp cache flush', 'chown --user deploy:staff2 /srv' ] ) ],
+  fn() => [ '{"session_id": "' . pick( [ 'abcd', 'main', 'guest' ] ) . '"}' ],
+  fn() => [ '<input type="checkbox" name="remember_token" value="' . pick( [ 'remember', 'yes', '1' ] ) . '" checked>' ],
 ];
 $NEG['hashes, ids and other long strings that are not secrets'] = [
   fn() => [ around( 'Fixed in commit ' . hex( 40 ) . ' (see the changelog).' ) ],
@@ -480,8 +520,10 @@ foreach ( $corpus as $s ) {
   }
   elseif ( $s['secret'] !== 'PEM' ) {
     // Found, but is the secret itself inside the blanked ranges? The audit log keeps the rest.
+    // Counted, not searched for: a secret that is a word the sample also uses elsewhere ("password":
+    // "password") is covered when it occurs one time fewer afterwards.
     $left = GMCP_Credential_Scan::redact_spans( $s['text'], '[x]' );
-    if ( strpos( $left, $s['secret'] ) !== false ) {
+    if ( substr_count( $left, $s['secret'] ) >= substr_count( $s['text'], $s['secret'] ) ) {
       $stats[ $c ]['span']++;
       $failed = true;
     }
