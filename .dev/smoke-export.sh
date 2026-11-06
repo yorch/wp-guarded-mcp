@@ -278,6 +278,33 @@ approve() { # approve <request_id>
 }
 FORM=$(ap_form "$R1")
 check "the request has an approve form on the screen" "$(python3 -c 'import sys; print("yes" if "|" in sys.argv[1] else "no")' "$FORM")" "yes"
+# What the person is told about the archive. The approval record holds a root, a path, a mode and a
+# digest, which says nothing about how large the tree is or how much of it is withheld.
+ap_cell() { curl -sS -b "$JAR" "$AP_URL" | python3 -c '
+import re,sys,html
+page=sys.stdin.read(); rid=sys.argv[1]
+for tr in re.findall(r"<tr>.*?</tr>",page,re.S):
+    if re.search(r"name=\"request_id\" value=\""+rid+"\"",tr):
+        t=re.sub(r"<[^>]+>"," ",tr); print(re.sub(r"\s+"," ",html.unescape(t))); break
+' "$1"; }
+CELL=$(ap_cell "$R1")
+MAN_FILES=$(jget cap_ok2 file_count); MAN_EXCL=$(jget cap_ok2 excluded_count)
+check "CONTROL: the screen cell for the request was read" "$(printf '%s' "$CELL" | grep -c 'wp_export_request')" "1"
+check "the screen says how many files the archive will hold" "$(printf '%s' "$CELL" | grep -c "This pull archives uploads/.*: $MAN_FILES files, ")" "1"
+check "and how many entries are withheld" "$(printf '%s' "$CELL" | grep -c "$MAN_EXCL entries are withheld")" "1"
+check "and names the reasons" "$(printf '%s' "$CELL" | grep -c 'symbolic_link 1')" "1"
+check "and the start of the digest it is bound to" "$(printf '%s' "$CELL" | grep -c "digest ${MAN_DIGEST:0:12}")" "1"
+call "$TOK" pull_unseen "$(tc wp_export_request '{"root":"uploads","mode":"pull","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')"
+RU=$(rid pull_unseen)
+check "CONTROL: a pull naming a digest no manifest produced is held too" "$(state pull_unseen)" "awaiting_human_approval"
+check "its screen cell says no summary is on record, instead of a count" "$(ap_cell "$RU" | grep -c 'has no summary for the manifest this request names')" "1"
+check "and prints no file count" "$(ap_cell "$RU" | grep -c 'This pull archives')" "0"
+check "CONTROL: the summary row of the real manifest exists in the options table" \
+  "$(dbq "SELECT COUNT(*) FROM wp_options WHERE option_name = '_transient_gmcp_export_summary_${MAN_DIGEST:0:40}'")" "1"
+call "$TOK" sum_read "$(tc wp_get_option '{"key":"_transient_gmcp_export_summary_'"${MAN_DIGEST:0:40}"'"}')"
+check "the option tool will not read the summary back" "$(verdict sum_read)" "error"
+check "CONTROL: the same tool reads an ordinary option" "$(call "$TOK" sum_ctl "$(tc wp_get_option '{"key":"blogname"}')"; verdict sum_ctl)" "ok"
+wpq 'global $wpdb; $wpdb->query($wpdb->prepare("UPDATE {$wpdb->prefix}gmcp_approvals SET status=%s WHERE id=%d","declined",'"$RU"'));' >/dev/null
 WN=${FORM%%|*}; AN=${FORM##*|}
 curl -sS -b "$JAR" -o /dev/null -X POST "$AP_URL" \
   --data-urlencode "_wpnonce=$WN" --data-urlencode "gmcp_action=approve_request" \
@@ -303,6 +330,25 @@ check "the archive is outside the web root" \
   "$(dc wp sh -c 'case "'"$ARCHIVE_PATH"'" in /var/www/*) echo inside;; *) echo outside;; esac' | tr -d '\r\n')" "outside"
 check "the archive is mode 0600" \
   "$(dc wp sh -c 'stat -c %a "'"$ARCHIVE_PATH"'"' | tr -d '\r\n')" "600"
+
+echo "-- a HEAD request (a link previewer) does not spend the token or the archive --"
+# WordPress routes HEAD to the GET handler, so the first HEAD used to redeem the token and delete
+# the archive before the person it was minted for had clicked.
+token_rows() { dbq "SELECT COUNT(*) FROM wp_options WHERE option_name = 'gmcp_export_token_$ETOK'"; }
+check "CONTROL: the token row and the archive exist before any request" \
+  "$(token_rows)$(dc wp sh -c 'test -e "'"$ARCHIVE_PATH"'" && echo present || echo gone' | tr -d '\r\n')" "1present"
+HCODE=$(curl -sS -I -o "$OUT/head.hdr" -w '%{http_code}' "$EXPORT_URL" 2>/dev/null)
+check "HEAD with a live token answers 200" "$HCODE" "200"
+check "and says it is a zip" "$(grep -ci '^content-type: application/zip' "$OUT/head.hdr")" "1"
+check "and carries the archive's length" "$(grep -i '^content-length:' "$OUT/head.hdr" | tr -dc '0-9')" "$(dc wp sh -c 'stat -c %s "'"$ARCHIVE_PATH"'"' | tr -d '\r\n')"
+curl -sS -I -o /dev/null "$EXPORT_URL" 2>/dev/null
+check "after two HEADs the token row and the archive are still there" \
+  "$(token_rows)$(dc wp sh -c 'test -e "'"$ARCHIVE_PATH"'" && echo present || echo gone' | tr -d '\r\n')" "1present"
+check "HEAD with an unknown token is refused" "$(curl -sS -I -o /dev/null -w '%{http_code}' "${EXPORT_URL%/*}/deadbeefdeadbeefdeadbeefdeadbeef" 2>/dev/null)" "403"
+set_export 0
+check "HEAD while the group is off is refused" "$(curl -sS -I -o /dev/null -w '%{http_code}' "$EXPORT_URL" 2>/dev/null)" "403"
+check "and did not discard the token the way a GET does" "$(token_rows)" "1"
+set_export 1
 
 echo "-- the archive contains the fixture and not the excluded entries --"
 curl -sS -L -o "$OUT/export.zip" "$EXPORT_URL" 2>/dev/null
@@ -475,6 +521,76 @@ check "no entry name holds a backslash" \
 check "the archive holds exactly the ordinary entries" \
   "$(python3 -c 'import zipfile,sys; print(",".join(sorted(zipfile.ZipFile(sys.argv[1]).namelist())))' "$OUT/withheld.zip")" "normal.txt,plain-dir/,plain-dir/nested.txt"
 
+echo "-- withheld files: the same secrets under a spelling a short rule misses --"
+# A secret whose name differs trivially from a listed one is the same secret: a trailing dot or
+# space (Windows drops it, an extractor may too), a no-break or ideographic space, a full-width
+# letter or a soft hyphen inside the name, another case, and names no rule had: rotated logs, the
+# SQLite write-ahead files, *.env, compressed dumps, key and certificate stores.
+WD2="export-names-$MARK"
+NAMEPY='
+import json, os, sys
+SECRET = [
+  "dump2.sql ", "debug2.log ", "server2.key.", "cert2.pem.", "cert3.pem. .", "db2.sql ", "db3.sql　",
+  "ｄｕｍｐ.ｓｑｌ", ".en­v", " .env", "PROD.PEM", "Store.JKS", "App.KEYSTORE", "Ca.CRT",
+  "site.sqlite.gz", "db.sqlite3-wal", "db.sqlite3-shm", "wp.sqlite3", "error_log.1", "access_log", "access_log.2.gz",
+  "prod.env", "staging.env.local", "export.dump", "all.sql.gz", "x.pfx", "x.p12", "x.jks", "x.pkcs12", "x.key", "x.csr",
+  "debug.log-20260101", "site-wal", "site-shm",
+]
+ORDINARY = ["catalog.png", "notes.txt", "environment.txt", "envelope.pdf", "dump-notes.txt", "login.txt", "keys.txt", "crtnotes.txt", "photo.jpg", "readme.md"]
+if sys.argv[1] == "create":
+  d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+  for n in SECRET: open(os.path.join(d, n), "w").write("SECRETMARK-" + sys.argv[3] + "\n")
+  for n in ORDINARY: open(os.path.join(d, n), "w").write("NORMAL-" + sys.argv[3] + "\n")
+  print(len(os.listdir(d)))
+else:
+  m = json.load(open(sys.argv[2]))
+  d = json.loads(m["result"]["content"][0]["text"])
+  got = {e["path"]: e["reason"] for e in d.get("excluded", [])}
+  for n in SECRET: print("%s\t%s" % ("S", json.dumps(n)), got.get(n, "-"))
+  for n in ORDINARY: print("%s\t%s" % ("O", json.dumps(n)), got.get(n, "-"))
+'
+check "CONTROL: every spelling exists on disk" "$(dc cli python3 -c "$NAMEPY" create "$UPLOADS/$WD2" "$MARK")" "44"
+call "$TOK" nm_man "$(tc wp_export_request '{"root":"uploads","path":"'"$WD2"'"}')"
+check "the manifest answers" "$(verdict nm_man)" "ok"
+check "CONTROL: the ordinary look-alikes are counted, so the exclusions below are about the names" "$(jget nm_man file_count)" "10"
+python3 -c "$NAMEPY" verify "$OUT/nm_man" > "$OUT/nm_lines.txt"
+while IFS="$(printf '\t')" read -r kind rest; do
+  name=${rest% *}; reason=${rest##* }
+  if [ "$kind" = "S" ]; then check "$name is withheld as private_name" "$reason" "private_name"
+  else check "CONTROL: $name is not withheld" "$reason" "-"; fi
+done < "$OUT/nm_lines.txt"
+check "CONTROL: that loop read every line" "$(wc -l < "$OUT/nm_lines.txt" | tr -d ' ')" "44"
+pull_zip nm "$WD2" "$OUT/names.zip"
+check "CONTROL: the pull produced a zip" "$(python3 -c 'import zipfile,sys; print("yes" if zipfile.is_zipfile(sys.argv[1]) else "no")' "$OUT/names.zip")" "yes"
+check "CONTROL: the ordinary files are in the archive" "$(zip_has "$OUT/names.zip" "NORMAL-$MARK")" "yes"
+check "no spelling of a withheld file reached the archive" "$(zip_has "$OUT/names.zip" "SECRETMARK-$MARK")" "no"
+
+echo "-- withheld directories: the form plugins' upload folders, as read from their source --"
+# The names below come from the plugins' own code (see PRIVATE_UPLOAD_DIRS), at depth, in another
+# case, and with the names a plugin does NOT use (the control that the rule is about the name).
+WD3="export-formdirs-$MARK"
+FORMDIRS="wpcf7_uploads wpforms fluentform ninja-forms-tmp nf-field-exports everest_forms_uploads Everes-Froms-Entries-CSV-file evf-logs forminator forminator_temp jet-form-builder cfdb7_uploads"
+dc cli sh -c "mkdir -p '$UPLOADS/$WD3/plain-dir'
+  printf 'NORMAL-$MARK\n' > '$UPLOADS/$WD3/plain-dir/ok.txt'
+  for d in $FORMDIRS; do mkdir -p '$UPLOADS/$WD3/'\$d '$UPLOADS/$WD3/plain-dir/'\$d; printf 'SECRETMARK-$MARK\n' > '$UPLOADS/$WD3/'\$d/entry.pdf; printf 'SECRETMARK-$MARK\n' > '$UPLOADS/$WD3/plain-dir/'\$d/deep.pdf; done
+  mkdir -p '$UPLOADS/$WD3/WPFORMS' '$UPLOADS/$WD3/flamingo' '$UPLOADS/$WD3/not-a-form-plugin'
+  printf 'SECRETMARK-$MARK\n' > '$UPLOADS/$WD3/WPFORMS/upper.pdf'
+  printf 'NORMAL-$MARK\n' > '$UPLOADS/$WD3/flamingo/free-has-no-upload-dir.txt'
+  printf 'NORMAL-$MARK\n' > '$UPLOADS/$WD3/not-a-form-plugin/ok2.txt'" >/dev/null 2>&1
+call "$TOK" fd_man "$(tc wp_export_request '{"root":"uploads","path":"'"$WD3"'"}')"
+check "the manifest answers" "$(verdict fd_man)" "ok"
+for d in $FORMDIRS; do
+  check "$d is withheld as private_name" "$(excl_reason fd_man "$d")" "private_name"
+  check "$d at depth is withheld as private_name" "$(excl_reason fd_man "plain-dir/$d")" "private_name"
+done
+check "WPFORMS (another case) is withheld as private_name" "$(excl_reason fd_man "WPFORMS")" "private_name"
+check "CONTROL: a directory the plugins do not use is not withheld (flamingo writes no uploads)" "$(excl_reason fd_man "flamingo")" "-"
+check "CONTROL: the ordinary files are counted (3), so the rest are about the names" "$(jget fd_man file_count)" "3"
+pull_zip fd "$WD3" "$OUT/formdirs.zip"
+check "CONTROL: the pull produced a zip" "$(python3 -c 'import zipfile,sys; print("yes" if zipfile.is_zipfile(sys.argv[1]) else "no")' "$OUT/formdirs.zip")" "yes"
+check "CONTROL: the ordinary files are in the archive" "$(zip_has "$OUT/formdirs.zip" "NORMAL-$MARK")" "yes"
+check "no file of a form plugin's directory reached the archive" "$(zip_has "$OUT/formdirs.zip" "SECRETMARK-$MARK")" "no"
+
 echo "-- a form submission's uploaded files are withheld, whatever directory they sit in --"
 SUB=$(wpq 'register_post_type("flamingo_inbound",["public"=>true,"label"=>"smoke submission"]);echo wp_insert_post(["post_title"=>"export smoke submission","post_type"=>"flamingo_inbound","post_status"=>"publish"]);')
 PNG="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
@@ -499,6 +615,16 @@ check "the submission's own file is not an entry" \
   "$(python3 -c 'import zipfile,sys; print("no" if sys.argv[2] in zipfile.ZipFile(sys.argv[1]).namelist() else "yes")' "$OUT/sub.zip" "$MARK-visitor.png")" "yes"
 check "its generated size's bytes are not in the archive" "$(zip_has "$OUT/sub.zip" "SUBMISSION-THUMB-$MARK")" "no"
 check "its converted copy's bytes are not in the archive" "$(zip_has "$OUT/sub.zip" "SUBMISSION-WEBP-$MARK")" "no"
+# KNOWN LIMIT, pinned so that fixing it forces the sentence in docs/guardrails.md to change: core's
+# wp_delete_post() points a deleted post's attachments at the post's own parent (0 for a
+# submission), after which nothing links the upload to the submission and the tree test cannot find
+# it. If this check starts to fail, the guard has learned to follow an upload after its submission is
+# gone; update the "deleted submission" paragraph and make this expect personal_data_upload.
+wpq 'wp_delete_post('"$SUB"', true);' >/dev/null
+check "CONTROL: the submission is deleted and the upload is still a row" \
+  "$(wpq 'echo get_post('"$SUB"') ? "submission" : "gone", "/", (int) get_post('"$SUBATT"')->post_parent, "/", get_post_type('"$SUBATT"');')" "gone/0/attachment"
+call "$TOK" sub_man2 "$(tc wp_export_request '{"root":"uploads","path":"'"$SUBDIR"'"}')"
+check "KNOWN LIMIT: after core deletes the submission its upload is no longer withheld" "$(excl_reason sub_man2 "$MARK-visitor.png")" "-"
 
 echo "-- a pull of a tree with nothing to archive says so, and leaves nothing behind --"
 dc cli sh -c "mkdir -p '$UPLOADS/export-nothing-$MARK' && printf 'x\n' > '$UPLOADS/export-nothing-$MARK/.env'" >/dev/null 2>&1
@@ -561,7 +687,7 @@ wpq 'global $wpdb;foreach($wpdb->get_col("SELECT option_name FROM {$wpdb->option
 echo "-- cleanup: fixtures, rows, and the two options this suite changed --"
 dc cli wp eval 'wp_delete_attachment('"$ATT"', true);' >/dev/null 2>&1
 dc cli sh -c "rm -f '$UPLOADS/export-symlink-$MARK.txt' '$UPLOADS/export-hardlink-source-$MARK.txt' '$UPLOADS/export-hardlink-copy-$MARK.txt' '$UPLOADS/export-big-$MARK.bin'" >/dev/null 2>&1
-dc cli sh -c "rm -rf '$UPLOADS/$WD' '$UPLOADS/export-nothing-$MARK' '$UPLOADS/export-die-$MARK'" >/dev/null 2>&1
+dc cli sh -c "rm -rf '$UPLOADS/$WD' '$UPLOADS/$WD2' '$UPLOADS/$WD3' '$UPLOADS/export-nothing-$MARK' '$UPLOADS/export-die-$MARK'" >/dev/null 2>&1
 wpq 'foreach(['"$SUBATT"','"$PUBATT"'] as $a){wp_delete_attachment($a,true);}wp_delete_post('"$SUB"',true);' >/dev/null
 dc cli sh -c "rm -f '$UPLOADS/$SUBDIR/$MARK-visitor'* '$UPLOADS/$SUBDIR/$MARK-public'*" >/dev/null 2>&1
 dc wp sh -c "rm -f /tmp/$MARK-outside.txt" >/dev/null 2>&1

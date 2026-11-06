@@ -1660,6 +1660,29 @@ asks is written down here.
   write through it replaced the stored layout. Not covered: another plugin's own reader, a
   layout kept under a key a site has not added to the filter, and a builder other than the one
   listed.
+- **A registered REST field is a second door to the layout, and the generated REST tools shut it.**
+  Beaver Builder registers `fl_builder_css_js` on its post types while its debug transient
+  (`fl_debug_mode`) is set or `FL_ENABLE_META_CSS_EDIT` is defined, and the field's callbacks read
+  and write `_fl_builder_data_settings`, the css and js the public page loads from the builder's
+  cache. `update_pages` with that field stored attacker script under a readwrite key (measured),
+  and `get_pages` returned it to a readonly one. Now `GMCP_Core::rest_write_refusal()` refuses any
+  argument named in `GMCP_Core::layout_rest_fields()` (extendable through `gmcp_layout_rest_fields`)
+  before the controller is asked, the generated schemas do not offer it, and for a dispatch the
+  field's callbacks are removed so no reply carries it. For a field NOT on that list,
+  `GMCP_Core::guard_rest_fields()` wraps every registered field's callbacks for the dispatch and,
+  while one runs, the WordPress meta functions treat a layout key (and the attachment file key) as
+  the generic meta tools do: a write throws and a read finds nothing. That is a backstop and is
+  late: the controller applies the post's own fields before the registered ones, so a refusal from
+  there leaves earlier fields of the same update stored, and the reply says so. Not covered: a
+  field callback that reads or writes the table with `$wpdb`, and a layout kept under a key nobody
+  has listed. The debug transient itself is under `option_write_policy()` too
+  (`GMCP_Core::layout_switch_options()`: `fl_debug_mode`, its `_transient_` and
+  `_transient_timeout_` rows, extendable through `gmcp_layout_switch_options`), judged as the
+  database compares the name, and under `option_guard()` for reads, because its value is also the
+  token that turns the builder's debug output on for any visitor. `FL_ENABLE_META_CSS_EDIT` is a
+  constant in `wp-config.php` and nothing here can set it; a site that defines it has opened the
+  field on purpose, and the tools still refuse to use it. `smoke-beaver-write.sh` plants a value
+  through a stand-in field and through the real one, and asserts the stored row and the replies.
 - **`beaver_create_page` is the one tool that writes a layout, and it only creates.** It has no
   argument that names an existing post. The builder's writer (`FLBuilderModel::update_layout_data()`)
   applies no capability check, no kses and no `sanitize_settings()`, so the tool is the only
@@ -1747,12 +1770,72 @@ one-time URL.
   with `gmcp_export_private_names` and `gmcp_export_private_directories`; the filters are merged
   over the built-in lists, so they cannot remove an entry. Naming a withheld file or directory in
   `path` is refused outright rather than answered with an empty tree.
+- **A name is matched as the system takes it, not as it was typed.** `dump.sql ` (trailing space),
+  `server.key.` (trailing dot), `db.sql` followed by a no-break or ideographic space, `ｄｕｍｐ.ｓｑｌ`
+  in full-width letters and `PROD.PEM` were each the file their short name says and each was
+  archived, because the globs were compared with `strtolower( $name )` (measured by an independent
+  review). `GMCP_Tools_Export::match_name()` now reads the name through NFKC (the `intl` extension;
+  without it the full-width ASCII block is mapped by hand and nothing else is folded), drops every
+  format character, strips leading and trailing spaces, control characters and trailing dots, and
+  folds case; a name is matched both as typed and as normalised, so `...` is still a dot-file. The
+  list grew by what the review found no rule for: rotated logs (`error_log*`, `access_log*`,
+  `*_log`, `*.log-*`), the SQLite companions (`*.sqlite3-wal`, `*-wal`, `*-shm`, `*.sqlite.gz`),
+  `*.env`, `*.dump`, and certificate and keystore files in any case. Not covered: a name that
+  differs by a character this does not fold (a look-alike letter from another script is not a
+  `.sql`), a secret kept in a file with an unlisted extension, and the archive entry itself keeps
+  the real name.
 - **What this does not find.** It is a list of names and a database question, not a content scan:
   a secret in a file with an ordinary name (`config.php` in a plugin, a `.json` in a theme) is
   archived. A file that no attachment row points at, in a directory the list does not name, is
-  archived. The directory names are written from memory of each plugin's storage layout and not
-  checked against their source. Files in `plugins`, `themes` and `mu-plugins` are matched by file
-  name only, since a directory called `logs` there is usually code.
+  archived. The directory names of the form plugins were read from source (the table below); the
+  shop, backup and generic names are still written from memory and not checked. Files in
+  `plugins`, `themes` and `mu-plugins` are matched by file name only, since a directory called
+  `logs` there is usually code.
+- **A deleted submission releases its uploads, and the guard cannot follow them.** Every guard that
+  protects a visitor's upload finds it by walking `post_parent` up to a form-submission type
+  (`post_read_guard()`, `unreadable_post_clauses()`, `personal_upload_paths()`). When core deletes
+  the submission, `wp_delete_post()` points its attachments at the deleted post's own parent, which
+  for a submission is 0 (measured: parent 1525 before, 0 after, the attachment row and its file
+  untouched). From then on the upload is an unattached media file: the tree test no longer finds
+  it, `wp_export_request` archives it unless it sits in a directory the name list withholds, and an
+  admin-level `wp_download_request` serves it. A key below admin is still refused by the download
+  tool, because that tool wants a published parent and an unattached file has none ("not attached to a
+  post at all"); the media listings, however, no longer hold the row back. A flag recorded on
+  `before_delete_post` (the ids of the attachments in the submission's tree, kept as meta and
+  read by the guards) would close it, and was not built: it would have to be read by every one of
+  those walks, by the SQL joins that page the listings and by the write guards, and a flag read by
+  some of them and not the rest would document a protection that some readers do not have, which is
+  worse than the plain statement. What helps today: the directory list above (a plugin that keeps
+  its uploads in its own folder stays withheld after the submission is gone), and deleting the
+  upload together with the submission, which the form plugin may or may not do. The suite pins the
+  gap (`smoke-export.sh`, "KNOWN LIMIT"), so a change that closes it has to update this paragraph.
+- **Where the form plugins put their files: measured from source, per plugin.** The list in
+  `GMCP_Tools_Export::PRIVATE_UPLOAD_DIRS` was written from memory and was wrong in both
+  directions. The free releases were downloaded from wordpress.org into a scratch directory and
+  READ with grep, never run (Contact Form 7 6.2.4.1, Flamingo 2.6.4, Ninja Forms 3.16.0, WPForms
+  Lite 2.0.4, Fluent Forms 6.2.17, Elementor 4.3.6, JetFormBuilder 3.6.8.1, Everest Forms 3.6.4,
+  Forminator 1.58.4, Formidable 7.0). Gravity Forms is paid and was not obtained.
+
+  | Plugin | Directory under `uploads` | Status |
+  |---|---|---|
+  | Contact Form 7 | `wpcf7_uploads` (`wpcf7_upload_tmp_dir()`); the constant `WPCF7_UPLOADS_TMP_DIR` moves it to a path under `wp-content`, outside uploads | verified in source |
+  | Flamingo | none: it writes no files (the earlier `flamingo` entry was removed) | verified: no upload code |
+  | Ninja Forms | `ninja-forms-tmp` (submission exports), `nf-field-exports`; export CSVs are also written to the dated uploads folder, which no name rule can find | verified in source |
+  | Ninja Forms File Uploads add-on | `ninja-forms` | UNVERIFIED (paid add-on, from memory) |
+  | WPForms Lite | `wpforms` (`wpforms_upload_dir()`: cache, `tmp`, icon choices, Stripe rate-limit files); filterable by `wpforms_upload_root` | verified in source |
+  | Fluent Forms | `fluentform` (the migrator writes there; the scheduler and the URL decoder build `uploads` + `FLUENTFORM_UPLOAD_DIR` + `/temp`) | verified in the free code; the constant is defined in the Pro plugin, which was not read |
+  | Elementor | `elementor` holds generated CSS, thumbnails and import scratch (`tmp`): none of it is a visitor's file, and it is not listed. The forms module that stores submissions' uploads is in Elementor Pro, not obtained | free: verified; Pro forms directory UNVERIFIED and not listed |
+  | JetFormBuilder | `jet-form-builder` (filter `jet-form-builder/file-upload/dir`), with `temp` and an md5-named folder per form and user; its attachments are inserted with a parent of 0 | verified in source |
+  | Everest Forms | `everest_forms_uploads` (per form, plus `tmp`), `Everes-Froms-Entries-CSV-file` (entry exports, spelt so), `evf-logs`; `everest_forms_styles` is generated CSS and is not listed | verified in source |
+  | Forminator | `forminator` (also leftover public exports), `forminator_temp`; the site can set a custom upload root, which is a name of its choosing | verified in source (custom root not findable by name) |
+  | Formidable | `formidable` holds only generated CSS in the free release (`formidable/css`); the upload folder of the Pro file field is from memory | UNVERIFIED for uploads; listed on that memory, which also hides the CSS from an export |
+  | Gravity Forms | `gravity_forms` | UNVERIFIED (paid, not obtained, from memory) |
+  | CFDB7 | `cfdb7_uploads` | inferred: Forminator's importer reads files from it; the plugin itself was not obtained |
+
+  Two consequences worth knowing. The database question (attachments whose parent chain reaches a
+  submission) does not help where a plugin inserts its uploads with a parent of 0, as
+  JetFormBuilder does, so for those the directory name is the only protection. And `wp_download_request`
+  does not ask the directory list at all; it asks the attachment's parent and publication state.
 - **A refusal costs a stat, not a read.** The byte cap was checked after a file was hashed, so one
   4 GiB file cost 19 seconds of reading to be told no (measured; the cost grew with the file). The
   size from `lstat` is compared first, and a private directory is never entered. The hash of a
@@ -1781,14 +1864,31 @@ one-time URL.
   recognised, and nothing writes one); `..`, `.`, empty segments, absolute paths, stream wrappers, a
   symlink in the path and a path in the wrong case are refused; and a
   400 MB archive streams under a 128 MB `memory_limit`.
-- **Honest limits.** The approval screen shows the root, the path and the digest, not a file list:
-  a person approves "this directory as it was when the agent read it". Between the per-entry
+- **Honest limits.** The approval screen shows the root, the path and the digest, and above them
+  what that digest covers: the file count, the size, the number of withheld entries and their
+  reasons, from the server's own walk when the agent read the manifest
+  (`GMCP_Tools_Export::remember_summary()`, a transient bound to the digest that the option tools
+  refuse to read and that no tool lists, so the agent cannot read it back; two hours). It is NOT a
+  file list, and when no manifest on this site produced the digest (or it is over two hours old) the
+  screen says it has no summary instead of showing numbers. A person approves "this directory as it
+  was when the agent read it". Between the per-entry
   re-check and the read `ZipArchive` does at `close()` a writer who can replace a file can still
   win the race; the closed archive is compared with the manifest's sizes and CRC-32s, which catches
   an accidental or naive change and not a deliberate collision. A fatal during the build leaves the
   approval spent. The reply and the audit log never carry the archive; the URL does carry a
   bearer token for five minutes, and a web server's own access log will have it (the endpoint is a
   GET).
+- **A HEAD request does not redeem a one-time URL.** WordPress routes HEAD to the GET handler, and
+  the handler spent the token on the way to answering, so a link previewer, a mail scanner or a
+  chat unfurler that fetched the URL it was shown burned the archive (or the download) before the
+  person it was minted for clicked (measured by an independent review). `handle_export()` and
+  `handle_download()` now answer HEAD from a read-only look at the token (`peek_token()` for the
+  export; the row, its timeout and the attachment's file for the download): 200 with the headers
+  the GET would send and no body, or the same 403, and nothing is deleted, not even an expired
+  row. Single use is for GET, and it is still all a scanner that sends GET gets: a previewer that
+  fetches with GET spends the token and nothing can tell it from a person. `smoke-export.sh` and
+  `smoke-download.sh` assert the rows and the archive after two HEADs, the GET that follows, and
+  HEAD on a spent, an unknown and (for the export) a switched-off token.
 
 ## Theme mods
 

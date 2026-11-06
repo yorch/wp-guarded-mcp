@@ -144,22 +144,32 @@ submission). The digest covers
 each file's name, size and contents, so a file rewritten in place is a change. It never returns
 file contents, and it refuses over 20,000 entries or 512 MiB rather than truncating the count.
 Its `pull` mode takes the digest from a manifest, refuses if the tree has changed, and always
-waits for a signed-in administrator on the Approvals screen, whatever `mcp_approval_mode` is
+waits for a signed-in administrator on the Approvals screen (which shows the file count, size and
+number of withheld entries of the manifest the request names, not a file list), whatever `mcp_approval_mode` is
 set to. Only after that approval does it build a zip outside the web root, with 0600
-permissions, and return a one-time URL that streams it for five minutes; the archive is never
+permissions, and return a one-time URL that streams it for five minutes (a GET spends it; a HEAD,
+which link previewers send, does not); the archive is never
 returned in a tool reply, and the token is scrubbed from the audit log. `uploads` means all of
 uploads, which on a real site can contain customer exports — that is why the group is off
 until somebody switches it on. Some things are withheld in every root and are never read:
-dot-files (`.env`, `.htpasswd`), `wp-config*`, private keys and keystores, database dumps and
-SQLite files, logs, backup archives and editor leftovers; in `uploads`, the private directories
+dot-files (`.env`, `.htpasswd`), `*.env`, `wp-config*`, private keys, certificates and keystores
+(`.pem`, `.key`, `.crt`, `.pfx`, `.p12`, `.jks`, `.keystore`, in any case), database dumps and
+SQLite files with their `-wal`, `-shm` and `.gz` companions, logs and their rotations (`error_log.1`,
+`access_log`), backup archives and editor leftovers, matched on the name as a filesystem would take
+it (a trailing dot or space, a no-break space, full-width letters and invisible format characters
+do not make `dump.sql ` another file); in `uploads`, the private directories
 of the common form, shop and backup plugins; and every uploaded file that belongs to a form
 submission (the files `wp_download_request` already refuses at every level), including the sizes
 WordPress generated from it. Naming one of them in `path` is refused. This is a list of names
 and a database question, not a content scan: a secret in a file with an ordinary name (a
 `config.php` in a plugin) is archived, a file no attachment row points at in a directory the
-list does not name is archived, and the plugin directory names are written from memory of each
-plugin's layout (extend them with `gmcp_export_private_directories` and `gmcp_export_private_names`).
-A tree whose every entry is withheld has nothing to archive and the pull says so.
+list does not name is archived, and the form plugins' directory names were read from the source of
+their free releases (the table in `docs/guardrails.md` says which are verified and which, such as
+Gravity Forms and the paid add-ons, are not; extend them with `gmcp_export_private_directories` and `gmcp_export_private_names`).
+A form submission's uploads are found through the submission they hang from, so once core deletes
+the submission (which makes its attachments unattached) they are archived like any other media file
+unless they sit in a directory the list names; `docs/guardrails.md` says what the download tool does
+about the same file. A tree whose every entry is withheld has nothing to archive and the pull says so.
 
 **Site administration**, off by default: installing, activating, updating and deleting
 plugins and themes; navigation menus and their items; widgets and widget areas; the
@@ -411,7 +421,12 @@ layout. So node types, counts and depth are returned, layout setting *names* are
 whether custom code is present is returned, and no value of either is. The layout keys are not
 readable through the generic meta tools either: `wp_get_post_meta` and `wp_get_post_snapshot` list
 them as withheld, and a key is judged the way the database compares it, so an accented or
-space-padded spelling is the same key. `beaver_layout` reports a post's title, type and status, so
+space-padded spelling is the same key. The generated REST tools (`update_pages` and the rest) do
+not read or write a layout either: a REST field another plugin registers for it (Beaver's
+`fl_builder_css_js`, which exists only while its debug flag is set) is refused, left out of replies
+and not offered in the tool's schema, a field that reaches the layout key through WordPress's meta
+functions is stopped while it runs, and the debug flag's option rows are not writable or readable
+through the option tools. `beaver_layout` reports a post's title, type and status, so
 it asks the same read policy the generic readers do: a form submission, and below admin an order
 or another plugin's configuration, answers as a post that does not exist. There is no tool that
 edits or replaces an existing layout, and none that accepts layout settings from the caller: it

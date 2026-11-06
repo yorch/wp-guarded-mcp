@@ -87,6 +87,9 @@ class GMCP_Tools_Export {
   /** Temporary files all start with this, so a sweep can find one left by an old row. */
   const TEMP_PREFIX = 'gmcp-export-';
   const CRON_HOOK = 'gmcp_export_cleanup';
+  /** What a manifest said, kept by its digest for the Approvals screen. @see self::remember_summary() */
+  const SUMMARY_PREFIX = 'gmcp_export_summary_';
+  const SUMMARY_TTL = 2 * HOUR_IN_SECONDS;
 
   const ROOTS = [ 'plugins', 'themes', 'mu-plugins', 'uploads' ];
 
@@ -95,18 +98,28 @@ class GMCP_Tools_Export {
   *
   * A directory is not a classification of its contents: uploads and plugins both collect files
   * whose whole purpose is to stay on the server. Dot-files (`.env`, `.htpasswd`, `.git`),
-  * `wp-config*`, private keys and keystores, database dumps and SQLite files, logs, editor and
-  * backup leftovers. Matched on the lower-cased name as a glob, `*` only. A match is listed in
+  * `wp-config*`, private keys, certificates and keystores in any case, database dumps and SQLite
+  * files with their `-wal`/`-shm`/`.gz` companions, logs and their rotations, `*.env`, editor and
+  * backup leftovers. Matched as a glob, `*` only, on the NAME AS A FILESYSTEM AND AN OPERATING
+  * SYSTEM READ IT, not as typed ({@see self::match_name()}): `dump.sql ` with a trailing space,
+  * `server.key.` with a trailing dot and `db.sql` followed by a no-break space are the files
+  * their short names say they are, and a rule on the typed spelling let each of them through. A match is listed in
   * the manifest with the reason `private_name` and its bytes are never read, so it is not in the
   * digest by content either. A site can ADD patterns with `gmcp_export_private_names`; the filter
   * cannot remove a built-in one, because it is a list of what is withheld and not of what is
   * allowed.
   */
   const PRIVATE_NAME_GLOBS = [
-    '.*', 'wp-config*', 'error_log', 'php_errorlog', '*.log', '*.log.*',
-    '*.sql', '*.sql.*', '*.sqlite', '*.sqlite3', '*.sqlite-*', '*.db', '*.dump',
+    '.*', 'wp-config*', 'error_log*', 'php_errorlog*', 'access_log*', '*_log', '*_log.*', '*_log-*',
+    '*.log', '*.log.*', '*.log-*',
+    '*.sql', '*.sql.*', '*.dump', '*.dump.*', '*.dmp', '*.mdb', '*.sqlite', '*.sqlite.*', '*.sqlite-*',
+    '*.sqlite3', '*.sqlite3.*', '*.sqlite3-*', '*.db', '*.db.*', '*.db-*', '*.db3', '*.s3db', '*.sdb',
+    '*-wal', '*-shm', '*-journal',
+    '*.env', '*.env.*', '*.envrc', 'htpasswd', '*.htpasswd',
     '*.bak', '*.old', '*.orig', '*.save', '*.swp', '*~',
-    '*.pem', '*.key', '*.p12', '*.pfx', '*.jks', '*.keystore', '*.kdbx', '*.ppk', '*.gpg', '*.pgp',
+    '*.pem', '*.pem.*', '*.key', '*.key.*', '*.crt', '*.cer', '*.der', '*.csr', '*.p7b', '*.p8',
+    '*.p12', '*.pfx', '*.pkcs12', '*.jks', '*.jceks', '*.bks', '*.keystore', '*.truststore',
+    '*.kdbx', '*.ppk', '*.gpg', '*.pgp', '*.asc',
     'id_rsa*', 'id_dsa*', 'id_ecdsa*', 'id_ed25519*',
     'auth.json', 'credentials*.json', 'secrets*.json', 'service-account*.json', 'client_secret*.json',
     '*.wpress',
@@ -114,17 +127,30 @@ class GMCP_Tools_Export {
 
   /**
   * Directories of the uploads root that hold another plugin's private files, matched on the
-  * lower-cased name at any depth: a form plugin's uploaded files and temporary files, a shop's
-  * paid downloads and logs, backup plugins' archives. Uploads only: in `plugins` and `themes` a
-  * directory called `logs` or `backup` is usually source code. UNVERIFIED: the names are written
-  * from memory of each plugin's storage layout, not checked against their source; a site with
-  * another store adds its directory through `gmcp_export_private_directories`. The files of a
-  * form submission that WordPress knows as attachments are found by the database instead
-  * ({@see self::personal_upload_paths()}), which does not depend on this list.
+  * lower-cased name at any depth: a form plugin's uploaded files, temporary files and exports, a
+  * shop's paid downloads and logs, backup plugins' archives. Uploads only: in `plugins` and
+  * `themes` a directory called `logs` or `backup` is usually source code.
+  *
+  * The form-plugin names were read from each plugin's source (the free releases, read with grep and
+  * never run) and the result, per plugin and with what could not be checked, is in
+  * docs/guardrails.md. In short: Contact Form 7 (`wpcf7_uploads`), WPForms (`wpforms`), Fluent Forms
+  * (`fluentform`), Ninja Forms (`ninja-forms-tmp`, `nf-field-exports`), Everest Forms
+  * (`everest_forms_uploads`, `Everes-Froms-Entries-CSV-file`, `evf-logs`), Forminator (`forminator`,
+  * `forminator_temp`) and JetFormBuilder (`jet-form-builder`) were found in source; Gravity Forms
+  * (`gravity_forms`), Ninja Forms' upload add-on (`ninja-forms`), Formidable's upload folder
+  * (`formidable`, which in the free release holds only generated CSS) and the non-form entries are
+  * UNVERIFIED. A directory a plugin lets the site rename (Forminator's custom upload root, a
+  * filtered path) is not found by name, and a site adds its own through
+  * `gmcp_export_private_directories`. The files of a form submission that WordPress knows as
+  * attachments are found by the database instead ({@see self::personal_upload_paths()}), which
+  * does not depend on this list, but only while the attachment's `post_parent` still reaches the
+  * submission: JetFormBuilder, for one, inserts its uploads with a parent of 0.
   */
   const PRIVATE_UPLOAD_DIRS = [
-    'wpforms', 'gravity_forms', 'ninja-forms', 'fluentform', 'wpcf7_uploads', 'flamingo',
-    'formidable', 'forminator', 'wc-logs', 'woocommerce_uploads', 'wpallimport', 'sucuri',
+    'wpforms', 'wpcf7_uploads', 'fluentform', 'ninja-forms-tmp', 'nf-field-exports', 'ninja-forms',
+    'everest_forms_uploads', 'everes-froms-entries-csv-file', 'evf-logs', 'forminator', 'forminator_temp',
+    'jet-form-builder', 'cfdb7_uploads', 'gravity_forms', 'formidable',
+    'wc-logs', 'woocommerce_uploads', 'wpallimport', 'sucuri',
     'updraft', 'backuply', 'ai1wm-backups', 'backwpup', 'wpvividbackups', 'backup', 'backups',
     'logs', 'private',
   ];
@@ -228,6 +254,7 @@ class GMCP_Tools_Export {
       // listing every included path would be a larger reconnaissance surface and a larger
       // audit row than the answer needs.
       unset( $scan['files'], $scan['directories'] );
+      self::remember_summary( $scan );
       return $this->json( $r, $scan );
     }
 
@@ -803,6 +830,72 @@ class GMCP_Tools_Export {
     ];
   }
 
+  /**
+  * Keep what a manifest said, keyed by its digest, for the screen where a person approves the pull.
+  *
+  * The approval record holds the call's arguments, and a pull's arguments are a root, a path, a mode
+  * and a digest: nothing that says how many files that is, how large, or how much was withheld, so
+  * a person approved "this directory as it was when the agent read it" without being told what it
+  * held. The numbers come from the server's own walk (not from anything the caller sent) and are
+  * bound to the digest, which covers the root, the path, every included file's name, size and
+  * contents and every exclusion; the pull refuses a tree that no longer hashes to it. They are kept
+  * as a transient whose name begins with the plugin's prefix, which the option tools refuse to read
+  * or list, and no tool reads the approval queue, so the agent that asks for the pull cannot read
+  * the summary back or edit it. No file name is stored, only counts.
+  */
+  private static function remember_summary( array $scan ): void {
+    $digest = (string) ( $scan['manifest_digest'] ?? '' );
+    if ( !preg_match( '/^[0-9a-f]{64}$/', $digest ) ) {
+      return;
+    }
+    set_transient( self::SUMMARY_PREFIX . substr( $digest, 0, 40 ), [
+      'digest' => $digest,
+      'root' => (string) ( $scan['root'] ?? '' ),
+      'path' => (string) ( $scan['path'] ?? '' ),
+      'files' => (int) ( $scan['file_count'] ?? 0 ),
+      'bytes' => (int) ( $scan['total_bytes'] ?? 0 ),
+      'withheld' => (int) ( $scan['excluded_count'] ?? 0 ),
+      'by_reason' => array_map( 'intval', (array) ( $scan['excluded_by_reason'] ?? [] ) ),
+      'at' => time(),
+    ], self::SUMMARY_TTL );
+  }
+
+  /**
+  * The sentence the Approvals screen prints above an export request's arguments: what the archive
+  * will hold according to the manifest whose digest the call names, or the plain statement that no
+  * summary is on record. Plain text; the caller escapes it. Null for a call that is not a pull.
+  *
+  * @param string $args_view The stored, canonical text of the call's arguments.
+  */
+  public static function approval_summary( string $args_view ): ?string {
+    $args = json_decode( $args_view, true );
+    if ( !is_array( $args ) || ( $args['mode'] ?? '' ) !== 'pull' ) {
+      return null;
+    }
+    $digest = isset( $args['manifest_digest'] ) && is_string( $args['manifest_digest'] ) ? strtolower( trim( $args['manifest_digest'] ) ) : '';
+    $row = preg_match( '/^[0-9a-f]{64}$/', $digest ) ? get_transient( self::SUMMARY_PREFIX . substr( $digest, 0, 40 ) ) : false;
+    // The digest covers the root and the path, so a row stored under it describes this call's tree.
+    if ( !is_array( $row ) || ( $row['digest'] ?? '' ) !== $digest ) {
+      return __( 'This screen has no summary for the manifest this request names (it was read more than two hours ago, or the digest did not come from a manifest read on this site). How many files this covers and what is withheld is not shown here; decline it unless you read the manifest yourself. The pull will still refuse a tree that no longer matches the digest.', 'guarded-mcp' );
+    }
+    $by = [];
+    foreach ( (array) $row['by_reason'] as $reason => $n ) {
+      $by[] = $reason . ' ' . (int) $n;
+    }
+    return sprintf(
+      /* translators: 1: root, 2: path, 3: file count, 4: size, 5: withheld count, 6: reasons, 7: age, 8: digest start. */
+      __( 'This pull archives %1$s/%2$s: %3$d files, %4$s. %5$d entries are withheld and not in the archive%6$s. Counted by the server %7$s ago, for digest %8$s; the pull refuses a tree that no longer hashes to it.', 'guarded-mcp' ),
+      (string) $row['root'],
+      (string) $row['path'] === '' ? '(whole root)' : (string) $row['path'],
+      (int) $row['files'],
+      self::bytes_label( (int) $row['bytes'] ),
+      (int) $row['withheld'],
+      $by ? ' (' . implode( ', ', $by ) . ')' : '',
+      human_time_diff( (int) $row['at'], time() ),
+      substr( $digest, 0, 12 ) . '…'
+    );
+  }
+
   private static function bytes_label( int $bytes ): string {
     if ( $bytes >= MB_IN_BYTES ) {
       return round( $bytes / MB_IN_BYTES, 1 ) . ' MiB';
@@ -844,7 +937,9 @@ class GMCP_Tools_Export {
     if ( preg_match( '//u', $name ) !== 1 || preg_match( '/[\x{0}-\x{1F}\x{7F}\\\\\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2066}-\x{2069}\x{FEFF}]/u', $name ) === 1 ) {
       return 'unsafe_name';
     }
-    $lower = strtolower( $name );
+    // Both readings: the name as typed (so `...` stays hidden by `.*` although it normalises to
+    // nothing) and the name as it is taken for.
+    $reads = array_values( array_unique( [ strtolower( $name ), self::match_name( $name ) ] ) );
     static $patterns = null;
     if ( $patterns === null ) {
       $globs = array_merge( self::PRIVATE_NAME_GLOBS, array_map( 'strtolower', array_map( 'strval', (array) apply_filters( 'gmcp_export_private_names', [] ) ) ) );
@@ -853,29 +948,64 @@ class GMCP_Tools_Export {
         $patterns[] = '/^' . str_replace( '\\*', '.*', preg_quote( $glob, '/' ) ) . '$/s';
       }
     }
-    foreach ( $patterns as $re ) {
-      if ( preg_match( $re, $lower ) === 1 ) {
+    foreach ( $reads as $lower ) {
+      foreach ( $patterns as $re ) {
+        if ( preg_match( $re, $lower ) === 1 ) {
+          return 'private_name';
+        }
+      }
+      if ( !$is_dir && preg_match( '/(backup|dump|snapshot).*\.(zip|gz|tgz|tar|bz2|xz|7z|rar)$/', $lower ) === 1 ) {
         return 'private_name';
       }
-    }
-    if ( !$is_dir && preg_match( '/(backup|dump|snapshot).*\.(zip|gz|tgz|tar|bz2|xz|7z|rar)$/', $lower ) === 1 ) {
-      return 'private_name';
     }
     if ( $is_dir && $root_key === 'uploads' ) {
       static $dirs = null;
       if ( $dirs === null ) {
         $dirs = array_merge( self::PRIVATE_UPLOAD_DIRS, array_map( 'strtolower', array_map( 'strval', (array) apply_filters( 'gmcp_export_private_directories', [] ) ) ) );
       }
-      if ( in_array( $lower, $dirs, true ) ) {
-        return 'private_name';
-      }
-      foreach ( self::PRIVATE_UPLOAD_DIR_PREFIXES as $prefix ) {
-        if ( strpos( $lower, $prefix ) === 0 ) {
+      foreach ( $reads as $lower ) {
+        if ( in_array( $lower, $dirs, true ) ) {
           return 'private_name';
+        }
+        foreach ( self::PRIVATE_UPLOAD_DIR_PREFIXES as $prefix ) {
+          if ( strpos( $lower, $prefix ) === 0 ) {
+            return 'private_name';
+          }
         }
       }
     }
     return '';
+  }
+
+  /**
+  * A file name as the private-name rules should read it: the name a person, a web server or an
+  * operating system would take it for.
+  *
+  * NFKC where the intl extension exists (full-width letters and the Kelvin sign become the plain
+  * ones; without intl the full-width ASCII block is mapped by hand), every format character
+  * removed (a soft hyphen or word joiner inside `.env` leaves it `.env`), then trailing dots and
+  * any kind of space or control character removed, and leading ones too (Windows drops a
+  * trailing dot or space when it creates a file, so `server.key.` is `server.key` there, and a
+  * leading no-break space before `.env` is a thin disguise), then case folded. The archive entry
+  * keeps the real name; this is for matching only.
+  */
+  private static function match_name( string $name ): string {
+    $n = $name;
+    if ( class_exists( 'Normalizer' ) ) {
+      $folded = \Normalizer::normalize( $n, \Normalizer::FORM_KC );
+      if ( is_string( $folded ) ) {
+        $n = $folded;
+      }
+    }
+    else {
+      $n = (string) preg_replace_callback( '/[\x{FF01}-\x{FF5E}]/u', static function ( $m ) {
+        return chr( mb_ord( $m[0], 'UTF-8' ) - 0xFEE0 );
+      }, $n );
+    }
+    $n = (string) preg_replace( '/[\p{Cf}]/u', '', $n );
+    $n = (string) preg_replace( '/^[\s\p{Z}\p{Cc}]+/u', '', $n );
+    $n = (string) preg_replace( '/[\s\p{Z}\p{Cc}.]+$/u', '', $n );
+    return function_exists( 'mb_strtolower' ) ? mb_strtolower( $n, 'UTF-8' ) : strtolower( $n );
   }
 
   /** A path as the comparison below wants it: lower case, NFC where the intl extension exists. */
@@ -1265,6 +1395,40 @@ class GMCP_Tools_Export {
       return [ 'error' => 'That archive is no longer available.', 'status' => 403 ];
     }
     return [ 'path' => $path, 'filename' => (string) $data['filename'] ];
+  }
+
+  /**
+  * Look at a token without spending it: what a HEAD request is answered from.
+  *
+  * A link previewer, a mail scanner or a chat client's unfurler sends HEAD (or GET, which this
+  * cannot tell from a person) to a URL it was shown, and WordPress routes HEAD to the GET
+  * handler. When that handler spent the token on the way to answering, the archive was gone
+  * before the person it was minted for had clicked. This checks everything take_token() checks
+  * and changes nothing: no row is deleted and no file is removed, not even an expired one (the
+  * GET that follows, or the sweep, does that).
+  *
+  * @return array{filename:string,size:int}|array{error:string,status:int}
+  */
+  public static function peek_token( string $token ): array {
+    global $wpdb;
+    $invalid = [ 'error' => 'Invalid or expired export token.', 'status' => 403 ];
+    if ( !preg_match( '/^[A-Za-z0-9]{16,128}$/', $token ) ) {
+      return $invalid;
+    }
+    $stored = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", self::TOKEN_OPTION_PREFIX . $token ) );
+    if ( $stored === null ) {
+      return $invalid;
+    }
+    $data = maybe_unserialize( $stored );
+    if ( !is_array( $data ) || empty( $data['path'] ) || empty( $data['filename'] ) || (int) ( $data['expires'] ?? 0 ) < time() ) {
+      return $invalid;
+    }
+    $path = (string) $data['path'];
+    if ( !self::safe_archive_path( $path ) || is_link( $path ) || !is_file( $path ) || !is_readable( $path ) ) {
+      return [ 'error' => 'That archive is no longer available.', 'status' => 403 ];
+    }
+    $size = filesize( $path );
+    return [ 'filename' => (string) $data['filename'], 'size' => $size === false ? 0 : (int) $size ];
   }
 
   /** Drop an unspent token and its file, e.g. because the group has been switched off. */

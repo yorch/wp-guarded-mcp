@@ -186,6 +186,10 @@ class GMCP_Tools_Rest {
     ];
 
     foreach ( $args as $name => $def ) {
+      // A field that carries a page builder's layout is not offered: the tool would refuse it.
+      if ( in_array( strtolower( trim( (string) $name ) ), GMCP_Core::layout_rest_fields(), true ) ) {
+        continue;
+      }
       $property = [];
       foreach ( $allowed_keys as $key ) {
         if ( array_key_exists( $key, $def ) ) {
@@ -424,6 +428,9 @@ class GMCP_Tools_Rest {
     if ( $action === 'create' ) {
       add_action( 'wp_insert_post', $track, 0, 3 );
     }
+    // Every registered REST field is held away from a page builder's layout for this dispatch, and a
+    // field that carries one is removed. @see GMCP_Core::guard_rest_fields()
+    $release_fields = GMCP_Core::guard_rest_fields();
     try {
       $response = $listing
         ? GMCP_Core::with_readable_posts_sql( static function () use ( $request ) {
@@ -451,12 +458,18 @@ class GMCP_Tools_Rest {
         $stuck[] = $new_id;
       }
       $note = $gone ? ' The ' . ( count( $gone ) === 1 ? 'post' : 'posts' ) . ' this call had already inserted (#' . implode( ', #', $gone ) . ') ' . ( count( $gone ) === 1 ? 'was' : 'were' ) . ' removed again, so nothing was created.' : '';
+      if ( $action === 'update' ) {
+        // The controller applies the post's own fields before the registered ones, so a refusal
+        // raised from a field's callback comes after part of the update was stored.
+        $note .= ' The other fields of this call may already have been applied: read the post to see what it holds.';
+      }
       if ( $stuck ) {
         $note .= ' Could not remove #' . implode( ', #', $stuck ) . ', which this call had already inserted: delete it with wp_delete_post.';
       }
       return $this->error( $id, $refusal->getMessage() . $note, 'gmcp_refused' );
     }
     finally {
+      $release_fields();
       if ( $action === 'create' ) {
         remove_action( 'wp_insert_post', $track, 0 );
       }
