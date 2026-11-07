@@ -43,27 +43,34 @@ if ( !defined( 'ABSPATH' ) ) {
 *      the pull recomputes the manifest and refuses if the present digest is not the one passed.
 *      An agent cannot be approved for one set of tables and then dump another.
 *
-* WHAT BUILDS IT, AND WHAT IT SAYS ABOUT ITSELF. A maintained dump utility is preferred, at a
-* pinned absolute path ({@see self::UTILITY_PATHS}), because a hand-written dumper is a worse
-* dumper: it will be missing something. It is run with an argv ARRAY through proc_open — never a
-* command string — with no flag the caller can influence, and its credentials go through a private
-* `--defaults-extra-file` at mode 0600 rather than argv or an environment variable. Where no such
-* utility exists at a pinned path (a container built without the client tools has neither), the
-* fallback in {@see self::php_dump()} writes the same artifact from `SHOW CREATE TABLE` and
-* retrieved rows. That is a visible downgrade, not a silent one: the manifest names the engine a
-* pull would use (`dump_engine`), the pull's reply names the engine that ran, and
-* docs/guardrails.md says what the fallback does not write (triggers, routines, events, views).
+* WHAT BUILDS IT, AND WHY THERE IS NO FALLBACK. A maintained dump utility is REQUIRED, at a pinned
+* absolute path ({@see self::UTILITY_PATHS}), and it is run with an argv ARRAY through proc_open —
+* never a command string — with no flag the caller can influence, and its credentials go through a
+* private `--defaults-extra-file` at mode 0600 rather than argv or an environment variable. Where no
+* such utility is present, the MANIFEST refuses and no pull can be requested: a faithful, restorable
+* dump needs a dumper somebody maintains. This plugin used to hand-write one as a fallback and no
+* longer does, because a hand-written dumper cannot promise a restorable snapshot — a failed
+* `$wpdb` query returns an empty array that reads as the end of a table while its own completion
+* trailer is still written, generated columns land in INSERT column lists, `_real_escape` is not a
+* literal-quoting function, and paginating with `LIMIT/OFFSET` is neither a snapshot nor stable. A
+* downgrade nobody can measure is worse than a refusal a person can act on, so the refusal names
+* what has to be installed.
 *
-* A PARTIAL FILE IS NEVER A SUCCESS. After the dump the artifact is read back through gzip, and it
-* must be non-empty, must decompress, must hold a `CREATE TABLE` for every table in the approved
-* list, and must end with the dump tool's own `-- Dump completed` trailer. Any of those failing
-* means nothing is kept and the reply says the dump was not built.
+* A PARTIAL FILE IS NEVER A SUCCESS, AND THE CHECK IS PER STATEMENT. After the dump the artifact is
+* read back through gzip, and it must be non-empty, must decompress, must hold a line that BEGINS
+* with `CREATE TABLE ` + the quoted name of every table in the approved list, and must END with the
+* dump tool's own `-- Dump completed` trailer on its last line. Both markers are anchored: the same
+* twelve characters occur inside row data and inside comments, and a trailer that merely appears
+* somewhere near the end is the shape a half-written file has. Any of those failing means nothing is
+* kept and the reply says the dump was not built.
 *
 * WHERE IT SITS. The artifact is a temporary file outside every web-served root (the same
 * {@see GMCP_Tools_Export::temp_dir()} answer the archive uses), mode 0600, streamed once by the
 * REST endpoint in server.php and removed after it is sent, on expiry, and on every failure path —
-* a shutdown callback is registered before a byte is written, because the PHP time limit on a large
-* dump ends the request where none of the unlinks below run.
+* a shutdown callback is registered before a byte is written, and it covers the 0600 defaults file
+* holding the database credentials and the running child process as well as the artifact, because
+* the PHP time limit on a large dump, and a fatal, end the request where none of the unlinks below
+* run. It stays armed until the token row exists; before that the file has no owner at all.
 *
 * WHAT IT INCLUDES, BY THE OWNER'S DECISION. The dump includes this plugin's own activity log
 * (`*_gmcp_audit`) and the approval queue (`*_gmcp_approvals`). That is a named exception to two
@@ -104,9 +111,13 @@ class GMCP_Tools_Db_Dump {
   */
   const MAX_TABLES = 2000;
 
-  /** Rows per INSERT statement and rows held in memory at once, in the PHP fallback. */
-  const ROWS_PER_STATEMENT = 200;
-  const READ_BATCH = 500;
+  /**
+  * How much of any one line the completeness check keeps.
+  *
+  * Both markers it looks for are anchored at the START of a line, so the tail of a line is never
+  * needed, and an INSERT holding a megabyte of row data costs nothing to skip.
+  */
+  const MAX_LINE_PREFIX = 1024;
 
   /** How long the dump utility may run before it is killed and the pull refuses. */
   const DUMP_TIMEOUT = 300;
@@ -123,11 +134,10 @@ class GMCP_Tools_Db_Dump {
   */
   const UTILITY_PATHS = [ '/usr/bin/mariadb-dump', '/usr/bin/mysqldump' ];
 
-  /** The last line a successful dump writes. Its presence is the completeness check. */
+  /** The last line a successful dump writes, and the only value `dump_engine` can take. */
   const TRAILER = '-- Dump completed';
 
   const ENGINE_UTILITY = 'mariadb-dump/mysqldump (pinned path)';
-  const ENGINE_PHP = 'php-fallback';
 
   public function __construct() {
     add_filter( 'gmcp_tools', [ $this, 'register_tools' ] );
@@ -159,7 +169,7 @@ class GMCP_Tools_Db_Dump {
     return [
       'wp_db_dump_request' => [
         'name' => 'wp_db_dump_request',
-        'description' => 'Inspect this site\'s database as a manifest, or dump it to one gzipped file that only a person can approve. scope=site (the default) is the current site\'s own tables; scope=network is every table named with the install\'s base prefix, which on a multisite is all blogs plus the network rows; scope=database is every base table in the configured database, including tables that are not WordPress\'s. mode=manifest (the default) returns the table count, the exact table list, a row count ESTIMATE per table (SHOW TABLE STATUS statistics, not a count of rows), the total size, and a manifest_digest. It returns no rows, no credentials and no SQL. mode=pull takes the manifest_digest from a manifest for the same scope: it recomputes the manifest and refuses if the set of tables changed, then asks a signed-in administrator to approve THIS exact call on the Approvals screen. Until that person approves it, nothing is dumped and no token exists. The dump is built by a maintained dump utility at a pinned absolute path where the server has one, and otherwise by a PHP fallback that writes table structure and rows only; which one ran is named in the reply. It is checked for completeness (it must decompress, hold a CREATE TABLE for every approved table and end with a dump-completed trailer) and a partial dump is never reported as success. After approval, repeat the identical call and it returns a one-time URL, valid for five minutes, that streams the .sql.gz. The file is never returned in a tool reply, because replies are copied into the audit log. The dump includes every table in scope, which means this plugin\'s own activity log and approval queue are in it: that is a deliberate, documented exception. The pull leg always needs human approval, whatever the site\'s approval mode is set to. Admin level.',
+        'description' => 'Inspect this site\'s database as a manifest, or dump it to one gzipped file that only a person can approve. scope=site (the default) is the current site\'s own tables; scope=network is every table named with the install\'s base prefix, which on a multisite is all blogs plus the network rows; scope=database is every base table in the configured database, including tables that are not WordPress\'s. mode=manifest (the default) returns the table count, the exact table list, a row count ESTIMATE per table (SHOW TABLE STATUS statistics, not a count of rows), the total size, and a manifest_digest. It returns no rows, no credentials and no SQL. mode=pull takes the manifest_digest from a manifest for the same scope: it recomputes the manifest and refuses if the set of tables changed, then asks a signed-in administrator to approve THIS exact call on the Approvals screen. Until that person approves it, nothing is dumped and no token exists. The dump is built by a maintained dump utility, mariadb-dump or mysqldump, at a pinned absolute path; where the server has neither, this tool refuses and says so, because a faithful, restorable dump needs a dumper somebody maintains and this plugin does not hand-write one. It is checked statement by statement (it must decompress, must BEGIN a line with a CREATE TABLE for every approved table, and must END with a dump-completed trailer on its last line) and a partial dump is never reported as success. After approval, repeat the identical call and it returns a one-time URL, valid for five minutes, that streams the .sql.gz. The file is never returned in a tool reply, because replies are copied into the audit log. The dump includes every table in scope, which means this plugin\'s own activity log and approval queue are in it: that is a deliberate, documented exception. The pull leg always needs human approval, whatever the site\'s approval mode is set to. Admin level.',
         'inputSchema' => [
           'type' => 'object',
           'properties' => [
@@ -209,6 +219,14 @@ class GMCP_Tools_Db_Dump {
     self::cleanup_expired();
 
     $manifest = self::manifest( $scope );
+    // BOTH modes answer a refused manifest with the refusal itself. Without this, a pull received
+    // the refused array and compared the caller's digest against a key that is not in it, so it
+    // was refused for "the tables changed" when the real reason was that there is no dump utility
+    // — sending the caller to re-run a manifest that will refuse again. The reason has to be the
+    // reason.
+    if ( !empty( $manifest['refused'] ) ) {
+      return $this->error( $r, (string) ( $manifest['message'] ?? 'A database dump is not available on this site.' ) );
+    }
     if ( isset( $manifest['refused'] ) ) {
       return $this->error( $r, $manifest['message'] );
     }
@@ -223,10 +241,18 @@ class GMCP_Tools_Db_Dump {
   /**
   * Describe the tables a scope covers, without reading a row.
   *
+  * The engine is resolved FIRST, and a server without one is refused here rather than at the pull:
+  * the manifest is what a person approves, and it has no honest `dump_engine` value to show or to
+  * approve when there is nothing on the server that could write one.
+  *
   * @return array{refused:true,message:string}|array The manifest, or the refusal to return.
   */
   public static function manifest( string $scope ): array {
     global $wpdb;
+    $engine = self::engine();
+    if ( isset( $engine['refused'] ) ) {
+      return [ 'refused' => true, 'message' => (string) $engine['message'] ];
+    }
     $suppressed = $wpdb->suppress_errors( true );
     try {
       $names = self::table_names( $scope );
@@ -263,7 +289,6 @@ class GMCP_Tools_Db_Dump {
     }
 
     $digest = self::digest( $scope, $names );
-    $engine = self::engine();
 
     return [
       'scope' => $scope,
@@ -274,8 +299,8 @@ class GMCP_Tools_Db_Dump {
       'row_counts_are_estimates' => true,
       'manifest_digest' => $digest,
       'digest_covers' => 'the scope and the sorted table names. The row counts and sizes are NOT in the digest: they are estimates that move on ordinary writes, so a digest built from them would stop matching while a person was reading the approval screen.',
-      'dump_engine' => $engine,
-      'note' => 'A manifest is a table list and estimates, never a row. A dump includes every table in scope, which means this plugin\'s own activity log and its approval queue are in it — a documented and deliberate exception to the rule that no tool exports the log or reads the queue. The row figures are the statistics SHOW TABLE STATUS reports, not a count of rows.',
+      'dump_engine' => (string) $engine['engine'],
+      'note' => 'A manifest is a table list and estimates, never a row. A dump includes every table in scope, which means this plugin\'s own activity log and its approval queue are in it — a documented and deliberate exception to the rule that no tool exports the log or reads the queue. The row figures are the statistics SHOW TABLE STATUS reports, not a count of rows. The dump requires a maintained dump utility on the server (mariadb-dump or mysqldump at a pinned path); where none is installed this manifest is refused instead of describing tables nothing here could dump faithfully.',
     ];
   }
 
@@ -460,8 +485,8 @@ class GMCP_Tools_Db_Dump {
       self::unlink_dump( (string) $built['path'] );
       return $this->error( $r, 'The one-time token could not be stored, so the dump was removed and no URL was issued.' );
     }
-    // The file now has an owner: the row above. The shutdown callback that removes it on any
-    // failure path is disarmed by this call.
+    // The file has an owner at last: the row above. Until this line the artifact had none, so the
+    // shutdown cleanup stayed armed through build(), gzip and this add_option().
     self::disarm_shutdown();
     wp_schedule_single_event( time() + self::TOKEN_TTL + MINUTE_IN_SECONDS, self::CRON_HOOK );
 
@@ -484,6 +509,10 @@ class GMCP_Tools_Db_Dump {
   /**
   * Build the artifact: dump, gzip, verify, and hand back the path of something proven whole.
   *
+  * The cleanup is armed at the first temporary file and is NOT disarmed here: a request that dies
+  * between this return and the token row's `add_option()` would otherwise leave a copy of the
+  * database in the temporary directory with nothing that owns it. {@see self::pull()} disarms it.
+  *
   * @param string[] $names The approved table list, in the manifest's order.
   * @return array{path:string,bytes:int,engine:string}|array{error:string}
   */
@@ -492,32 +521,19 @@ class GMCP_Tools_Db_Dump {
     if ( $dir === null ) {
       return [ 'error' => 'No writable temporary directory outside the web root was found, so a dump was not built. The manifest is still available.' ];
     }
+    $engine = self::engine();
+    if ( isset( $engine['refused'] ) ) {
+      return [ 'error' => (string) $engine['message'] ];
+    }
     $plain = tempnam( $dir, self::TEMP_PREFIX );
     if ( $plain === false ) {
       return [ 'error' => 'A temporary file could not be created outside the web root, so a dump was not built. The manifest is still available.' ];
     }
     @chmod( $plain, 0600 );
+    self::track_pending( $plain );
     $gzipped = null;
-    $keep = false;
-    // Until the token row exists the artifact has no owner, and a request that dies here (the PHP
-    // time limit on a large dump, an out-of-memory fatal, a client that went away) ran none of the
-    // unlinks below. A shutdown callback runs on every one of those ends.
-    self::arm_shutdown( static function () use ( &$plain, &$gzipped, &$keep ) {
-      if ( $keep ) {
-        return;
-      }
-      if ( is_string( $plain ) ) {
-        GMCP_Tools_Db_Dump::unlink_dump( $plain );
-      }
-      if ( is_string( $gzipped ) ) {
-        GMCP_Tools_Db_Dump::unlink_dump( $gzipped );
-      }
-    } );
 
-    $engine = self::engine();
-    $failure = $engine === self::ENGINE_PHP
-      ? self::php_dump( $plain, $scope, $names )
-      : self::utility_dump( $plain, $names );
+    $failure = self::utility_dump( (string) $engine['binary'], $plain, $names );
     if ( is_string( $failure ) ) {
       self::unlink_dump( $plain );
       self::disarm_shutdown();
@@ -531,12 +547,11 @@ class GMCP_Tools_Db_Dump {
       return [ 'error' => 'A temporary file could not be created for the compressed dump, so a dump was not built.' ];
     }
     @chmod( $gzipped, 0600 );
+    self::track_pending( $gzipped );
     $compress = self::gzip_file( $plain, $gzipped );
     self::unlink_dump( $plain );
-    $plain = null;
     if ( $compress !== true ) {
       self::unlink_dump( $gzipped );
-      $gzipped = null;
       self::disarm_shutdown();
       return [ 'error' => 'The dump could not be compressed, so nothing was kept. The site error log has the reason.' ];
     }
@@ -547,38 +562,92 @@ class GMCP_Tools_Db_Dump {
     if ( $problem !== '' ) {
       $size = (int) @filesize( $gzipped );
       self::unlink_dump( $gzipped );
-      $gzipped = null;
       self::disarm_shutdown();
       GMCP_Logging::error( 'Database dump failed its completeness check (' . $problem . '); ' . $size . ' bytes were removed. Tables expected: ' . count( $names ) . '.' );
       return [ 'error' => 'The dump did not pass its completeness check (' . $problem . '), so nothing was kept and no URL was issued. A dump that stops early is not reported as one that succeeded; try again, or narrow the scope.' ];
     }
 
-    $bytes = (int) @filesize( (string) $gzipped );
-    $keep = true;
-    return [ 'path' => (string) $gzipped, 'bytes' => $bytes, 'engine' => $engine ];
+    $bytes = (int) @filesize( $gzipped );
+    return [ 'path' => $gzipped, 'bytes' => $bytes, 'engine' => (string) $engine['engine'] ];
   }
 
-  /** The shutdown callback registered by build(), held so it can be disarmed. */
-  private static $shutdown = null;
+  /**
+  * Files a request may leave behind, keyed by path so one registered twice is removed once.
+  *
+  * @var array<string,bool>
+  */
+  private static $pending = [];
 
-  private static function arm_shutdown( callable $cleanup ): void {
-    self::$shutdown = $cleanup;
+  /** The dump utility while it is running, so a shutdown ends it rather than orphaning it. */
+  private static $pending_process = null;
+
+  /** Whether this request has registered its shutdown callback. One per request is enough. */
+  private static $cleanup_armed = false;
+
+  /**
+  * Register cleanup for a temporary file this request may not survive to remove itself.
+  *
+  * WHAT IT HAS TO COVER. The artifact, the 0600 defaults file holding the database credentials
+  * ({@see self::utility_dump()}) and the running child: a fatal or the PHP time limit ends the
+  * request in the middle of the dump, where no `finally` runs at all, and the credential file is as
+  * bad to leave behind as the dump.
+  *
+  * WHEN IT ENDS. Not here, and not when the artifact is proven whole: only once the token row
+  * exists and therefore owns the file ({@see self::disarm_shutdown()}). Between those points the
+  * temporary directory holds a copy of the database that nothing points at.
+  */
+  private static function track_pending( string $path ): void {
+    self::$pending[ $path ] = true;
+    self::arm_shutdown();
+  }
+
+  /** Remember the child that has just started, so a shutdown can stop it. */
+  private static function track_process( $process ): void {
+    self::$pending_process = $process;
+    self::arm_shutdown();
+  }
+
+  private static function arm_shutdown(): void {
+    if ( self::$cleanup_armed ) {
+      return;
+    }
+    self::$cleanup_armed = true;
     register_shutdown_function( static function () {
-      if ( is_callable( GMCP_Tools_Db_Dump::$shutdown ) ) {
-        call_user_func( GMCP_Tools_Db_Dump::$shutdown );
-      }
+      GMCP_Tools_Db_Dump::run_shutdown_cleanup();
     } );
   }
 
   /**
-  * Disarm the cleanup registered by build().
+  * What the shutdown callback does: stop the child, remove every pending file.
   *
-  * Called once the token row exists: from then on the row owns the file, and the sweep that removes
-  * an expired row removes its dump with it. The callback itself is not unregistered (PHP has no
-  * way to do that), so the flag it closes over is what makes it do nothing.
+  * Runs on a fatal, on the time limit and on an ordinary end of request, which is the only one of
+  * the three a `finally` covers.
+  */
+  public static function run_shutdown_cleanup(): void {
+    $process = self::$pending_process;
+    self::$pending_process = null;
+    if ( is_resource( $process ) ) {
+      $status = @proc_get_status( $process );
+      if ( is_array( $status ) && !empty( $status['running'] ) ) {
+        @proc_terminate( $process, 9 );
+      }
+    }
+    $paths = array_keys( self::$pending );
+    self::$pending = [];
+    foreach ( $paths as $path ) {
+      self::unlink_dump( $path );
+    }
+  }
+
+  /**
+  * End the cleanup: the token row now owns the artifact.
+  *
+  * Called only after `add_option()` has returned true. The callback itself cannot be unregistered
+  * (PHP has no way to do that), so it is the empty lists that make it do nothing.
   */
   private static function disarm_shutdown(): void {
-    self::$shutdown = null;
+    self::$pending = [];
+    self::$pending_process = null;
   }
 
   /**
@@ -598,16 +667,13 @@ class GMCP_Tools_Db_Dump {
   * /proc, and is what `ps` prints; an environment variable is inherited by anything the dump tool
   * or a hook it runs starts.
   *
-  * @param string   $sql_path Where the SQL goes. Opened here at 0600 and handed to the child as
-  *                           its stdout, so the tool never creates a file with its own umask.
+  * @param string   $binary     The pinned utility to run, as resolved by {@see self::engine()}.
+  * @param string   $sql_path   Where the SQL goes. Opened here at 0600 and handed to the child as
+  *                             its stdout, so the tool never creates a file with its own umask.
   * @param string[] $names
   * @return null|string
   */
-  private static function utility_dump( string $sql_path, array $names ) {
-    $binary = self::utility_binary();
-    if ( $binary === null ) {
-      return 'The dump utility this scope prefers is not present at a pinned path on the server running this plugin, and the fallback was not chosen, so no dump was built.';
-    }
+  private static function utility_dump( string $binary, string $sql_path, array $names ) {
     if ( !defined( 'DB_NAME' ) || !defined( 'DB_USER' ) || !defined( 'DB_HOST' ) ) {
       return 'The database name, user or host is not available to PHP (wp-config.php may be supplying the connection another way), so the dump utility cannot be pointed at this database.';
     }
@@ -626,12 +692,16 @@ class GMCP_Tools_Db_Dump {
       return 'A temporary file for the database credentials could not be created, so no dump was built.';
     }
     @chmod( $credential_file, 0600 );
+    // Tracked like the artifact: it holds the database credentials, and a request that dies during
+    // the dump leaves it at mode 0600 in a world-readable directory.
+    self::track_pending( $credential_file );
     $error_file = tempnam( (string) self::temp_dir(), self::TEMP_PREFIX );
     if ( $error_file === false ) {
       self::unlink_dump( $credential_file );
       return 'A temporary file for the dump tool\'s output could not be created, so no dump was built.';
     }
     @chmod( $error_file, 0600 );
+    self::track_pending( $error_file );
     $handle = @fopen( $sql_path, 'wb' );
     if ( $handle === false ) {
       self::unlink_dump( $credential_file );
@@ -675,6 +745,9 @@ class GMCP_Tools_Db_Dump {
       if ( !is_resource( $process ) ) {
         return 'The dump utility could not be started, so no dump was built.';
       }
+      // Registered while it runs, so a fatal or the time limit stops the child instead of leaving a
+      // dumper writing into a temporary file nobody will ever read.
+      self::track_process( $process );
       $deadline = microtime( true ) + self::DUMP_TIMEOUT;
       while ( true ) {
         $status = proc_get_status( $process );
@@ -700,6 +773,7 @@ class GMCP_Tools_Db_Dump {
       if ( is_resource( $handle ) ) {
         fclose( $handle );
       }
+      self::$pending_process = null;
       self::unlink_dump( $credential_file );
     }
 
@@ -779,181 +853,6 @@ class GMCP_Tools_Db_Dump {
     return null;
   }
 
-  /**
-  * Write the whole dump as SQL, for a server with no dump utility at a pinned path.
-  *
-  * A visible downgrade: the manifest says this is what a pull would use, the reply says it is what
-  * ran, and docs/guardrails.md says what it does not write — triggers, stored routines, events and
-  * views, which `mysqldump`/`mariadb-dump` do write when asked. It writes what a database is made of
-  * otherwise: one `DROP TABLE IF EXISTS` and the table's own `CREATE TABLE` statement, then the rows
-  * as INSERT statements in batches, read a batch at a time so a large table costs memory in
-  * proportion to the batch rather than to the table.
-  *
-  * @param string   $sql_path
-  * @param string   $scope
-  * @param string[] $names
-  * @return null|string Null on success, or the sentence to refuse with.
-  */
-  private static function php_dump( string $sql_path, string $scope, array $names ) {
-    global $wpdb;
-    $out = @fopen( $sql_path, 'wb' );
-    if ( $out === false ) {
-      return 'The dump file could not be opened for writing, so no dump was built.';
-    }
-    @chmod( $sql_path, 0600 );
-    $started = true;
-    try {
-      $started = self::write_all( $out, "-- Guarded MCP database dump\n"
-        . "-- Written by the PHP fallback: no mysqldump or mariadb-dump is present at a pinned path.\n"
-        . '-- scope: ' . $scope . "\n"
-        . '-- tables: ' . count( $names ) . "\n"
-        . '-- date: ' . gmdate( 'c' ) . "\n"
-        . "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\nSET SQL_MODE='NO_AUTO_VALUE_ON_ZERO';\n" );
-      foreach ( $names as $name ) {
-        if ( !$started ) {
-          break;
-        }
-        $started = self::php_dump_table( $out, $name );
-      }
-      if ( $started ) {
-        $started = self::write_all( $out, "SET FOREIGN_KEY_CHECKS=1;\n" . self::TRAILER . ' on ' . gmdate( 'c' ) . "\n" );
-      }
-    }
-    finally {
-      if ( is_resource( $out ) ) {
-        fclose( $out );
-      }
-    }
-    if ( !$started ) {
-      $error = $wpdb->last_error === '' ? 'the output file could not be written' : 'a query failed';
-      if ( $wpdb->last_error !== '' ) {
-        // Same rule as the utility's stderr: the operator gets it, the caller does not.
-        GMCP_Logging::error( 'Database dump (PHP fallback) stopped: ' . GMCP_Core::log_text( (string) $wpdb->last_error ) );
-      }
-      return 'The dump stopped part-way (' . $error . '), so nothing was kept. The site error log has the reason.';
-    }
-    return null;
-  }
-
-  /** One table's structure and rows. False when a query or a write failed. */
-  private static function php_dump_table( $out, string $name ): bool {
-    global $wpdb;
-    $quoted = self::quote_ident( $name );
-    $suppressed = $wpdb->suppress_errors( true );
-    try {
-      $create = $wpdb->get_row( 'SHOW CREATE TABLE ' . $quoted, ARRAY_N );
-      if ( !is_array( $create ) || !isset( $create[1] ) || (string) $create[1] === '' ) {
-        return false;
-      }
-      $columns = $wpdb->get_results( 'SHOW COLUMNS FROM ' . $quoted, ARRAY_A );
-      if ( !is_array( $columns ) ) {
-        return false;
-      }
-      // `SHOW CREATE TABLE` reports an auto-increment value as it stands, which is what makes the
-      // restored table continue where this one left off rather than at 1.
-      $head = "\n--\n-- Table structure for table " . $quoted . "\n--\n"
-        . 'DROP TABLE IF EXISTS ' . $quoted . ";\n"
-        . rtrim( (string) $create[1], ";" ) . ";\n";
-      if ( !self::write_all( $out, $head ) ) {
-        return false;
-      }
-      if ( !$columns ) {
-        return true;
-      }
-      $names = [];
-      $types = [];
-      foreach ( $columns as $column ) {
-        $field = (string) ( $column['Field'] ?? '' );
-        $names[] = self::quote_ident( $field );
-        $types[] = strtolower( (string) ( $column['Type'] ?? '' ) );
-      }
-      $select = implode( ',', $names );
-      $offset = 0;
-      while ( true ) {
-        $rows = $wpdb->get_results(
-          'SELECT ' . $select . ' FROM ' . $quoted . ' LIMIT ' . (int) self::READ_BATCH . ' OFFSET ' . (int) $offset,
-          ARRAY_N
-        );
-        if ( !is_array( $rows ) ) {
-          return false;
-        }
-        if ( $rows === [] ) {
-          return true;
-        }
-        $tuples = [];
-        foreach ( $rows as $row ) {
-          $values = [];
-          foreach ( array_values( $row ) as $index => $value ) {
-            $values[] = self::sql_value( $value, $types[ $index ] ?? '' );
-          }
-          $tuples[] = '(' . implode( ',', $values ) . ')';
-          if ( count( $tuples ) >= self::ROWS_PER_STATEMENT ) {
-            if ( !self::write_all( $out, 'INSERT INTO ' . $quoted . ' (' . $select . ') VALUES ' . implode( ',', $tuples ) . ";\n" ) ) {
-              return false;
-            }
-            $tuples = [];
-          }
-        }
-        if ( $tuples ) {
-          if ( !self::write_all( $out, 'INSERT INTO ' . $quoted . ' (' . $select . ') VALUES ' . implode( ',', $tuples ) . ";\n" ) ) {
-            return false;
-          }
-        }
-        if ( count( $rows ) < self::READ_BATCH ) {
-          return true;
-        }
-        $offset += self::READ_BATCH;
-      }
-    }
-    finally {
-      $wpdb->suppress_errors( $suppressed );
-    }
-  }
-
-  /** A table or column name as SQL: backticks, with an embedded backtick doubled. */
-  private static function quote_ident( string $name ): string {
-    return '`' . str_replace( '`', '``', $name ) . '`';
-  }
-
-  /**
-  * One value as an SQL literal.
-  *
-  * Binary columns are written as hex: a byte string is not text, and a charset conversion on the
-  * way through an INSERT is how a serialized PHP string in a blob comes back a different length.
-  * Numeric columns are written bare so that a decimal keeps its scale. Everything else is a quoted
-  * string escaped by the connection WordPress is already using, so the escaping bits match the
-  * server's own mode.
-  *
-  * @param mixed $value
-  */
-  private static function sql_value( $value, string $type ): string {
-    global $wpdb;
-    if ( $value === null ) {
-      return 'NULL';
-    }
-    if ( strpos( $type, 'blob' ) !== false || strpos( $type, 'binary' ) !== false || strpos( $type, 'bit' ) === 0 ) {
-      return '_binary 0x' . bin2hex( (string) $value );
-    }
-    if ( preg_match( '/^(tinyint|smallint|mediumint|int|integer|bigint|decimal|numeric|float|double|real)/', $type ) && is_numeric( $value ) ) {
-      return (string) $value;
-    }
-    return "'" . $wpdb->_real_escape( (string) $value ) . "'";
-  }
-
-  /** Write a string to a handle, reporting a short write as a failure rather than ignoring it. */
-  private static function write_all( $handle, string $text ): bool {
-    $length = strlen( $text );
-    $written = 0;
-    while ( $written < $length ) {
-      $chunk = @fwrite( $handle, substr( $text, $written, 1048576 ) );
-      if ( $chunk === false || $chunk === 0 ) {
-        return false;
-      }
-      $written += $chunk;
-    }
-    return true;
-  }
-
   /** Copy a file through gzip into another file. True on success. */
   private static function gzip_file( string $source, string $target ) {
     $in = @fopen( $source, 'rb' );
@@ -991,20 +890,29 @@ class GMCP_Tools_Db_Dump {
   }
 
   /**
-  * Read the artifact back and prove it is whole.
+  * Read the artifact back and prove it is whole, statement by statement.
   *
-  * Four questions, and the answer is a sentence naming the one that failed or an empty string:
+  * FOUR QUESTIONS, and the answer is a sentence naming the one that failed or an empty string:
   *
   *   - is there anything in the file at all;
   *   - does it decompress (a truncated gz fails its CRC, which gzread reports);
-  *   - is there a `CREATE TABLE` for EVERY table in the approved list, custom-prefix and all, so a
-  *     dump that stopped after the tenth table cannot pass on the first ten;
-  *   - does it end with the dump tool's own completion trailer, which is the one line a dump that
-  *     was cut off never reaches.
+  *   - does a LINE BEGIN with `CREATE TABLE ` and the quoted name of EVERY table in the approved
+  *     list, custom-prefix and all, so a dump that stopped after the tenth table cannot pass on the
+  *     first ten;
+  *   - is the LAST line of the file the dump tool's own completion trailer, which is the one line a
+  *     dump that was cut off never reaches.
+  *
+  * BOTH MARKERS ARE ANCHORED. `CREATE TABLE ` + a name is twelve characters that occur inside row
+  * data and inside comments: a substring search is satisfied by a post body that quotes the
+  * statement, so a dump with no table in it at all could pass. A trailer that merely appears
+  * somewhere in the last few hundred bytes is satisfied by a dump that wrote its trailer and then
+  * went on writing, which is what a half-flushed stream looks like.
   *
   * Streamed, in one pass, with a fixed buffer: a dump of a real site is larger than a request's
-  * memory, and holding it to count a string is how a check on a large database becomes a fatal.
-  * The scan carries the tail of the previous chunk so a marker split across two chunks is found.
+  * memory, and holding it to count a string is how a check on a large database becomes a fatal. The
+  * beginning of the line being read is carried across chunks, so a statement split between two
+  * reads is still judged at its line start, and only {@see self::MAX_LINE_PREFIX} bytes of any line
+  * are kept, so a megabyte-long INSERT costs nothing.
   *
   * @param string[] $names
   * @return string Empty when the artifact is whole, otherwise what failed.
@@ -1019,7 +927,8 @@ class GMCP_Tools_Db_Dump {
       $expected[ 'CREATE TABLE `' . str_replace( '`', '``', $name ) . '`' ] = $name;
     }
     $found = [];
-    $tail = '';
+    $carry = '';
+    $last = '';
     $bytes = 0;
     $handle = @gzopen( $path, 'rb' );
     if ( $handle === false ) {
@@ -1035,13 +944,16 @@ class GMCP_Tools_Db_Dump {
           break;
         }
         $bytes += strlen( $chunk );
-        $window = $tail . $chunk;
-        foreach ( $expected as $marker => $name ) {
-          if ( !isset( $found[ $name ] ) && strpos( $window, $marker ) !== false ) {
-            $found[ $name ] = true;
-          }
+        // `$carry` holds the beginning of the line still being read, so element 0 of the split is
+        // that line and every element after it begins a line of its own.
+        $lines = explode( "\n", $carry . $chunk );
+        $carry = (string) array_pop( $lines );
+        if ( strlen( $carry ) > self::MAX_LINE_PREFIX ) {
+          $carry = substr( $carry, 0, self::MAX_LINE_PREFIX );
         }
-        $tail = substr( $window, -512 );
+        foreach ( $lines as $line ) {
+          self::judge_line( rtrim( $line, "\r" ), $expected, $found, $last );
+        }
       }
     }
     finally {
@@ -1050,33 +962,66 @@ class GMCP_Tools_Db_Dump {
     if ( $bytes <= 0 ) {
       return 'it is empty once decompressed';
     }
+    // The final line: what is left after the last newline if it holds anything, and otherwise the
+    // last line that did, because a dump ends with a newline.
+    self::judge_line( rtrim( $carry, "\r" ), $expected, $found, $last );
     $missing = count( $expected ) - count( $found );
     if ( $missing > 0 ) {
-      return $missing . ' of ' . count( $expected ) . ' tables have no CREATE TABLE in the file';
+      return $missing . ' of ' . count( $expected ) . ' tables have no CREATE TABLE at the start of a line in the file';
     }
-    if ( strpos( $tail, self::TRAILER ) === false ) {
-      return 'it does not end with a "Dump completed" trailer';
+    if ( strncmp( $last, self::TRAILER, strlen( self::TRAILER ) ) !== 0 ) {
+      return 'its last line is not a "' . self::TRAILER . '" trailer';
     }
     return '';
   }
 
   /**
-  * The engine a pull would use, and whether a maintained utility is reachable.
+  * Judge one line of the artifact: does it open a still-missing table, and does it hold content.
+  *
+  * The marker is compared at the start of the line with strncmp, never with strpos: where it occurs
+  * is the whole point of the check.
+  *
+  * @param string[]            $expected Marker by table name.
+  * @param array<string,true>  $found    Tables already seen, added to.
+  * @param string              $last     The beginning of the last line with content in it, set.
+  */
+  private static function judge_line( string $line, array $expected, array &$found, string &$last ): void {
+    foreach ( $expected as $marker => $name ) {
+      if ( !isset( $found[ $name ] ) && strncmp( $line, $marker, strlen( $marker ) ) === 0 ) {
+        $found[ $name ] = true;
+      }
+    }
+    if ( trim( $line ) !== '' ) {
+      $last = strlen( $line ) > self::MAX_LINE_PREFIX ? substr( $line, 0, self::MAX_LINE_PREFIX ) : $line;
+    }
+  }
+
+  /**
+  * The engine a pull would use, or the sentence that refuses because there is none.
+  *
+  * Asked at MANIFEST time as well as at the pull, so a server that cannot dump faithfully is refused
+  * before anybody is offered a table list to approve. Three ways for there to be no engine, and each
+  * gets its own sentence because the operator's next move is different: the utility is not installed,
+  * or wp-config.php did not define the connection constants, or the host is a form a client tool
+  * cannot take.
   *
   * The label carries no path: an absolute server path in a reply is a filesystem disclosure the
-  * caller did not need, and the person answering the approval is told what ran either way.
+  * caller did not need.
+  *
+  * @return array{engine:string,binary:string}|array{refused:true,message:string}
   */
-  public static function engine(): string {
-    if ( self::utility_binary() === null ) {
-      return self::ENGINE_PHP;
+  private static function engine(): array {
+    $binary = self::utility_binary();
+    if ( $binary === null ) {
+      return [ 'refused' => true, 'message' => 'A database dump needs a maintained dump utility on the server, and neither mariadb-dump nor mysqldump was found at a pinned path, so this call is refused and nothing was dumped. A faithful, restorable dump needs a dumper somebody maintains: this plugin will not hand-write one, because a hand-written dumper silently writes a completion trailer over a dump that stopped early, puts generated columns in INSERT lists, and takes no snapshot, so its artifact looks like a backup and is not one. Install mariadb-client (or mysql-client) on the server that runs WordPress, confirm the binary is at /usr/bin/mariadb-dump or /usr/bin/mysqldump, and call this again.' ];
     }
     if ( !defined( 'DB_NAME' ) || !defined( 'DB_USER' ) || !defined( 'DB_HOST' ) ) {
-      return self::ENGINE_PHP;
+      return [ 'refused' => true, 'message' => 'A dump utility is installed, but the database name, user or host is not available to PHP (wp-config.php may be supplying the connection another way), so the utility cannot be pointed at this database. Nothing was described and nothing will be dumped.' ];
     }
     if ( self::utility_host_parts( (string) DB_HOST ) === null ) {
-      return self::ENGINE_PHP;
+      return [ 'refused' => true, 'message' => 'A dump utility is installed, but the configured database host is a form the utility cannot take (a comma-separated list of hosts), so nothing was described and nothing will be dumped.' ];
     }
-    return self::ENGINE_UTILITY;
+    return [ 'engine' => self::ENGINE_UTILITY, 'binary' => $binary ];
   }
 
   /** The pinned dump utility that exists here, or null. @see self::UTILITY_PATHS */

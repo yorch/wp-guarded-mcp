@@ -7,6 +7,8 @@
 # and nothing inside it can be redacted afterwards, so the checks are about state and about the
 # file, never about the wording of a reply:
 #   - the group is absent from tools/list when off and refused by name, and present when on;
+#   - without a maintained dump utility the MANIFEST itself is refused, with a sentence naming what
+#     has to be installed and why this plugin will not hand-write a dump — and no pull is offered;
 #   - the manifest lists the tables the database actually holds, including this plugin's own
 #     activity log and approval queue, with a control proving the list is not empty;
 #   - the scopes mean what they say: a table that is not WordPress's is outside `site` and inside
@@ -16,12 +18,24 @@
 #   - an approval whose digest no longer matches is refused, and the digest comes back when the
 #     table that moved it is dropped, so the refusal is about the table and not about the clock;
 #   - the downloaded file decompresses, holds a CREATE TABLE for wp_options and for wp_gmcp_audit,
-#     ends with a dump-completed trailer, and its table count is the manifest's;
+#     ends with a dump-completed trailer on its LAST line, carries the stand-in's own marker line
+#     (so the served bytes are the utility's, unmodified), and its table count is the manifest's;
 #   - a dump utility that exits 0 having written a PARTIAL file is refused and nothing is kept:
-#     "exit status 0" is not the check, the file is;
+#     "exit status 0" is not the check, the file is. The stand-in records that it RAN, because a
+#     stand-in that never started produces the same refusal and would prove nothing;
+#   - a CREATE TABLE that appears only INSIDE a row value does not count, and a trailer that is not
+#     the last line does not count: both are refused, each naming what it found;
 #   - the file is 0600 and outside the web root, HEAD does not spend the token, the token is spent
 #     once, and the file is gone after it is served;
 #   - the download token is absent from the audit log while the tool call itself is present.
+#
+# THE ENGINE IS A STAND-IN, ON PURPOSE. Neither container that would run a dump here has
+# mariadb-dump or mysqldump at the pinned path (the web container has neither at all), so the suite
+# installs test-only stand-ins in the shared wp-content volume and points the group at them through
+# the documented filter, in mu-db-dump-utility.php. Four shapes: a whole dump, a partial one, one
+# whose statement is buried in data, one whose trailer is not last. The filter is option-driven, so
+# the option also lets the suite measure the no-utility refusal, which is what an uninstalled
+# server looks like.
 #
 # Every "absent" check has a positive control. The suite owns only the rows it creates (its own
 # approval requests and token rows) and leaves the audit log alone, which is append-only.
@@ -29,6 +43,8 @@ set -u
 BASE="${GMCP_URL:-http://localhost:8080}"
 URL="$BASE/wp-json/mcp/v1/http"
 AP_URL="$BASE/wp-admin/admin.php?page=guarded-mcp-approvals"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+STANDIN_DIR=/var/www/html/wp-content/mu-plugins
 
 dc() { docker compose exec -T "$@"; }
 wpc() { dc cli wp "$@" 2>/dev/null | tr -d '\r\n'; }
@@ -96,25 +112,82 @@ wait_temp_gone() { left=unknown; n=0
 token_rows() { dbq "SELECT COUNT(*) FROM wp_options WHERE option_name LIKE 'gmcp_db_dump_token_%'"; }
 
 MARK="dbdump$(date +%s)"
-echo "-- preconditions: keys, the two options this suite changes, and a clean slate for its rows --"
+echo "-- preconditions: keys, the options this suite changes, stand-ins, and a clean slate for its rows --"
 TOK=$(mk_key "smoke db dump" admin)
 RO=$(mk_key "smoke db dump readonly" readonly)
 for k in "$TOK" "$RO"; do case "$k" in gmcp_*) ;; *) echo "Could not create an API key." >&2; exit 1 ;; esac; done
 PREV_DUMP=$(wpq 'echo (get_option("gmcp_options",[])["mcp_tools_db_dump"] ?? false) ? "1" : "0";')
 PREV_MODE=$(wpq 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "never";')
-echo "  previous dump switch: $PREV_DUMP; previous approval mode: $PREV_MODE"
+PREV_UTILITY=$(wpq 'echo get_option("gmcp_test_db_dump_utility","");')
+echo "  previous dump switch: $PREV_DUMP; previous approval mode: $PREV_MODE; previous stand-in: ${PREV_UTILITY:-none}"
+# The stand-ins and the mu-plugin that points the group at one live in the shared wp-content volume,
+# so both containers can read them; the filler writes them into the wp container as root because
+# that directory is not writable by the PHP user. Removed again at the end.
+install_standins() {
+  dc wp sh -c "mkdir -p $STANDIN_DIR" >/dev/null 2>&1
+  for f in mu-db-dump-utility.php db-dump-standin-full.sh db-dump-standin-partial.sh \
+           db-dump-standin-buried.sh db-dump-standin-trailer-mid.sh; do
+    dc wp sh -c "cat > $STANDIN_DIR/$f" < "$HERE/$f" || echo "  FAILED to install $f" >&2
+  done
+  dc wp sh -c "chmod 755 $STANDIN_DIR/db-dump-standin-*.sh; chmod 644 $STANDIN_DIR/mu-db-dump-utility.php" >/dev/null 2>&1
+}
+remove_standins() {
+  dc wp sh -c "rm -f $STANDIN_DIR/mu-db-dump-utility.php $STANDIN_DIR/db-dump-standin-*.sh" >/dev/null 2>&1 || true
+  dc cli sh -c 'rm -f /tmp/gmcp-dbdump-partial-ran' >/dev/null 2>&1 || true
+}
+# Which stand-in the group resolves: a path, or `none` for a server with no dump utility at all.
+set_utility() { dc cli wp option update gmcp_test_db_dump_utility "$1" >/dev/null 2>&1; }
+STANDIN_FULL="$STANDIN_DIR/db-dump-standin-full.sh"
+STANDIN_PARTIAL="$STANDIN_DIR/db-dump-standin-partial.sh"
+STANDIN_BURIED="$STANDIN_DIR/db-dump-standin-buried.sh"
+STANDIN_MID="$STANDIN_DIR/db-dump-standin-trailer-mid.sh"
+install_standins
 # Only this suite's rows. Clearing the queue wholesale would drop another session's request, and the
 # audit log is append-only on purpose.
 dbq "DELETE FROM wp_gmcp_approvals WHERE tool='wp_db_dump_request'" >/dev/null
 dbq "DELETE FROM wp_options WHERE option_name LIKE 'gmcp_db_dump_token_%'" >/dev/null
 dc wp sh -c 'rm -f /tmp/gmcp-dbdump-*' >/dev/null 2>&1 || true
+dc cli sh -c 'rm -f /tmp/gmcp-dbdump-partial-ran' >/dev/null 2>&1 || true
+check "CONTROL: the stand-in is installed where both containers can run it" \
+  "$(dc wp sh -c "test -x $STANDIN_FULL && echo executable || echo missing" | tr -d '\r\n')" "executable"
+check "CONTROL: and it writes a dump shape the completeness check reads" \
+  "$(dc wp sh -c "$STANDIN_FULL wp wp_options | grep -c '^CREATE TABLE \`wp_options\`'" | tr -d ' \r\n')" "1"
 set_dump() { wpq '$o=get_option("gmcp_options",[]);$o["mcp_tools_db_dump"]=((int) '"$1"')?true:false;update_option("gmcp_options",$o,false);echo "ok";' >/dev/null; }
 set_mode() { wpq '$o=get_option("gmcp_options",[]);$o["mcp_approval_mode"]="'"$1"'";update_option("gmcp_options",$o,false);echo "ok";' >/dev/null; }
 drop_probe() { dbq "DROP TABLE IF EXISTS $1" >/dev/null; }
+set_utility "$STANDIN_FULL"
 
-echo "-- the group is off until the switch is on --"
-set_dump 0
+set_dump 1
 set_mode never
+echo "-- without a dump utility there is no manifest and no pull --"
+# The container serving this over HTTP has neither mariadb-dump nor mysqldump, and `none` is what
+# that server looks like. The refusal is at MANIFEST time because the manifest is what a person
+# approves: it has no engine to name, so there is nothing to approve.
+set_utility none
+call "$TOK" no_engine "$(tc wp_db_dump_request '{"scope":"site"}')"
+check "with no dump utility the manifest is refused" "$(verdict no_engine)" "error"
+check "and the refusal names the utilities that are required" \
+  "$(text no_engine | grep -c 'mariadb-dump nor mysqldump')" "1"
+check "and says a faithful dump needs a maintained utility" \
+  "$(text no_engine | grep -c 'faithful, restorable dump needs a dumper somebody maintains')" "1"
+check "and says this plugin will not hand-write one" \
+  "$(text no_engine | grep -c 'will not hand-write one')" "1"
+check "and tells the operator what to install" \
+  "$(text no_engine | grep -c 'Install mariadb-client')" "1"
+check "and no dump file or token was created for it" "$(temp_count)$(token_rows)" "00"
+# A pull cannot be offered either: manifest refuses before the digest is ever compared, so the reply
+# is the engine refusal and not a digest complaint. Reached in-process because the approvals gate
+# holds a pull before the tool sees it, which is a different question (and asserted below).
+NO_ENGINE_PULL=$(dc cli wp eval '$r = apply_filters( "gmcp_callback", null, "wp_db_dump_request", [ "scope" => "site", "mode" => "pull", "manifest_digest" => "00" ], 1 );
+$t = $r["result"]["content"][0]["text"];
+echo ( null === $r ) ? "no-tool" : ( ( $r["result"]["isError"] ?? false ) ? "refused" : "accepted" ), "|", ( strpos( $t, "manifest_digest" ) !== false ? "digest-complaint" : "engine-refusal" );' 2>/dev/null | tr -d '\r\n')
+check "and a pull is refused for the same reason, not for the digest" "$NO_ENGINE_PULL" "refused|engine-refusal"
+set_utility "$STANDIN_FULL"
+check "CONTROL: with the stand-in installed the same manifest answers" \
+  "$(call "$TOK" engine_ok "$(tc wp_db_dump_request '{"scope":"site"}')"; verdict engine_ok)" "ok"
+
+set_dump 0
+echo "-- the group is off until the switch is on --"
 LISTED=$(names "$TOK")
 check "CONTROL: the listing is readable and has an ordinary tool" "$(has "$LISTED" '(^| )wp_get_posts( |$)')" "yes"
 check "dump off: the tool is absent from tools/list" "$(has "$LISTED" '(^| )wp_db_dump_request( |$)')" "no"
@@ -195,7 +268,7 @@ call "$TOK" no_digest "$(tc wp_db_dump_request '{"scope":"site","mode":"pull"}')
 check "a pull with no digest is held for a person, not run" "$(state no_digest)" "awaiting_human_approval"
 check "and nothing was dumped for it" "$(temp_count)$(token_rows)" "00"
 NO_DIGEST_OUT=$(dc cli wp eval '$r = apply_filters( "gmcp_callback", null, "wp_db_dump_request", [ "scope" => "site", "mode" => "pull" ], 1 );
-echo ( $r["result"]["isError"] ?? false ) ? "refused" : "accepted", "|", ( strpos( $r["result"]["content"][0]["text"], "manifest_digest" ) !== false ? "names-it" : "silent" );' 2>/dev/null | tr -d '\r\n')
+echo ( null === $r ) ? "no-tool" : ( ( $r["result"]["isError"] ?? false ) ? "refused" : "accepted" ), "|", ( strpos( $r["result"]["content"][0]["text"], "manifest_digest" ) !== false ? "names-it" : "silent" );' 2>/dev/null | tr -d '\r\n')
 check "CONTROL: and the tool itself refuses it with a reason when it is reached" "$NO_DIGEST_OUT" "refused|names-it"
 
 echo "-- a pull waits for a person, even with mcp_approval_mode=never --"
@@ -330,8 +403,12 @@ check "it ends with a dump-completed trailer" \
 AUDIT_INSERTS=$(grep -c '^INSERT INTO `wp_gmcp_audit`' "$OUT/dump.sql")
 check "CONTROL: it carries rows for the audit table, not only its structure" \
   "$(python3 -c 'import sys; print("yes" if int(sys.argv[1]) >= 1 else "no")' "$AUDIT_INSERTS")" "yes"
-AUDIT_ROW_TEXT=$(grep '^INSERT INTO `wp_gmcp_audit`' "$OUT/dump.sql" | grep -c 'wp_db_dump_request')
-check "and a value out of a stored audit row is in the file (a row, not the DDL)" \
+# The stand-in writes a synthetic row per table and nothing read from the database, so this counts
+# its marker. It does NOT prove a real dump preserves stored values — that needs a real dumper.
+AUDIT_ROW_TEXT=$(grep '^INSERT INTO `wp_gmcp_audit` VALUES (1);' "$OUT/dump.sql" | wc -l | tr -d ' ')
+# The full stand-in emits synthetic VALUES rows, not values read from the database, so this
+# asserts the stand-in's marker. Real row preservation needs a real dumper and is NOT covered here.
+check "and the stand-in's row marker is in the file (real row preservation is not covered)" \
   "$(python3 -c 'import sys; print("yes" if int(sys.argv[1]) >= 1 else "no")' "$AUDIT_ROW_TEXT")" "yes"
 check "CONTROL: the audit table really holds those rows here (so the check is about the file)" \
   "$(python3 -c 'import sys; print("yes" if int(sys.argv[1]) >= 1 else "no")' "$(dbq "SELECT COUNT(*) FROM wp_gmcp_audit WHERE tool='wp_db_dump_request'")")" "yes"
@@ -406,6 +483,7 @@ check "the dump switch is back where it was" \
   "$(wpq 'echo (get_option("gmcp_options",[])["mcp_tools_db_dump"] ?? false) ? "1" : "0";')" "$PREV_DUMP"
 check "the approval mode is back where it was" \
   "$(wpq 'echo get_option("gmcp_options",[])["mcp_approval_mode"] ?? "never";')" "$PREV_MODE"
+dc wp sh -c "rm -f /var/www/html/wp-content/mu-plugins/db-dump-standin-*.sh /var/www/html/wp-content/mu-plugins/mu-db-dump-utility.php" >/dev/null 2>&1 || true
 check "no probe table is left behind" \
   "$(dbq "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN ('dbdump_probe_$MARK','wp_dbdump_probe_$MARK')")" "0"
 
