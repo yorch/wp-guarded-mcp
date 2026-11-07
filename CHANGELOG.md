@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/yorch/wp-guarded-mcp/compare/v1.3.1...v1.4.0) (2026-11-07)
+
+
+### Features
+
+* download a copy of the database, behind its own switch ([#58](https://github.com/yorch/wp-guarded-mcp/issues/58)) ([3c17b5b](https://github.com/yorch/wp-guarded-mcp/commit/3c17b5bfe9eaf87942ccbd99199c0210dee0317e))
+
 ## [1.3.1](https://github.com/yorch/wp-guarded-mcp/compare/v1.3.0...v1.3.1) (2026-11-06)
 
 
