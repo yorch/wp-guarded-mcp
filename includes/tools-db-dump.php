@@ -46,7 +46,10 @@ if ( !defined( 'ABSPATH' ) ) {
 * WHAT BUILDS IT, AND WHY THERE IS NO FALLBACK. A maintained dump utility is REQUIRED, at a pinned
 * absolute path ({@see self::UTILITY_PATHS}), and it is run with an argv ARRAY through proc_open —
 * never a command string — with no flag the caller can influence, and its credentials go through a
-* private `--defaults-extra-file` at mode 0600 rather than argv or an environment variable. Where no
+* private `--defaults-file` at mode 0600 rather than argv or an environment variable. `--defaults-file`
+* rather than `--defaults-extra-file`, because the "extra" form still reads the machine's own client
+* configuration: a `no-data` under `[mysqldump]` in /etc/my.cnf would make the utility write schema
+* and no rows, which passes the completeness check below and would then be handed out. Where no
 * such utility is present, the MANIFEST refuses and no pull can be requested: a faithful, restorable
 * dump needs a dumper somebody maintains. This plugin used to hand-write one as a fallback and no
 * longer does, because a hand-written dumper cannot promise a restorable snapshot — a failed
@@ -129,8 +132,8 @@ class GMCP_Tools_Db_Dump {
   * mysqli driver, whose client is the one shipped alongside it. Nothing here searches `PATH` and
   * nothing takes a path from a caller: an argv[0] an agent can choose is a way to run a program of
   * its choosing with the site's database credentials. A site that must move one can filter it
-  * ({@see self::utility_paths()}), and the test suite pins the fallback on a container that has
-  * neither.
+  * ({@see self::utility_paths()}), and the test suite points it at a stand-in on the container that
+  * serves the tool, because that container has neither.
   */
   const UTILITY_PATHS = [ '/usr/bin/mariadb-dump', '/usr/bin/mysqldump' ];
 
@@ -142,6 +145,39 @@ class GMCP_Tools_Db_Dump {
   public function __construct() {
     add_filter( 'gmcp_tools', [ $this, 'register_tools' ] );
     add_filter( 'gmcp_callback', [ $this, 'handle_call' ], 10, 4 );
+    // Asked by the dispatcher BEFORE it enters the approvals queue: a pull this server cannot
+    // carry out is refused there, not queued for a person and refused after they approve it.
+    add_filter( 'gmcp_preflight', [ $this, 'preflight' ], 10, 3 );
+  }
+
+  /**
+  * Refuse a pull the server cannot carry out, before it becomes a request a person has to answer.
+  *
+  * WHY HERE AS WELL AS AT THE MANIFEST. The dispatcher opens the approvals queue before it
+  * dispatches, so without this the no-utility refusal was only reachable AFTER an administrator had
+  * read and approved the request: an approval spent on an operation the machine could never perform,
+  * asked on a screen that gave them no way to know. The answers are the sentences
+  * {@see self::engine()} already produces and the manifest already returns, so a caller is told the
+  * same reason whichever door it came through.
+  *
+  * The manifest leg is not touched: it does not wait for a person, and it refuses on its own.
+  *
+  * @param null|string $prev The refusal another filter already made, or null to leave it open.
+  * @return null|string
+  */
+  public function preflight( $prev, string $tool, array $args ) {
+    if ( $prev !== null && $prev !== '' ) {
+      return $prev;
+    }
+    if ( $tool !== 'wp_db_dump_request' ) {
+      return $prev;
+    }
+    $mode = isset( $args['mode'] ) ? (string) $args['mode'] : 'manifest';
+    if ( $mode !== 'pull' ) {
+      return $prev;
+    }
+    $engine = self::engine();
+    return isset( $engine['refused'] ) ? (string) $engine['message'] : $prev;
   }
 
   /**
@@ -662,10 +698,19 @@ class GMCP_Tools_Db_Dump {
   * that begins with "-" is refused rather than handed to a program that would read it as an
   * option.
   *
-  * CREDENTIALS IN A FILE, NOT IN argv. They go through --defaults-extra-file, mode 0600, created
-  * here and removed in the finally block. argv is readable by every process on the host through
-  * /proc, and is what `ps` prints; an environment variable is inherited by anything the dump tool
-  * or a hook it runs starts.
+  * CREDENTIALS IN A FILE, NOT IN argv. They go through --defaults-file, mode 0600, created here
+  * and removed in the finally block. argv is readable by every process on the host through /proc,
+  * and is what `ps` prints; an environment variable is inherited by anything the dump tool or a
+  * hook it runs starts.
+  *
+  * --defaults-file AND NOT --defaults-extra-file. The client tools read the machine's own option
+  * files (/etc/my.cnf and the directory it includes, ~/.my.cnf) unless the FIRST argument is
+  * --defaults-file, and the "extra" form reads them ON TOP of ours. So with "extra" a site whose
+  * my.cnf says `no-data` gets a schema-only dump, and a schema-only dump passes the completeness
+  * check that is supposed to catch a bad dump (measured with `mariadb-dump` 11.8.9: with a `[mysqldump]
+  * no-data` in /etc/my.cnf.d and --defaults-extra-file the output held its CREATE TABLE and no
+  * INSERT at all, while the same argv with --defaults-file held the rows). Nothing about this
+  * environment can make a caller's flags safer than a file only we wrote.
   *
   * @param string   $binary     The pinned utility to run, as resolved by {@see self::engine()}.
   * @param string   $sql_path   Where the SQL goes. Opened here at 0600 and handed to the child as
@@ -713,8 +758,10 @@ class GMCP_Tools_Db_Dump {
     $argv = array_merge(
       [
         $binary,
-        // FIRST, as the client tool requires, and never anywhere else.
-        '--defaults-extra-file=' . $credential_file,
+        // FIRST, as the client tool requires, and never anywhere else. `--defaults-file` and not
+        // `--defaults-extra-file`: only this form stops the client reading the machine's own
+        // /etc/my.cnf and ~/.my.cnf on top of ours. @see self::utility_dump()
+        '--defaults-file=' . $credential_file,
         '--single-transaction',
         '--skip-lock-tables',
         '--quick',
@@ -798,40 +845,96 @@ class GMCP_Tools_Db_Dump {
   /**
   * Write the private defaults file the dump tool reads its credentials from.
   *
-  * The option-file syntax quotes with double quotes and escapes backslashes and quotes; a password
-  * holding either would otherwise end the value early and put the rest of it into an option the
-  * tool parses as something else.
+  * FAILS CLOSED. If a value cannot be written for the client to read back exactly, this answers
+  * false and the caller refuses with a sentence, rather than handing the utility a file that holds
+  * something other than the site's credentials.
   *
-  * @param array{host:string,socket:string|null} $host_parts
+  * @param array{host:string,port:string|null,socket:string|null} $host_parts
   */
   private static function write_credentials( string $path, array $host_parts ): bool {
-    $quote = static function ( string $value ): string {
-      return '"' . str_replace( [ '\\', '"' ], [ '\\\\', '\\"' ], $value ) . '"';
-    };
-    $lines = [
-      '[client]',
-      'user=' . $quote( (string) DB_USER ),
-      'password=' . $quote( defined( 'DB_PASSWORD' ) ? (string) DB_PASSWORD : '' ),
-      'host=' . $quote( $host_parts['host'] ),
-    ];
-    if ( $host_parts['socket'] !== null ) {
-      $lines[] = 'socket=' . $quote( $host_parts['socket'] );
+    $text = self::credentials_text(
+      $host_parts,
+      (string) DB_USER,
+      defined( 'DB_PASSWORD' ) ? (string) DB_PASSWORD : ''
+    );
+    if ( $text === null ) {
+      return false;
     }
     // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
-    $written = @file_put_contents( $path, implode( "\n", $lines ) . "\n", LOCK_EX );
+    $written = @file_put_contents( $path, $text, LOCK_EX );
     @chmod( $path, 0600 );
     return is_int( $written ) && $written > 0;
+  }
+
+  /**
+  * The contents of the private defaults file, or null when a value cannot be expressed in it.
+  *
+  * ONE VALUE PER LINE, one host and at most one port or socket, which is the whole of what the
+  * client tool reads: a `host:port` in DB_HOST is two keys here, and `host:/path/to.sock` is a host
+  * and a socket, because the client parses neither form from a single value.
+  *
+  * @param array{host:string,port:string|null,socket:string|null} $host_parts
+  */
+  private static function credentials_text( array $host_parts, string $user, string $password ): ?string {
+    $pairs = [
+      'user' => $user,
+      'password' => $password,
+      'host' => $host_parts['host'],
+    ];
+    if ( $host_parts['port'] !== null ) {
+      $pairs['port'] = $host_parts['port'];
+    }
+    if ( $host_parts['socket'] !== null ) {
+      $pairs['socket'] = $host_parts['socket'];
+    }
+    $lines = [ '[client]' ];
+    foreach ( $pairs as $key => $value ) {
+      $quoted = self::option_value( (string) $value );
+      if ( $quoted === null ) {
+        return null;
+      }
+      $lines[] = $key . '=' . $quoted;
+    }
+    return implode( "\n", $lines ) . "\n";
+  }
+
+  /**
+  * One value of the defaults file, double-quoted and escaped as the client's option parser reads it.
+  *
+  * AN OPTION FILE IS NEITHER SHELL NOR SQL, so it has its own two rules and its own escapes. A
+  * double-quoted value runs to its closing quote, `\\` and `\"` are the two characters that would
+  * otherwise end it early, and the client recognizes `\n`, `\r` and `\t` inside the quotes. A
+  * newline left literal ENDS THE LINE: the rest of the password became a line of its own, which the
+  * client read as an option — measured on mariadb 11.8's client with a password holding one, which
+  * answered `unknown option '--cd"'` — and a valid multi-line password would therefore break every
+  * dump on the site instead of being used.
+  *
+  * Null for a value holding a control character the client has no escape for, so the caller refuses
+  * rather than write a file it cannot prove means what the site's credentials are.
+  */
+  private static function option_value( string $value ): ?string {
+    if ( preg_match( '/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/', $value ) ) {
+      return null;
+    }
+    $escaped = str_replace(
+      [ '\\', '"', "\n", "\r", "\t" ],
+      [ '\\\\', '\\"', '\\n', '\\r', '\\t' ],
+      $value
+    );
+    return '"' . $escaped . '"';
   }
 
   /**
   * DB_HOST as the client tool wants it, or null when it is a form it cannot take.
   *
   * wpdb accepts "host", "host:port", "host:/path/to.sock" and a comma-separated list of hosts with
-  * DB_HOST_ADDRESSES. An option file holds one host and one socket, so the list form is refused
-  * here and the caller falls back to the PHP dumper, which uses wpdb's own connection and needs no
-  * parsing at all.
+  * DB_HOST_ADDRESSES. The option file takes one host, one port and one socket as separate keys, and
+  * the client does not parse a port back out of the host value it is given, so "host:port" is split
+  * here: writing it whole as `host="db:3307"` names a host called `db:3307`, which does not resolve,
+  * and the dump fails on a site whose database is configured that way. The comma-separated list form
+  * is refused because it has no single-host equivalent here.
   *
-  * @return array{host:string,socket:string|null}|null
+  * @return array{host:string,port:string|null,socket:string|null}|null
   */
   private static function utility_host_parts( string $db_host ): ?array {
     $db_host = trim( $db_host );
@@ -839,16 +942,18 @@ class GMCP_Tools_Db_Dump {
       return null;
     }
     if ( strpos( $db_host, ':' ) === false ) {
-      return [ 'host' => $db_host, 'socket' => null ];
+      return [ 'host' => $db_host, 'port' => null, 'socket' => null ];
     }
     [ $host, $rest ] = explode( ':', $db_host, 2 );
+    if ( $host === '' ) {
+      // ":/path/to.sock" and ":3307" both mean the local host, as wpdb reads them.
+      $host = 'localhost';
+    }
     if ( $rest !== '' && $rest[0] === '/' ) {
-      return [ 'host' => $host === '' ? 'localhost' : $host, 'socket' => $rest ];
+      return [ 'host' => $host, 'port' => null, 'socket' => $rest ];
     }
     if ( ctype_digit( $rest ) ) {
-      // A port. The option file has no port key, so it goes back into the host, which is the form
-      // both client tools accept.
-      return [ 'host' => $host . ':' . $rest, 'socket' => null ];
+      return [ 'host' => $host, 'port' => $rest, 'socket' => null ];
     }
     return null;
   }

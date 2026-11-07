@@ -185,11 +185,15 @@ set of tables has changed, and always waits for a signed-in administrator on the
 whatever `mcp_approval_mode` is set to. Only then is the dump built: by `mariadb-dump` or
 `mysqldump` at a pinned absolute path where the server has one, run from an argv array with no
 shell and no flag a caller can influence, with the database credentials in a private file at mode
-0600 rather than in the command line; and otherwise by a PHP fallback that writes table structure
-and rows only, named as the fallback in the manifest before the person approves and in the reply
-afterwards, so the downgrade is never silent. The artifact is gzipped, written outside the web root
-at mode 0600, and read back before anybody is told it worked: it must decompress, hold a
-`CREATE TABLE` for every table that was approved, and end with the dump tool's `-- Dump completed`
+0600 rather than in the command line. **A maintained dump utility is required.** This plugin
+hand-writes no dumper and has no fallback: a hand-written one cannot promise a restorable snapshot,
+so where there is no `mariadb-dump` or `mysqldump` at `/usr/bin/` the manifest is refused and the
+pull is refused before it is even queued for approval, with a sentence naming what to install.
+That is the state of the development container in this repository, which has neither binary in the
+web container (the `cli` container has `mariadb-dump`, and is where the suite runs a real dump).
+The artifact is gzipped, written outside the web root at mode 0600, and read back before
+anybody is told it worked: it must decompress, hold a `CREATE TABLE` for every table that was
+approved, and end with the dump tool's `-- Dump completed`
 trailer. A dump that stopped early is reported as a failure with nothing kept, whatever the tool's
 exit status said. Then a one-time URL, valid for five minutes, streams it (a GET spends it; a HEAD,
 which link previewers send, does not), and the file is deleted after it is sent. The dump is never
@@ -199,6 +203,17 @@ a deliberate and documented exception to the rule that nothing exports the log i
 touches the queue, because a backup that omits the record of what happened is not the database. It
 is off until somebody switches it on: a dump is every post body, every user and every option row
 in one file, with nothing in it that a field-name rule could redact.
+
+What the dump is verified to do, and what it is not. The checks are about the artifact: it
+decompresses, holds a `CREATE TABLE` for every approved table, ends with the trailer, and a partial
+or schema-only file is refused with nothing kept. Beyond that, the evidence is limited, and these
+are the limits rather than a proof: the suite never restores a dump into a database, so "the file
+is complete" is not "the file restores"; the artifact's rows are a stand-in's marker rows or a real
+`mariadb-dump` of this development site, not a real site's data; a multisite's `network` and `site`
+scopes are untested here (the development stack is a single install, so `network` equals `site`);
+and no large table was timed, so how long a dump of a multi-gigabyte database takes through an HTTP
+request is unmeasured. The 300-second limit exists because of that, not because it was measured on
+a database of that size.
 
 **Site administration**, off by default: installing, activating, updating and deleting
 plugins and themes; navigation menus and their items; widgets and widget areas; the

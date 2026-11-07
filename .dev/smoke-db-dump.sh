@@ -126,7 +126,7 @@ echo "  previous dump switch: $PREV_DUMP; previous approval mode: $PREV_MODE; pr
 install_standins() {
   dc wp sh -c "mkdir -p $STANDIN_DIR" >/dev/null 2>&1
   for f in mu-db-dump-utility.php db-dump-standin-full.sh db-dump-standin-partial.sh \
-           db-dump-standin-buried.sh db-dump-standin-trailer-mid.sh; do
+           db-dump-standin-buried.sh db-dump-standin-trailer-mid.sh db-dump-standin-record.sh; do
     dc wp sh -c "cat > $STANDIN_DIR/$f" < "$HERE/$f" || echo "  FAILED to install $f" >&2
   done
   dc wp sh -c "chmod 755 $STANDIN_DIR/db-dump-standin-*.sh; chmod 644 $STANDIN_DIR/mu-db-dump-utility.php" >/dev/null 2>&1
@@ -141,6 +141,7 @@ STANDIN_FULL="$STANDIN_DIR/db-dump-standin-full.sh"
 STANDIN_PARTIAL="$STANDIN_DIR/db-dump-standin-partial.sh"
 STANDIN_BURIED="$STANDIN_DIR/db-dump-standin-buried.sh"
 STANDIN_MID="$STANDIN_DIR/db-dump-standin-trailer-mid.sh"
+STANDIN_RECORD="$STANDIN_DIR/db-dump-standin-record.sh"
 install_standins
 # Only this suite's rows. Clearing the queue wholesale would drop another session's request, and the
 # audit log is append-only on purpose.
@@ -395,9 +396,9 @@ FILE_TABLES=$(grep -c '^CREATE TABLE `' "$OUT/dump.sql")
 check "its table count is the manifest's" "$FILE_TABLES" "$MAN_COUNT"
 check "it ends with a dump-completed trailer" \
   "$(tail -c 300 "$OUT/dump.sql" | grep -c -- '-- Dump completed')" "1"
-# Not an exact count of INSERT statements: the fallback writes one per 200 rows, so the number
-# grows with the log and a check pinned to 1 fails on a busy site for the wrong reason. What is
-# asserted is the property (at least one INSERT INTO the audit table), plus a value that only
+# Not an exact count of INSERT statements: a real dumper writes one INSERT per table per batch, so
+# the number grows with the log and a check pinned to 1 fails on a busy site for the wrong reason.
+# What is asserted is the property (at least one INSERT INTO the audit table), plus a value that only
 # exists in a ROW and never in the DDL, which is what separates "the rows are in the file" from
 # "the table's structure is in the file".
 AUDIT_INSERTS=$(grep -c '^INSERT INTO `wp_gmcp_audit`' "$OUT/dump.sql")
@@ -412,8 +413,8 @@ check "and the stand-in's row marker is in the file (real row preservation is no
   "$(python3 -c 'import sys; print("yes" if int(sys.argv[1]) >= 1 else "no")' "$AUDIT_ROW_TEXT")" "yes"
 check "CONTROL: the audit table really holds those rows here (so the check is about the file)" \
   "$(python3 -c 'import sys; print("yes" if int(sys.argv[1]) >= 1 else "no")' "$(dbq "SELECT COUNT(*) FROM wp_gmcp_audit WHERE tool='wp_db_dump_request'")")" "yes"
-check "the reply names which engine wrote it" \
-  "$(jget dump_engine pull2 | grep -cE '^(php-fallback|mariadb-dump/mysqldump \(pinned path\))$')" "1"
+check "the reply names the maintained utility as the only engine" \
+  "$(jget dump_engine pull2 | grep -cE '^mariadb-dump/mysqldump \(pinned path\)$')" "1"
 check "the manifest named the same engine before it was built" \
   "$(jget dump_engine man2)" "$(jget dump_engine pull2)"
 
@@ -470,6 +471,191 @@ check "and its token row and file are cleaned up again" \
   "$(token_rows)$(dc cli sh -c 'ls /tmp/gmcp-dbdump-* 2>/dev/null | wc -l' | tr -d ' \r\n')" "00"
 dc cli sh -c "rm -f '$PARTIAL'" >/dev/null 2>&1
 
+echo "-- the private option file and the exact argv the client tool is given --"
+# Two things the plugin decides and never shows: the argv, and the credentials file. A stand-in
+# records both and then hands the SAME argv to a real client where one exists, so what is judged
+# below is a real dump and not a stand-in's shape.
+dc cli sh -c 'rm -rf /tmp/gmcp-record' >/dev/null 2>&1 || true
+set_utility "$STANDIN_RECORD"
+REC_OUT=$(dc cli wp eval '$m = GMCP_Tools_Db_Dump::manifest("site");
+$r = apply_filters("gmcp_callback",null,"wp_db_dump_request",["scope"=>"site","mode"=>"pull","manifest_digest"=>$m["manifest_digest"]],1);
+$d = json_decode($r["result"]["content"][0]["text"],true);
+if (($r["result"]["isError"] ?? false) || empty($d["download_url"])) { echo "refused"; return; }
+GMCP_Tools_Db_Dump::discard_token(basename($d["download_url"])); echo "ready";' 2>/dev/null | tr -d '\r\n')
+check "CONTROL: a pull through the recording stand-in is accepted" "$REC_OUT" "ready"
+ARGV=$(dc cli sh -c 'cat /tmp/gmcp-record/argv.txt' 2>/dev/null | tr -d '\r')
+check "CONTROL: the argv was recorded" "$(printf '%s\n' "$ARGV" | grep -c '^--single-transaction$')" "1"
+# A shell script's positional parameters do not include its own path, so line 1 is the first
+# argument the plugin passed. The client requires --defaults-file to be FIRST above all else.
+check "the credentials file is the FIRST option, as the client requires" \
+  "$(printf '%s\n' "$ARGV" | sed -n 1p | grep -cE '^--defaults-file=/tmp/gmcp-dbdump-')" "1"
+# The whole point of the flag: `--defaults-extra-file` is read ON TOP of the machine's own
+# /etc/my.cnf and ~/.my.cnf, so a `no-data` there changes the artifact (measured in the next block).
+check "and it is --defaults-file, not --defaults-extra-file" \
+  "$(printf '%s\n' "$ARGV" | grep -c 'defaults-extra-file')" "0"
+check "and the seven constant options are all of the flags, so no caller-supplied one is there" \
+  "$(printf '%s\n' "$ARGV" | grep -cE '^--')" "7"
+REC_DEFAULTS=$(dc cli sh -c 'cat /tmp/gmcp-record/defaults.cnf' 2>/dev/null | tr -d '\r')
+PROBE=$(dc cli wp eval-file wp-content/plugins/guarded-mcp/.dev/db-dump-defaults-probe.php 2>/dev/null)
+LIVE_PW_LINE=$(printf '%s' "$PROBE" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("live_password_line") or "")')
+printf '  argv: %s\n' "$(printf '%s' "$ARGV" | tr '\n' ' ')"
+printf '  defaults.cnf: %s\n' "$(printf '%s' "$REC_DEFAULTS" | sed -E 's/^(password=).*/\1"[redacted]"/' | tr '\n' ' ')"
+check "the credentials file opens the client group the tool reads" \
+  "$(printf '%s\n' "$REC_DEFAULTS" | grep -c '^\[client\]$')" "1"
+check "it holds the site's own database user" \
+  "$(printf '%s\n' "$REC_DEFAULTS" | sed -n 2p | grep -cE '^user=".+"$')" "1"
+check "its password line is the escaping function's own output" \
+  "$(printf '%s\n' "$REC_DEFAULTS" | sed -n 3p)" "$LIVE_PW_LINE"
+check "a plain DB_HOST is one host value, with no port or socket key invented" \
+  "$(printf '%s\n' "$REC_DEFAULTS" | grep -cE '^(port|socket)=')" "0"
+
+# The three DB_HOST forms and a password holding a newline. DB_HOST is a constant in wp-config.php,
+# so one stack can only be configured one way; the forms are measured through the group's own
+# parsing and writing functions, and then put through the REAL client's `--print-defaults`, which is
+# the client's own statement of what it decoded.
+pget() { printf '%s' "$PROBE" | python3 -c 'import json,sys; print((json.load(sys.stdin)["cases"][sys.argv[1]].get(sys.argv[2]) or ""))' "$1" "$2"; }
+pfile() { printf '%s' "$PROBE" | python3 -c 'import json,sys; print((json.load(sys.stdin)["cases"][sys.argv[1]].get("file") or ""))' "$1"; }
+decode() { dc cli sh -c "/usr/bin/mariadb-dump --defaults-file=$1 --print-defaults 2>&1" | tr -d '\r' | grep -v 'would have been started' | sed -e 's/[[:space:]]*$//'; }
+check "CONTROL: the DB_HOST forms were parsed at all" \
+  "$(pget plain host)$(pget host_port host)" "dbdb"
+check "host:port is split into a host and a port" "$(pget host_port host):$(pget host_port port)" "db:3307"
+check "and the credentials file writes both keys" \
+  "$(pfile host_port | grep -cE '^host="db"$|^port="3307"$')" "2"
+check "host:/path/to.sock is a host and a socket" \
+  "$(pget socket host)|$(pget socket socket)" "localhost|/var/run/mysqld/mysqld.sock"
+check "a socket with no host means the local host" "$(pget socket_no_host host)" "localhost"
+check "a comma-separated host list is refused, not written as one host" \
+  "$(pget list host)$(pfile list)" ""
+check "a password holding a newline is written as the client's escape" \
+  "$(pfile newline_password | grep -cF 'password="ab\ncd"')" "1"
+check "a password holding a CR is written as the client's escape" \
+  "$(pfile cr_password | grep -cF 'password="ab\rcd"')" "1"
+check "a password holding a quote and a backslash is escaped, not ended early" \
+  "$(pfile quote_password | grep -cF 'password="ab\"c\\d"')" "1"
+check "a control character the client cannot read is refused rather than guessed" \
+  "$(pfile nul_password)" ""
+# The real client, on the file the group would hand it. --print-defaults prints the values it
+# decoded, so this is the client agreeing with the writer rather than the test agreeing with itself.
+check "the client decodes host and port from those two keys" \
+  "$(decode /tmp/gmcp-record/probe/host_port.cnf | python3 -c 'import sys; l=sys.stdin.read(); print("yes" if "--host=db" in l and "--port=3307" in l else "no")')" "yes"
+check "the client decodes a socket beside a host" \
+  "$(decode /tmp/gmcp-record/probe/socket.cnf | python3 -c 'import sys; l=sys.stdin.read(); print("yes" if "--host=localhost" in l and "--socket=/var/run/mysqld/mysqld.sock" in l else "no")')" "yes"
+check "the client decodes the escaped newline to a real newline in the password" \
+  "$(decode /tmp/gmcp-record/probe/newline_password.cnf | sed -n 2p)" "cd --host=db"
+# The control for the line above, and the defect it was found by: the same password written with the
+# newline left literal ends the value, and the rest of it becomes an option the client reads.
+printf '[client]\nuser="wp"\npassword="ab\ncd"\nhost="db"\n' > "$OUT/raw-newline.cnf"
+dc cli sh -c 'cat > /tmp/gmcp-raw-newline.cnf' < "$OUT/raw-newline.cnf"
+check "CONTROL: a literal newline really does break that value for the client" \
+  "$(decode /tmp/gmcp-raw-newline.cnf | grep -cE '^--user=wp --password="ab --cd"')" "1"
+# And the control for splitting host:port: written whole, the client reads one host that does not
+# resolve and no port at all, which is what the fix avoids.
+printf '[client]\nuser="wp"\npassword="wp"\nhost="db:3307"\n' > "$OUT/whole-host.cnf"
+dc cli sh -c 'cat > /tmp/gmcp-whole-host.cnf' < "$OUT/whole-host.cnf"
+check "CONTROL: the unsplit form is a host called 'db:3307' with no port" \
+  "$(decode /tmp/gmcp-whole-host.cnf | python3 -c 'import sys; l=sys.stdin.read(); print("yes" if "--host=db:3307" in l and "--port" not in l else "no")')" "yes"
+dc cli sh -c 'rm -f /tmp/gmcp-raw-newline.cnf /tmp/gmcp-whole-host.cnf' >/dev/null 2>&1 || true
+
+# A later block needs the REAL utility, which this stack only has in the cli container.
+set_utility "$STANDIN_FULL"
+
+echo "-- a global client option cannot change the shape of the dump --"
+# The client tools read the machine's own option files (/etc/my.cnf and the directory it includes,
+# ~/.my.cnf) on every invocation unless the FIRST argument is --defaults-file. `no-data` there is a
+# documented way to make a client write structure and no rows, and such an artifact still
+# decompresses, still opens a line with CREATE TABLE for every table and still ends with the
+# trailer: it passes the completeness check and would be handed out as the database. So the check
+# is not that the file looks right, it is that the injected option cannot reach the dump.
+INJECT=/etc/my.cnf.d/zz-gmcp-inject.cnf
+DBNAME=$(wpq 'echo DB_NAME;')
+DBUSER=$(wpq 'echo DB_USER;')
+DBPASS=$(wpq 'echo DB_PASSWORD;')
+DBHOST=$(wpq 'echo DB_HOST;')
+dc cli sh -c "printf '[client]\nuser=\"$DBUSER\"\npassword=\"$DBPASS\"\nhost=\"$DBHOST\"\n' > /tmp/gmcp-creds.cnf; chmod 600 /tmp/gmcp-creds.cnf"
+dc -u 0 cli sh -c "printf '[mysqldump]\nno-data\n[mariadb-dump]\nno-data\n' > $INJECT; chmod 644 $INJECT"
+check "CONTROL: the injection file is in place where the client reads it" \
+  "$(dc -u 0 cli sh -c "test -f $INJECT && echo present || echo missing" | tr -d '\r\n')" "present"
+OLD_SHAPE=$(dc cli sh -c "/usr/bin/mariadb-dump --defaults-extra-file=/tmp/gmcp-creds.cnf --single-transaction --skip-lock-tables --quick --no-tablespaces --hex-blob --default-character-set=utf8mb4 $DBNAME wp_options 2>/dev/null")
+check "CONTROL: with --defaults-extra-file the injected no-data DOES take effect" \
+  "$(printf '%s\n' "$OLD_SHAPE" | grep -c '^INSERT INTO')" "0"
+check "CONTROL: and that dump is schema-only, not empty — it would pass the completeness check" \
+  "$(printf '%s\n' "$OLD_SHAPE" | grep -c '^CREATE TABLE `wp_options`')" "1"
+# The real utility, through the plugin's own argv. Nothing in the site can be assumed about its
+# my.cnf, so this is run where the plugin resolves a real binary: the cli container.
+set_utility ""
+INJ_PHP=$(cat <<'PHP'
+$m = GMCP_Tools_Db_Dump::manifest( 'site' );
+if ( !empty( $m['refused'] ) ) { echo 'manifest-refused'; return; }
+$r = apply_filters( 'gmcp_callback', null, 'wp_db_dump_request', [ 'scope' => 'site', 'mode' => 'pull', 'manifest_digest' => $m['manifest_digest'] ], 1 );
+$d = json_decode( $r['result']['content'][0]['text'], true );
+if ( !empty( $r['result']['isError'] ) || empty( $d['download_url'] ) ) { echo 'refused|', ( $r['result']['content'][0]['text'] ?? '' ); return; }
+$token = basename( $d['download_url'] );
+$stored = get_option( 'gmcp_db_dump_token_' . $token );
+$path = is_array( $stored ) ? (string) ( $stored['path'] ?? '' ) : '';
+$inserts = 0; $creates = 0;
+$gz = $path === '' ? false : @gzopen( $path, 'rb' );
+if ( $gz !== false ) {
+	$carry = '';
+	while ( !gzeof( $gz ) ) {
+		$chunk = gzread( $gz, 1048576 );
+		if ( $chunk === false || $chunk === '' ) { break; }
+		$lines = explode( "\n", $carry . $chunk );
+		$carry = (string) array_pop( $lines );
+		foreach ( $lines as $line ) {
+			if ( strncmp( $line, 'INSERT INTO ', 12 ) === 0 ) { $inserts++; }
+			if ( strncmp( $line, 'CREATE TABLE ', 13 ) === 0 ) { $creates++; }
+		}
+	}
+	gzclose( $gz );
+}
+GMCP_Tools_Db_Dump::discard_token( $token );
+echo 'ready|', $inserts, '|', $creates;
+PHP
+)
+INJ_OUT=$(dc cli wp eval "$INJ_PHP" 2>/dev/null | tr -d '\r\n')
+INJ_INSERTS=$(printf '%s' "$INJ_OUT" | cut -d'|' -f2)
+INJ_CREATES=$(printf '%s' "$INJ_OUT" | cut -d'|' -f3)
+check "a pull with the injected no-data still answers" "$(printf '%s' "$INJ_OUT" | cut -d'|' -f1)" "ready"
+check "CONTROL: its artifact has structure for the tables" \
+  "$(python3 -c 'import sys; print("yes" if int(sys.argv[1]) >= 1 else "no")' "$INJ_CREATES")" "yes"
+check "and it still holds ROWS: the machine's no-data did not reach it" \
+  "$(python3 -c 'import sys; print("yes" if int(sys.argv[1]) >= 1 else "no")' "$INJ_INSERTS")" "yes"
+dc -u 0 cli sh -c "rm -f $INJECT" >/dev/null 2>&1 || true
+check "the injection file is gone again" \
+  "$(dc -u 0 cli sh -c "test -f $INJECT && echo present || echo missing" | tr -d '\r\n')" "missing"
+dc cli sh -c 'rm -f /tmp/gmcp-creds.cnf' >/dev/null 2>&1 || true
+
+# A pull this server cannot carry out is refused BEFORE it becomes a request a person answers.
+echo "-- a pull this server cannot run is refused before anybody is asked to approve it --"
+set_utility "$STANDIN_FULL"
+# Only this suite's rows, and only for this tool: the block counts rows, so it starts from zero.
+dbq "DELETE FROM wp_gmcp_approvals WHERE tool='wp_db_dump_request'" >/dev/null
+call "$TOK" pf_man "$(tc wp_db_dump_request '{"scope":"site"}')"
+PF_DIGEST=$(jget manifest_digest pf_man)
+check "CONTROL: a manifest with a utility installed returns a digest" \
+  "$(printf '%s' "$PF_DIGEST" | grep -cE '^[0-9a-f]{64}$')" "1"
+ROWS_BEFORE=$(dbq "SELECT COUNT(*) FROM wp_gmcp_approvals WHERE tool='wp_db_dump_request'")
+set_utility none
+call "$TOK" pf_pull "$(tc wp_db_dump_request '{"scope":"site","mode":"pull","manifest_digest":"'"$PF_DIGEST"'"}')"
+check "a pull with no dump utility is refused, not queued for a person" "$(verdict pf_pull)" "error"
+check "and the refusal is the engine's own sentence" \
+  "$(text pf_pull | grep -c 'mariadb-dump nor mysqldump')" "1"
+check "and it says what to install" "$(text pf_pull | grep -c 'Install mariadb-client')" "1"
+check "and it is not a pending approval" "$(state pf_pull)" "-"
+check "no approval row was created for it" \
+  "$(dbq "SELECT COUNT(*) FROM wp_gmcp_approvals WHERE tool='wp_db_dump_request'")" "$ROWS_BEFORE"
+check "and nothing was dumped for it" "$(temp_count)$(token_rows)" "00"
+# The control: the same call, with a utility present, is a request for a person again. Without it the
+# refusal above would also pass on a gate that had stopped holding pulls altogether.
+set_utility "$STANDIN_FULL"
+call "$TOK" pf_pull2 "$(tc wp_db_dump_request '{"scope":"site","mode":"pull","manifest_digest":"'"$PF_DIGEST"'"}')"
+check "CONTROL: with a utility installed the same call is held for a person" \
+  "$(state pf_pull2)" "awaiting_human_approval"
+check "CONTROL: and that one did create exactly one pending row" \
+  "$(dbq "SELECT COUNT(*) FROM wp_gmcp_approvals WHERE tool='wp_db_dump_request' AND status='pending'")" "1"
+dbq "DELETE FROM wp_gmcp_approvals WHERE tool='wp_db_dump_request'" >/dev/null
+dc cli sh -c 'rm -rf /tmp/gmcp-record' >/dev/null 2>&1 || true
+
 echo "-- cleanup: this suite's rows, files and the two options it changed --"
 dbq "DROP TABLE IF EXISTS dbdump_probe_$MARK" >/dev/null
 dbq "DROP TABLE IF EXISTS wp_dbdump_probe_$MARK" >/dev/null
@@ -477,6 +663,8 @@ dbq "DELETE FROM wp_gmcp_approvals WHERE tool='wp_db_dump_request'" >/dev/null
 dbq "DELETE FROM wp_options WHERE option_name LIKE 'gmcp_db_dump_token_%'" >/dev/null
 dc wp sh -c 'rm -f /tmp/gmcp-dbdump-*' >/dev/null 2>&1 || true
 dc cli sh -c 'rm -f /tmp/gmcp-dbdump-*' >/dev/null 2>&1 || true
+dc -u 0 cli sh -c 'rm -f /etc/my.cnf.d/zz-gmcp-inject.cnf' >/dev/null 2>&1 || true
+dc cli sh -c 'rm -rf /tmp/gmcp-record' >/dev/null 2>&1 || true
 set_mode "$PREV_MODE"
 set_dump "$PREV_DUMP"
 check "the dump switch is back where it was" \

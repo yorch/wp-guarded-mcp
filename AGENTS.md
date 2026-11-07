@@ -377,8 +377,13 @@ pull leg, so no `mcp_approval_mode` — `never` included — can hand it out una
 approval is bound to the scope and to a digest over the sorted table list, so a table that
 appeared after the person read the screen gets a new request; the reply carries a table count,
 a size, a digest and a one-time URL and never a row, a credential or a SQL fragment; the dump
-is built by a maintained utility at a pinned absolute path or, where the server has none, by a
-visible PHP fallback that the manifest names in advance and the reply names afterwards; and it
+is built by a maintained utility at a pinned absolute path, and by nothing else — a site without
+`mariadb-dump` or `mysqldump` there has its manifest refused and its pull refused *before* the
+queue, so nobody is asked to approve an operation that cannot run, and there is no PHP fallback
+(a hand-written dumper cannot promise a restorable snapshot, so a refusal a person can act on is
+the honest answer); the stray client configuration is shut out, because the utility is run with
+`--defaults-file` rather than `--defaults-extra-file` and its credentials are written with the
+client's own option-file escapes (`DB_HOST` split into host and port); and it
 is read back and refused unless it decompresses, holds a `CREATE TABLE` for every approved
 table and ends with the tool's `-- Dump completed` trailer. No tool reads a row of either table
 and returns it, and no tool *writes*, lists or answers the queue: what this adds is one artifact,

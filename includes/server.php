@@ -1666,6 +1666,32 @@ class GMCP_Server {
         return $response;
       }
 
+      // A refusal a tool can decide BEFORE the call becomes a request a person has to read.
+      //
+      // The approvals queue is the last thing between an agent and an artifact or a write, and a
+      // call that cannot run at all must not spend a person's attention on it. Measured: a
+      // database-dump pull on a server with no dump utility was queued, read and approved by an
+      // administrator, and only then answered "install mariadb-client" — an approval of an
+      // operation nothing on the machine could carry out, asked on a screen that gave no way to
+      // know. The tool that knows its own preconditions answers here, and the answers are the ones
+      // its other doors give, so the reason is the reason.
+      //
+      // A filter and not a call to a class: there is one dispatcher and any tool may register
+      // this beside its own registration, before the gate below is ever entered.
+      $preflight = apply_filters( 'gmcp_preflight', null, (string) $tool, (array) $args, $this->tool_definitions[ $tool ] ?? null );
+      if ( is_string( $preflight ) && $preflight !== '' ) {
+        $error_msg = $preflight;
+        $response = [
+          'jsonrpc' => '2.0',
+          'id' => $id,
+          'result' => [
+            'content' => [ [ 'type' => 'text', 'text' => $preflight ] ],
+            'isError' => true,
+          ],
+        ];
+        return $response;
+      }
+
       // The human approval gate. Here and not earlier or later, for three reasons.
       //
       // It is the one function every tools/call passes through: handle_direct_jsonrpc()
@@ -1674,7 +1700,7 @@ class GMCP_Server {
       // tool class would be one gate per class, which is how the option policy once
       // protected one writer and not the others.
       //
-      // It is after the access, key-scope and required-argument checks, so a call that
+      // It is after the access, key-scope, required-argument and preflight checks, so a call that
       // would have been refused anyway never becomes a request a person has to read, and
       // a request is only ever for a call that would otherwise have run.
       //
