@@ -359,6 +359,7 @@ class GMCP_Settings {
       'mcp_tools_beaver' => 'bool',
       'mcp_tools_beaver_write' => 'bool',
       'mcp_tools_export' => 'bool',
+      'mcp_tools_db_dump' => 'bool',
       'mcp_approval_mode' => 'approval_mode',
       'mcp_debug_mode' => 'bool',
       'mcp_activity_log' => 'bool',
@@ -1315,6 +1316,9 @@ class GMCP_Settings {
     // Site-file export has no plugin dependency: the four roots exist on every WordPress
     // site, so its checkbox is always on screen and its stored value is always declared.
     $keys[] = 'mcp_tools_export';
+    // The same for the database dump: every site has a database, so its switch is always on
+    // screen and an unticked box that was never rendered cannot switch it off on save.
+    $keys[] = 'mcp_tools_db_dump';
     if ( $woo ) {
       $keys[] = 'mcp_tools_woo';
     }
@@ -1506,6 +1510,10 @@ class GMCP_Settings {
               <label>
                 <input type="checkbox" name="mcp_tools_export" value="1" <?php checked( !empty( $options['mcp_tools_export'] ) ); ?>>
                 <?php esc_html_e( 'Site files (a manifest of plugins, themes, mu-plugins or uploads, and an archive that only a person can approve; secrets by file name and form submissions\' uploads are withheld)', 'guarded-mcp' ); ?>
+              </label>
+              <label>
+                <input type="checkbox" name="mcp_tools_db_dump" value="1" <?php checked( !empty( $options['mcp_tools_db_dump'] ) ); ?>>
+                <?php esc_html_e( 'Database dump (a manifest of the site\'s tables, and a gzipped dump of every row that only a person can approve; it includes this plugin\'s own activity log and approval queue)', 'guarded-mcp' ); ?>
               </label>
               <label>
                 <input type="checkbox" name="mcp_tools_rest" value="1" <?php checked( !empty( $options['mcp_tools_rest'] ) ); ?>>

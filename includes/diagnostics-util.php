@@ -900,7 +900,10 @@ final class GMCP_Diag_Util {
     $out = preg_replace(
       [
         '#(' . $sep . 'download' . $sep . ')[A-Za-z0-9]{8,}+#i',
-        '#(v1' . $sep . '(?:upload|export)' . $sep . ')[A-Za-z0-9]{8,}+#i',
+        // The database dump's route is in the same group as upload and export, and it is the
+        // route that mints a bearer token for a copy of the whole database: leaving it out
+        // would put a working URL for every row of the site into the audit log.
+        '#(v1' . $sep . '(?:upload|export|db-dump)' . $sep . ')[A-Za-z0-9]{8,}+#i',
       ],
       '$1[redacted]',
       $text
@@ -923,7 +926,7 @@ final class GMCP_Diag_Util {
   * reader. Not for what a tool returns to its caller about the site's own data.
   */
   public static function scrub_preview_tokens( string $text ): string {
-    if ( stripos( $text, 'preview' ) === false && stripos( $text, 'download' ) === false && stripos( $text, 'upload' ) === false && stripos( $text, 'export' ) === false && stripos( $text, '%' ) === false ) {
+    if ( stripos( $text, 'preview' ) === false && stripos( $text, 'download' ) === false && stripos( $text, 'upload' ) === false && stripos( $text, 'export' ) === false && stripos( $text, 'dump' ) === false && stripos( $text, '%' ) === false ) {
       return $text;
     }
     // A one-time download or upload URL is a bearer credential too, and the tool reply that

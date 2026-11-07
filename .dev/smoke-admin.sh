@@ -2873,21 +2873,27 @@ tc_groups() { # tc_groups <admin 0|1> <woo 0|1>
     $o["mcp_tools_rest"] = false;
     $o["mcp_tools_woo_subscriptions"] = false;
     // The export group has its own switch and is not one the table counts; left on it would
-    // move every number for a reason unrelated to the content/admin/woo surface.
+    // move every number for a reason unrelated to the content/admin/woo surface. The database
+    // dump group is in the same position, and its tool name carries the wp_ prefix, so no
+    // prefix filter can exclude it: switching its group off is the only thing that keeps the
+    // numbers below equal to the table. (No apostrophes in here: this whole block is inside a
+    // single-quoted wp eval, and one would end the string the code runs from.)
     $o["mcp_tools_export"] = false;
+    $o["mcp_tools_db_dump"] = false;
     update_option( "gmcp_options", $o, false );' >/dev/null 2>&1
 }
-tc_unprefixed_groups() { # prints "<rest>,<subscriptions>,<export>" as stored: 1 when switched on
+tc_unprefixed_groups() { # prints "<rest>,<subscriptions>,<export>,<db dump>" as stored: 1 when switched on
   docker compose exec -T cli wp eval '
     $o = get_option( "gmcp_options", [] );
-    echo ( ! empty( $o["mcp_tools_rest"] ) ? 1 : 0 ), ",", ( ! empty( $o["mcp_tools_woo_subscriptions"] ) ? 1 : 0 ), ",", ( ! empty( $o["mcp_tools_export"] ) ? 1 : 0 );' 2>/dev/null | tr -d '\r\n'
+    echo ( ! empty( $o["mcp_tools_rest"] ) ? 1 : 0 ), ",", ( ! empty( $o["mcp_tools_woo_subscriptions"] ) ? 1 : 0 ), ",", ( ! empty( $o["mcp_tools_export"] ) ? 1 : 0 ), ",", ( ! empty( $o["mcp_tools_db_dump"] ) ? 1 : 0 );' 2>/dev/null | tr -d '\r\n'
 }
-tc_restore_unprefixed() { # tc_restore_unprefixed <rest 0|1> <subscriptions 0|1> <export 0|1>
+tc_restore_unprefixed() { # tc_restore_unprefixed <rest 0|1> <subscriptions 0|1> <export 0|1> <db dump 0|1>
   docker compose exec -T cli wp eval '
     $o = get_option( "gmcp_options", [] );
     $o["mcp_tools_rest"] = '"$1"' ? true : false;
     $o["mcp_tools_woo_subscriptions"] = '"$2"' ? true : false;
     $o["mcp_tools_export"] = '"$3"' ? true : false;
+    $o["mcp_tools_db_dump"] = '"$4"' ? true : false;
     update_option( "gmcp_options", $o, false );' >/dev/null 2>&1
 }
 # Optional groups are excluded by tool-name prefix, because the table counts only the groups
@@ -2941,16 +2947,22 @@ esac
 # end of the block is measured: with it found off, "restored" and "left off" are the same state and the
 # check below could not tell them apart. The stack's own value is put back after that check.
 TC_UNPREFIXED_ORIG=$(tc_unprefixed_groups)
-tc_restore_unprefixed "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f1)" "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f2)" 1
+tc_restore_unprefixed "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f1)" "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f2)" 1 1
 TC_UNPREFIXED_WAS=$(tc_unprefixed_groups)
 check "CONTROL: the export group is on before the count, so its restore can be told from leaving it off" "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f3)" "1"
+check "CONTROL: the dump group is on before the count, so its restore can be told from leaving it off" "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f4)" "1"
 tc_groups 0 0
-# The precondition, asserted: the counts below are only the table's if neither group is on.
-check "precondition: the REST, Subscriptions and export groups are off while counting" "$(tc_unprefixed_groups)" "0,0,0"
+# The precondition, asserted: the counts below are only the table's if none of these groups is on.
+check "precondition: the REST, Subscriptions, export and dump groups are off while counting" "$(tc_unprefixed_groups)" "0,0,0,0"
 # And a control that the probe sees the problem it guards against: with the REST group on,
 # the same counter must move off the documented number.
-tc_restore_unprefixed 1 0 0
+tc_restore_unprefixed 1 0 0 0
 check "control: with the REST group on the content-only count is not the documented one" \
+  "$([ "$(tc_count "$TC_ADMIN")" != "$(tc_doc admin 1)" ] && echo moved || echo same)" "moved"
+# The same control for the dump group, whose tool is named wp_ and cannot be excluded by prefix:
+# with its switch on, the counter must move, which is what proves tc_groups() has to switch it off.
+tc_restore_unprefixed 0 0 0 1
+check "control: with the dump group on the content-only count is not the documented one" \
   "$([ "$(tc_count "$TC_ADMIN")" != "$(tc_doc admin 1)" ] && echo moved || echo same)" "moved"
 tc_groups 0 0
 check "content only, admin level"     "$(tc_count "$TC_ADMIN")" "$(tc_doc admin 1)"
@@ -2976,9 +2988,9 @@ tc_groups 1 0
 # Put the three groups back as this block found them, so the later blocks and the next suite
 # see the site the way it was. The export switch was left off by tc_groups() and not restored,
 # so a stack that had it on lost it for every suite after this one.
-tc_restore_unprefixed "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f1)" "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f2)" "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f3)"
-check "the REST, Subscriptions and export groups are as they were before the count" "$(tc_unprefixed_groups)" "$TC_UNPREFIXED_WAS"
-tc_restore_unprefixed "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f1)" "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f2)" "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f3)"
+tc_restore_unprefixed "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f1)" "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f2)" "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f3)" "$(printf '%s' "$TC_UNPREFIXED_WAS" | cut -d, -f4)"
+check "the REST, Subscriptions, export and dump groups are as they were before the count" "$(tc_unprefixed_groups)" "$TC_UNPREFIXED_WAS"
+tc_restore_unprefixed "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f1)" "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f2)" "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f3)" "$(printf '%s' "$TC_UNPREFIXED_ORIG" | cut -d, -f4)"
 gmcp_clear_other_keys "smoke suite"
 
 echo "-- scheduled events --"

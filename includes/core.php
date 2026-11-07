@@ -112,6 +112,12 @@ class GMCP_Core {
     // archive of uploads can be a customer export; the switch is the site owner's decision,
     // and no approval mode can turn the pull leg on without a person.
     'mcp_tools_export' => false,
+    // The database itself: a manifest of the tables, and one gzipped dump that always waits for
+    // a person on the Approvals screen. Off by default, and its own switch rather than part of
+    // the export group, because a dump is every row of the database in one file and nothing in
+    // it can be redacted afterwards. By the owner's decision the dump includes this plugin's own
+    // activity log and approval queue; @see GMCP_Tools_Db_Dump for why that exception exists.
+    'mcp_tools_db_dump' => false,
     // Out-of-band human approval. 'never' | 'deletes' | 'site': which tool calls are held
     // until a logged-in administrator approves them on the Approvals screen. Global rather
     // than per key, so that a key, an OAuth grant and a key minted next week are all
@@ -3996,6 +4002,9 @@ class GMCP_Core {
     // The export group's expiry sweep is registered whether the group is on or off, so an
     // archive minted before somebody switched it off is still removed when it lapses.
     GMCP_Tools_Export::boot();
+    // The same for the database dump: a token minted before the switch went off must still have
+    // its copy of the database removed when the event fires.
+    GMCP_Tools_Db_Dump::boot();
     GMCP_Core::install_trash_meta_net();
     GMCP_Core::install_personal_data_net();
 
@@ -4182,6 +4191,13 @@ class GMCP_Core {
     // that it always needs a person (see GMCP_Tools_Export and GMCP_Approvals).
     if ( $this->get_option( 'mcp_tools_export' ) ) {
       new GMCP_Tools_Export();
+    }
+
+    // The database dump. Its own switch, off by default, and its pull leg declares that it always
+    // needs a person for the same reason the export's does: an artifact that leaves the server
+    // whole is not something a setting should be able to hand out unattended.
+    if ( $this->get_option( 'mcp_tools_db_dump' ) ) {
+      new GMCP_Tools_Db_Dump();
     }
   }
 

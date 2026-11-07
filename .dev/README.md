@@ -105,6 +105,7 @@ docker compose exec -T cli wp plugin install beaver-builder-lite-version --activ
 
 ./smoke-download.sh   # the one-time download endpoint; needs nothing beyond the plugin
 ./smoke-export.sh     # the site-file manifest, the approval-gated archive and its one-time endpoint
+./smoke-db-dump.sh    # the database-dump manifest, the approval-gated dump and its one-time endpoint; needs nothing beyond the plugin
 ./smoke-listing-filters.sh  # the listing tools under another plugin's query filters; needs nothing beyond the plugin
 ```
 
