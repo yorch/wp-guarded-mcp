@@ -231,6 +231,15 @@ class GMCP_Server {
       'permission_callback' => '__return_true',
       'show_in_index' => false,
     ] );
+    // One-time database dump. Same shape as the export archive, and for the same reason: the
+    // group switch is checked inside the handler, so turning the group off ends every URL it
+    // ever issued rather than only the ones it would issue next.
+    register_rest_route( $this->namespace, '/db-dump/(?P<token>[a-zA-Z0-9]+)', [
+      'methods' => 'GET',
+      'callback' => [ $this, 'handle_db_dump' ],
+      'permission_callback' => '__return_true',
+      'show_in_index' => false,
+    ] );
   }
 
   /**
@@ -2095,7 +2104,85 @@ class GMCP_Server {
   }
   #endregion
 
-  #region Message Queue (per-message transient)
+  #region Handle /db-dump (one-time database dump via token)
+  /**
+  * Serve one database dump to a one-time token.
+  *
+  * The dump is built by wp_db_dump_request only after a person approved the exact call, and it sits
+  * outside the web root with 0600 permissions. It is streamed here and deleted afterwards; the
+  * bytes never pass through a tool reply, which would copy them into the audit log. The token is
+  * consumed with a conditional DELETE, so two requests cannot both receive the same file, and the
+  * group switch is checked first so turning it off ends every URL it issued rather than only
+  * future ones.
+  *
+  * Same shape as handle_export(), deliberately: two one-time artifact endpoints that behaved
+  * differently would be two places for the HEAD, the expiry and the cleanup to be got right.
+  */
+  public function handle_db_dump( WP_REST_Request $request ) {
+    $token = (string) $request->get_param( 'token' );
+    if ( class_exists( 'GMCP_Tools_Db_Dump' ) ) {
+      GMCP_Tools_Db_Dump::cleanup_expired();
+    }
+    // HEAD is answered from what the token says and spends nothing: a link previewer sends one
+    // before the person has clicked. @see GMCP_Tools_Db_Dump::peek_token()
+    if ( $request->get_method() === 'HEAD' ) {
+      if ( !class_exists( 'GMCP_Tools_Db_Dump' ) || !GMCP_Tools_Db_Dump::enabled() ) {
+        return new WP_REST_Response( [ 'success' => false, 'message' => 'The database dump group is switched off.' ], 403 );
+      }
+      $seen = GMCP_Tools_Db_Dump::peek_token( $token );
+      if ( isset( $seen['error'] ) ) {
+        return new WP_REST_Response( [ 'success' => false, 'message' => $seen['error'] ], (int) ( $seen['status'] ?? 403 ) );
+      }
+      return $this->head_response( 'application/gzip', $seen['size'], (string) $seen['filename'] );
+    }
+    if ( !class_exists( 'GMCP_Tools_Db_Dump' ) || !GMCP_Tools_Db_Dump::enabled() ) {
+      if ( class_exists( 'GMCP_Tools_Db_Dump' ) ) {
+        // The group is off: the URL it issued stops working, and the file it was holding does not
+        // stay on the disk waiting for a switch that may never come back on.
+        GMCP_Tools_Db_Dump::discard_token( $token );
+      }
+      return new WP_REST_Response( [ 'success' => false, 'message' => 'The database dump group is switched off.' ], 403 );
+    }
+
+    $taken = GMCP_Tools_Db_Dump::take_token( $token );
+    if ( isset( $taken['error'] ) ) {
+      return new WP_REST_Response( [ 'success' => false, 'message' => $taken['error'] ], (int) ( $taken['status'] ?? 403 ) );
+    }
+
+    $path = (string) $taken['path'];
+    $filename = (string) $taken['filename'];
+    // Re-checked at serve time, not trusted from the token row: the row says what was true when it
+    // was minted and the filesystem is not immutable.
+    if ( is_link( $path ) || !is_file( $path ) || !is_readable( $path ) ) {
+      GMCP_Tools_Db_Dump::unlink_dump( $path );
+      return new WP_REST_Response( [ 'success' => false, 'message' => 'That dump is no longer available.' ], 403 );
+    }
+    $size = filesize( $path );
+
+    // REGISTERED BEFORE THE FIRST BYTE, like the export's: the token above is spent, so this file
+    // has no other owner, and a connection that dies while readfile() is writing ends the request
+    // where the unlink below never runs. A copy of the database is not something to leave in a
+    // temporary directory for a sweep to find.
+    register_shutdown_function( static function () use ( $path ) {
+      GMCP_Tools_Db_Dump::unlink_dump( $path );
+    } );
+    @ignore_user_abort( false );
+
+    nocache_headers();
+    header( 'X-Content-Type-Options: nosniff' );
+    header( 'Content-Type: application/gzip' );
+    if ( $size !== false ) {
+      header( 'Content-Length: ' . (string) $size );
+    }
+    header( 'Content-Disposition: attachment; filename="' . sanitize_file_name( $filename ) . '"' );
+    readfile( $path );
+    if ( connection_aborted() || connection_status() !== CONNECTION_NORMAL ) {
+      GMCP_Logging::log( 'Database dump download of ' . $filename . ' was interrupted by the client; the dump was removed.' );
+    }
+    GMCP_Tools_Db_Dump::unlink_dump( $path );
+    exit;
+  }
+  #endregion
   private function transient_key( $sess, $id ) {
     return "{$this->queue_key}_{$sess}_{$id}";
   }

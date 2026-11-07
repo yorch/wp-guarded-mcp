@@ -94,10 +94,10 @@ An access level belongs to a named key, or to an OAuth grant. A key carries the 
 These nine numbers are checked by `smoke-admin.sh` against a running site, because all
 nine had drifted behind the code before anything checked them. Elementor, Kirki, Yoast SEO,
 ACF, Gravity Forms, LearnDash, Elementor Pro, WP Activity Log, Redirection, Polylang, Rank Math and All in One SEO,
-Wordfence, Stream, Beaver Builder, the form-submission tools and the site-file export group
-are not counted: their tools are optional groups that come and go with a plugin (or, for the
-export group, with its switch), so folding them in would make the table depend on what
-happens to be installed or enabled.
+Wordfence, Stream, Beaver Builder, the form-submission tools, the site-file export group
+and the database-dump group are not counted: their tools are optional groups that come and go
+with a plugin (or, for the last two, with their own switch), so folding them in would make the
+table depend on what happens to be installed or enabled.
 
 A **named key** narrows this further. It carries its own level, an optional expiry date,
 and an optional list of the only tools it may call, so a key handed to a deploy script
@@ -170,6 +170,35 @@ A form submission's uploads are found through the submission they hang from, so 
 the submission (which makes its attachments unattached) they are archived like any other media file
 unless they sit in a directory the list names; `docs/guardrails.md` says what the download tool does
 about the same file. A tree whose every entry is withheld has nothing to archive and the pull says so.
+
+**Database dump**, off by default: `wp_db_dump_request` is a manifest of the database's
+tables, and a dump of them that only a person can approve. `scope` is `site` (this site's own
+tables; on a multisite, another blog's tables and the network's rows are excluded), `network`
+(every table under the install's base prefix) or `database` (every base table in the configured
+database, including tables that are not WordPress's). The default `manifest` mode returns the
+table count, the exact table list, a row count **estimate** per table (the statistics
+`SHOW TABLE STATUS` reports, not a count of rows), the total size and a digest, and never a row,
+a credential or a SQL fragment. The digest covers the scope and the sorted table list, not the
+estimates: those move on ordinary writes, and a digest built from them would stop matching while
+a person was reading the screen. Its `pull` mode takes the digest from a manifest, refuses if the
+set of tables has changed, and always waits for a signed-in administrator on the Approvals screen,
+whatever `mcp_approval_mode` is set to. Only then is the dump built: by `mariadb-dump` or
+`mysqldump` at a pinned absolute path where the server has one, run from an argv array with no
+shell and no flag a caller can influence, with the database credentials in a private file at mode
+0600 rather than in the command line; and otherwise by a PHP fallback that writes table structure
+and rows only, named as the fallback in the manifest before the person approves and in the reply
+afterwards, so the downgrade is never silent. The artifact is gzipped, written outside the web root
+at mode 0600, and read back before anybody is told it worked: it must decompress, hold a
+`CREATE TABLE` for every table that was approved, and end with the dump tool's `-- Dump completed`
+trailer. A dump that stopped early is reported as a failure with nothing kept, whatever the tool's
+exit status said. Then a one-time URL, valid for five minutes, streams it (a GET spends it; a HEAD,
+which link previewers send, does not), and the file is deleted after it is sent. The dump is never
+returned in a tool reply, and its token is scrubbed from the audit log. The dump contains every
+table in scope, which means **this plugin's own activity log and its approval queue are in it** —
+a deliberate and documented exception to the rule that nothing exports the log in bulk and no tool
+touches the queue, because a backup that omits the record of what happened is not the database. It
+is off until somebody switches it on: a dump is every post body, every user and every option row
+in one file, with nothing in it that a field-name rule could redact.
 
 **Site administration**, off by default: installing, activating, updating and deleting
 plugins and themes; navigation menus and their items; widgets and widget areas; the
@@ -737,7 +766,7 @@ docker run --rm -v "$PWD":/app -w /app php:8.1-cli sh -c 'for f in includes/*.ph
 ```
 
 A throwaway WordPress for testing lives in `.dev/` (see that directory's README). It carries
-twenty-three suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
+twenty-four suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
 previews; `smoke-admin.sh` for the administration tools, the change journal, named keys and
 every guard around them, which rebuilds `.htaccess` partway through and is the destructive
 one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor tools;
@@ -751,11 +780,14 @@ for the Polylang tools; `smoke-seo.sh` for the Rank Math and All in One SEO tool
 `smoke-stream.sh` for the Stream tools; `smoke-beaver.sh` for the Beaver Builder tools;
 `smoke-beaver-write.sh` for the tool that builds a Beaver Builder page;
 `smoke-download.sh` for the one-time download endpoint; `smoke-export.sh` for the site
-files manifest, the approval-gated archive and its one-time endpoint; and `smoke-listing-filters.sh`
+files manifest, the approval-gated archive and its one-time endpoint; `smoke-db-dump.sh` for
+the database-dump manifest, the approval-gated dump and its one-time endpoint; and
+`smoke-listing-filters.sh`
 for the listing tools under another plugin's query filters. `smoke-seo.sh`,
 `smoke-forms.sh`, `smoke-polylang.sh` and `smoke-redirection.sh` were written without a
 running stack and have not been run. The plugin-specific suites need their plugin installed;
-`smoke-download.sh`, `smoke-export.sh` and `smoke-listing-filters.sh` need only this plugin.
+`smoke-download.sh`, `smoke-export.sh`, `smoke-db-dump.sh` and `smoke-listing-filters.sh` need
+only this plugin.
 
 Wordfence makes every call on a stack slow: it checks in with its own servers when it loads,
 and with no outbound route each request waits for that to time out — measured at 0.3s per

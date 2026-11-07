@@ -37,6 +37,7 @@ spl_autoload_register( function ( $class ) {
     'GMCP_Tools_Beaver' => '/includes/tools-beaver.php',
     'GMCP_Tools_Beaver_Write' => '/includes/tools-beaver-write.php',
     'GMCP_Tools_Export' => '/includes/tools-export.php',
+    'GMCP_Tools_Db_Dump' => '/includes/tools-db-dump.php',
     'GMCP_Tools_Admin' => '/includes/tools-admin.php',
     'GMCP_Tools_Diagnostics' => '/includes/tools-diagnostics.php',
     'GMCP_Diag_Util' => '/includes/diagnostics-util.php',

@@ -1939,6 +1939,109 @@ one-time URL.
   `smoke-download.sh` assert the rows and the archive after two HEADs, the GET that follows, and
   HEAD on a spent, an unknown and (for the export) a switched-off token.
 
+## Database dump
+
+`wp_db_dump_request` is off by default (its own switch, `mcp_tools_db_dump`, no plugin needed),
+admin level and nothing lower: a `readwrite` and a `readonly` key are refused by name and do not
+see it in `tools/list` (measured, with the admin key as the control that the same call answers).
+The `manifest` mode returns the table count, the exact table list, a row count estimate and a size
+per table, and a digest; `pull` is held for a person in every approval mode (see Human approval),
+then builds one gzipped dump outside the web root and returns a one-time URL. This is the
+capability the two rules elsewhere in this document withhold, and the exception is named:
+**the dump includes this plugin's own activity log (`*_gmcp_audit`) and its approval queue
+(`*_gmcp_approvals`)**. The reasoning is that a table list which quietly omitted the two tables
+whose whole purpose is to say what happened would hand a person a backup that restores into a site
+with no history and no way to tell — that is worse than no backup, because it looks like one. What
+bounds it: the file leaves only through the approvals queue, which a signed-in administrator
+answers with a cookie no bearer key or OAuth grant has; the approval is bound to the scope and to a
+digest over the sorted table list; the reply carries a count, a size, a digest and a one-time URL
+and never a row, a credential or a SQL fragment; and no tool reads a row of either table. What it
+deliberately does not do: no `SELECT` tool, no row in any reply, no manifest that names rows, no
+restore, and no way for a caller to send a table name — the scopes are three names, and the table
+list comes from `SHOW FULL TABLES`.
+- **The scopes are defined by a rule, not by a feeling.** `site` is every base table whose name
+  begins with *this* blog's prefix, minus another blog's tables (`wp_2_posts` when this is not
+  blog 2) and, on a multisite, minus the network's own rows (`wp_blogs`, `wp_site`, `wp_sitemeta`,
+  ...), which share blog 1's prefix and are not this blog's. `network` is every base table under the
+  install's base prefix, and on a single install it is therefore the same set as `site`. `database`
+  is every base table in the configured database, including tables that are not WordPress's at all.
+  Views are not tables and are in no scope: a view is a query, and dumping one writes a definition
+  that restores only onto a schema that already has the tables behind it. The consequence worth
+  naming rather than hiding: the shared user tables (`wp_users`, `wp_usermeta`) are named with the
+  BASE prefix, so on a multisite they are in a `site` dump for blog 1 and not for blog 2, and a dump
+  that must carry them for every blog is the `network` scope. `smoke-db-dump.sh` measures all of it
+  with probe tables either side of the boundary, not by reading the code.
+- **The digest is over the table list, and the numbers are not in it.** The row counts and sizes are
+  `SHOW TABLE STATUS` statistics — an estimate on InnoDB — and they move on ordinary writes. A digest
+  built from them would stop matching while a person was reading the approval screen, and every pull
+  would be refused for a reason nobody could act on. So the digest covers the scope and the sorted
+  table names, and the manifest says so in a field of its own (`digest_covers`). What that binds is
+  the SET of tables: one that appears or disappears between the manifest and the pull changes the
+  digest and is refused, which the suite proves by creating a table after the approval and by
+  dropping it again to show the digest comes back. Every reply calls the row figure an estimate; no
+  sentence here says the dump reports how many rows a table holds.
+- **A partial dump is never reported as success.** The dump is read back through gzip before anybody
+  is offered it, and it must be non-empty, must decompress (a truncated gz fails its CRC), must hold
+  a `CREATE TABLE` for every table in the approved list, and must end with the dump tool's own
+  `-- Dump completed` trailer. Any of those failing means nothing is kept, no token row is written,
+  and the reply says the dump was not built. The suite proves it against the hardest case: a
+  stand-in utility, reached through `gmcp_db_dump_utility_paths`, that EXITS 0 after writing one
+  table — the exit status is not the check, the file is. The scan is streamed in fixed chunks with
+  the previous chunk's tail carried over, so a marker split across two reads is still found and a
+  dump larger than a request's memory is not held to be counted.
+- **Which engine ran is on the record, because the fallback is a downgrade.** `mariadb-dump` or
+  `mysqldump` is preferred at a pinned absolute path (`GMCP_Tools_Db_Dump::UTILITY_PATHS`), run with
+  an argv ARRAY through `proc_open` — never a command string, so a table name is never parsed by a
+  shell — with no flag a caller can influence and the database name and table names as the only
+  variable arguments (a table name beginning with `-` is refused rather than handed to a program
+  that would read it as an option). The credentials go through a private `--defaults-extra-file` at
+  mode 0600, removed in a `finally`: argv is what `ps` prints and `/proc` exposes, and an environment
+  variable is inherited by anything the tool starts. Where the server has no such binary — the
+  `wordpress:php8.2-apache` container in `.dev/` has neither, measured, while the `cli` container
+  has `mariadb-dump` — the PHP fallback writes the artifact from `SHOW CREATE TABLE` and retrieved
+  rows. It is not silent: the manifest names the engine a pull would use (`dump_engine`) before the
+  person approves, and the reply names the engine that ran. What the fallback does NOT write:
+  triggers, stored routines, events and views, which the maintained tools do; binary columns are
+  written as hex, numeric columns bare, and everything else escaped by the connection WordPress is
+  already using, so a serialized value in a blob comes back the same length. A dump that needs
+  triggers or routines must be taken with the tools of the server, not through this plugin.
+- **Rows are read a batch at a time.** The fallback reads `LIMIT 500 OFFSET n` and writes one INSERT
+  per 200 rows, so a large table costs memory in proportion to the batch rather than to the table.
+  The price is that OFFSET makes a very large table quadratic: a site with tens of millions of rows
+  in one table will be slow, and a web request that runs past `max_execution_time` is ended by PHP,
+  which is a failure the tool reports as one (the shutdown callback removes the partial file). For a
+  database that size, the backup belongs on the server, not in an HTTP request.
+- **The artifact is outside every web-served root, at 0600, and removed on every path.** The
+  temporary directory is the same answer `GMCP_Tools_Export::temp_dir()` gives the archive — one
+  answer to "is this inside something the web server serves", because two would eventually disagree
+  and the half that drifted would put a copy of the database behind a URL. A shutdown callback is
+  registered before a byte is written, because the time limit on a large dump ends the request where
+  no unlink below runs; it is disarmed once the token row exists, and from then on the row owns the
+  file — the cron sweep, the endpoint, `discard_token()` and the expiry check all remove it. The
+  token is consumed by a CONDITIONAL `DELETE` so two requests cannot both stream one dump, the
+  expiry is read from the row rather than from an option cache, HEAD is answered from a read-only
+  look (`peek_token()`) so a link previewer does not burn it, and turning the group off discards
+  every outstanding token and its file rather than only ending future ones.
+- **The token is scrubbed, and the suite proves the scrubber looked.** The reply's URL is scrubbed
+  from the audit log by `GMCP_Diag_Util::scrub_transfer_tokens()`, which now also matches the
+  `db-dump` route beside `upload` and `export` (the early-out that skips the whole function when no
+  keyword is present was extended too, or the route would never have been looked at).
+  `smoke-db-dump.sh` asserts both halves of that: the tool call is in the log and the token is not,
+  AND the route is present with `[redacted]` where the token was — an absence check with no control
+  passes on a scrubber that never ran, which is the shape of false pass this repository has had
+  before.
+- **Honest limits.** The approval screen shows the scope and the digest the call carries, which is
+  what binds it; it does not show the table list, so a person approves "these tables as the digest
+  named them" and can read the list by running the manifest themselves. Row counts are estimates and
+  are labelled as such. `--single-transaction` makes the dump consistent for InnoDB tables; MyISAM
+  tables are not transactional and can be dumped mid-write. The dump is not encrypted and is not
+  checked against a checksum after it is served. `scope=database` includes every table the account
+  can see, which on a shared database may include another application's; that is what the scope
+  says it does, and `site` and `network` are the narrower choices. Whether the *maintained* utility
+  leg works on a given host was measured only in the `.dev` `cli` container (it has
+  `mariadb-dump`): the web container has neither binary, so the shipped path there is the fallback.
+
+
 ## Theme mods
 
 Theme mods are the customizer's storage, and four generic tools cover them:

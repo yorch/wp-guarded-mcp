@@ -325,7 +325,10 @@ administrator with no cookie. A tool that listed pending requests would hand a
 prompt-injected agent the ids and arguments to reason about; a tool that approved would
 delete the feature. `smoke-admin.sh` asserts no such tool exists at any level. Which tools
 are held is derived from their registration (`GMCP_Approvals::classify()`), never from a
-list of names, and an unclassifiable tool is held.
+list of names, and an unclassifiable tool is held. The one channel through which the queue's
+rows leave the server is the database dump, and it is the named exception above, not a
+loosening of this rule: nothing reads the queue, and the dump is a whole-database artifact a
+person approved.
 
 **There is no kit import, and no tool that takes an archive.** `elementor_set_active_kit`
 switches between kits the site already has, which is reversible because the previous one is
@@ -358,6 +361,29 @@ point anywhere, as any post body can); the module set is four types.
 **The audit log has no bulk actions and no row deletion in the UI.** Rows hash the row
 before them, so removing one from the middle is exactly what the chain exists to make
 visible. A convenient button for it would be building the attack into the product.
+
+**One exception, and it is named: a database dump includes this plugin's own tables.**
+The two rules above this one and below it — that nothing exports the audit log in bulk, and
+that no tool reads, lists, answers or edits the approval queue — are the reason an agent
+cannot silence its own record. `wp_db_dump_request` (its own switch, `mcp_tools_db_dump`, off
+by default, admin level) hands out a gzipped dump of the database, and that dump contains
+`*_gmcp_audit` and `*_gmcp_approvals`, because a table list that omitted the two tables whose
+whole purpose is to say what happened would hand a person a backup that restores into a site
+with no history and no way to tell — a dump that is not the database is worse than no dump,
+because it looks like one. The exception is bounded, and every bound is a separate thing that
+has to keep holding: the artifact leaves only through the approvals queue, which a signed-in
+administrator answers with a cookie no bearer key or OAuth grant has (`requiresApproval` on the
+pull leg, so no `mcp_approval_mode` — `never` included — can hand it out unattended); the
+approval is bound to the scope and to a digest over the sorted table list, so a table that
+appeared after the person read the screen gets a new request; the reply carries a table count,
+a size, a digest and a one-time URL and never a row, a credential or a SQL fragment; the dump
+is built by a maintained utility at a pinned absolute path or, where the server has none, by a
+visible PHP fallback that the manifest names in advance and the reply names afterwards; and it
+is read back and refused unless it decompresses, holds a `CREATE TABLE` for every approved
+table and ends with the tool's `-- Dump completed` trailer. No tool reads a row of either table
+and returns it, and no tool *writes*, lists or answers the queue: what this adds is one artifact,
+through a person. Anything that widens it — a `SELECT` tool, a manifest that names rows, a
+second route to the same file — is a different decision and needs this paragraph rewritten.
 
 ## Verification
 
@@ -425,16 +451,19 @@ Flamingo, Fluent Forms, Ninja Forms, WPForms; its first block needs no form plug
 `smoke-beaver.sh` covers the Beaver Builder tools, `smoke-beaver-write.sh` covers the one that
 builds a page (and renders it, because a stored-node count passed on a page that showed nothing),
 `smoke-download.sh` covers the one-time download endpoint, `smoke-export.sh` covers the
-site-file manifest, the approval-gated archive and its one-time endpoint, and
+site-file manifest, the approval-gated archive and its one-time endpoint,
+`smoke-db-dump.sh` covers the database-dump manifest, the approval-gated dump and its one-time
+endpoint, and
 `smoke-listing-filters.sh` covers the listing tools under another plugin's query filters.
 Run all
-twenty-three before committing. The plugin-specific suites need
+twenty-four before committing. The plugin-specific suites need
 their plugin installed and say so and exit rather than reporting failures against a site that
-simply does not have it; `smoke-download.sh`, `smoke-export.sh` and `smoke-listing-filters.sh` need only this plugin.
+simply does not have it; `smoke-download.sh`, `smoke-export.sh`, `smoke-db-dump.sh` and
+`smoke-listing-filters.sh` need only this plugin.
 (This sentence said fourteen while twelve suites existed and sixteen
 while seventeen did, and said twenty-one with twenty-two on disk and the newest suite missing
 from the list, which is the same drift the access-level table had: a count nothing checks
-moves on its own. It is twenty-three now, counted from `ls .dev/smoke*.sh`.)
+moves on its own. It is twenty-four now, counted from `ls .dev/smoke*.sh`.)
 
 **A test for a guard must not depend on that guard.** Read the value, make the hostile
 call, read it back, **put it back**, and only then compare. The first version of the
