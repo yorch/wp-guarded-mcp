@@ -38,6 +38,20 @@ if ( !defined( 'ABSPATH' ) ) {
 *                          not referrable (the token is in the URL, and a Referer header
 *                          would carry it to every external image on the page).
 *
+* PAGE BUILDERS. A builder that renders a layout through its own function, not through
+* post_content, usually asks its own visibility question first, and for a draft that
+* question is "may this visitor read it?" with a visitor who has no account. Beaver
+* Builder's FLBuilder::render_content_by_id() does exactly that (a post must be publicly
+* viewable, or the user must have the read capability on it) and prints nothing when the
+* answer is no, so a draft shows its title and an empty body. Its answer is exposed as
+* the fl_render_content_by_id_can_view filter, and template_redirect registers a callback
+* on it only after the grant has been verified. The callback turns a "no" into a "yes"
+* for the granted post's own id and nothing else, only while the post is still a draft,
+* pending or scheduled, only before the link expires, and never over a password: the
+* builder asks about the password before it asks the filter, and the callback asks again.
+* No capability is granted, no user is set, and the builder's own checks stay in force
+* for every other post, so a layout embedded from a second post is still judged on its own.
+*
 * The grant is never a way to see a PUBLISHED post: the query asks for draft, pending and
 * future only, so on a published post the query matches nothing and the answer is a 404.
 * Publishing, trashing, or deleting a post revokes its links outright, so reverting later
@@ -179,6 +193,62 @@ class GMCP_Preview {
     return $before - count( $links );
   }
 
+  /**
+  * A short identifier for one stored link that is not the token and cannot be turned into it.
+  *
+  * Keyed with the site's salt, so the screen that lists links never prints any part of a stored
+  * hash either, and a ref copied from one site means nothing on another. 64 bits is far more
+  * than the 100 links a site can hold need to tell each other apart.
+  */
+  private static function ref( string $hash ): string {
+    return substr( hash_hmac( 'sha256', $hash, wp_salt( 'auth' ) ), 0, 16 );
+  }
+
+  /**
+  * The live links for the settings screen: when, for what and by whom, and a ref to end one.
+  * Never the token (only a hash is stored) and never the hash.
+  *
+  * @return list<array{ref:string,post:int,exp:int,by:int,at:int}> Soonest to expire first.
+  */
+  public static function listing(): array {
+    $rows = [];
+    foreach ( self::live( self::all() ) as $hash => $g ) {
+      $rows[] = [
+        'ref' => self::ref( (string) $hash ),
+        'post' => (int) $g['post'],
+        'exp' => (int) $g['exp'],
+        'by' => (int) ( $g['by'] ?? 0 ),
+        'at' => (int) ( $g['at'] ?? 0 ),
+      ];
+    }
+    usort( $rows, static function ( $a, $b ) {
+      return $a['exp'] <=> $b['exp'];
+    } );
+    return $rows;
+  }
+
+  /**
+  * End exactly one link, named by the ref the listing gave.
+  *
+  * @return int|null The post the link was for, or null when no stored link has that ref
+  *                  (already expired, already ended, or never existed).
+  */
+  public static function revoke_ref( string $ref ): ?int {
+    if ( !preg_match( '/^[a-f0-9]{16}$/', $ref ) ) {
+      return null;
+    }
+    $links = self::all();
+    foreach ( $links as $hash => $g ) {
+      if ( hash_equals( self::ref( (string) $hash ), $ref ) ) {
+        $post = is_array( $g ) ? (int) ( $g['post'] ?? 0 ) : 0;
+        unset( $links[ $hash ] );
+        self::save( self::live( $links ) );
+        return $post;
+      }
+    }
+    return null;
+  }
+
   /** Live links for a post, without anything that could rebuild one. */
   public static function count_for( int $post_id ): int {
     return count( array_filter( self::live( self::all() ), static function ( $g ) use ( $post_id ) {
@@ -278,6 +348,31 @@ class GMCP_Preview {
     // token on the way and turning a working link into a 404.
     add_filter( 'redirect_canonical', '__return_false' );
     remove_action( 'template_redirect', 'wp_old_slug_redirect' );
+
+    // Registered here, after the grant was verified for this request, and nowhere else.
+    add_filter( 'fl_render_content_by_id_can_view', [ $this, 'builder_can_view' ], 10, 2 );
+  }
+
+  /**
+  * Beaver Builder asks whether the visitor may see a layout; for a draft the visitor
+  * cannot, and the layout is dropped. Say yes for the granted post, and only that one.
+  *
+  * Never turns a "yes" into anything and never answers for another id. The post is read
+  * again here, so a post published, trashed or moved out of the shareable statuses
+  * between the query and the render is not shown, and so is the expiry.
+  *
+  * @param bool $can_view What the builder concluded.
+  * @param mixed $post_id The post whose layout is about to be rendered.
+  */
+  public function builder_can_view( $can_view, $post_id ): bool {
+    if ( $can_view || $this->active === null || (int) $post_id !== $this->active['post'] || $this->active['exp'] <= time() ) {
+      return (bool) $can_view;
+    }
+    $post = get_post( (int) $post_id );
+    if ( self::refusal_for( $post ) !== null || post_password_required( $post ) ) {
+      return false;
+    }
+    return true;
   }
 
   /* --------------------------------------------------------------- lifecycle cleanup */

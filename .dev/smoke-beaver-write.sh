@@ -323,6 +323,55 @@ docker compose exec -T cli rm -f /var/www/html/wp-content/mu-plugins/smoke-bw-re
 [ "$REST_WAS" = "1" ] || wpc eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_rest"]=false;update_option("gmcp_options",$o,false);delete_transient(GMCP_Tools_Rest::CACHE_KEY);' >/dev/null 2>&1
 for p in "$PIDD"; do wpc eval 'wp_delete_post('"${p:-0}"', true);' >/dev/null 2>&1; done
 
+echo "-- a preview link shows the builder layout of the one draft it was issued for --"
+# The layout is dropped for a visitor with no account unless the preview grant says otherwise
+# (FLBuilder::render_content_by_id() asks whether the post is publicly viewable or readable
+# first), so this fetches the page as that visitor and looks for the text INSIDE the builder's
+# wrapper. The preview hooks live in the admin tool group, which is switched on for the block.
+ADMIN_WAS=$(wpc eval '$o=get_option("gmcp_options",[]); echo !empty($o["mcp_tools_admin"]) ? 1 : 0;')
+wpc eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_admin"]=true;update_option("gmcp_options",$o,false);delete_option("gmcp_preview_links");' >/dev/null 2>&1
+PVM="pvmark$MARK"
+call v1 "$(tc beaver_create_page '{"title":"BWV '"$MARK"'","modules":[{"type":"rich-text","text":"<p>'"$PVM"'-a</p>"}]}')"
+call v2 "$(tc beaver_create_page '{"title":"BWV2 '"$MARK"'","modules":[{"type":"rich-text","text":"<p>'"$PVM"'-b</p>"}]}')"
+PIDV=$(jget v1 ID); PIDV2=$(jget v2 ID)
+check "CONTROL: both draft fixtures exist and are drafts" "$(wpc eval 'echo get_post_status('"$PIDV"'),get_post_status('"$PIDV2"');')" "draftdraft"
+pv_url() { wpc eval 'echo GMCP_Preview::create( get_post('"$1"'), 2, 1 )["url"];'; }
+# Prints how many times $2 appears after the builder wrapper opens in the page saved as $1
+# (the text is the layout's own, so before the wrapper it could only be somebody else's copy).
+pv_in_layout() { python3 - "$OUT/$1" "$2" <<'PYEOF'
+import re, sys
+h = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+m = re.search(r'class="[^"]*fl-builder-content[ "]', h)
+print(h[m.end():].count(sys.argv[2]) if m else "no-wrapper")
+PYEOF
+}
+fetch() { curl -sS -o "$OUT/$1" -w '%{http_code}' "$2"; }
+check "no link, anonymous: the draft is a 404" "$(fetch pv0 "$BASE/?page_id=$PIDV")" "404"
+U1=$(pv_url "$PIDV")
+check "CONTROL: a link was issued" "$(printf '%s' "$U1" | grep -c 'gmcp_preview=[a-f0-9]\{40\}')" "1"
+check "the draft answers 200 with its link" "$(fetch pv1 "$U1")" "200"
+check "and its layout text is inside the builder wrapper" "$(pv_in_layout pv1 "$PVM-a")" "1"
+curl -sS -D "$OUT/pv1h" -o /dev/null "$U1"
+check "and it is still not indexable, cacheable or referrable" "$(grep -ic -e '^x-robots-tag:.*noindex' -e '^cache-control:.*no-store' -e '^referrer-policy: no-referrer' "$OUT/pv1h")" "3"
+check "the same link does not open the other draft" "$(fetch pv2 "${U1/page_id=$PIDV/page_id=$PIDV2}")" "404"
+check "and the other draft's layout text is nowhere in that reply" "$(grep -c "$PVM-b" "$OUT/pv2")" "0"
+PWD_ID=$(wpc eval 'wp_update_post(["ID"=>'"$PIDV"',"post_password"=>"pw-'"$MARK"'"]); echo get_post('"$PIDV"')->post_password === "pw-'"$MARK"'" ? "set" : "not-set";')
+check "CONTROL: the draft is now password protected" "$PWD_ID" "set"
+fetch pv3 "$U1" >/dev/null
+check "a password still hides the layout from a link" "$(grep -c "$PVM-a" "$OUT/pv3")" "0"
+wpc eval 'wp_update_post(["ID"=>'"$PIDV"',"post_password"=>""]);' >/dev/null
+check "CONTROL: without the password the layout is back, so the line above was the password" "$(fetch pv4 "$U1" >/dev/null; pv_in_layout pv4 "$PVM-a")" "1"
+# wp_update_post, not wp_publish_post: only the former names the page, and a page with no
+# slug redirects to the home page, which would test the redirect.
+wpc eval 'wp_update_post(["ID"=>'"$PIDV"',"post_status"=>"publish"]);' >/dev/null
+check "published: the link's grant ended with the draft" "$(wpc eval 'echo GMCP_Preview::count_for('"$PIDV"');')" "0"
+check "and the published page shows its layout to anyone, as before" "$(curl -sSL -o "$OUT/pv6" "$BASE/?page_id=$PIDV"; pv_in_layout pv6 "$PVM-a")" "1"
+wpc eval 'wp_update_post(["ID"=>'"$PIDV"',"post_status"=>"private"]);' >/dev/null
+check "private: a link cannot be made for it" "$(wpc eval '$r=GMCP_Preview::create(get_post('"$PIDV"'),2,1); echo $r["ok"] ? "made" : "refused";')" "refused"
+[ "$ADMIN_WAS" = "1" ] || wpc eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_admin"]=false;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+wpc eval 'delete_option("gmcp_preview_links");' >/dev/null 2>&1
+for p in "$PIDV" "$PIDV2"; do wpc eval 'wp_delete_post('"${p:-0}"', true);' >/dev/null 2>&1; done
+
 echo "-- cleanup --"
 for p in "$PID" "$PID2" "$PIDE" "$PIDL" "$PIDF" "$PIDM" "$SUB" "$UPL" "$TXT" "$ATT"; do wpc eval 'wp_delete_post('"${p:-0}"', true);' >/dev/null 2>&1; done
 wpc eval 'foreach ((array) get_posts(["post_type"=>"any","post_status"=>"any","numberposts"=>-1,"fields"=>"ids","s"=>"'"$MARK"'"]) as $i) { wp_delete_post($i,true); }' >/dev/null 2>&1

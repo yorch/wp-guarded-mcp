@@ -22,6 +22,7 @@ class GMCP_Settings {
   const PAGE_ACCESS = 'guarded-mcp-access';
   const PAGE_TOOLS = 'guarded-mcp-tools';
   const PAGE_APPROVALS = 'guarded-mcp-approvals';
+  const PAGE_PREVIEWS = 'guarded-mcp-previews';
   const PAGE_LOGGING = 'guarded-mcp-logging';
   const PAGE_LOGS = 'guarded-mcp-logs';
   const NONCE_ACTION = 'gmcp_save_settings';
@@ -39,6 +40,7 @@ class GMCP_Settings {
     'access' => self::PAGE_ACCESS,
     'tools' => self::PAGE_TOOLS,
     'approvals' => self::PAGE_APPROVALS,
+    'previews' => self::PAGE_PREVIEWS,
     'logging' => self::PAGE_LOGGING,
     'logs' => self::PAGE_LOGS,
   ];
@@ -186,6 +188,14 @@ class GMCP_Settings {
       'manage_options',
       self::PAGE_APPROVALS,
       [ $this, 'render_approvals_page' ]
+    );
+    $hooks[] = add_submenu_page(
+      self::PAGE_SLUG,
+      __( 'Preview Links', 'guarded-mcp' ),
+      __( 'Preview Links', 'guarded-mcp' ),
+      'manage_options',
+      self::PAGE_PREVIEWS,
+      [ $this, 'render_previews_page' ]
     );
     $hooks[] = add_submenu_page(
       self::PAGE_SLUG,
@@ -458,6 +468,9 @@ class GMCP_Settings {
       $nonce = isset( $_POST['gmcp_approval_nonce'] ) ? sanitize_text_field( wp_unslash( $_POST['gmcp_approval_nonce'] ) ) : '';
       [ $ok, $this->notice ] = GMCP_Approvals::decide( $id, $action === 'approve_request' ? 'approve' : 'decline', $nonce );
       $this->notice_failed = !$ok;
+    }
+    elseif ( $action === 'revoke_preview_link' || $action === 'revoke_post_previews' || $action === 'revoke_all_previews' ) {
+      $this->revoke_previews( $action );
     }
     elseif ( $action === 'revoke_key' ) {
       $id = isset( $_POST['key_id'] ) ? sanitize_key( wp_unslash( $_POST['key_id'] ) ) : '';
@@ -776,6 +789,50 @@ class GMCP_Settings {
     $this->notice = __( 'Access revoked for that app.', 'guarded-mcp' );
   }
 
+  /**
+  * End preview links from the settings screen: one, all of a post's, or all on the site.
+  *
+  * The capability and the page nonce were settled in maybe_handle_post(). A single link is named
+  * by the ref the listing printed (never the token, which is not stored, and not its hash).
+  * Each ending leaves a row in the audit log, as it does when the tool ends links: what was
+  * ended and for which post, and nothing that could open a link.
+  */
+  private function revoke_previews( string $action ): void {
+    $removed = 0;
+    $target = '';
+    $scope = '';
+    if ( $action === 'revoke_preview_link' ) {
+      $ref = isset( $_POST['link_ref'] ) ? sanitize_key( wp_unslash( $_POST['link_ref'] ) ) : '';
+      $post = GMCP_Preview::revoke_ref( $ref );
+      $removed = $post === null ? 0 : 1;
+      $target = $post ? 'post:' . $post : '';
+      $scope = $post ? sprintf( 'one link for post %d', $post ) : '';
+    }
+    elseif ( $action === 'revoke_post_previews' ) {
+      $post = isset( $_POST['post_id'] ) ? absint( $_POST['post_id'] ) : 0;
+      $removed = $post > 0 ? GMCP_Preview::revoke( $post ) : 0;
+      $target = 'post:' . $post;
+      $scope = sprintf( 'every link for post %d', $post );
+    }
+    else {
+      $removed = GMCP_Preview::revoke( null );
+      $scope = 'every link on the site';
+    }
+    wp_cache_delete( GMCP_Preview::OPTION, 'options' );
+    if ( $removed > 0 ) {
+      GMCP_Audit::note( 'gmcp_preview_revoked', sprintf( 'Ended %d preview link(s) from the settings screen: %s.', $removed, $scope ), $target );
+      $this->notice = sprintf(
+        /* translators: %d: number of preview links ended. */
+        _n( 'Ended %d preview link.', 'Ended %d preview links.', $removed, 'guarded-mcp' ),
+        $removed
+      );
+    }
+    else {
+      $this->notice = __( 'No such link: it had already expired or been ended.', 'guarded-mcp' );
+      $this->notice_failed = true;
+    }
+  }
+
   #endregion
 
   #region Render
@@ -864,6 +921,14 @@ class GMCP_Settings {
     $this->render_page( __( 'Approvals', 'guarded-mcp' ), function () {
       $options = $this->core->get_all_options( true );
       $this->render_approvals( $options );
+    } );
+  }
+
+  /** The Preview Links page. */
+  public function render_previews_page() {
+    $this->render_page( __( 'Preview Links', 'guarded-mcp' ), function () {
+      $options = $this->core->get_all_options( true );
+      $this->render_previews( $options );
     } );
   }
 
@@ -1700,6 +1765,114 @@ class GMCP_Settings {
     </form>
     <?php
   }
+
+  #region Preview links
+
+  /**
+  * The live draft preview links: who made them, for what, how long they have left.
+  *
+  * This lists and ends links. It cannot make one and it cannot show one: the site keeps only a
+  * hash of each token, so a link's address is gone after the call that made it, and nothing
+  * on this page (a field, a title attribute, a hidden input, the audit row) holds a token or a
+  * hash. A single link is named by a salted short reference that opens nothing. Making a link
+  * stays a tool call, so what this page adds to the front end is nothing.
+  */
+  private function render_previews( array $options ): void {
+    $rows = GMCP_Preview::listing();
+    $per_post = [];
+    foreach ( $rows as $row ) {
+      $per_post[ $row['post'] ] = ( $per_post[ $row['post'] ] ?? 0 ) + 1;
+    }
+    ?>
+    <p class="gmcp-intro"><?php esc_html_e( 'A preview link lets someone with no account read one unpublished post (a draft, a pending or a scheduled one) until it expires. These are the links that are live now. A link ends by itself when it expires and when its post is published, trashed or deleted.', 'guarded-mcp' ); ?></p>
+    <p class="gmcp-intro"><strong><?php esc_html_e( 'A link\'s address cannot be shown again.', 'guarded-mcp' ); ?></strong>
+      <?php esc_html_e( 'The site keeps only a one-way hash of each link, so that nobody who can read this site\'s database or this screen can open one. If a link is lost, end it here and ask the agent for a new one. Links are made with the wp_create_preview_link tool, not from this page.', 'guarded-mcp' ); ?></p>
+    <?php if ( empty( $options['mcp_tools_admin'] ) && $rows ) : ?>
+      <div class="notice notice-warning inline"><p><?php esc_html_e( 'The Administration tool group is switched off, and the code that opens these links belongs to it, so none of them opens a page right now. They stay stored and will work again if the group is switched back on, until they expire.', 'guarded-mcp' ); ?></p></div>
+    <?php endif; ?>
+
+    <h2 class="title"><?php
+      /* translators: %d: number of live preview links. */
+      echo esc_html( sprintf( __( 'Live links (%d)', 'guarded-mcp' ), count( $rows ) ) ); ?></h2>
+    <?php if ( !$rows ) : ?>
+      <p class="gmcp-muted"><?php esc_html_e( 'No preview link is live.', 'guarded-mcp' ); ?></p>
+    <?php else : ?>
+      <table class="widefat striped gmcp-table">
+        <thead><tr>
+          <th><?php esc_html_e( 'Post', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Live links for it', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Made by', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Created', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'Expires', 'guarded-mcp' ); ?></th>
+          <th><?php esc_html_e( 'End', 'guarded-mcp' ); ?></th>
+        </tr></thead>
+        <tbody>
+        <?php foreach ( $rows as $row ) :
+          $pid = (int) $row['post'];
+          $post = get_post( $pid );
+          $who = (int) $row['by'] > 0 ? ( get_userdata( (int) $row['by'] )->user_login ?? '' ) : '';
+          $title = $post ? get_the_title( $post ) : '';
+          ?>
+          <tr>
+            <td>
+              <?php if ( $post ) : ?>
+                <?php echo esc_html( $title !== '' ? $title : __( '(no title)', 'guarded-mcp' ) ); ?>
+                <span class="gmcp-detail">#<?php echo (int) $pid; ?>, <?php echo esc_html( $post->post_status ); ?></span>
+                <?php if ( current_user_can( 'edit_post', $pid ) ) : ?>
+                  <br><a href="<?php echo esc_url( get_edit_post_link( $pid, 'raw' ) ); ?>"><?php esc_html_e( 'Edit', 'guarded-mcp' ); ?></a>
+                <?php endif; ?>
+              <?php else : ?>
+                <span class="gmcp-muted"><?php
+                  /* translators: %d: post id. */
+                  echo esc_html( sprintf( __( 'Post #%d no longer exists', 'guarded-mcp' ), $pid ) ); ?></span>
+              <?php endif; ?>
+            </td>
+            <td><?php echo (int) $per_post[ $pid ]; ?></td>
+            <td>
+              <?php echo esc_html( $who !== '' ? $who : __( 'unknown', 'guarded-mcp' ) ); ?><br>
+              <span class="gmcp-detail"><?php esc_html_e( 'the account the key acts as', 'guarded-mcp' ); ?></span>
+            </td>
+            <td class="gmcp-nowrap"><?php echo esc_html( $row['at'] ? wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), $row['at'] ) : '' ); ?></td>
+            <td class="gmcp-nowrap"><?php echo esc_html( wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), $row['exp'] ) ); ?><br>
+              <span class="gmcp-detail"><?php
+                /* translators: %s: human-readable time left, e.g. "5 hours". */
+                echo esc_html( sprintf( __( '%s left', 'guarded-mcp' ), human_time_diff( time(), $row['exp'] ) ) ); ?></span></td>
+            <td class="gmcp-nowrap">
+              <form method="post" style="display:inline">
+                <?php
+                $this->form_head( 'revoke_preview_link' );
+                printf( '<input type="hidden" name="link_ref" value="%s">', esc_attr( $row['ref'] ) );
+                ?>
+                <button type="submit" class="button"><?php esc_html_e( 'End this link', 'guarded-mcp' ); ?></button>
+              </form>
+              <?php if ( $per_post[ $pid ] > 1 ) : ?>
+                <form method="post" style="display:inline">
+                  <?php
+                  $this->form_head( 'revoke_post_previews' );
+                  printf( '<input type="hidden" name="post_id" value="%d">', (int) $pid );
+                  ?>
+                  <button type="submit" class="button"><?php
+                    /* translators: %d: number of links for the post. */
+                    echo esc_html( sprintf( __( 'End all %d for this post', 'guarded-mcp' ), (int) $per_post[ $pid ] ) ); ?></button>
+                </form>
+              <?php endif; ?>
+            </td>
+          </tr>
+        <?php endforeach; ?>
+        </tbody>
+      </table>
+      <form method="post" class="gmcp-actions">
+        <?php $this->form_head( 'revoke_all_previews' ); ?>
+        <button type="submit" class="button button-secondary"><?php esc_html_e( 'End every preview link on the site', 'guarded-mcp' ); ?></button>
+      </form>
+    <?php endif; ?>
+    <p class="gmcp-muted gmcp-limits"><?php
+      /* translators: 1: most links one post can have, 2: most links the site can have. */
+      echo esc_html( sprintf( __( 'Limits: %1$d live links per post and %2$d on the site. Viewing a link is not logged; making and ending links is. This page does not change what a visitor with a link can see.', 'guarded-mcp' ), GMCP_Preview::MAX_PER_POST, GMCP_Preview::MAX_ACTIVE ) ); ?></p>
+    <?php
+  }
+
+  #endregion
 
   #region Approvals
 

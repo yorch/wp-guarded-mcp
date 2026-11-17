@@ -573,7 +573,7 @@ option guards live on the option, why backups never return filenames, and the re
 
 ## The settings screen
 
-At **MCP Server** in the admin menu, in six pages. It is top level rather than buried
+At **MCP Server** in the admin menu, in seven pages. It is top level rather than buried
 under Settings, because it is the first thing anyone needs after activating, and there
 is a Settings link on the plugin's row too.
 
@@ -659,6 +659,20 @@ read-level or write-level tools, `wp_undo_change` (a write-level tool that repla
 values), or the one-time upload endpoint behind `wp_upload_request`. A preview waits like
 the call it previews. A tool at the `admin` level with no destructive verb, annotation or
 read verb in its name is a site change, not a deletion, so it waits only in the wider mode.
+
+### Preview Links
+
+The draft preview links that are live now (`wp_create_preview_link`): the post, with its ID
+and an edit link, the account the key acts as, when each link was made and when it expires,
+how much time is left, and how many live links the post has. A link can be ended on its own,
+all of a post's links together, or every link on the site. The site keeps only a hash of each
+link, so the page cannot show a link's address again and offers no way to copy one; to replace
+a lost link, end it and make a new one with the tool. The page never prints a token or a
+stored hash (one link is named by a short salted reference that opens nothing), cannot make a
+link, and does not change what a visitor holding a link can see. Ending links needs
+`manage_options` and the settings nonce, and each ending is written to the audit log with the
+post it was for. The links only open while the Administration tool group is switched on, and the
+page says so when it is off.
 
 ### Logging
 
@@ -781,7 +795,7 @@ docker run --rm -v "$PWD":/app -w /app php:8.1-cli sh -c 'for f in includes/*.ph
 ```
 
 A throwaway WordPress for testing lives in `.dev/` (see that directory's README). It carries
-twenty-four suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
+twenty-five suites: `smoke.sh` for the transport, auth, content tools, prompts, resources and
 previews; `smoke-admin.sh` for the administration tools, the change journal, named keys and
 every guard around them, which rebuilds `.htaccess` partway through and is the destructive
 one; `smoke-woo.sh` for the shop tools; `smoke-elementor.sh` for the Elementor tools;
@@ -796,13 +810,13 @@ for the Polylang tools; `smoke-seo.sh` for the Rank Math and All in One SEO tool
 `smoke-beaver-write.sh` for the tool that builds a Beaver Builder page;
 `smoke-download.sh` for the one-time download endpoint; `smoke-export.sh` for the site
 files manifest, the approval-gated archive and its one-time endpoint; `smoke-db-dump.sh` for
-the database-dump manifest, the approval-gated dump and its one-time endpoint; and
+the database-dump manifest, the approval-gated dump and its one-time endpoint; `smoke-preview-links.sh` for the Preview Links screen; and
 `smoke-listing-filters.sh`
 for the listing tools under another plugin's query filters. `smoke-seo.sh`,
 `smoke-forms.sh`, `smoke-polylang.sh` and `smoke-redirection.sh` were written without a
 running stack and have not been run. The plugin-specific suites need their plugin installed;
-`smoke-download.sh`, `smoke-export.sh`, `smoke-db-dump.sh` and `smoke-listing-filters.sh` need
-only this plugin.
+`smoke-download.sh`, `smoke-export.sh`, `smoke-db-dump.sh`, `smoke-preview-links.sh` and
+`smoke-listing-filters.sh` need only this plugin.
 
 Wordfence makes every call on a stack slow: it checks in with its own servers when it loads,
 and with no outbound route each request waits for that to time out — measured at 0.3s per

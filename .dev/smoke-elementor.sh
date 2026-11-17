@@ -283,5 +283,28 @@ check "saying why, not that it does not exist" \
   "$(py 'import json,sys;t=json.load(sys.stdin)["result"]["content"][0]["text"];print("gated" if "not loaded" in t else t[:40])' er_css)" "gated"
 docker compose exec -T cli wp plugin activate elementor >/dev/null 2>&1
 
+echo "-- a preview link shows an Elementor draft to a visitor --"
+# Measured against Elementor 4.4.1: unlike Beaver Builder, Elementor does not ask whether the
+# visitor may read a draft before it prints its layout, so the preview grant needs no help
+# here. This keeps that true: if a later Elementor starts asking, this fails.
+ADMIN_WAS=$(docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]); echo !empty($o["mcp_tools_admin"]) ? 1 : 0;' 2>/dev/null | tr -d '\r\n')
+docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_admin"]=true;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+ELMARK="elprev$(date +%s)"
+ELP=$(docker compose exec -T cli wp eval '
+  $id = wp_insert_post( [ "post_title" => "EL preview '"$ELMARK"'", "post_type" => "page", "post_status" => "draft", "post_content" => "plain" ] );
+  $d = [ [ "id" => "a1b2c3d4", "elType" => "container", "settings" => [], "isInner" => false, "elements" => [ [ "id" => "e5f6a7b8", "elType" => "widget", "widgetType" => "text-editor", "settings" => [ "editor" => "<p>'"$ELMARK"'</p>" ], "elements" => [] ] ] ] ];
+  update_post_meta( $id, "_elementor_data", wp_slash( wp_json_encode( $d ) ) );
+  update_post_meta( $id, "_elementor_edit_mode", "builder" );
+  update_post_meta( $id, "_elementor_template_type", "wp-page" );
+  echo $id;' 2>/dev/null | tr -d '\r\n')
+ELURL=$(docker compose exec -T cli wp eval 'echo GMCP_Preview::create( get_post( '"${ELP:-0}"' ), 2, 1 )["url"];' 2>/dev/null | tr -d '\r\n')
+check "CONTROL: the Elementor draft exists and has a link" "$(printf '%s' "$ELURL" | grep -c 'gmcp_preview=[a-f0-9]\{40\}')" "1"
+check "no link, no layout: the draft is a 404 to a visitor" "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/?page_id=$ELP")" "404"
+# The text is only in the widget (the post's own content is "plain"). Elementor prints it more
+# than once, so it is presence that is asserted.
+check "with its link a visitor sees the widget's text" "$(curl -sS "$ELURL" | grep -c "$ELMARK" | awk '{print ($1>0) ? "yes" : "no"}')" "yes"
+docker compose exec -T cli wp eval 'wp_delete_post( '"${ELP:-0}"', true ); delete_option( "gmcp_preview_links" );' >/dev/null 2>&1
+[ "$ADMIN_WAS" = "1" ] || docker compose exec -T cli wp eval '$o=get_option("gmcp_options",[]);$o["mcp_tools_admin"]=false;update_option("gmcp_options",$o,false);' >/dev/null 2>&1
+
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

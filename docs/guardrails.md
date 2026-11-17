@@ -428,6 +428,26 @@ something that looks harmless and is not, so each says what it cannot promise.
   a 404, and publishing, trashing or deleting a post deletes its links so
   reverting does not revive them. Lifetime is 24 hours by default, at most 168.
   Feeds, embeds, trackbacks and the REST API never honour a token.
+- What a link shows is the post as the theme renders it for a visitor, and a page builder
+  can decide on its own that a visitor may not see its layout. Measured, not assumed:
+  - **Beaver Builder (Lite 2.11.2.2, read from its source and run in the dev stack).**
+    `FLBuilder::render_content_by_id()` returns nothing unless the post is publicly viewable
+    or the user has the `read` capability on it, so a draft previewed by a visitor showed its
+    title and an empty body. The preview grant now answers the builder's own
+    `fl_render_content_by_id_can_view` filter, from a callback registered only after the
+    link was verified, for the granted post's id only, only while that post is a draft,
+    pending or scheduled, before the expiry, and never over a post password. It gives the
+    request no user and no capability, and a layout the page embeds from another post (a
+    saved row, a global, the `[fl_builder_insert_layout]` shortcode) is still judged by the
+    builder on its own terms, so it can still be left out of a preview. `smoke-beaver-write.sh`
+    fetches a draft through a link as a visitor and looks for the layout's text.
+  - **Elementor (4.4.1, dev stack, a draft page with a text widget).** The layout showed
+    through a link with no change. Not measured: Elementor Pro's theme builder templates,
+    popups, dynamic tags, or other versions.
+  - **Any other builder or plugin** that gates its output on the visitor's capabilities has
+    the same shape of problem and is not covered. If a previewed draft has its title and no
+    body, fetch the link as a visitor before sending it. The cause is the builder's own
+    visibility check, and it is not something the link can be widened to fix.
 - The link is a bearer credential and it travels in a URL, where no field name
   marks it secret. `GMCP_Core::redact()` therefore scrubs the `gmcp_preview`
   parameter (in any spelling PHP maps to it: `gmcp.preview`, `gmcp+preview`,
@@ -487,7 +507,8 @@ something that looks harmless and is not, so each says what it cannot promise.
   credential has no business being fetched by a tool that cannot show a draft
   anyway.
 - Nobody can read a token back: no tool returns one after the call that made it,
-  there is no tool that lists links, and the stored row holds only the SHA-256 of
+  there is no tool that lists links (the Preview Links screen in wp-admin does, to
+  `manage_options`, and shows no token and no hash: see below), and the stored row holds only the SHA-256 of
   each token, which `wp_get_option` and every other option tool refuse to read at
   any level. Measured with three keys (write, drafts-only, admin) that each made and
   opened a link: the exact tokens were searched for in every column of every audit
@@ -501,6 +522,23 @@ something that looks harmless and is not, so each says what it cannot promise.
   count, never a token or an id, and asking destroys what it counts, but it does tell a
   key whether a link existed for a post and ends it, including one made by another key
   or another person. Ending every link needs an admin-level key.
+- The **Preview Links** screen (MCP Server, `manage_options`) lists the live links and ends
+  them: one, all of a post's, or all on the site. It is a list and a set of revoke buttons and
+  nothing else, so it adds nothing to what the front end can do. Every POST passes the settings
+  page's capability check and nonce. It prints the post (title, id, status, an edit link where the
+  user may edit it), the account the key acted as, created and expiry times, the time left and
+  the number of live links the post has. It never prints a token or a stored hash, and offers no
+  copy control, because only the hash is kept and the address cannot be rebuilt. One link is named
+  by a 16-character reference, an HMAC of its hash keyed with the site's salt: it opens nothing, and
+  a token submitted in its place matches no link. Each ending that removed something writes an
+  audit row (`gmcp_preview_revoked`, client "settings screen", the post id and a count; no token,
+  hash or reference), as the tool's does. Not covered: viewing is still not logged; the screen
+  shows who made a link as the administrator the key acts as, so it cannot tell two keys apart;
+  an ending that matches nothing (a link that had already expired) is reported to the person and
+  not logged; the screen cannot be reached below `manage_options`, so a key or user that can
+  only edit a post still ends its links through the tool. Measured in `.dev/smoke-preview-links.sh`
+  (page contents against the stored hashes and tokens, the editor and no-nonce refusals, the stored
+  option and the audit rows after each kind of ending).
 - Not closed, and said so: viewing a link is not logged (only issuing and
   revoking are); the token is in the URL, so the web server's access log, a
   proxy's, the browser's history and any Referer to a third party carry it,

@@ -458,17 +458,18 @@ builds a page (and renders it, because a stored-node count passed on a page that
 `smoke-download.sh` covers the one-time download endpoint, `smoke-export.sh` covers the
 site-file manifest, the approval-gated archive and its one-time endpoint,
 `smoke-db-dump.sh` covers the database-dump manifest, the approval-gated dump and its one-time
-endpoint, and
+endpoint,
+`smoke-preview-links.sh` covers the Preview Links screen, and
 `smoke-listing-filters.sh` covers the listing tools under another plugin's query filters.
 Run all
-twenty-four before committing. The plugin-specific suites need
+twenty-five before committing. The plugin-specific suites need
 their plugin installed and say so and exit rather than reporting failures against a site that
-simply does not have it; `smoke-download.sh`, `smoke-export.sh`, `smoke-db-dump.sh` and
-`smoke-listing-filters.sh` need only this plugin.
+simply does not have it; `smoke-download.sh`, `smoke-export.sh`, `smoke-db-dump.sh`,
+`smoke-preview-links.sh` and `smoke-listing-filters.sh` need only this plugin.
 (This sentence said fourteen while twelve suites existed and sixteen
 while seventeen did, and said twenty-one with twenty-two on disk and the newest suite missing
 from the list, which is the same drift the access-level table had: a count nothing checks
-moves on its own. It is twenty-four now, counted from `ls .dev/smoke*.sh`.)
+moves on its own. It is twenty-five now, counted from `ls .dev/smoke*.sh`.)
 
 **A test for a guard must not depend on that guard.** Read the value, make the hostile
 call, read it back, **put it back**, and only then compare. The first version of the
