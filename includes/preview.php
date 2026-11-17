@@ -193,6 +193,62 @@ class GMCP_Preview {
     return $before - count( $links );
   }
 
+  /**
+  * A short identifier for one stored link that is not the token and cannot be turned into it.
+  *
+  * Keyed with the site's salt, so the screen that lists links never prints any part of a stored
+  * hash either, and a ref copied from one site means nothing on another. 64 bits is far more
+  * than the 100 links a site can hold need to tell each other apart.
+  */
+  private static function ref( string $hash ): string {
+    return substr( hash_hmac( 'sha256', $hash, wp_salt( 'auth' ) ), 0, 16 );
+  }
+
+  /**
+  * The live links for the settings screen: when, for what and by whom, and a ref to end one.
+  * Never the token (only a hash is stored) and never the hash.
+  *
+  * @return list<array{ref:string,post:int,exp:int,by:int,at:int}> Soonest to expire first.
+  */
+  public static function listing(): array {
+    $rows = [];
+    foreach ( self::live( self::all() ) as $hash => $g ) {
+      $rows[] = [
+        'ref' => self::ref( (string) $hash ),
+        'post' => (int) $g['post'],
+        'exp' => (int) $g['exp'],
+        'by' => (int) ( $g['by'] ?? 0 ),
+        'at' => (int) ( $g['at'] ?? 0 ),
+      ];
+    }
+    usort( $rows, static function ( $a, $b ) {
+      return $a['exp'] <=> $b['exp'];
+    } );
+    return $rows;
+  }
+
+  /**
+  * End exactly one link, named by the ref the listing gave.
+  *
+  * @return int|null The post the link was for, or null when no stored link has that ref
+  *                  (already expired, already ended, or never existed).
+  */
+  public static function revoke_ref( string $ref ): ?int {
+    if ( !preg_match( '/^[a-f0-9]{16}$/', $ref ) ) {
+      return null;
+    }
+    $links = self::all();
+    foreach ( $links as $hash => $g ) {
+      if ( hash_equals( self::ref( (string) $hash ), $ref ) ) {
+        $post = is_array( $g ) ? (int) ( $g['post'] ?? 0 ) : 0;
+        unset( $links[ $hash ] );
+        self::save( self::live( $links ) );
+        return $post;
+      }
+    }
+    return null;
+  }
+
   /** Live links for a post, without anything that could rebuild one. */
   public static function count_for( int $post_id ): int {
     return count( array_filter( self::live( self::all() ), static function ( $g ) use ( $post_id ) {
