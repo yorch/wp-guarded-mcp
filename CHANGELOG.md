@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/yorch/wp-guarded-mcp/compare/v1.4.0...v1.4.1) (2026-11-17)
+
+
+### Bug Fixes
+
+* **preview:** show a Beaver Builder layout on a previewed draft; add a Preview Links admin screen ([#60](https://github.com/yorch/wp-guarded-mcp/issues/60)) ([4523ecf](https://github.com/yorch/wp-guarded-mcp/commit/4523ecfc6ebf79407e96c58478d0103b2f102964))
+
 ## [1.4.0](https://github.com/yorch/wp-guarded-mcp/compare/v1.3.1...v1.4.0) (2026-11-07)
 
 
