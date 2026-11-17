@@ -38,6 +38,20 @@ if ( !defined( 'ABSPATH' ) ) {
 *                          not referrable (the token is in the URL, and a Referer header
 *                          would carry it to every external image on the page).
 *
+* PAGE BUILDERS. A builder that renders a layout through its own function, not through
+* post_content, usually asks its own visibility question first, and for a draft that
+* question is "may this visitor read it?" with a visitor who has no account. Beaver
+* Builder's FLBuilder::render_content_by_id() does exactly that (a post must be publicly
+* viewable, or the user must have the read capability on it) and prints nothing when the
+* answer is no, so a draft shows its title and an empty body. Its answer is exposed as
+* the fl_render_content_by_id_can_view filter, and template_redirect registers a callback
+* on it only after the grant has been verified. The callback turns a "no" into a "yes"
+* for the granted post's own id and nothing else, only while the post is still a draft,
+* pending or scheduled, only before the link expires, and never over a password: the
+* builder asks about the password before it asks the filter, and the callback asks again.
+* No capability is granted, no user is set, and the builder's own checks stay in force
+* for every other post, so a layout embedded from a second post is still judged on its own.
+*
 * The grant is never a way to see a PUBLISHED post: the query asks for draft, pending and
 * future only, so on a published post the query matches nothing and the answer is a 404.
 * Publishing, trashing, or deleting a post revokes its links outright, so reverting later
@@ -278,6 +292,31 @@ class GMCP_Preview {
     // token on the way and turning a working link into a 404.
     add_filter( 'redirect_canonical', '__return_false' );
     remove_action( 'template_redirect', 'wp_old_slug_redirect' );
+
+    // Registered here, after the grant was verified for this request, and nowhere else.
+    add_filter( 'fl_render_content_by_id_can_view', [ $this, 'builder_can_view' ], 10, 2 );
+  }
+
+  /**
+  * Beaver Builder asks whether the visitor may see a layout; for a draft the visitor
+  * cannot, and the layout is dropped. Say yes for the granted post, and only that one.
+  *
+  * Never turns a "yes" into anything and never answers for another id. The post is read
+  * again here, so a post published, trashed or moved out of the shareable statuses
+  * between the query and the render is not shown, and so is the expiry.
+  *
+  * @param bool $can_view What the builder concluded.
+  * @param mixed $post_id The post whose layout is about to be rendered.
+  */
+  public function builder_can_view( $can_view, $post_id ): bool {
+    if ( $can_view || $this->active === null || (int) $post_id !== $this->active['post'] || $this->active['exp'] <= time() ) {
+      return (bool) $can_view;
+    }
+    $post = get_post( (int) $post_id );
+    if ( self::refusal_for( $post ) !== null || post_password_required( $post ) ) {
+      return false;
+    }
+    return true;
   }
 
   /* --------------------------------------------------------------- lifecycle cleanup */
