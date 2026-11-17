@@ -428,6 +428,26 @@ something that looks harmless and is not, so each says what it cannot promise.
   a 404, and publishing, trashing or deleting a post deletes its links so
   reverting does not revive them. Lifetime is 24 hours by default, at most 168.
   Feeds, embeds, trackbacks and the REST API never honour a token.
+- What a link shows is the post as the theme renders it for a visitor, and a page builder
+  can decide on its own that a visitor may not see its layout. Measured, not assumed:
+  - **Beaver Builder (Lite 2.11.2.2, read from its source and run in the dev stack).**
+    `FLBuilder::render_content_by_id()` returns nothing unless the post is publicly viewable
+    or the user has the `read` capability on it, so a draft previewed by a visitor showed its
+    title and an empty body. The preview grant now answers the builder's own
+    `fl_render_content_by_id_can_view` filter, from a callback registered only after the
+    link was verified, for the granted post's id only, only while that post is a draft,
+    pending or scheduled, before the expiry, and never over a post password. It gives the
+    request no user and no capability, and a layout the page embeds from another post (a
+    saved row, a global, the `[fl_builder_insert_layout]` shortcode) is still judged by the
+    builder on its own terms, so it can still be left out of a preview. `smoke-beaver-write.sh`
+    fetches a draft through a link as a visitor and looks for the layout's text.
+  - **Elementor (4.4.1, dev stack, a draft page with a text widget).** The layout showed
+    through a link with no change. Not measured: Elementor Pro's theme builder templates,
+    popups, dynamic tags, or other versions.
+  - **Any other builder or plugin** that gates its output on the visitor's capabilities has
+    the same shape of problem and is not covered. If a previewed draft has its title and no
+    body, fetch the link as a visitor before sending it. The cause is the builder's own
+    visibility check, and it is not something the link can be widened to fix.
 - The link is a bearer credential and it travels in a URL, where no field name
   marks it secret. `GMCP_Core::redact()` therefore scrubs the `gmcp_preview`
   parameter (in any spelling PHP maps to it: `gmcp.preview`, `gmcp+preview`,
