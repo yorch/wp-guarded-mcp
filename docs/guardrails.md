@@ -507,7 +507,8 @@ something that looks harmless and is not, so each says what it cannot promise.
   credential has no business being fetched by a tool that cannot show a draft
   anyway.
 - Nobody can read a token back: no tool returns one after the call that made it,
-  there is no tool that lists links, and the stored row holds only the SHA-256 of
+  there is no tool that lists links (the Preview Links screen in wp-admin does, to
+  `manage_options`, and shows no token and no hash: see below), and the stored row holds only the SHA-256 of
   each token, which `wp_get_option` and every other option tool refuse to read at
   any level. Measured with three keys (write, drafts-only, admin) that each made and
   opened a link: the exact tokens were searched for in every column of every audit
@@ -521,6 +522,23 @@ something that looks harmless and is not, so each says what it cannot promise.
   count, never a token or an id, and asking destroys what it counts, but it does tell a
   key whether a link existed for a post and ends it, including one made by another key
   or another person. Ending every link needs an admin-level key.
+- The **Preview Links** screen (MCP Server, `manage_options`) lists the live links and ends
+  them: one, all of a post's, or all on the site. It is a list and a set of revoke buttons and
+  nothing else, so it adds nothing to what the front end can do. Every POST passes the settings
+  page's capability check and nonce. It prints the post (title, id, status, an edit link where the
+  user may edit it), the account the key acted as, created and expiry times, the time left and
+  the number of live links the post has. It never prints a token or a stored hash, and offers no
+  copy control, because only the hash is kept and the address cannot be rebuilt. One link is named
+  by a 16-character reference, an HMAC of its hash keyed with the site's salt: it opens nothing, and
+  a token submitted in its place matches no link. Each ending that removed something writes an
+  audit row (`gmcp_preview_revoked`, client "settings screen", the post id and a count; no token,
+  hash or reference), as the tool's does. Not covered: viewing is still not logged; the screen
+  shows who made a link as the administrator the key acts as, so it cannot tell two keys apart;
+  an ending that matches nothing (a link that had already expired) is reported to the person and
+  not logged; the screen cannot be reached below `manage_options`, so a key or user that can
+  only edit a post still ends its links through the tool. Measured in `.dev/smoke-preview-links.sh`
+  (page contents against the stored hashes and tokens, the editor and no-nonce refusals, the stored
+  option and the audit rows after each kind of ending).
 - Not closed, and said so: viewing a link is not logged (only issuing and
   revoking are); the token is in the URL, so the web server's access log, a
   proxy's, the browser's history and any Referer to a third party carry it,
